@@ -1,0 +1,15 @@
+.svelte-kit
+.data
+.playwright-mcp
+.run
+build
+node_modules
+backend/target
+dist
+.env
+.env.*
+!.env.example
+*.log
+rhwp-*.png
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*

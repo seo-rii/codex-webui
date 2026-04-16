@@ -1,0 +1,64 @@
+{
+  "name": "codex-webui",
+  "private": false,
+  "version": "0.1.0",
+  "description": "Claude-like web UI for Codex CLI with a Rust WebSocket gateway and SvelteKit frontend.",
+  "type": "module",
+  "bin": {
+    "codex-webui": "./bin/codex-webui.mjs"
+  },
+  "files": [
+    "bin",
+    "build",
+    "backend",
+    "dist",
+    "docs",
+    "scripts",
+    "src",
+    "static",
+    "README.md",
+    ".env.example",
+    "svelte.config.js",
+    "vite.config.ts"
+  ],
+  "scripts": {
+    "cli": "node ./bin/codex-webui.mjs",
+    "paraglide:compile": "paraglide-js compile --project ./project.inlang --outdir ./src/lib/paraglide --strategy cookie globalVariable preferredLanguage baseLocale --is-server 'import.meta.env.SSR' --emit-ts-declarations",
+    "dev": "pnpm paraglide:compile && vite dev",
+    "build": "pnpm paraglide:compile && svelte-kit sync && vite build",
+    "build:cross": "node ./scripts/build-cross.mjs",
+    "gateway:dev": "cargo run --manifest-path backend/Cargo.toml",
+    "gateway:check": "cargo check --manifest-path backend/Cargo.toml",
+    "gateway:build": "cargo build --manifest-path backend/Cargo.toml",
+    "preview": "vite preview",
+    "check": "pnpm paraglide:compile && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "hash-password": "node scripts/hash-password.mjs"
+  },
+  "dependencies": {
+    "@inlang/paraglide-js": "^2.16.0",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-node": "^5.2.12",
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.48.4",
+    "@sveltejs/vite-plugin-svelte": "^7.0.0",
+    "@tailwindcss/vite": "^4.2.2",
+    "@types/node": "^25.6.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "autoprefixer": "^10.5.0",
+    "hast-util-to-html": "^9.0.5",
+    "lowlight": "^3.3.0",
+    "lucide-svelte": "^1.0.1",
+    "marked": "^17.0.0",
+    "monaco-editor": "^0.55.1",
+    "postcss": "^8.5.9",
+    "svelte": "^5.39.6",
+    "svelte-check": "^4.3.1",
+    "tailwindcss": "^4.2.2",
+    "tslib": "^2.8.1",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.8"
+  }
+}

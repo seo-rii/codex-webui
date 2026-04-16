@@ -33,6 +33,7 @@ export type SessionSummary = {
   createdAt: number;
   updatedAt: number;
   status: string;
+  isSubagent: boolean;
   agentNickname: string | null;
   agentRole: string | null;
   preferences: SessionPreferences | null;
@@ -82,6 +83,7 @@ export type CodexThread = {
   status: string;
   createdAt: number;
   updatedAt: number;
+  isSubagent: boolean;
   agentNickname: string | null;
   agentRole: string | null;
   turns: CodexTurn[];

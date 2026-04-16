@@ -74,8 +74,8 @@ async function listSessionFiles(rootDir) {
   return results;
 }
 
-async function parseSessionFile(filePath) {
-  const stat = await fs.stat(filePath);
+async function parseSessionFile(filePath, stat = null) {
+  const resolvedStat = stat ?? (await fs.stat(filePath));
   const stream = createReadStream(filePath, { encoding: "utf8" });
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
 
@@ -150,8 +150,8 @@ async function parseSessionFile(filePath) {
     preview,
     cwd: cwd || "",
     isSubagent,
-    createdAt: createdAt || Math.floor(stat.birthtimeMs / 1000) || Math.floor(stat.mtimeMs / 1000),
-    updatedAt: Math.floor(stat.mtimeMs / 1000),
+    createdAt: createdAt || Math.floor(resolvedStat.birthtimeMs / 1000) || Math.floor(resolvedStat.mtimeMs / 1000),
+    updatedAt: Math.floor(resolvedStat.mtimeMs / 1000),
     status: "unknown"
   };
 }
@@ -161,6 +161,7 @@ let cache = {
   loadedAt: 0,
   entries: []
 };
+let sessionFileCache = new Map();
 
 async function loadIndex(codexHome) {
   const cacheKey = codexHome;
@@ -170,9 +171,42 @@ async function loadIndex(codexHome) {
 
   const rootDir = path.join(codexHome, "sessions");
   const files = await listSessionFiles(rootDir);
-  const parsedEntries = await Promise.all(files.map((filePath) => parseSessionFile(filePath)));
+  const activeFiles = new Set(files);
+  for (const cachedPath of sessionFileCache.keys()) {
+    if (!activeFiles.has(cachedPath)) {
+      sessionFileCache.delete(cachedPath);
+    }
+  }
+
+  const parsedEntries = await Promise.all(
+    files.map(async (filePath) => {
+      let stat;
+      try {
+        stat = await fs.stat(filePath);
+      } catch {
+        sessionFileCache.delete(filePath);
+        return null;
+      }
+
+      const cached = sessionFileCache.get(filePath);
+      if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+        return cached.entry;
+      }
+
+      const entry = await parseSessionFile(filePath, stat);
+      sessionFileCache.set(filePath, {
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        entry
+      });
+      return entry;
+    })
+  );
   const entryMap = new Map();
   for (const entry of parsedEntries) {
+    if (!entry) {
+      continue;
+    }
     const current = entryMap.get(entry.id);
     if (!current) {
       entryMap.set(entry.id, entry);
@@ -207,7 +241,9 @@ async function loadIndex(codexHome) {
     });
   }
 
-  const entries = [...entryMap.values()].sort((left, right) => right.updatedAt - left.updatedAt);
+  const entries = [...entryMap.values()]
+    .filter((entry) => !entry.isSubagent)
+    .sort((left, right) => right.updatedAt - left.updatedAt);
 
   cache = {
     key: cacheKey,
@@ -217,19 +253,39 @@ async function loadIndex(codexHome) {
   return entries;
 }
 
+function sliceEntries(entries, cursor, limit) {
+  const start = Math.max(0, Number.parseInt(String(cursor ?? "0"), 10) || 0);
+  const numericLimit = Number(limit);
+  const pageSize = Number.isFinite(numericLimit) && numericLimit > 0 ? Math.max(1, Math.floor(numericLimit)) : 20;
+  const nextIndex = start + pageSize;
+  return {
+    entries: entries.slice(start, nextIndex),
+    nextCursor: nextIndex < entries.length ? String(nextIndex) : null
+  };
+}
+
 parentPort?.on("message", async (message) => {
   const { id, method, params } = message ?? {};
-  if (!id || method !== "session-index/list") {
+  if (!id || (method !== "session-index/list" && method !== "session-index/page")) {
     return;
   }
 
   try {
     const entries = await loadIndex(String(params?.codexHome || ""));
+    const query = normalizeText(String(params?.query || "")).toLowerCase();
+    const filteredEntries = query
+      ? entries.filter((entry) => `${normalizeText(entry.name)}\n${normalizeText(entry.preview)}`.toLowerCase().includes(query))
+      : entries;
+    const page = method === "session-index/page" ? sliceEntries(filteredEntries, params?.cursor, params?.limit) : {
+      entries: filteredEntries,
+      nextCursor: null
+    };
     parentPort?.postMessage({
       id,
       ok: true,
       result: {
-        entries
+        entries: page.entries,
+        nextCursor: page.nextCursor
       }
     });
   } catch (error) {

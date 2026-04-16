@@ -209,8 +209,14 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
     seeded.turn.durationMs = turn.durationMs;
     next.thread.turns = seeded.turns;
     next.activeTurnId = method === "turn/started" ? turn.id : next.activeTurnId === turn.id ? null : next.activeTurnId;
+    if (method === "turn/started") {
+      next.thread.status = "running";
+    }
     if (next.thread.status !== "running" && next.thread.status !== "active") {
       next.activeTurnId = resolveConversationRunningTurn(next);
+    }
+    if (method === "turn/completed" && !next.activeTurnId && (next.thread.status === "running" || next.thread.status === "active")) {
+      next.thread.status = "completed";
     }
     return next;
   }

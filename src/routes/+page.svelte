@@ -1538,14 +1538,17 @@
       createdAt: state.thread.createdAt,
       updatedAt: Math.max(state.thread.updatedAt, Math.floor(Date.now() / 1000)),
       status: state.thread.status,
+      isSubagent: state.thread.isSubagent,
       agentNickname: state.thread.agentNickname,
       agentRole: state.thread.agentRole,
       preferences: state.preferences
     };
   }
 
-  function isSubagentSessionSummary(session: Pick<SessionSummary, "agentNickname" | "agentRole"> | null | undefined) {
-    return Boolean((session?.agentNickname ?? "").trim() || (session?.agentRole ?? "").trim());
+  function isSubagentSessionSummary(
+    session: Pick<SessionSummary, "isSubagent" | "agentNickname" | "agentRole"> | null | undefined
+  ) {
+    return Boolean(session?.isSubagent || (session?.agentNickname ?? "").trim() || (session?.agentRole ?? "").trim());
   }
 
   function applyAccountState(payload: { account: Record<string, unknown>; requiresOpenaiAuth: boolean }) {
@@ -1933,6 +1936,7 @@
         createdAt: detail.thread.createdAt,
         updatedAt: detail.thread.updatedAt,
         status: detail.thread.status,
+        isSubagent: detail.thread.isSubagent,
         agentNickname: detail.thread.agentNickname,
         agentRole: detail.thread.agentRole,
         preferences: detail.preferences
@@ -2503,6 +2507,7 @@
         createdAt: conversation?.thread.createdAt ?? Math.floor(Date.now() / 1000),
         updatedAt: Math.floor(Date.now() / 1000),
         status: conversation?.thread.status ?? "unknown",
+        isSubagent: conversation?.thread.isSubagent ?? false,
         agentNickname: conversation?.thread.agentNickname ?? null,
         agentRole: conversation?.thread.agentRole ?? null,
         preferences: conversation?.preferences ?? null

@@ -32,7 +32,7 @@ import { configTomlPath, syncCodexTomlWithPreferences } from "./codex-config";
 import { getRuntimeConfig } from "./env";
 import { buildSandboxPolicy, listDirectoryPayload, resolveAllowedDirectory } from "./fs";
 import { resolveGitRepository } from "./git";
-import { sessionIndexClient } from "./session-index";
+import { sessionIndexClient, type IndexedSessionSummary } from "./session-index";
 import { uiStateStore } from "./store";
 
 type InternalPendingRequest = PendingServerRequest & {
@@ -44,6 +44,8 @@ type SessionHydrationState = SessionDetailPayload["hydration"] & {
 };
 
 const SESSION_WINDOW_SIZE = 20;
+const RECENT_LIVE_THREAD_WINDOW_SIZE = 120;
+const RECENT_LIVE_THREAD_CACHE_TTL_MS = 2500;
 const HYDRATION_CACHE_LIMIT = 2;
 const DEFERRED_ITEM_TYPES = new Set(["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"]);
 const DEFAULT_THREAD_NAME = "New thread";
@@ -117,6 +119,7 @@ function normalizeThread(thread: Record<string, unknown>): Record<string, unknow
     name: asText(thread.name),
     preview: stripAttachmentPreamble(asText(thread.preview) ?? ""),
     status: normalizeThreadStatus(thread.status),
+    isSubagent: isSubagentThread(thread),
     agentNickname: getThreadAgentNickname(thread),
     agentRole: getThreadAgentRole(thread),
     turns: Array.isArray(thread.turns) ? thread.turns : []
@@ -184,14 +187,39 @@ function toSummary(
     createdAt: Number(normalized.createdAt ?? 0),
     updatedAt: Number(normalized.updatedAt ?? 0),
     status: asText(normalized.status) ?? "unknown",
+    isSubagent: Boolean(normalized.isSubagent),
     agentNickname: asText(normalized.agentNickname),
     agentRole: asText(normalized.agentRole),
     preferences
   };
 }
 
-function isSubagentSessionSummary(session: Pick<SessionSummary, "agentNickname" | "agentRole"> | null | undefined) {
-  return Boolean((session?.agentNickname ?? "").trim() || (session?.agentRole ?? "").trim());
+function indexedSessionToSummary(
+  indexed: IndexedSessionSummary,
+  preferences: SessionPreferences | null,
+  queueCount: number
+): SessionSummary {
+  return {
+    id: indexed.id,
+    name: indexed.name,
+    preview: indexed.preview,
+    queueCount: Math.max(0, queueCount),
+    cwd: indexed.cwd || preferences?.cwd || getRuntimeConfig().defaults.cwd,
+    archived: false,
+    createdAt: indexed.createdAt,
+    updatedAt: indexed.updatedAt,
+    status: indexed.status || "unknown",
+    isSubagent: indexed.isSubagent,
+    agentNickname: null,
+    agentRole: null,
+    preferences
+  };
+}
+
+function isSubagentSessionSummary(
+  session: Pick<SessionSummary, "isSubagent" | "agentNickname" | "agentRole"> | null | undefined
+) {
+  return Boolean(session?.isSubagent || (session?.agentNickname ?? "").trim() || (session?.agentRole ?? "").trim());
 }
 
 function areLikelyDuplicateQueueItems(left: SessionQueueItem, right: SessionQueueItem) {
@@ -213,13 +241,27 @@ function findActiveTurnId(thread: Record<string, unknown>) {
   return activeTurn ? String(activeTurn.id ?? "") : null;
 }
 
+function resolveTrackedActiveTurnId(thread: Record<string, unknown>, fallback: string | null = null) {
+  const activeTurnId = findActiveTurnId(thread);
+  if (activeTurnId) {
+    return activeTurnId;
+  }
+
+  const turns = Array.isArray(thread.turns) ? (thread.turns as Array<Record<string, unknown>>) : [];
+  if (turns.length > 0) {
+    return null;
+  }
+
+  return fallback;
+}
+
 function getThreadActiveTurnId(thread: Record<string, unknown>, fallback: string | null = null) {
   const status = String(normalizeThreadStatus(thread.status) ?? "");
   if (status !== "running" && status !== "active") {
     return null;
   }
 
-  return fallback ?? findActiveTurnId(thread);
+  return resolveTrackedActiveTurnId(thread, fallback);
 }
 
 function itemCacheKey(turnId: string, itemId: string) {
@@ -312,6 +354,9 @@ export class CodexGateway {
   private readonly itemDetailsByThread = new Map<string, Map<string, CodexItem>>();
   private readonly fullTurnsByThread = new Map<string, Map<string, CodexTurn>>();
   private readonly drainingQueues = new Set<string>();
+  private recentLiveSessions = new Map<string, SessionSummary>();
+  private recentLiveSessionsLoadedAt = 0;
+  private recentLiveSessionsPromise: Promise<Map<string, SessionSummary>> | null = null;
   private shutdownTimer: ReturnType<typeof setTimeout> | null = null;
   private shutdownScheduledFor: number | null = null;
   private shutdownScheduledThreadId: string | null = null;
@@ -445,12 +490,43 @@ export class CodexGateway {
 
   async listSessions(archived = false, cursor: string | null = null, limit = SESSION_WINDOW_SIZE): Promise<SessionListPayload> {
     if (!archived) {
-      const mergedSessions = await this.collectListableSessions(false);
-      const start = Math.max(0, Number.parseInt(cursor ?? "0", 10) || 0);
-      const nextIndex = start + limit;
+      const [preferences, queueCounts, indexedPage, recentLiveSessions] = await Promise.all([
+        uiStateStore.getAll(),
+        uiStateStore.getQueueCounts(),
+        sessionIndexClient.page(getRuntimeConfig().codexHome, cursor, limit, null),
+        this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>())
+      ]);
+
+      if (indexedPage.entries.length === 0 && (cursor === null || cursor === "0")) {
+        return {
+          sessions: [...recentLiveSessions.values()]
+            .filter((session) => !isSubagentSessionSummary(session))
+            .slice(0, limit),
+          nextCursor: null
+        };
+      }
+
       return {
-        sessions: mergedSessions.slice(start, nextIndex),
-        nextCursor: nextIndex < mergedSessions.length ? String(nextIndex) : null
+        sessions: indexedPage.entries
+          .filter((entry) => !entry.isSubagent)
+          .map((entry) => {
+            const stored = preferences[entry.id];
+            const live = recentLiveSessions.get(entry.id);
+            if (!live) {
+              return indexedSessionToSummary(entry, stored ? coercePreferences(stored) : null, queueCounts[entry.id] ?? 0);
+            }
+
+            return {
+              ...live,
+              name: !isPlaceholderThreadName(live.name) ? live.name : entry.name,
+              preview: live.preview?.trim() ? live.preview : entry.preview,
+              cwd: live.cwd || entry.cwd,
+              createdAt: live.createdAt || entry.createdAt,
+              updatedAt: Math.max(live.updatedAt || 0, entry.updatedAt || 0)
+            } satisfies SessionSummary;
+          })
+          .filter((session) => !isSubagentSessionSummary(session)),
+        nextCursor: indexedPage.nextCursor
       };
     }
 
@@ -479,6 +555,48 @@ export class CodexGateway {
     const needle = query.trim().toLowerCase();
     if (!needle) {
       return this.listSessions(archived, cursor, limit);
+    }
+
+    if (!archived && scope === "summary") {
+      const [preferences, queueCounts, indexedPage, recentLiveSessions] = await Promise.all([
+        uiStateStore.getAll(),
+        uiStateStore.getQueueCounts(),
+        sessionIndexClient.page(getRuntimeConfig().codexHome, cursor, limit, needle),
+        this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>())
+      ]);
+
+      if (indexedPage.entries.length === 0 && (cursor === null || cursor === "0")) {
+        return {
+          sessions: [...recentLiveSessions.values()]
+            .filter((session) => !isSubagentSessionSummary(session))
+            .filter((session) => `${session.name ?? ""}\n${session.preview ?? ""}`.toLowerCase().includes(needle))
+            .slice(0, limit),
+          nextCursor: null
+        };
+      }
+
+      return {
+        sessions: indexedPage.entries
+          .filter((entry) => !entry.isSubagent)
+          .map((entry) => {
+            const stored = preferences[entry.id];
+            const live = recentLiveSessions.get(entry.id);
+            if (!live) {
+              return indexedSessionToSummary(entry, stored ? coercePreferences(stored) : null, queueCounts[entry.id] ?? 0);
+            }
+
+            return {
+              ...live,
+              name: !isPlaceholderThreadName(live.name) ? live.name : entry.name,
+              preview: live.preview?.trim() ? live.preview : entry.preview,
+              cwd: live.cwd || entry.cwd,
+              createdAt: live.createdAt || entry.createdAt,
+              updatedAt: Math.max(live.updatedAt || 0, entry.updatedAt || 0)
+            } satisfies SessionSummary;
+          })
+          .filter((session) => !isSubagentSessionSummary(session)),
+        nextCursor: indexedPage.nextCursor
+      };
     }
 
     const sessions = await this.collectListableSessions(archived);
@@ -549,6 +667,7 @@ export class CodexGateway {
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         status: session.status || "unknown",
+        isSubagent: session.isSubagent,
         agentNickname: null,
         agentRole: null,
         preferences: stored ? coercePreferences(stored) : null
@@ -596,9 +715,46 @@ export class CodexGateway {
     return sessions;
   }
 
+  private async getRecentLiveSessionSummaries() {
+    const now = Date.now();
+    if (this.recentLiveSessions.size > 0 && now - this.recentLiveSessionsLoadedAt < RECENT_LIVE_THREAD_CACHE_TTL_MS) {
+      return this.recentLiveSessions;
+    }
+
+    if (this.recentLiveSessionsPromise) {
+      return this.recentLiveSessionsPromise;
+    }
+
+    this.recentLiveSessionsPromise = (async () => {
+      const [preferences, queueCounts] = await Promise.all([uiStateStore.getAll(), uiStateStore.getQueueCounts()]);
+      const response = asRecord(
+        await this.client.request("thread/list", { limit: RECENT_LIVE_THREAD_WINDOW_SIZE, archived: false, cursor: null })
+      );
+      const threads = (response.data as Array<Record<string, unknown>> | undefined) ?? [];
+      const nextRecentLiveSessions = new Map(
+        threads
+          .filter((thread) => !isSubagentThread(thread))
+          .map((thread) => {
+            const threadId = String(thread.id);
+            const stored = preferences[threadId];
+            const summary = toSummary(thread, stored ? coercePreferences(stored) : null, false, queueCounts[threadId] ?? 0);
+            return [threadId, summary] as const;
+          })
+      );
+      this.recentLiveSessions = nextRecentLiveSessions;
+      this.recentLiveSessionsLoadedAt = Date.now();
+      return nextRecentLiveSessions;
+    })().finally(() => {
+      this.recentLiveSessionsPromise = null;
+    });
+
+    return this.recentLiveSessionsPromise;
+  }
+
   async archiveSession(threadId: string) {
     await this.client.request("thread/archive", { threadId });
     sessionIndexClient.invalidate();
+    this.recentLiveSessions.delete(threadId);
     this.rolloutPaths.delete(threadId);
     this.sessionHydrations.delete(threadId);
     this.itemDetailsByThread.delete(threadId);
@@ -615,9 +771,12 @@ export class CodexGateway {
     this.fullTurnsByThread.delete(threadId);
     const thread = normalizeThread(asRecord(response.thread));
     const preferences = await this.getPreferences(threadId, thread);
+    const summary = toSummary(thread, preferences, false);
+    this.recentLiveSessions.set(threadId, summary);
+    this.recentLiveSessionsLoadedAt = Date.now();
     return {
       ok: true,
-      session: toSummary(thread, preferences, false)
+      session: summary
     };
   }
 
@@ -672,6 +831,8 @@ export class CodexGateway {
 
     const summary = toSummary(thread, nextPreferences);
     sessionIndexClient.invalidate();
+    this.recentLiveSessions.set(String(thread.id), summary);
+    this.recentLiveSessionsLoadedAt = Date.now();
     this.emitGlobal({
       kind: "notification",
       method: "codex-webui/sessionSummaryUpdated",
@@ -691,7 +852,7 @@ export class CodexGateway {
     const windowSize = Math.max(1, limit);
     const visibleTurns = hydration.turns.slice(-windowSize).map((turn) => structuredClone(turn));
     const totalTurns = hydration.totalTurns ?? hydration.turns.length;
-    const trackedActiveTurnId = this.activeTurns.get(threadId) ?? findActiveTurnId({ turns: hydration.turns });
+    const trackedActiveTurnId = findActiveTurnId({ turns: hydration.turns }) ?? this.activeTurns.get(threadId) ?? null;
     const activeTurnId = getThreadActiveTurnId(thread, trackedActiveTurnId);
     if (activeTurnId) {
       this.activeTurns.set(threadId, activeTurnId);
@@ -1664,6 +1825,8 @@ export class CodexGateway {
           const activeTurnId = findActiveTurnId({ turns: initial.turns });
           if (activeTurnId) {
             this.activeTurns.set(threadId, activeTurnId);
+          } else {
+            this.activeTurns.delete(threadId);
           }
           this.pruneHydrationCache();
           return;
@@ -1681,6 +1844,8 @@ export class CodexGateway {
         const activeTurnId = findActiveTurnId(thread);
         if (activeTurnId) {
           this.activeTurns.set(threadId, activeTurnId);
+        } else {
+          this.activeTurns.delete(threadId);
         }
         this.pruneHydrationCache();
       } catch (error) {
@@ -1741,6 +1906,7 @@ export class CodexGateway {
     if (method === "turn/started") {
       const turn = asRecord(params.turn);
       this.activeTurns.set(threadId, String(turn.id ?? ""));
+      void this.emitSessionSummaryUpdated(threadId, null, null, null, "running");
     } else if (method === "turn/completed") {
       const turn = asRecord(params.turn);
       if (this.activeTurns.get(threadId) === String(turn.id ?? "")) {
@@ -1756,6 +1922,7 @@ export class CodexGateway {
           reason: "completed"
         }
       });
+      void this.emitSessionSummaryUpdated(threadId, null, null, null, "completed");
     } else if (method === "thread/status/changed") {
       const nextStatus = normalizeThreadStatus(params.status) ?? "unknown";
       if (nextStatus !== "running" && nextStatus !== "active") {
@@ -1818,7 +1985,7 @@ export class CodexGateway {
             : params
     });
 
-    if (["turn/started", "turn/completed", "thread/name/updated", "thread/status/changed"].includes(method)) {
+    if (["thread/name/updated", "thread/status/changed"].includes(method)) {
       void this.emitSessionSummaryUpdated(threadId);
     }
 
@@ -2085,16 +2252,22 @@ export class CodexGateway {
     threadId: string,
     thread: Record<string, unknown> | null = null,
     preferences: SessionPreferences | null = null,
-    queueCount: number | null = null
+    queueCount: number | null = null,
+    statusOverride: string | null = null
   ) {
     try {
       const resolvedThread = normalizeThread(thread ?? (await this.readThread(threadId, false)));
       const resolvedPreferences = preferences ?? (await this.getPreferences(threadId, resolvedThread));
       const resolvedQueueCount = queueCount ?? (await this.getQueue(threadId)).items.length;
-      const summary = toSummary(resolvedThread, resolvedPreferences, false, resolvedQueueCount);
+      const summary = {
+        ...toSummary(resolvedThread, resolvedPreferences, false, resolvedQueueCount),
+        status: statusOverride ?? (asText(resolvedThread.status) ?? "unknown")
+      } satisfies SessionSummary;
       if (isSubagentSessionSummary(summary)) {
         return;
       }
+      this.recentLiveSessions.set(threadId, summary);
+      this.recentLiveSessionsLoadedAt = Date.now();
       this.emitGlobal({
         kind: "notification",
         method: "codex-webui/sessionSummaryUpdated",

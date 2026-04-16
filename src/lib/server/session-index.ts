@@ -12,11 +12,17 @@ export type IndexedSessionSummary = {
   status: string;
 };
 
+export type IndexedSessionPage = {
+  entries: IndexedSessionSummary[];
+  nextCursor: string | null;
+};
+
 type WorkerResponse = {
   id: string;
   ok: boolean;
   result?: {
     entries: IndexedSessionSummary[];
+    nextCursor?: string | null;
   };
   error?: string;
 };
@@ -27,23 +33,36 @@ export class SessionIndexClient {
   private pending = new Map<
     string,
     {
-      resolve: (value: IndexedSessionSummary[]) => void;
+      resolve: (value: IndexedSessionPage) => void;
       reject: (error: Error) => void;
     }
   >();
 
   async list(codexHome: string) {
+    const page = await this.page(codexHome, null, Number.MAX_SAFE_INTEGER, null);
+    return page.entries;
+  }
+
+  async page(codexHome: string, cursor: string | null = null, limit = 20, query: string | null = null) {
     if (!codexHome) {
-      return [];
+      return {
+        entries: [],
+        nextCursor: null
+      } satisfies IndexedSessionPage;
     }
     const worker = this.getWorker();
     const id = `session-index-${this.nextRequestId++}`;
-    return new Promise<IndexedSessionSummary[]>((resolve, reject) => {
+    return new Promise<IndexedSessionPage>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       worker.postMessage({
         id,
-        method: "session-index/list",
-        params: { codexHome }
+        method: "session-index/page",
+        params: {
+          codexHome,
+          cursor,
+          limit,
+          query
+        }
       });
     });
   }
@@ -77,7 +96,11 @@ export class SessionIndexClient {
         pending.reject(new Error(message.error || "Session index worker failed."));
         return;
       }
-      pending.resolve(message.result?.entries ?? []);
+      pending.resolve({
+        entries: message.result?.entries ?? [],
+        nextCursor:
+          typeof message.result?.nextCursor === "string" && message.result.nextCursor.trim() ? message.result.nextCursor : null
+      });
     });
     this.worker.on("error", (error: Error) => {
       for (const pending of this.pending.values()) {

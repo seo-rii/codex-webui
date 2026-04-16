@@ -3956,7 +3956,16 @@
   }
 
   function summarizeCommand(item: Record<string, unknown>) {
-    return formatValue(item.command) || m.command();
+    const command = item.command;
+    if (Array.isArray(command)) {
+      const fragments = command
+        .map((entry) => (typeof entry === "string" ? entry : formatValue(entry)))
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0);
+      return fragments.join(" ").trim() || m.command();
+    }
+
+    return formatValue(command).replace(/\s+/g, " ").trim() || m.command();
   }
 
   function getParsedCommands(item: Record<string, unknown>) {
@@ -3969,46 +3978,136 @@
   }
 
   function isReadOnlyShellCommand(item: Record<string, unknown>) {
+    return getSpecialShellCommandKind(item) !== null;
+  }
+
+  function getSpecialShellCommandKind(item: Record<string, unknown>) {
     if (item.type !== "commandExecution") {
-      return false;
+      return null;
     }
 
     const parsedCommands = getParsedCommands(item);
     if (parsedCommands.length > 0) {
       const parsedTypes = parsedCommands.map((entry) => String(entry.type ?? ""));
       if (parsedTypes.every((type) => readOnlyParsedCommandTypes.has(type))) {
-        return true;
+        if (parsedTypes.some((type) => type === "list_files" || type === "search")) {
+          return "search" as const;
+        }
+        return "read" as const;
       }
       if (parsedTypes.some((type) => type && type !== "unknown" && !readOnlyParsedCommandTypes.has(type))) {
-        return false;
+        return null;
       }
     }
 
-    const command = summarizeCommand(item).trim();
+    const commandParts = Array.isArray(item.command)
+      ? item.command
+          .map((entry) => (typeof entry === "string" ? entry : formatValue(entry)))
+          .map((entry) => entry.trim())
+          .filter((entry) => entry.length > 0)
+      : [];
+    let command = summarizeCommand(item).trim();
     if (!command || />|>>|<<?|\btee\b|\brm\b|\bmv\b|\bcp\b|\btouch\b|\bmkdir\b|\bapply_patch\b|\bpython3?\b/iu.test(command)) {
-      return false;
+      return null;
     }
 
-    const segments = command
-      .replace(/^\/bin\/bash\s+-lc\s+/u, "")
-      .replace(/^bash\s+-lc\s+/u, "")
-      .split(/&&|\|\||;/u)
-      .map((segment) => segment.trim())
+    if (
+      commandParts.length >= 3 &&
+      /(?:^|\/)(?:bash|sh)$/iu.test(commandParts[0] ?? "") &&
+      /^-l?c$/u.test(commandParts[1] ?? "")
+    ) {
+      command = commandParts.slice(2).join(" ").trim();
+    } else {
+      command = command
+        .replace(/^(?:(?:\S+\/)?(?:bash|sh)|\/usr\/bin\/env\s+(?:\S+\/)?(?:bash|sh))\s+-l?c\s+/iu, "")
+        .trim();
+    }
+
+    while (
+      command.length >= 2 &&
+      ((command.startsWith('"') && command.endsWith('"')) || (command.startsWith("'") && command.endsWith("'")))
+    ) {
+      command = command.slice(1, -1).trim();
+    }
+
+    if (!command || /(?:&&|\|\|)/u.test(command)) {
+      return null;
+    }
+
+    const parts = command
+      .split("|")
+      .map((part) => part.trim())
       .filter(Boolean);
 
-    if (segments.length === 0) {
-      return false;
+    if (parts.length === 0) {
+      return null;
     }
 
-    return segments.every((segment) =>
-      segment
-        .split("|")
-        .map((part) => part.trim())
-        .filter(Boolean)
-        .every((part) =>
-          /^(pwd|ls|find|rg|sed|cat|head|tail|wc|sort|tree|stat|git\s+(status|diff|show|log)\b)/iu.test(part)
-        )
-    );
+    let sawGit = false;
+    let sawSearch = false;
+    let sawRead = false;
+
+    for (const part of parts) {
+      if (/^(?:\S+\/)?git\b/iu.test(part)) {
+        const gitTokens = part.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+        let tokenIndex = 1;
+
+        while (tokenIndex < gitTokens.length) {
+          const token = gitTokens[tokenIndex] ?? "";
+          if (token === "-C" || token === "-c" || token === "--git-dir" || token === "--work-tree") {
+            tokenIndex += 2;
+            continue;
+          }
+          if (token.startsWith("-")) {
+            tokenIndex += 1;
+            continue;
+          }
+          break;
+        }
+
+        const gitSubcommand = (gitTokens[tokenIndex] ?? "").replace(/^['"]|['"]$/g, "").toLowerCase();
+        if (
+          [
+            "status",
+            "diff",
+            "show",
+            "log",
+            "reflog",
+            "branch",
+            "rev-parse",
+            "remote",
+            "ls-files",
+            "symbolic-ref",
+            "blame",
+            "grep"
+          ].includes(gitSubcommand)
+        ) {
+          sawGit = true;
+          continue;
+        }
+        return null;
+      }
+      if (/^(pwd|sed|cat|head|tail|wc|sort|stat)\b/iu.test(part)) {
+        sawRead = true;
+        continue;
+      }
+      if (/^(ls|find|rg|tree)\b/iu.test(part)) {
+        sawSearch = true;
+        continue;
+      }
+      return null;
+    }
+
+    if (sawGit) {
+      return "git" as const;
+    }
+    if (sawSearch) {
+      return "search" as const;
+    }
+    if (sawRead) {
+      return "read" as const;
+    }
+    return null;
   }
 
   function getReadOnlyCommandTarget(item: Record<string, unknown>) {
@@ -4034,13 +4133,40 @@
     return `${uniqueTargets[0]}, ${uniqueTargets[1]} +${uniqueTargets.length - 2}`;
   }
 
-  function getReadOnlyCommandGroupLabel(items: CodexItem[]) {
+  function getReadOnlyCommandGroupKind(items: CodexItem[]) {
+    const specialKinds = items
+      .map((item) => getSpecialShellCommandKind(item))
+      .filter((kind): kind is "read" | "search" | "git" => Boolean(kind));
+    if (specialKinds.length > 0 && specialKinds.every((kind) => kind === "git")) {
+      return "git" as const;
+    }
+    if (specialKinds.length > 0 && specialKinds.every((kind) => kind === "search")) {
+      return "search" as const;
+    }
+    if (specialKinds.length > 0 && specialKinds.every((kind) => kind === "read")) {
+      return "read" as const;
+    }
+
     const parsedTypes = items.flatMap((item) => getParsedCommands(item).map((entry) => String(entry.type ?? "")));
     if (parsedTypes.length > 0 && parsedTypes.every((type) => type === "read")) {
-      return m.read();
+      return "read" as const;
     }
     if (parsedTypes.some((type) => type === "list_files" || type === "search")) {
+      return "search" as const;
+    }
+    return "inspect" as const;
+  }
+
+  function getReadOnlyCommandGroupLabel(items: CodexItem[]) {
+    const kind = getReadOnlyCommandGroupKind(items);
+    if (kind === "git") {
+      return m.git();
+    }
+    if (kind === "search") {
       return m.search();
+    }
+    if (kind === "read") {
+      return m.read();
     }
     return m.inspect();
   }
@@ -4274,7 +4400,17 @@
       return item.title;
     }
     if (item.type === "commandExecution") {
-      return isReadOnlyShellCommand(item) ? m.read() : m.run_command();
+      const specialKind = getSpecialShellCommandKind(item);
+      if (specialKind === "git") {
+        return m.git();
+      }
+      if (specialKind === "search") {
+        return m.search();
+      }
+      if (specialKind === "read") {
+        return m.read();
+      }
+      return m.run_command();
     }
     if (item.type === "fileChange") {
       const count = getFileChangeSummaryEntries(item).length;

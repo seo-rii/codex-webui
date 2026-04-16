@@ -224,7 +224,16 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
   if (method === "item/started" || method === "item/completed") {
     const turnId = String(params.turnId ?? "");
     const seeded = ensureTurn(next, turnId);
-    upsertItem(seeded.turn, params.item as CodexItem);
+    const streamItem = (params.item as CodexItem) ?? ({ id: String(params.itemId ?? ""), type: "unknown" } satisfies CodexItem);
+    upsertItem(
+      seeded.turn,
+      streamItem.type === "contextCompaction"
+        ? {
+            ...streamItem,
+            lifecycleStatus: method === "item/started" ? "inProgress" : "completed"
+          }
+        : streamItem
+    );
     next.thread.turns = seeded.turns;
     return next;
   }

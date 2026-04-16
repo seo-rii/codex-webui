@@ -46,9 +46,11 @@ type SessionHydrationState = SessionDetailPayload["hydration"] & {
 const SESSION_WINDOW_SIZE = 20;
 const RECENT_LIVE_THREAD_WINDOW_SIZE = 120;
 const RECENT_LIVE_THREAD_CACHE_TTL_MS = 2500;
+const LOADED_THREAD_CACHE_TTL_MS = 1500;
 const HYDRATION_CACHE_LIMIT = 2;
 const DEFERRED_ITEM_TYPES = new Set(["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"]);
 const DEFAULT_THREAD_NAME = "New thread";
+const LIVE_THREAD_STATUSES = new Set(["running", "active"]);
 
 function asRecord(value: unknown) {
   return (value ?? {}) as Record<string, unknown>;
@@ -88,6 +90,10 @@ function normalizeThreadStatus(value: unknown) {
   }
 
   return asText(value);
+}
+
+function isLiveThreadStatus(value: unknown) {
+  return LIVE_THREAD_STATUSES.has(String(normalizeThreadStatus(value) ?? ""));
 }
 
 function getThreadSpawnMetadata(source: unknown) {
@@ -222,17 +228,73 @@ function isSubagentSessionSummary(
   return Boolean(session?.isSubagent || (session?.agentNickname ?? "").trim() || (session?.agentRole ?? "").trim());
 }
 
-function areLikelyDuplicateQueueItems(left: SessionQueueItem, right: SessionQueueItem) {
-  if (left.prompt.trim() !== right.prompt.trim()) {
-    return false;
+function getSessionSortPriority(status: string | null | undefined) {
+  return status === "running" || status === "active" ? 1 : 0;
+}
+
+function compareSessionSummaries(left: SessionSummary, right: SessionSummary) {
+  const priorityDifference = getSessionSortPriority(right.status) - getSessionSortPriority(left.status);
+  if (priorityDifference !== 0) {
+    return priorityDifference;
   }
-  if (left.attachmentIds.length !== right.attachmentIds.length) {
-    return false;
+
+  const updatedDifference = (right.updatedAt || 0) - (left.updatedAt || 0);
+  if (updatedDifference !== 0) {
+    return updatedDifference;
   }
-  if (left.attachmentIds.some((attachmentId, index) => attachmentId !== right.attachmentIds[index])) {
-    return false;
+
+  const createdDifference = (right.createdAt || 0) - (left.createdAt || 0);
+  if (createdDifference !== 0) {
+    return createdDifference;
   }
-  return Math.abs(left.createdAt - right.createdAt) <= 4000;
+
+  return 0;
+}
+
+function mergeIndexedSessionsWithRecentLiveSessions(
+  indexedEntries: IndexedSessionSummary[],
+  preferences: Record<string, SessionPreferences>,
+  queueCounts: Record<string, number>,
+  recentLiveSessions: Map<string, SessionSummary>,
+  limit: number,
+  matcher: ((session: SessionSummary) => boolean) | null = null,
+  includeUnindexedLiveSessions = false
+) {
+  const sessions = indexedEntries
+    .filter((entry) => !entry.isSubagent)
+    .map((entry) => {
+      const stored = preferences[entry.id];
+      const live = recentLiveSessions.get(entry.id);
+      if (!live) {
+        return indexedSessionToSummary(entry, stored ? coercePreferences(stored) : null, queueCounts[entry.id] ?? 0);
+      }
+
+      return {
+        ...live,
+        name: !isPlaceholderThreadName(live.name) ? live.name : entry.name,
+        preview: live.preview?.trim() ? live.preview : entry.preview,
+        cwd: live.cwd || entry.cwd,
+        createdAt: live.createdAt || entry.createdAt,
+        updatedAt: Math.max(live.updatedAt || 0, entry.updatedAt || 0)
+      } satisfies SessionSummary;
+    })
+    .filter((session) => !isSubagentSessionSummary(session));
+
+  if (includeUnindexedLiveSessions) {
+    const seen = new Set(sessions.map((session) => session.id));
+    for (const live of recentLiveSessions.values()) {
+      if (seen.has(live.id) || isSubagentSessionSummary(live)) {
+        continue;
+      }
+      if (matcher && !matcher(live)) {
+        continue;
+      }
+      sessions.push(live);
+      seen.add(live.id);
+    }
+  }
+
+  return sessions.sort(compareSessionSummaries).slice(0, limit);
 }
 
 function findActiveTurnId(thread: Record<string, unknown>) {
@@ -257,11 +319,22 @@ function resolveTrackedActiveTurnId(thread: Record<string, unknown>, fallback: s
 
 function getThreadActiveTurnId(thread: Record<string, unknown>, fallback: string | null = null) {
   const status = String(normalizeThreadStatus(thread.status) ?? "");
-  if (status !== "running" && status !== "active") {
+  if (!LIVE_THREAD_STATUSES.has(status)) {
     return null;
   }
 
   return resolveTrackedActiveTurnId(thread, fallback);
+}
+
+function normalizeStoppedTurn(turn: CodexTurn): CodexTurn {
+  if (String(turn.status ?? "") !== "inProgress") {
+    return turn;
+  }
+
+  return {
+    ...turn,
+    status: "stopped"
+  };
 }
 
 function itemCacheKey(turnId: string, itemId: string) {
@@ -357,6 +430,9 @@ export class CodexGateway {
   private recentLiveSessions = new Map<string, SessionSummary>();
   private recentLiveSessionsLoadedAt = 0;
   private recentLiveSessionsPromise: Promise<Map<string, SessionSummary>> | null = null;
+  private loadedThreadIds = new Set<string>();
+  private loadedThreadIdsLoadedAt = 0;
+  private loadedThreadIdsPromise: Promise<Set<string>> | null = null;
   private shutdownTimer: ReturnType<typeof setTimeout> | null = null;
   private shutdownScheduledFor: number | null = null;
   private shutdownScheduledThreadId: string | null = null;
@@ -497,35 +573,16 @@ export class CodexGateway {
         this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>())
       ]);
 
-      if (indexedPage.entries.length === 0 && (cursor === null || cursor === "0")) {
-        return {
-          sessions: [...recentLiveSessions.values()]
-            .filter((session) => !isSubagentSessionSummary(session))
-            .slice(0, limit),
-          nextCursor: null
-        };
-      }
-
       return {
-        sessions: indexedPage.entries
-          .filter((entry) => !entry.isSubagent)
-          .map((entry) => {
-            const stored = preferences[entry.id];
-            const live = recentLiveSessions.get(entry.id);
-            if (!live) {
-              return indexedSessionToSummary(entry, stored ? coercePreferences(stored) : null, queueCounts[entry.id] ?? 0);
-            }
-
-            return {
-              ...live,
-              name: !isPlaceholderThreadName(live.name) ? live.name : entry.name,
-              preview: live.preview?.trim() ? live.preview : entry.preview,
-              cwd: live.cwd || entry.cwd,
-              createdAt: live.createdAt || entry.createdAt,
-              updatedAt: Math.max(live.updatedAt || 0, entry.updatedAt || 0)
-            } satisfies SessionSummary;
-          })
-          .filter((session) => !isSubagentSessionSummary(session)),
+        sessions: mergeIndexedSessionsWithRecentLiveSessions(
+          indexedPage.entries,
+          preferences,
+          queueCounts,
+          recentLiveSessions,
+          limit,
+          null,
+          cursor === null || cursor === "0"
+        ),
         nextCursor: indexedPage.nextCursor
       };
     }
@@ -540,7 +597,8 @@ export class CodexGateway {
           const stored = preferences[String(thread.id)];
           return toSummary(thread, stored ? coercePreferences(stored) : null, archived);
         })
-        .filter((session) => !isSubagentSessionSummary(session)),
+        .filter((session) => !isSubagentSessionSummary(session))
+        .sort(compareSessionSummaries),
       nextCursor: typeof response.nextCursor === "string" && response.nextCursor.trim() ? String(response.nextCursor) : null
     };
   }
@@ -565,42 +623,23 @@ export class CodexGateway {
         this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>())
       ]);
 
-      if (indexedPage.entries.length === 0 && (cursor === null || cursor === "0")) {
-        return {
-          sessions: [...recentLiveSessions.values()]
-            .filter((session) => !isSubagentSessionSummary(session))
-            .filter((session) => `${session.name ?? ""}\n${session.preview ?? ""}`.toLowerCase().includes(needle))
-            .slice(0, limit),
-          nextCursor: null
-        };
-      }
-
       return {
-        sessions: indexedPage.entries
-          .filter((entry) => !entry.isSubagent)
-          .map((entry) => {
-            const stored = preferences[entry.id];
-            const live = recentLiveSessions.get(entry.id);
-            if (!live) {
-              return indexedSessionToSummary(entry, stored ? coercePreferences(stored) : null, queueCounts[entry.id] ?? 0);
-            }
-
-            return {
-              ...live,
-              name: !isPlaceholderThreadName(live.name) ? live.name : entry.name,
-              preview: live.preview?.trim() ? live.preview : entry.preview,
-              cwd: live.cwd || entry.cwd,
-              createdAt: live.createdAt || entry.createdAt,
-              updatedAt: Math.max(live.updatedAt || 0, entry.updatedAt || 0)
-            } satisfies SessionSummary;
-          })
-          .filter((session) => !isSubagentSessionSummary(session)),
+        sessions: mergeIndexedSessionsWithRecentLiveSessions(
+          indexedPage.entries,
+          preferences,
+          queueCounts,
+          recentLiveSessions,
+          limit,
+          (session) => `${session.name ?? ""}
+${session.preview ?? ""}`.toLowerCase().includes(needle),
+          cursor === null || cursor === "0"
+        ),
         nextCursor: indexedPage.nextCursor
       };
     }
 
     const sessions = await this.collectListableSessions(archived);
-    sessions.sort((left, right) => right.updatedAt - left.updatedAt);
+    sessions.sort(compareSessionSummaries);
     const matches: SessionSummary[] = [];
     for (const session of sessions) {
       const summaryHaystack = `${session.name ?? ""}\n${session.preview ?? ""}`.toLowerCase();
@@ -684,7 +723,7 @@ export class CodexGateway {
       (session, index, collection) => collection.findIndex((candidate) => candidate.id === session.id) === index
     );
     const visibleSessions = dedupedSessions.filter((session) => !isSubagentSessionSummary(session));
-    visibleSessions.sort((left, right) => right.updatedAt - left.updatedAt);
+    visibleSessions.sort(compareSessionSummaries);
     return visibleSessions;
   }
 
@@ -850,15 +889,10 @@ export class CodexGateway {
     const pending = [...(this.pendingRequests.get(threadId)?.values() ?? [])].map(({ rawId: _rawId, ...request }) => request);
     const hydration = await this.ensureSessionHistory(threadId, thread);
     const windowSize = Math.max(1, limit);
-    const visibleTurns = hydration.turns.slice(-windowSize).map((turn) => structuredClone(turn));
+    const runtimeState = await this.resolveRuntimeSessionState(threadId, thread, hydration.turns, this.activeTurns.get(threadId) ?? null);
+    const visibleTurns = runtimeState.turns.slice(-windowSize).map((turn) => structuredClone(turn));
     const totalTurns = hydration.totalTurns ?? hydration.turns.length;
-    const trackedActiveTurnId = findActiveTurnId({ turns: hydration.turns }) ?? this.activeTurns.get(threadId) ?? null;
-    const activeTurnId = getThreadActiveTurnId(thread, trackedActiveTurnId);
-    if (activeTurnId) {
-      this.activeTurns.set(threadId, activeTurnId);
-    } else {
-      this.activeTurns.delete(threadId);
-    }
+    const activeTurnId = runtimeState.activeTurnId;
 
     let queue = await this.getQueue(threadId);
     if (queue.resumeRequired && !activeTurnId && preferences.steeringResumeMode === "auto") {
@@ -870,6 +904,7 @@ export class CodexGateway {
     return {
       thread: {
         ...(thread as SessionDetailPayload["thread"]),
+        status: runtimeState.status,
         turns: visibleTurns
       },
       preferences,
@@ -890,6 +925,8 @@ export class CodexGateway {
 
   async getSessionOlderTurns(threadId: string, beforeTurnId: string, limit = SESSION_WINDOW_SIZE): Promise<SessionTurnsPagePayload> {
     const hydration = await this.ensureSessionHistory(threadId);
+    const thread = await this.readThread(threadId, false);
+    const runtimeState = await this.resolveRuntimeSessionState(threadId, thread, hydration.turns, this.activeTurns.get(threadId) ?? null);
     const beforeIndex = hydration.turns.findIndex((turn) => turn.id === beforeTurnId);
     if (beforeIndex <= 0) {
       return {
@@ -902,7 +939,7 @@ export class CodexGateway {
 
     const windowSize = Math.max(1, limit);
     const start = Math.max(0, beforeIndex - windowSize);
-    const turns = hydration.turns.slice(start, beforeIndex).map((turn) => structuredClone(turn));
+    const turns = runtimeState.turns.slice(start, beforeIndex).map((turn) => structuredClone(turn));
     return {
       turns,
       loadedTurns: beforeIndex,
@@ -920,7 +957,13 @@ export class CodexGateway {
     }
 
     const thread = await this.readThread(threadId, true);
-    const rawTurn = (Array.isArray(thread.turns) ? (thread.turns as CodexTurn[]) : []).find((candidate) => candidate.id === turnId);
+    const runtimeState = await this.resolveRuntimeSessionState(
+      threadId,
+      thread,
+      Array.isArray(thread.turns) ? (thread.turns as CodexTurn[]) : [],
+      this.activeTurns.get(threadId) ?? null
+    );
+    const rawTurn = runtimeState.turns.find((candidate) => candidate.id === turnId);
     if (!rawTurn) {
       throw new Error("Turn not found.");
     }
@@ -1027,31 +1070,10 @@ export class CodexGateway {
   }
 
   async getQueue(threadId: string): Promise<SessionQueuePayload> {
-    let stored = await uiStateStore.getQueue(threadId);
-    let items = stored?.items ?? [];
-    if (items.length > 1) {
-      const duplicateIds: string[] = [];
-      let previousItem: SessionQueueItem | null = null;
-      for (const item of items) {
-        if (previousItem && areLikelyDuplicateQueueItems(previousItem, item)) {
-          duplicateIds.push(item.id);
-          continue;
-        }
-        previousItem = item;
-      }
-
-      if (duplicateIds.length > 0) {
-        for (const duplicateId of duplicateIds) {
-          await uiStateStore.removeQueueItem(threadId, duplicateId);
-        }
-        stored = await uiStateStore.getQueue(threadId);
-        items = stored?.items ?? [];
-      }
-    }
-
+    const stored = await uiStateStore.getQueue(threadId);
     return {
       sessionId: threadId,
-      items,
+      items: stored?.items ?? [],
       resumeRequired: Boolean(stored?.resumePending && (stored?.items.length ?? 0) > 0),
       updatedAt: stored?.updatedAt ?? null
     };
@@ -1063,7 +1085,6 @@ export class CodexGateway {
       throw new Error("Provide a prompt or at least one attachment.");
     }
 
-    const existingQueue = await this.getQueue(threadId);
     const nextItem = {
       id: crypto.randomUUID(),
       prompt: trimmedPrompt,
@@ -1071,19 +1092,19 @@ export class CodexGateway {
       attachmentNames: attachments.map((attachment) => attachment.originalName),
       createdAt: Date.now()
     } satisfies SessionQueueItem;
-    const mostRecentItem = existingQueue.items.at(-1) ?? null;
-    if (mostRecentItem && areLikelyDuplicateQueueItems(mostRecentItem, nextItem)) {
-      await uiStateStore.setQueueResumePending(threadId, false);
-      return this.getQueue(threadId);
-    }
 
     await uiStateStore.enqueueQueueItem(threadId, {
       ...nextItem
     });
     await uiStateStore.setQueueResumePending(threadId, false);
     const queue = await this.getQueue(threadId);
+    const enqueueAccepted = queue.items.some((item) => item.id === nextItem.id);
     this.emitQueueUpdated(threadId, queue);
-    return queue;
+    return {
+      ...queue,
+      enqueueAccepted,
+      enqueueItemId: nextItem.id
+    };
   }
 
   async removeQueuedMessage(threadId: string, queueId: string): Promise<SessionQueuePayload> {
@@ -1296,6 +1317,33 @@ export class CodexGateway {
     return config.models.find((model) => model.isDefault)?.id ?? config.models[0]?.id ?? null;
   }
 
+  private async getLoadedThreadIds() {
+    const now = Date.now();
+    if (this.loadedThreadIdsLoadedAt > 0 && now - this.loadedThreadIdsLoadedAt < LOADED_THREAD_CACHE_TTL_MS) {
+      return this.loadedThreadIds;
+    }
+
+    if (this.loadedThreadIdsPromise) {
+      return this.loadedThreadIdsPromise;
+    }
+
+    this.loadedThreadIdsPromise = (async () => {
+      const response = asRecord(await this.client.request("thread/loaded/list", {}));
+      const ids = new Set(
+        ((response.data as unknown[] | undefined) ?? [])
+          .filter((value) => typeof value === "string" && value.trim())
+          .map((value) => String(value))
+      );
+      this.loadedThreadIds = ids;
+      this.loadedThreadIdsLoadedAt = Date.now();
+      return ids;
+    })().finally(() => {
+      this.loadedThreadIdsPromise = null;
+    });
+
+    return this.loadedThreadIdsPromise;
+  }
+
   private async readThread(threadId: string, includeTurns: boolean) {
     try {
       const response = asRecord(await this.client.request("thread/read", { threadId, includeTurns }));
@@ -1310,15 +1358,59 @@ export class CodexGateway {
     }
   }
 
-  private async resolveActiveTurnId(threadId: string) {
-    const thread = await this.readThread(threadId, true);
-    const activeTurnId = getThreadActiveTurnId(thread, this.activeTurns.get(threadId));
+  private async resolveRuntimeSessionState(
+    threadId: string,
+    thread: Record<string, unknown>,
+    turns: CodexTurn[],
+    fallbackActiveTurnId: string | null = null
+  ) {
+    const persistedActiveTurnId = findActiveTurnId({ turns });
+    let loadedThreadIds: Set<string> | null = null;
+    try {
+      loadedThreadIds = await this.getLoadedThreadIds();
+    } catch {
+      loadedThreadIds = null;
+    }
+
+    const loadedThreadIdsAvailable = loadedThreadIds !== null;
+    const loadedInMemory = loadedThreadIdsAvailable
+      ? loadedThreadIds!.has(threadId) || this.activeTurns.has(threadId)
+      : this.activeTurns.has(threadId) || isLiveThreadStatus(thread.status);
+    const staleRunning =
+      loadedThreadIdsAvailable && !loadedInMemory && (isLiveThreadStatus(thread.status) || Boolean(persistedActiveTurnId));
+    const status = staleRunning ? "stopped" : String(normalizeThreadStatus(thread.status) ?? "unknown");
+    const normalizedTurns = staleRunning ? turns.map((turn) => normalizeStoppedTurn(turn)) : turns;
+    const activeTurnId = loadedInMemory
+      ? getThreadActiveTurnId(
+          {
+            ...thread,
+            status,
+            turns: normalizedTurns
+          },
+          persistedActiveTurnId ?? fallbackActiveTurnId ?? this.activeTurns.get(threadId) ?? null
+        )
+      : null;
+
     if (activeTurnId) {
       this.activeTurns.set(threadId, activeTurnId);
-    } else {
+    } else if (staleRunning || !LIVE_THREAD_STATUSES.has(status)) {
       this.activeTurns.delete(threadId);
     }
-    return activeTurnId;
+
+    return {
+      loadedInMemory,
+      staleRunning,
+      status,
+      turns: normalizedTurns,
+      activeTurnId
+    };
+  }
+
+  private async resolveActiveTurnId(threadId: string) {
+    const thread = await this.readThread(threadId, true);
+    const turns = Array.isArray(thread.turns) ? (thread.turns as CodexTurn[]) : [];
+    const runtimeState = await this.resolveRuntimeSessionState(threadId, thread, turns, this.activeTurns.get(threadId) ?? null);
+    return runtimeState.activeTurnId;
   }
 
   private getHydrationState(threadId: string): SessionHydrationState {
@@ -1398,6 +1490,16 @@ export class CodexGateway {
     const normalized = structuredClone(asRecord(rawItem)) as CodexItem;
     normalized.id = String(normalized.id ?? `${turnId}:${Math.random().toString(36).slice(2, 8)}`);
     normalized.type = String(normalized.type ?? "unknown");
+
+    if (normalized.type === "contextCompaction") {
+      return {
+        id: normalized.id,
+        type: normalized.type,
+        title: "Context compression",
+        detailState: "inline",
+        detailPreview: "Compressing conversation context"
+      };
+    }
 
     if (!DEFERRED_ITEM_TYPES.has(normalized.type)) {
       return {
@@ -1598,7 +1700,7 @@ export class CodexGateway {
               continue;
             }
 
-            if (record.type !== "event_msg") {
+            if (record.type !== "event_msg" && record.type !== "response_item") {
               continue;
             }
 
@@ -1654,6 +1756,68 @@ export class CodexGateway {
               } satisfies SessionDetailPayload["thread"]["turns"][number]);
             if (!turnsById.has(activeTurnId)) {
               turnsById.set(activeTurnId, turn);
+            }
+
+            if (record.type === "response_item" && eventType === "reasoning") {
+              const summaryEntries = Array.isArray(payload.summary)
+                ? payload.summary
+                    .map((entry) => asRecord(entry))
+                    .map((entry) => asText(entry.text) ?? "")
+                    .filter((entry) => entry.trim().length > 0)
+                : [];
+              const existingReasoning = [...turn.items].reverse().find((item) => item.type === "reasoning");
+              const mergedSummary = Array.isArray(existingReasoning?.summary)
+                ? existingReasoning.summary.map((entry) => String(entry))
+                : [];
+
+              for (const summaryEntry of summaryEntries) {
+                if (mergedSummary[mergedSummary.length - 1] !== summaryEntry) {
+                  mergedSummary.push(summaryEntry);
+                }
+              }
+
+              const nextReasoningItem = {
+                id: existingReasoning?.id ?? `${activeTurnId}:reasoning`,
+                type: "reasoning",
+                text: typeof payload.content === "string" ? payload.content : String(existingReasoning?.text ?? ""),
+                summary: mergedSummary
+              } satisfies CodexItem;
+              const existingReasoningIndex = turn.items.findIndex((item) => item.id === nextReasoningItem.id);
+              if (existingReasoningIndex >= 0) {
+                turn.items[existingReasoningIndex] = nextReasoningItem;
+              } else if (summaryEntries.length > 0 || nextReasoningItem.text.trim()) {
+                turn.items.push(nextReasoningItem);
+              }
+              continue;
+            }
+
+            if (eventType === "agent_reasoning") {
+              const summaryEntry = String(payload.text ?? "").trim();
+              if (!summaryEntry) {
+                continue;
+              }
+
+              const existingReasoning = [...turn.items].reverse().find((item) => item.type === "reasoning");
+              const mergedSummary = Array.isArray(existingReasoning?.summary)
+                ? existingReasoning.summary.map((entry) => String(entry))
+                : [];
+              if (mergedSummary[mergedSummary.length - 1] !== summaryEntry) {
+                mergedSummary.push(summaryEntry);
+              }
+
+              const nextReasoningItem = {
+                id: existingReasoning?.id ?? `${activeTurnId}:reasoning`,
+                type: "reasoning",
+                text: String(existingReasoning?.text ?? ""),
+                summary: mergedSummary
+              } satisfies CodexItem;
+              const existingReasoningIndex = turn.items.findIndex((item) => item.id === nextReasoningItem.id);
+              if (existingReasoningIndex >= 0) {
+                turn.items[existingReasoningIndex] = nextReasoningItem;
+              } else {
+                turn.items.push(nextReasoningItem);
+              }
+              continue;
             }
 
             if (eventType === "user_message") {
@@ -1906,7 +2070,9 @@ export class CodexGateway {
     if (method === "turn/started") {
       const turn = asRecord(params.turn);
       this.activeTurns.set(threadId, String(turn.id ?? ""));
-      void this.emitSessionSummaryUpdated(threadId, null, null, null, "running");
+      this.loadedThreadIds.add(threadId);
+      this.loadedThreadIdsLoadedAt = Date.now();
+      void this.emitSessionSummaryUpdated(threadId, null, null, null, "running", Math.floor(Date.now() / 1000));
     } else if (method === "turn/completed") {
       const turn = asRecord(params.turn);
       if (this.activeTurns.get(threadId) === String(turn.id ?? "")) {
@@ -1922,13 +2088,19 @@ export class CodexGateway {
           reason: "completed"
         }
       });
-      void this.emitSessionSummaryUpdated(threadId, null, null, null, "completed");
+      void this.emitSessionSummaryUpdated(threadId, null, null, null, "completed", Math.floor(Date.now() / 1000));
     } else if (method === "thread/status/changed") {
       const nextStatus = normalizeThreadStatus(params.status) ?? "unknown";
       if (nextStatus !== "running" && nextStatus !== "active") {
         this.activeTurns.delete(threadId);
         void this.maybeDrainQueue(threadId);
       }
+      if (nextStatus === "notLoaded") {
+        this.loadedThreadIds.delete(threadId);
+      } else {
+        this.loadedThreadIds.add(threadId);
+      }
+      this.loadedThreadIdsLoadedAt = Date.now();
     } else if (method === "serverRequest/resolved") {
       const requestId = String(params.requestId ?? "");
       this.pendingRequests.get(threadId)?.delete(requestId);
@@ -1985,8 +2157,19 @@ export class CodexGateway {
             : params
     });
 
-    if (["thread/name/updated", "thread/status/changed"].includes(method)) {
+    if (method === "thread/name/updated") {
       void this.emitSessionSummaryUpdated(threadId);
+    }
+
+    if (method === "thread/status/changed") {
+      void this.emitSessionSummaryUpdated(
+        threadId,
+        null,
+        null,
+        null,
+        normalizeThreadStatus(params.status) ?? "unknown",
+        Math.floor(Date.now() / 1000)
+      );
     }
 
     if (method === "thread/archived" || method === "thread/unarchived") {
@@ -2253,15 +2436,22 @@ export class CodexGateway {
     thread: Record<string, unknown> | null = null,
     preferences: SessionPreferences | null = null,
     queueCount: number | null = null,
-    statusOverride: string | null = null
+    statusOverride: string | null = null,
+    activityAt: number | null = null
   ) {
     try {
       const resolvedThread = normalizeThread(thread ?? (await this.readThread(threadId, false)));
       const resolvedPreferences = preferences ?? (await this.getPreferences(threadId, resolvedThread));
       const resolvedQueueCount = queueCount ?? (await this.getQueue(threadId)).items.length;
+      const previousSummary = this.recentLiveSessions.get(threadId);
       const summary = {
         ...toSummary(resolvedThread, resolvedPreferences, false, resolvedQueueCount),
-        status: statusOverride ?? (asText(resolvedThread.status) ?? "unknown")
+        status: statusOverride ?? (asText(resolvedThread.status) ?? "unknown"),
+        updatedAt: Math.max(
+          Number(resolvedThread.updatedAt ?? 0),
+          previousSummary?.updatedAt ?? 0,
+          activityAt ?? 0
+        )
       } satisfies SessionSummary;
       if (isSubagentSessionSummary(summary)) {
         return;

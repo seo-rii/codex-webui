@@ -183,6 +183,7 @@
   let sendIntent = $state<"message" | "steer" | "queue" | null>(null);
   let editingQueueId = $state<string | null>(null);
   let editingQueuePrompt = $state("");
+  let queuedFollowupsExpanded = $state(true);
   let sessionHighlights = $state<Record<string, { kind: "completed" | "attention"; at: number }>>({});
   let startupAlertModalOpen = $state(false);
   let startupAlertDismissed = $state(false);
@@ -311,8 +312,6 @@
       steerNow: m.steer_now(),
       sendNow: m.send_now(),
       liveTurn: m.live_turn(),
-      workingTreeChangesStreaming: m.working_tree_changes_streaming(),
-      turnCurrentlyRunning: m.turn_currently_running(),
       composerSettings: m.composer_settings(),
       securitySession: m.security_session(),
       addAttachments: m.add_attachments(),
@@ -338,6 +337,8 @@
       closeThreadList: m.close_thread_list(),
       shutdownScheduledNotice: (seconds: number) => m.shutdown_scheduled_notice({ seconds: String(seconds) }),
       invalidJsonResponse: (message: string) => m.invalid_json_response({ message }),
+      active: m.active(),
+      done: m.done(),
       copyReply: m.copy_reply(),
       plannedStrategy: m.planned_strategy(),
       executing: m.executing(),
@@ -348,7 +349,11 @@
       instructions: m.instructions(),
       opsCount: (count: number) => m.ops_count({ count: String(count) }),
       readingFileData: m.reading_file_data(),
-      computingDiffs: m.computing_diffs()
+      computingDiffs: m.computing_diffs(),
+      contextCompression: m.context_compression(),
+      contextCompressionInProgress: m.context_compression_in_progress(),
+      contextCompressionCompleted: m.context_compression_completed(),
+      stopped: m.stopped()
     };
   });
 
@@ -590,6 +595,19 @@
   let lastLoadedConversationId = $state<string | null>(null);
   let lastActiveLiveTurnId = $state<string | null>(null);
 
+  function canQueueComposerMessage(currentConversation: ConversationState | null = conversation) {
+    if (!currentConversation || !selectedSessionId) {
+      return false;
+    }
+    if (pendingQueueModeSessionId === selectedSessionId) {
+      return true;
+    }
+    if (currentConversation.thread.status === "running" || currentConversation.thread.status === "active") {
+      return true;
+    }
+    return currentConversation.thread.turns.some((turn) => String(turn.status ?? "") === "inProgress");
+  }
+
   const running = $derived.by(() => {
     const currentConversation = conversation;
     if (!currentConversation?.activeTurnId) {
@@ -602,7 +620,7 @@
       (turn) => turn.id === currentConversation.activeTurnId && String(turn.status ?? "") === "inProgress"
     );
   });
-  const queueModeActive = $derived.by(() => running || pendingQueueModeSessionId === selectedSessionId);
+  const queueModeActive = $derived.by(() => canQueueComposerMessage());
   const selectedSessionSummary = $derived(sessions.find((session) => session.id === selectedSessionId) ?? null);
   const queuedMessages = $derived(conversation?.queue.items ?? []);
   const activeTurn = $derived.by(() => {
@@ -655,6 +673,26 @@
   const activeLiveTurnPlan = $derived.by(() => (activeLiveTurnId ? conversation?.livePlans[activeLiveTurnId] ?? null : null));
   const activeLiveTurnDiff = $derived.by(() => (activeLiveTurnId ? conversation?.liveDiffs[activeLiveTurnId] ?? null : null));
   const activeLiveTurnDiffViews = $derived.by(() => (activeLiveTurnDiff ? parseAggregatedDiffViews(activeLiveTurnDiff) : []));
+  const activeLiveTurnSummary = $derived.by(() => {
+    const explanation = activeLiveTurnPlan?.explanation?.trim();
+    if (explanation) {
+      return explanation;
+    }
+
+    if (activeLiveTurnSubagents.length > 0) {
+      const prompt = activeLiveTurnSubagents[0]?.prompt?.trim();
+      if (prompt) {
+        return prompt;
+      }
+
+      const tool = activeLiveTurnSubagents[0]?.tool?.trim();
+      if (tool) {
+        return tool;
+      }
+    }
+
+    return null;
+  });
   const visibleOptimisticMessage = $derived.by(() => {
     if (!optimisticMessage || optimisticMessage.sessionId !== selectedSessionId) {
       return null;
@@ -1288,8 +1326,31 @@
     };
   });
 
+  function getSessionSortPriority(status: string | null | undefined) {
+    return status === "running" || status === "active" ? 1 : 0;
+  }
+
+  function compareSessions(left: SessionSummary, right: SessionSummary) {
+    const priorityDifference = getSessionSortPriority(right.status) - getSessionSortPriority(left.status);
+    if (priorityDifference !== 0) {
+      return priorityDifference;
+    }
+
+    const updatedDifference = (right.updatedAt || 0) - (left.updatedAt || 0);
+    if (updatedDifference !== 0) {
+      return updatedDifference;
+    }
+
+    const createdDifference = (right.createdAt || 0) - (left.createdAt || 0);
+    if (createdDifference !== 0) {
+      return createdDifference;
+    }
+
+    return 0;
+  }
+
   function sortSessions(items: SessionSummary[]) {
-    return [...items].sort((left, right) => right.updatedAt - left.updatedAt);
+    return [...items].sort(compareSessions);
   }
 
   function highlightSession(sessionId: string, kind: "completed" | "attention") {
@@ -1655,6 +1716,12 @@
   }
 
   function buildSessionSummaryFromConversation(state: ConversationState): SessionSummary {
+    const hasLiveTurn =
+      Boolean(state.activeTurnId) ||
+      state.thread.status === "running" ||
+      state.thread.status === "active" ||
+      state.thread.turns.some((turn) => String(turn.status ?? "") === "inProgress");
+
     return {
       id: state.thread.id,
       name: getDisplayThreadTitle(state.thread.name, state.thread.preview),
@@ -1664,7 +1731,7 @@
       archived: selectedSessionSummary?.archived ?? showArchivedSessions,
       createdAt: state.thread.createdAt,
       updatedAt: Math.max(state.thread.updatedAt, Math.floor(Date.now() / 1000)),
-      status: state.thread.status,
+      status: hasLiveTurn ? "running" : state.thread.status,
       isSubagent: state.thread.isSubagent,
       agentNickname: state.thread.agentNickname,
       agentRole: state.thread.agentRole,
@@ -2039,21 +2106,7 @@
         pendingQueueModeSessionId = null;
       }
       titleDraft = getDisplayThreadTitle(detail.thread.name, detail.thread.preview) ?? "";
-      upsertSessionSummary({
-        id: detail.thread.id,
-        name: getDisplayThreadTitle(detail.thread.name, detail.thread.preview),
-        preview: detail.thread.preview,
-        queueCount: detail.queue.items.length,
-        cwd: detail.thread.cwd,
-        archived: showArchivedSessions,
-        createdAt: detail.thread.createdAt,
-        updatedAt: detail.thread.updatedAt,
-        status: detail.thread.status,
-        isSubagent: detail.thread.isSubagent,
-        agentNickname: detail.thread.agentNickname,
-        agentRole: detail.thread.agentRole,
-        preferences: detail.preferences
-      });
+      upsertSessionSummary(buildSessionSummaryFromConversation(nextConversation));
       await loadSavedDraft(detail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
       const hasOnlyLiveTurnShell =
         nextConversation.thread.turns.length <= 1 &&
@@ -2723,7 +2776,7 @@
   }
 
   async function queueMessage() {
-    if (!selectedSessionId || !conversation || sending || uploading || !queueModeActive || (!draft.trim() && draftAttachments.length === 0)) {
+    if (!selectedSessionId || !conversation || sending || uploading || !canQueueComposerMessage(conversation) || (!draft.trim() && draftAttachments.length === 0)) {
       return;
     }
 
@@ -2738,13 +2791,24 @@
         prompt: draft,
         attachmentIds: draftAttachments.map((attachment) => attachment.id)
       });
-      recordComposerHistory(prompt);
       if (conversation?.thread.id === selectedSessionId) {
         conversation = {
           ...conversation,
           queue
         };
       }
+
+      const enqueueConfirmed =
+        queue.enqueueAccepted === true &&
+        typeof queue.enqueueItemId === "string" &&
+        queue.items.some((item) => item.id === queue.enqueueItemId);
+
+      if (!enqueueConfirmed) {
+        errorText = m.queue_enqueue_failed();
+        return;
+      }
+
+      recordComposerHistory(prompt);
       draft = "";
       draftAttachments = [];
       scheduleComposerTextareaResize();
@@ -3635,6 +3699,40 @@
     return new Intl.NumberFormat("en-US").format(value);
   }
 
+  function formatThreadStatusLabel(status: string | null | undefined) {
+    const normalized = String(status ?? "").trim().toLowerCase();
+    if (!normalized || normalized === "idle") {
+      return "idle";
+    }
+    if (normalized === "running" || normalized === "active") {
+      return ui.active;
+    }
+    if (["completed", "done", "success"].includes(normalized)) {
+      return ui.done;
+    }
+    if (normalized === "stopped") {
+      return ui.stopped;
+    }
+    return normalized;
+  }
+
+  function getThreadStatusTextClass(status: string | null | undefined) {
+    const normalized = String(status ?? "").trim().toLowerCase();
+    if (normalized === "running" || normalized === "active") {
+      return "text-amber-600";
+    }
+    if (["completed", "done", "success"].includes(normalized)) {
+      return "text-emerald-600";
+    }
+    if (normalized === "stopped" || normalized === "idle") {
+      return "text-gray-500";
+    }
+    if (["failed", "error", "systemerror"].includes(normalized)) {
+      return "text-red-600";
+    }
+    return "text-gray-500";
+  }
+
   function formatContextUsage() {
     const tokenUsage = conversation?.tokenUsage;
     if (!tokenUsage?.modelContextWindow || tokenUsage.modelContextWindow <= 0) {
@@ -3751,6 +3849,10 @@
 
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
       event.preventDefault();
+      if (canQueueComposerMessage()) {
+        void queueMessage();
+        return;
+      }
       void submitComposer();
       return;
     }
@@ -4183,6 +4285,9 @@
     if (item.type === "webSearch") {
       return m.web_search();
     }
+    if (item.type === "contextCompaction") {
+      return ui.contextCompression;
+    }
     return item.type;
   }
 
@@ -4229,6 +4334,11 @@
     }
     if (item.type === "webSearch") {
       return formatValue(item.query) || m.search_details();
+    }
+    if (item.type === "contextCompaction") {
+      return isContextCompactionRunning(conversation?.activeTurnId ?? "", item)
+        ? ui.contextCompressionInProgress
+        : ui.contextCompressionCompleted;
     }
     return m.load_details();
   }
@@ -4490,6 +4600,16 @@
     }
 
     return conversation.thread.turns.some((turn) => turn.id === turnId && String(turn.status ?? "") === "inProgress");
+  }
+
+  function isContextCompactionRunning(turnId: string, item: CodexItem) {
+    if (item.type !== "contextCompaction") {
+      return false;
+    }
+    if (String(item.lifecycleStatus ?? "") === "completed") {
+      return false;
+    }
+    return String(item.lifecycleStatus ?? "") === "inProgress" || isTurnRunning(turnId);
   }
 
   function getFinalAgentItem(turn: ConversationState["thread"]["turns"][number]) {
@@ -5109,7 +5229,9 @@
             <div class="flex items-center gap-1.5 mt-0.5">
               <span class="text-[10px] font-bold text-gray-400 uppercase tracking-widest leading-none">{selectedModel.displayName}</span>
               <span class="w-1 h-1 rounded-full bg-gray-300"></span>
-              <span class="text-[10px] font-medium text-amber-600 uppercase tracking-widest leading-none">{conversation?.thread.status || "idle"}</span>
+              <span class={`text-[10px] font-medium uppercase tracking-widest leading-none ${getThreadStatusTextClass(conversation?.thread.status)}`}>
+                {formatThreadStatusLabel(conversation?.thread.status)}
+              </span>
             </div>
           {/if}
         </div>
@@ -5285,7 +5407,7 @@
                         {#if shouldCollapseTurnLogs(turn)}
                           {#if getCollapsedTurnProgressCount(turn) > 0}
                             <div class="border border-gray-100 rounded-xl bg-gray-50/50 overflow-hidden">
-                              <button class="w-full flex items-center justify-between px-4 py-3 hover:bg-gray-100/50 transition-colors" onclick={() => void toggleTurnLogs(turn.id)}>
+                              <button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-4 py-3 hover:bg-gray-100/50 transition-colors" onclick={() => void toggleTurnLogs(turn.id)}>
                                 <div class="flex items-center gap-3">
                                   <div class="p-1.5 bg-white border border-gray-200 rounded-lg text-gray-400"><History size={14} /></div>
                                   <span class="text-xs font-bold text-gray-600 tracking-tight uppercase">{m.work_steps_count({ count: String(getCollapsedTurnProgressCount(turn)) })}</span>
@@ -5307,7 +5429,7 @@
                         
                         {#if conversation.livePlans[turn.id] && turn.id !== conversation.activeTurnId}
                           <div class="border border-amber-100 rounded-xl bg-amber-50/30 overflow-hidden">
-                            <div class="px-4 py-2 bg-amber-100/50 border-b border-amber-100 flex items-center gap-2 text-[10px] font-bold text-amber-700 uppercase tracking-widest"><ListTodo size={12} /><span>{ui.livePlan}</span></div>
+                            <div class="turn-card-header turn-card-header--amber px-4 py-2 border-b border-amber-100 flex items-center gap-2 text-[10px] font-bold text-amber-700 uppercase tracking-widest"><ListTodo size={12} /><span>{ui.livePlan}</span></div>
                             <div class="p-4 text-sm text-gray-700 space-y-3">
                               {#if conversation.livePlans[turn.id].explanation}<p class="leading-relaxed">{conversation.livePlans[turn.id].explanation}</p>{/if}
                               <ul class="space-y-1.5 pl-2">
@@ -5323,7 +5445,7 @@
                         {/if}
                         {#if conversation.liveDiffs[turn.id] && turn.id !== conversation.activeTurnId}
                           <details class="group bg-gray-50 border border-gray-200 rounded-xl overflow-hidden">
-                            <summary class="flex items-center justify-between px-4 py-2 text-[10px] font-bold text-gray-500 uppercase tracking-widest cursor-pointer hover:bg-gray-100 transition-colors">
+                            <summary class="turn-card-header turn-card-header--neutral flex items-center justify-between px-4 py-2 text-[10px] font-bold text-gray-500 uppercase tracking-widest cursor-pointer hover:bg-gray-100 transition-colors">
                               <div class="flex items-center gap-2"><FileDiff size={12} /> {ui.aggregatedDiff}</div>
                               <ChevronDown size={12} class="group-open:rotate-180 transition-transform" />
                             </summary>
@@ -5377,12 +5499,7 @@
 
                 {#if inlineGenerationState}
                   <div class="flex py-3">
-                    <div class="thinking-indicator inline-flex items-center gap-3 rounded-2xl border border-gray-200/80 bg-white/90 px-4 py-3 shadow-sm">
-                      <div class="flex items-center gap-1.5" aria-hidden="true">
-                        <span class="thinking-indicator__dot"></span>
-                        <span class="thinking-indicator__dot"></span>
-                        <span class="thinking-indicator__dot"></span>
-                      </div>
+                    <div class="thinking-indicator inline-flex items-center rounded-2xl border border-gray-200/80 bg-white/90 px-4 py-3 shadow-sm">
                       <span class="thinking-indicator__label text-sm font-medium">{inlineGenerationState.label}</span>
                     </div>
                   </div>
@@ -5454,70 +5571,79 @@
 
               {#if queuedMessages.length > 0}
                 <div class="border border-gray-200 rounded-2xl bg-gray-50/80 shadow-sm overflow-hidden">
-                  <div class="flex items-center justify-between gap-3 px-3.5 py-2.5 border-b border-gray-200 bg-white/80">
+                  <button
+                    class={`flex w-full items-center justify-between gap-3 bg-white/80 px-3.5 py-2.5 text-left transition-colors hover:bg-white ${queuedFollowupsExpanded ? "border-b border-gray-200" : ""}`}
+                    onclick={() => (queuedFollowupsExpanded = !queuedFollowupsExpanded)}
+                    type="button"
+                  >
                     <div>
                       <p class="text-[11px] font-bold text-gray-900 uppercase tracking-widest">{ui.queuedFollowups}</p>
-                      <p class="text-[10px] text-gray-500 mt-0.5">{m.pending_count({ count: String(queuedMessages.length) })}</p>
+                      <p class="mt-0.5 text-[10px] text-gray-500">{m.pending_count({ count: String(queuedMessages.length) })}</p>
                     </div>
-                    {#if conversation?.queue.resumeRequired}
-                      <span class="px-2 py-1 rounded-full bg-amber-100 text-[10px] font-bold text-amber-700 uppercase tracking-widest">{ui.paused}</span>
-                    {/if}
-                  </div>
-                  <div class="max-h-52 overflow-y-auto divide-y divide-gray-200 overscroll-contain">
-                    {#each queuedMessages as item (item.id)}
-                      <div class="px-3.5 py-2.5 flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
-                        <div class="min-w-0 flex-1 space-y-1">
-                          <div class="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-gray-400">
-                            <span>{ui.followUp}</span>
-                            {#if item.attachmentNames.length > 0}
-                              <span class="text-gray-300">•</span>
-                              <span>{m.attached_files_count({ count: String(item.attachmentNames.length) })}</span>
+                    <div class="flex items-center gap-2.5">
+                      {#if conversation?.queue.resumeRequired}
+                        <span class="px-2 py-1 rounded-full bg-amber-100 text-[10px] font-bold text-amber-700 uppercase tracking-widest">{ui.paused}</span>
+                      {/if}
+                      <ChevronDown size={15} class={`text-gray-400 transition-transform ${queuedFollowupsExpanded ? "rotate-180" : ""}`} />
+                    </div>
+                  </button>
+                  {#if queuedFollowupsExpanded}
+                    <div class="max-h-52 overflow-y-auto divide-y divide-gray-200 overscroll-contain">
+                      {#each queuedMessages as item (item.id)}
+                        <div class="px-3.5 py-2.5 flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                          <div class="min-w-0 flex-1 space-y-1">
+                            <div class="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-gray-400">
+                              <span>{ui.followUp}</span>
+                              {#if item.attachmentNames.length > 0}
+                                <span class="text-gray-300">•</span>
+                                <span>{m.attached_files_count({ count: String(item.attachmentNames.length) })}</span>
+                              {/if}
+                            </div>
+                            {#if editingQueueId === item.id}
+                              <div class="space-y-2">
+                                <textarea
+                                  bind:value={editingQueuePrompt}
+                                  class="w-full min-h-[4.25rem] rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 shadow-sm focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-100"
+                                  onkeydown={(event) => {
+                                    if (event.key === "Escape") {
+                                      event.preventDefault();
+                                      cancelQueuedMessageEdit();
+                                    }
+                                    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                                      event.preventDefault();
+                                      void saveQueuedMessage(item.id);
+                                    }
+                                  }}
+                                  placeholder={m.edit_queued_followup()}
+                                ></textarea>
+                                {#if item.attachmentNames.length > 0}
+                                  <div class="flex flex-wrap gap-1.5">
+                                    {#each item.attachmentNames as attachmentName}
+                                      <span class="rounded-full border border-gray-200 bg-white px-2 py-1 text-[11px] text-gray-500">{attachmentName}</span>
+                                    {/each}
+                                  </div>
+                                {/if}
+                                <p class="text-[11px] text-gray-400">{m.attached_files_stay()}</p>
+                              </div>
+                            {:else}
+                              <p class="text-[13px] leading-5 text-gray-700 break-words">{summarizeQueueItem(item)}</p>
                             {/if}
                           </div>
-                          {#if editingQueueId === item.id}
-                            <div class="space-y-2">
-                              <textarea
-                                bind:value={editingQueuePrompt}
-                                class="w-full min-h-[4.25rem] rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 shadow-sm focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-100"
-                                onkeydown={(event) => {
-                                  if (event.key === "Escape") {
-                                    event.preventDefault();
-                                    cancelQueuedMessageEdit();
-                                  }
-                                  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-                                    event.preventDefault();
-                                    void saveQueuedMessage(item.id);
-                                  }
-                                }}
-                                placeholder={m.edit_queued_followup()}
-                              ></textarea>
-                              {#if item.attachmentNames.length > 0}
-                                <div class="flex flex-wrap gap-1.5">
-                                  {#each item.attachmentNames as attachmentName}
-                                    <span class="rounded-full border border-gray-200 bg-white px-2 py-1 text-[11px] text-gray-500">{attachmentName}</span>
-                                  {/each}
-                                </div>
-                              {/if}
-                              <p class="text-[11px] text-gray-400">{m.attached_files_stay()}</p>
-                            </div>
-                          {:else}
-                            <p class="text-[13px] leading-5 text-gray-700 break-words">{summarizeQueueItem(item)}</p>
-                          {/if}
+                          <div class="flex flex-wrap items-center gap-2 md:justify-end">
+                            {#if editingQueueId === item.id}
+                              <button class="px-2.5 py-1.5 rounded-lg border border-emerald-200 bg-emerald-50 text-[11px] font-bold text-emerald-700 hover:bg-emerald-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.save}</button>
+                              <button class="px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-[11px] font-bold text-gray-700 hover:bg-gray-100 transition-colors disabled:opacity-50" disabled={sending} onclick={cancelQueuedMessageEdit} type="button">{ui.cancel}</button>
+                            {:else}
+                              <button class="px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-[11px] font-bold text-gray-700 hover:bg-gray-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => beginQueuedMessageEdit(item)} type="button">{ui.edit}</button>
+                              <button class="px-2.5 py-1.5 rounded-lg border border-amber-200 bg-amber-50 text-[11px] font-bold text-amber-700 hover:bg-amber-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => void dispatchQueuedMessage(item.id, "steer")} type="button">{ui.steerNow}</button>
+                              <button class="px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-[11px] font-bold text-gray-700 hover:bg-gray-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => void dispatchQueuedMessage(item.id, "message")} type="button">{ui.sendNow}</button>
+                            {/if}
+                            <button class="p-2 rounded-lg text-gray-400 hover:text-red-600 hover:bg-red-50 transition-colors disabled:opacity-50" aria-label={m.remove_queued_message()} disabled={sending} onclick={() => void removeQueuedMessage(item.id)} type="button"><Trash2 size={14} /></button>
+                          </div>
                         </div>
-                        <div class="flex flex-wrap items-center gap-2 md:justify-end">
-                          {#if editingQueueId === item.id}
-                            <button class="px-2.5 py-1.5 rounded-lg border border-emerald-200 bg-emerald-50 text-[11px] font-bold text-emerald-700 hover:bg-emerald-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.save}</button>
-                            <button class="px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-[11px] font-bold text-gray-700 hover:bg-gray-100 transition-colors disabled:opacity-50" disabled={sending} onclick={cancelQueuedMessageEdit} type="button">{ui.cancel}</button>
-                          {:else}
-                            <button class="px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-[11px] font-bold text-gray-700 hover:bg-gray-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => beginQueuedMessageEdit(item)} type="button">{ui.edit}</button>
-                            <button class="px-2.5 py-1.5 rounded-lg border border-amber-200 bg-amber-50 text-[11px] font-bold text-amber-700 hover:bg-amber-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => void dispatchQueuedMessage(item.id, "steer")} type="button">{ui.steerNow}</button>
-                            <button class="px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-[11px] font-bold text-gray-700 hover:bg-gray-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => void dispatchQueuedMessage(item.id, "message")} type="button">{ui.sendNow}</button>
-                          {/if}
-                          <button class="p-2 rounded-lg text-gray-400 hover:text-red-600 hover:bg-red-50 transition-colors disabled:opacity-50" aria-label={m.remove_queued_message()} disabled={sending} onclick={() => void removeQueuedMessage(item.id)} type="button"><Trash2 size={14} /></button>
-                        </div>
-                      </div>
-                    {/each}
-                  </div>
+                      {/each}
+                    </div>
+                  {/if}
                 </div>
               {/if}
 
@@ -5543,17 +5669,9 @@
                             </span>
                           {/if}
                         </div>
-                        <p class="mt-0.5 truncate text-xs text-gray-500">
-                          {#if activeLiveTurnPlan?.explanation}
-                            {activeLiveTurnPlan.explanation}
-                          {:else if activeLiveTurnSubagents.length > 0}
-                            {activeLiveTurnSubagents[0].prompt || activeLiveTurnSubagents[0].tool}
-                          {:else if activeLiveTurnDiff}
-                            {ui.workingTreeChangesStreaming}
-                          {:else}
-                            {ui.turnCurrentlyRunning}
-                          {/if}
-                        </p>
+                        {#if activeLiveTurnSummary}
+                          <p class="mt-0.5 truncate text-xs text-gray-500">{activeLiveTurnSummary}</p>
+                        {/if}
                       </div>
                     </div>
                     <div class="flex items-center gap-1.5 shrink-0 self-center">
@@ -5678,8 +5796,8 @@
               {/if}
 
               <div class="relative group">
-                <form class="bg-white border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden focus-within:border-amber-500/50 transition-all duration-300" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
-                  <textarea bind:this={composerTextareaElement} bind:value={draft} class="w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 focus:ring-0 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} rows="1"></textarea>
+                <form class="bg-white/95 border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200 focus-within:-translate-y-0.5 focus-within:border-amber-400/70 focus-within:bg-white focus-within:shadow-[0_24px_60px_-34px_rgba(245,158,11,0.65)]" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
+                  <textarea bind:this={composerTextareaElement} bind:value={draft} class="w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 transition-colors duration-150 focus:ring-0 focus:placeholder:text-amber-500/70 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} rows="1"></textarea>
                   
                   {#if draftAttachments.length > 0}
                     <div class="px-4 pb-2 flex flex-wrap gap-2">
@@ -5687,17 +5805,17 @@
                     </div>
                   {/if}
 
-                  <div class="flex flex-wrap items-center gap-2 border-t border-gray-100 bg-gray-50/80 px-3 py-2.5 sm:px-4 sm:py-3">
+                  <div class="flex flex-wrap items-center gap-2 border-t border-gray-100 bg-gray-50/80 px-3 py-2.5 transition-colors duration-200 group-focus-within:border-amber-100 group-focus-within:bg-[linear-gradient(180deg,rgba(255,251,235,0.9),rgba(255,255,255,0.98))] sm:px-4 sm:py-3">
                     <div class="flex min-w-0 flex-1 items-center gap-1.5 sm:gap-2">
                       <input bind:this={filePickerElement} disabled={uploading} hidden multiple onchange={(event) => void uploadFiles((event.currentTarget as HTMLInputElement).files)} type="file" />
-                      <button class="rounded-xl p-1.5 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 sm:p-2" disabled={uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={18} class="animate-spin" />{:else}<Paperclip size={18} />{/if}</button>
+                      <button class="rounded-xl p-1.5 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 group-focus-within:bg-white/90 group-focus-within:text-amber-700 sm:p-2" disabled={uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={18} class="animate-spin" />{:else}<Paperclip size={18} />{/if}</button>
                       {#if conversation}
                         <div class="mx-0.5 hidden h-4 w-px bg-gray-200 sm:block"></div>
-                        <button class="flex min-w-0 max-w-[8.5rem] items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 sm:max-w-[11rem] sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button">
+                        <button class="flex min-w-0 max-w-[8.5rem] items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:max-w-[11rem] sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button">
                           <span class="truncate">{composerSettingsSummary.model}</span>
                           <ChevronDown size={14} class={`shrink-0 transition-transform ${composerSettingsOpen ? "rotate-180" : ""}`} />
                         </button>
-                        <button class="flex shrink-0 items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSecurityOpen = !composerSecurityOpen; composerSettingsOpen = false; }} title={ui.securitySession} type="button"><Zap size={14} /><span class="hidden sm:inline">{ui.securitySession}</span></button>
+                        <button class="flex shrink-0 items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSecurityOpen = !composerSecurityOpen; composerSettingsOpen = false; }} title={ui.securitySession} type="button"><Zap size={14} /><span class="hidden sm:inline">{ui.securitySession}</span></button>
                       {/if}
                     </div>
                     <div class="flex w-full items-center justify-end gap-1.5 sm:w-auto sm:gap-2">
@@ -5725,14 +5843,34 @@
                     <div class="flex items-center justify-between border-b border-gray-100 pb-3 mb-2"><h3 class="text-xs font-bold text-gray-400 uppercase tracking-widest">{ui.securitySession}</h3><button class="text-gray-400 hover:text-gray-600" onclick={() => (composerSecurityOpen = false)}><X size={16} /></button></div>
                     <div class="space-y-4">
                       <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-approval-select">{ui.approvalMode}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all" id="composer-approval-select" onchange={(event) => setPreference("autoApproveMode", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["autoApproveMode"])} value={conversation.preferences.autoApproveMode ?? "manual"}><option value="manual">{ui.manual}</option><option value="turn">{ui.autoOnce}</option><option value="session">{ui.autoSession}</option></select></div>
-                      <div class="flex items-center gap-3 p-3 bg-gray-50 rounded-xl border border-gray-100"><input class="w-4 h-4 text-amber-600 rounded focus:ring-amber-500" checked={conversation.preferences.networkAccess ?? false} onchange={(event) => setPreference("networkAccess", (event.currentTarget as HTMLInputElement).checked)} type="checkbox" id="network-access" /><label for="network-access" class="text-xs font-semibold text-gray-700">{ui.allowNetworkAccess}</label></div>
-                      <div class="flex items-start gap-3 p-3 bg-gray-50 rounded-xl border border-gray-100">
-                          <input class="mt-0.5 w-4 h-4 text-amber-600 rounded focus:ring-amber-500 disabled:opacity-40" checked={conversation.preferences.shutdownOnCompletion ?? false} disabled={!config?.systemShutdown.available} onchange={(event) => setPreference("shutdownOnCompletion", (event.currentTarget as HTMLInputElement).checked)} type="checkbox" id="shutdown-on-completion" />
-                          <div class="min-w-0">
-                            <label for="shutdown-on-completion" class="text-xs font-semibold text-gray-700">{ui.shutdownAfterQueueCompletes}</label>
-                            <p class="mt-1 text-[11px] leading-relaxed text-gray-500">{m.shutdown_wait_description({ seconds: String(config?.systemShutdown.delaySeconds ?? 30) })}</p>
-                          </div>
-                      </div>
+                      <label class="checkbox-card" for="network-access">
+                        <input
+                          class="checkbox-input"
+                          checked={conversation.preferences.networkAccess ?? false}
+                          onchange={(event) => setPreference("networkAccess", (event.currentTarget as HTMLInputElement).checked)}
+                          type="checkbox"
+                          id="network-access"
+                        />
+                        <span aria-hidden="true" class="checkbox-control"></span>
+                        <span class="checkbox-copy">
+                          <span class="checkbox-title">{ui.allowNetworkAccess}</span>
+                        </span>
+                      </label>
+                      <label class:checkbox-card--disabled={!config?.systemShutdown.available} class="checkbox-card" for="shutdown-on-completion">
+                        <input
+                          class="checkbox-input"
+                          checked={conversation.preferences.shutdownOnCompletion ?? false}
+                          disabled={!config?.systemShutdown.available}
+                          onchange={(event) => setPreference("shutdownOnCompletion", (event.currentTarget as HTMLInputElement).checked)}
+                          type="checkbox"
+                          id="shutdown-on-completion"
+                        />
+                        <span aria-hidden="true" class="checkbox-control"></span>
+                        <span class="checkbox-copy">
+                          <span class="checkbox-title">{ui.shutdownAfterQueueCompletes}</span>
+                          <span class="checkbox-description">{m.shutdown_wait_description({ seconds: String(config?.systemShutdown.delaySeconds ?? 30) })}</span>
+                        </span>
+                      </label>
                     </div>
                   </div>
                 {/if}
@@ -5954,49 +6092,33 @@
     }
   }
 
-  @keyframes thinking-dot {
-    0%,
-    80%,
-    100% {
-      transform: translateY(0) scale(0.78);
-      opacity: 0.28;
-    }
-
-    40% {
-      transform: translateY(-1px) scale(1);
-      opacity: 1;
-    }
-  }
-
   .thinking-indicator {
     backdrop-filter: blur(10px);
   }
 
   .thinking-indicator__label {
-    background-image: linear-gradient(90deg, rgba(107, 114, 128, 0.62) 0%, rgba(17, 24, 39, 0.96) 34%, rgba(16, 185, 129, 0.82) 52%, rgba(17, 24, 39, 0.96) 68%, rgba(107, 114, 128, 0.62) 100%);
+    background-image: linear-gradient(90deg, rgba(107, 114, 128, 0.62) 0%, rgba(17, 24, 39, 0.96) 32%, rgba(217, 119, 6, 0.88) 52%, rgba(17, 24, 39, 0.96) 70%, rgba(107, 114, 128, 0.62) 100%);
     background-size: 220% 100%;
     background-clip: text;
     -webkit-background-clip: text;
     color: transparent;
     animation: thinking-shimmer 1.9s linear infinite;
   }
-
-  .thinking-indicator__dot {
-    height: 0.4rem;
-    width: 0.4rem;
-    border-radius: 9999px;
-    background: linear-gradient(180deg, rgba(16, 185, 129, 0.95), rgba(5, 150, 105, 0.7));
-    box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.08), 0 0 16px rgba(16, 185, 129, 0.22);
-    animation: thinking-dot 1.15s ease-in-out infinite;
+  .turn-card-header {
+    position: sticky;
+    top: 0.35rem;
+    z-index: 4;
+    backdrop-filter: blur(12px);
   }
 
-  .thinking-indicator__dot:nth-child(2) {
-    animation-delay: 0.16s;
+  .turn-card-header--neutral {
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(249, 250, 251, 0.94));
   }
 
-  .thinking-indicator__dot:nth-child(3) {
-    animation-delay: 0.32s;
+  .turn-card-header--amber {
+    background: linear-gradient(180deg, rgba(255, 251, 235, 0.98), rgba(255, 247, 237, 0.94));
   }
+
 </style>
 
 {#snippet renderTurnItem(turnId: string, item: CodexItem)}
@@ -6009,7 +6131,7 @@
     </div>
   {:else if item.type === "reasoning"}
     <div class="overflow-hidden rounded-2xl border border-amber-100 bg-amber-50/40 shadow-sm">
-      <div class="flex items-start gap-3 border-b border-amber-100 bg-amber-50/70 px-4 py-3">
+      <div class="turn-card-header turn-card-header--amber flex items-start gap-3 border-b border-amber-100 px-4 py-3">
         <div class="mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg border border-amber-100 bg-white text-amber-600">
           <Zap size={16} />
         </div>
@@ -6025,14 +6147,14 @@
       <div class="space-y-3 bg-white/85 px-4 py-3">
         {#if String(item.text ?? "").trim()}
           <div class="rounded-xl border border-amber-100 bg-white px-3 py-3">
-            <pre class="whitespace-pre-wrap text-xs leading-relaxed text-gray-700">{String(item.text ?? "")}</pre>
+            <MarkdownMessage compact on:openLocalPath={(event: CustomEvent<{ href: string }>) => void openGitFileFromMessage(event.detail.href)} text={String(item.text ?? "")} />
           </div>
         {/if}
         {#if Array.isArray(item.summary) && item.summary.length > 0}
           <div class="space-y-2">
             {#each item.summary as summaryEntry, index (`${item.id}:summary:${index}`)}
-              <div class="rounded-xl bg-amber-50/60 px-3 py-2 text-sm leading-relaxed text-gray-700">
-                {summaryEntry}
+              <div class="rounded-xl border border-amber-100/70 bg-amber-50/60 px-3 py-2.5 text-sm leading-relaxed text-gray-700">
+                <MarkdownMessage compact on:openLocalPath={(event: CustomEvent<{ href: string }>) => void openGitFileFromMessage(event.detail.href)} text={summaryEntry} />
               </div>
             {/each}
           </div>
@@ -6040,10 +6162,34 @@
       </div>
     </div>
   {:else if item.type === "plan"}
-    <div class="border border-amber-100 rounded-2xl bg-amber-50/20 overflow-hidden shadow-sm"><div class="px-4 py-2.5 bg-amber-100/50 border-b border-amber-100 flex items-center gap-3"><ListTodo size={14} class="text-amber-700" /><span class="text-[10px] font-bold text-amber-700 uppercase tracking-widest">{ui.plannedStrategy}</span></div><pre class="p-5 text-xs font-mono text-gray-700 leading-relaxed whitespace-pre-wrap">{String(item.text ?? "")}</pre></div>
+    <div class="border border-amber-100 rounded-2xl bg-amber-50/20 overflow-hidden shadow-sm"><div class="turn-card-header turn-card-header--amber px-4 py-2.5 border-b border-amber-100 flex items-center gap-3"><ListTodo size={14} class="text-amber-700" /><span class="text-[10px] font-bold text-amber-700 uppercase tracking-widest">{ui.plannedStrategy}</span></div><pre class="p-5 text-xs font-mono text-gray-700 leading-relaxed whitespace-pre-wrap">{String(item.text ?? "")}</pre></div>
+  {:else if item.type === "contextCompaction"}
+    {@const contextCompressionRunning = isContextCompactionRunning(turnId, item)}
+    <div class="overflow-hidden rounded-2xl border border-amber-200 bg-gradient-to-br from-amber-50/80 via-white to-white shadow-sm">
+      <div class="turn-card-header turn-card-header--amber flex items-center justify-between gap-3 border-b border-amber-100 px-4 py-3">
+        <div class="flex min-w-0 items-center gap-3">
+          <div class={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl border ${contextCompressionRunning ? "border-amber-200 bg-amber-100 text-amber-700" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}>
+            {#if contextCompressionRunning}
+              <RefreshCw size={15} class="animate-spin" />
+            {:else}
+              <CheckCircle2 size={15} />
+            {/if}
+          </div>
+          <div class="min-w-0">
+            <h4 class="text-[10px] font-bold uppercase tracking-widest text-amber-700">{ui.contextCompression}</h4>
+            <p class="mt-1 text-xs leading-relaxed text-gray-600">
+              {contextCompressionRunning ? ui.contextCompressionInProgress : ui.contextCompressionCompleted}
+            </p>
+          </div>
+        </div>
+        <span class={`rounded-full px-2 py-1 text-[10px] font-bold uppercase tracking-widest ${contextCompressionRunning ? "bg-amber-100 text-amber-700" : "bg-emerald-50 text-emerald-700"}`}>
+          {contextCompressionRunning ? ui.executing : m.done()}
+        </span>
+      </div>
+    </div>
   {:else if ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"].includes(item.type)}
     <div class="border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm hover:shadow-md transition-shadow">
-      <button class="w-full flex items-center justify-between px-4 py-3 hover:bg-gray-50 transition-colors" onclick={() => void toggleToolItem(turnId, item.id)}>
+      <button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-4 py-3 hover:bg-gray-50 transition-colors" onclick={() => void toggleToolItem(turnId, item.id)}>
         <div class="flex items-center gap-3"><div class="p-2 bg-gray-100 text-gray-500 rounded-xl">{#if item.type === 'commandExecution'}<Terminal size={14} />{:else if item.type === 'fileChange'}<FileDiff size={14} />{:else if item.type === 'webSearch'}<Layout size={14} />{:else}<Zap size={14} />{/if}</div><div class="text-left"><h4 class="text-xs font-bold text-gray-900 leading-tight">{getToolItemLabel(item)}</h4><p class="text-[10px] text-gray-500 mt-0.5 font-medium">{getToolItemSummary(item) || ui.executing}</p></div></div>
         <div class="flex items-center gap-3">{#if item.type === "commandExecution" && item.exitCode !== null}<span class="px-1.5 py-0.5 bg-gray-100 text-[9px] font-bold text-gray-500 rounded uppercase tracking-tighter">Exit {item.exitCode}</span>{/if}<ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, item.id) ? 'rotate-180' : ''} transition-transform" /></div>
       </button>
@@ -6060,7 +6206,7 @@
     </div>
   {:else if item.type === "collabAgentToolCall"}
     <div class="border border-amber-200 rounded-2xl bg-white overflow-hidden shadow-sm group">
-      <div class="px-4 py-3 bg-amber-50/50 flex items-center justify-between gap-4">
+      <div class="turn-card-header turn-card-header--amber px-4 py-3 flex items-center justify-between gap-4">
         <div class="flex items-center gap-3"><div class="p-2 bg-white border border-amber-200 text-amber-600 rounded-xl group-hover:bg-amber-600 group-hover:text-white transition-all shadow-sm"><Bot size={16} /></div><div><h4 class="text-xs font-bold text-gray-900 leading-tight">{ui.subagentInvocation}</h4><div class="flex items-center gap-2 mt-0.5"><span class="text-[10px] font-bold text-amber-600 uppercase tracking-widest">{item.tool}</span><span class="w-1 h-1 rounded-full bg-amber-200"></span><span class="text-[10px] text-gray-500 font-medium uppercase tracking-tighter">{item.status}</span></div></div></div>
         {#if getPrimarySubagentThreadId(item)}<button class="px-3 py-1.5 bg-white border border-amber-200 rounded-lg text-[10px] font-bold text-amber-700 hover:bg-amber-600 hover:text-white transition-all shadow-sm" onclick={() => void openSubagentThread(getPrimarySubagentThreadId(item) ?? "")}>{ui.viewThread}</button>{/if}
       </div>
@@ -6073,7 +6219,7 @@
   {#if entry.kind === "item"}{@render renderTurnItem(turnId, entry.item)}
   {:else if entry.kind === "readGroup"}
     <div class="border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm">
-      <button class="w-full flex items-center justify-between px-4 py-3 hover:bg-gray-50 transition-colors" onclick={() => void toggleReadOnlyCommandGroup(turnId, entry.key, entry.items)}><div class="flex items-center gap-3"><div class="p-2 bg-gray-100 text-gray-400 rounded-xl"><Search size={14} /></div><div class="text-left"><h4 class="text-xs font-bold text-gray-900 leading-tight">{getReadOnlyCommandGroupLabel(entry.items)}</h4><p class="text-[10px] text-gray-500 mt-0.5 font-medium">{summarizeReadOnlyCommandGroup(entry.items)}</p></div></div><div class="flex items-center gap-3"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{ui.opsCount(entry.items.length)}</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
+      <button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-4 py-3 hover:bg-gray-50 transition-colors" onclick={() => void toggleReadOnlyCommandGroup(turnId, entry.key, entry.items)}><div class="flex items-center gap-3"><div class="p-2 bg-gray-100 text-gray-400 rounded-xl"><Search size={14} /></div><div class="text-left"><h4 class="text-xs font-bold text-gray-900 leading-tight">{getReadOnlyCommandGroupLabel(entry.items)}</h4><p class="text-[10px] text-gray-500 mt-0.5 font-medium">{summarizeReadOnlyCommandGroup(entry.items)}</p></div></div><div class="flex items-center gap-3"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{ui.opsCount(entry.items.length)}</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
       {#if isItemExpanded(turnId, entry.key)}
         <div class="border-t border-gray-100 bg-gray-50/30">{#if isItemDetailLoading(turnId, entry.key)}<div class="p-6 flex justify-center text-gray-400 italic text-xs animate-pulse">{ui.readingFileData}</div>
           {:else}<div class="p-0">{#each entry.items as commandItem}<div class="p-4 border-b border-gray-100 last:border-0"><div class="flex items-center justify-between mb-2"><span class="text-[10px] font-bold text-gray-500 uppercase tracking-widest">{summarizeCommand(commandItem)}</span>{#if commandItem.exitCode !== null}<span class="text-[9px] font-mono text-gray-400">Exit {commandItem.exitCode}</span>{/if}</div><pre class="p-3 bg-white border border-gray-200 rounded-lg text-[10px] font-mono text-gray-600 overflow-x-auto max-h-60 leading-relaxed">{String(commandItem.aggregatedOutput ?? "")}</pre></div>{/each}</div>{/if}</div>
@@ -6081,7 +6227,7 @@
     </div>
   {:else}
     <div class="border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm">
-      <div class="flex items-center gap-2 pr-3">
+      <div class="turn-card-header turn-card-header--neutral flex items-center gap-2 pr-3">
         <button class="min-w-0 flex-1 flex items-center justify-between px-4 py-3 hover:bg-gray-50 transition-colors" onclick={() => void toggleFileChangeGroup(turnId, entry.key, entry.items)} type="button"><div class="flex items-center gap-3 min-w-0"><div class="p-2 bg-gray-100 text-gray-400 rounded-xl shrink-0"><FileDiff size={14} /></div><div class="text-left min-w-0"><h4 class="text-xs font-bold text-gray-900 leading-tight">{getFileChangeGroupLabel(entry.items)}</h4><p class="text-[10px] text-gray-500 mt-0.5 font-medium truncate">{summarizeFileChangeGroup(entry.items)}</p></div></div><div class="flex items-center gap-3 shrink-0"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{getFileChangeGroupSummaryEntries(entry.items).length} Files</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
         {#if getFileChangeGroupViews(entry.items).length > 0}
           <button

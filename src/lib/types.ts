@@ -273,6 +273,8 @@ export type SessionQueuePayload = {
   items: SessionQueueItem[];
   resumeRequired: boolean;
   updatedAt: number | null;
+  enqueueAccepted?: boolean;
+  enqueueItemId?: string | null;
 };
 
 export type StreamEvent =

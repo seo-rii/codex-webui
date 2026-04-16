@@ -482,13 +482,19 @@
         <span>{ui.worktreeBranch}</span>
         <input bind:value={newWorktreeBranch} disabled={detachWorktree} placeholder={detachWorktree ? ui.detachedHeadShort : ui.branchOrNewBranch} type="text" />
       </label>
-      <label class="inline-checkbox">
-        <input bind:checked={createWorktreeBranch} disabled={detachWorktree} type="checkbox" />
-        <span>{ui.createBranchOption}</span>
+      <label class:checkbox-card--disabled={detachWorktree} class="checkbox-card checkbox-card--compact">
+        <input bind:checked={createWorktreeBranch} class="checkbox-input" disabled={detachWorktree} type="checkbox" />
+        <span aria-hidden="true" class="checkbox-control"></span>
+        <span class="checkbox-copy">
+          <span class="checkbox-title">{ui.createBranchOption}</span>
+        </span>
       </label>
-      <label class="inline-checkbox">
-        <input bind:checked={detachWorktree} type="checkbox" />
-        <span>{ui.detachHeadOption}</span>
+      <label class="checkbox-card checkbox-card--compact">
+        <input bind:checked={detachWorktree} class="checkbox-input" type="checkbox" />
+        <span aria-hidden="true" class="checkbox-control"></span>
+        <span class="checkbox-copy">
+          <span class="checkbox-title">{ui.detachHeadOption}</span>
+        </span>
       </label>
       <button class="solid-button" disabled={!newWorktreePath.trim() || (!detachWorktree && !newWorktreeBranch.trim()) || worktreeBusy} type="button" onclick={createWorktree}>
         {worktreeBusy ? ui.creating : ui.addWorktree}
@@ -698,8 +704,7 @@
   .git-header,
   .git-meta,
   .git-actions,
-  .inline-field,
-  .inline-checkbox {
+  .inline-field {
     display: flex;
     gap: 0.75rem;
     align-items: center;
@@ -756,16 +761,6 @@
     background: rgba(255, 255, 255, 0.86);
     color: var(--ink);
     padding: 0.85rem 0.95rem;
-  }
-
-  .inline-checkbox {
-    justify-content: flex-start;
-    white-space: nowrap;
-  }
-
-  .inline-checkbox span {
-    color: var(--muted);
-    font-size: 0.82rem;
   }
 
   .meta-pill {

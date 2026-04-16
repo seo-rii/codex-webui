@@ -394,6 +394,133 @@
     return inferDisplayThreadTitle(formatValue(preview));
   }
 
+  function createDraftConversation(preferences: SessionPreferences, title: string | null = null): ConversationState {
+    const now = Math.floor(Date.now() / 1000);
+    return {
+      thread: {
+        id: "",
+        preview: "",
+        name: title,
+        cwd: preferences.cwd,
+        status: "idle",
+        createdAt: now,
+        updatedAt: now,
+        isSubagent: false,
+        agentNickname: null,
+        agentRole: null,
+        turns: []
+      },
+      preferences: {
+        ...preferences
+      },
+      attachments: [],
+      queue: {
+        sessionId: "",
+        items: [],
+        resumeRequired: false,
+        updatedAt: null
+      },
+      pendingRequests: [],
+      activeTurnId: null,
+      tokenUsage: null,
+      hydration: {
+        state: "complete",
+        loadedTurns: 0,
+        totalTurns: 0,
+        remainingTurns: 0,
+        message: null
+      },
+      livePlans: {},
+      liveDiffs: {}
+    };
+  }
+
+  function activateDraftSession(
+    preferences: SessionPreferences,
+    options: {
+      draftText?: string;
+      draftAttachments?: AttachmentRecord[];
+      title?: string | null;
+    } = {}
+  ) {
+    clearHydrationRefresh();
+    disconnectStream();
+    selectedSessionId = null;
+    conversation = createDraftConversation(preferences, options.title ?? null);
+    draftPersistencePaused = false;
+    pendingSessionEvents = {};
+    expandedItems = {};
+    expandedFileChangeEntries = {};
+    loadingItemDetails = {};
+    itemDetailErrors = {};
+    expandedTurnLogs = {};
+    loadingTurns = {};
+    turnLoadErrors = {};
+    draft = options.draftText ?? "";
+    draftAttachments = [...(options.draftAttachments ?? [])];
+    titleDraft = options.title ?? "";
+    loadingDetail = false;
+    pendingSteerResume = null;
+    optimisticMessage = null;
+    sendIntent = null;
+    olderTurnsAutoLoadEnabled = true;
+    olderTurnsAutoLoadPaused = false;
+    olderTurnsAutoTriggerTimestamps = [];
+    loadingOlderTurns = false;
+    mobileSidebarOpen = false;
+    composerSettingsOpen = false;
+    composerSecurityOpen = false;
+    activeWorkspaceTabId = "chat";
+    syncSelectedSessionInUrl(null);
+    queueMicrotask(() => {
+      scheduleComposerTextareaResize();
+    });
+  }
+
+  async function ensureSessionForComposer() {
+    if (selectedSessionId && conversation) {
+      return {
+        sessionId: selectedSessionId,
+        state: conversation
+      };
+    }
+
+    if (!runtime?.installed) {
+      errorText = m.codex_cli_required();
+      return null;
+    }
+    if (!config || !conversation) {
+      return null;
+    }
+
+    const draftState = conversation;
+    const draftTextSnapshot = draft;
+    const draftAttachmentSnapshot = [...draftAttachments];
+    const draftTitleSnapshot = titleDraft.trim();
+    const nextTitle = draftTitleSnapshot && !isPlaceholderThreadTitle(draftTitleSnapshot) ? draftTitleSnapshot : null;
+
+    const created = await api.createSession(draftState.preferences, nextTitle);
+    upsertSessionSummary(created);
+    const restored = await selectSession(created.id);
+    if (!restored || !conversation || selectedSessionId !== created.id) {
+      activateDraftSession(draftState.preferences, {
+        draftText: draftTextSnapshot,
+        draftAttachments: draftAttachmentSnapshot,
+        title: draftTitleSnapshot
+      });
+      throw new Error("Failed to open the created session.");
+    }
+
+    draft = draftTextSnapshot;
+    draftAttachments = draftAttachmentSnapshot;
+    scheduleComposerTextareaResize();
+
+    return {
+      sessionId: created.id,
+      state: conversation
+    };
+  }
+
   function hasStartupAlerts(nextConfig: AppConfigPayload | null) {
     if (!nextConfig) {
       return false;
@@ -1757,21 +1884,7 @@
         return;
       }
 
-      try {
-        const created = await api.createSession(config.defaults, null);
-        showArchivedSessions = false;
-        sessionSearchQuery = "";
-        sessionSearchScope = "summary";
-        await refreshSessions(created);
-        await selectSession(created.id);
-      } catch (createError) {
-        const fallbackSession = sessions[0] ?? null;
-        if (fallbackSession) {
-          await selectSession(fallbackSession.id);
-        } else {
-          throw createError;
-        }
-      }
+      activateDraftSession(config.defaults);
     } catch (error) {
       errorText = describeError(error);
     }
@@ -2430,17 +2543,11 @@
       return;
     }
 
-    try {
-      showArchivedSessions = false;
-      sessionSearchQuery = "";
-      sessionSearchScope = "summary";
-      mobileSidebarOpen = false;
-      const created = await api.createSession(config.defaults, null);
-      await refreshSessions(created);
-      await selectSession(created.id);
-    } catch (error) {
-      errorText = describeError(error);
-    }
+    showArchivedSessions = false;
+    sessionSearchQuery = "";
+    sessionSearchScope = "summary";
+    mobileSidebarOpen = false;
+    activateDraftSession(config.defaults);
   }
 
   function setPreference<Key extends keyof SessionPreferences>(key: Key, value: SessionPreferences[Key]) {
@@ -2484,13 +2591,27 @@
   }
 
   async function saveTitle() {
-    if (!selectedSessionId || !titleDraft.trim()) {
+    if (!titleDraft.trim()) {
       return;
     }
 
     const nextTitle = titleDraft.trim();
     const currentDisplayTitle = getDisplayThreadTitle(conversation?.thread.name, conversation?.thread.preview) ?? "";
     if (nextTitle === currentDisplayTitle) {
+      return;
+    }
+
+    if (!selectedSessionId) {
+      if (conversation) {
+        conversation = {
+          ...conversation,
+          thread: {
+            ...conversation.thread,
+            name: nextTitle
+          }
+        };
+      }
+      titleDraft = nextTitle;
       return;
     }
 
@@ -2529,62 +2650,76 @@
   }
 
   async function sendMessage() {
-    if (!selectedSessionId || !conversation || sending || startingMessage || uploading || queueModeActive) {
+    if (!conversation || sending || startingMessage || uploading || queueModeActive) {
       return;
     }
 
-    const sessionId = selectedSessionId;
     const prompt = draft.trim();
     const draftText = draft;
-    const attachmentIds = draftAttachments.map((attachment) => attachment.id);
     const attachmentNames = draftAttachments.map((attachment) => attachment.originalName);
     const attachmentSnapshot = [...draftAttachments];
-    const preferences = conversation.preferences;
     startingMessage = true;
     errorText = "";
     noticeText = "";
-    optimisticMessage = {
-      sessionId,
-      prompt,
-      attachmentNames,
-      createdAt: Date.now(),
-      baselineTurnId: conversation.thread.turns.at(-1)?.id ?? null,
-      baselineTurnCount: conversation.thread.turns.length
-    };
-    stickTranscriptToBottom = true;
-    forceTranscriptScroll = true;
-    pendingQueueModeSessionId = sessionId;
-    recordComposerHistory(prompt);
-    draft = "";
-    draftAttachments = [];
-    composerSettingsOpen = false;
-    composerSecurityOpen = false;
 
-    void api
-      .sendMessage(sessionId, {
-        prompt: draftText,
-        attachmentIds,
-        preferences
-      })
+    try {
+      const materialized = await ensureSessionForComposer();
+      if (!materialized) {
+        return;
+      }
+
+      const sessionId = materialized.sessionId;
+      const activeConversation = materialized.state;
+      const attachmentIds = draftAttachments.map((attachment) => attachment.id);
+      const preferences = activeConversation.preferences;
+      optimisticMessage = {
+        sessionId,
+        prompt,
+        attachmentNames,
+        createdAt: Date.now(),
+        baselineTurnId: activeConversation.thread.turns.at(-1)?.id ?? null,
+        baselineTurnCount: activeConversation.thread.turns.length
+      };
+      stickTranscriptToBottom = true;
+      forceTranscriptScroll = true;
+      pendingQueueModeSessionId = sessionId;
+      recordComposerHistory(prompt);
+      draft = "";
+      draftAttachments = [];
+      scheduleComposerTextareaResize();
+      composerSettingsOpen = false;
+      composerSecurityOpen = false;
+
+      void api
+        .sendMessage(sessionId, {
+          prompt: draftText,
+          attachmentIds,
+          preferences
+        })
       .then(() => {
         scheduleSessionRefresh(80);
       })
-      .catch((error) => {
-        if (pendingQueueModeSessionId === sessionId) {
-          pendingQueueModeSessionId = null;
-        }
-        if (optimisticMessage?.sessionId === sessionId && optimisticMessage.prompt === prompt) {
-          optimisticMessage = null;
-        }
-        if (selectedSessionId === sessionId && !draft.trim() && draftAttachments.length === 0) {
-          draft = draftText;
-          draftAttachments = attachmentSnapshot;
-        }
-        errorText = describeError(error);
-      })
-      .finally(() => {
-        startingMessage = false;
-      });
+        .catch((error) => {
+          if (pendingQueueModeSessionId === sessionId) {
+            pendingQueueModeSessionId = null;
+          }
+          if (optimisticMessage?.sessionId === sessionId && optimisticMessage.prompt === prompt) {
+            optimisticMessage = null;
+          }
+          if (selectedSessionId === sessionId && !draft.trim() && draftAttachments.length === 0) {
+            draft = draftText;
+            draftAttachments = attachmentSnapshot;
+            scheduleComposerTextareaResize();
+          }
+          errorText = describeError(error);
+        })
+        .finally(() => {
+          startingMessage = false;
+        });
+    } catch (error) {
+      errorText = describeError(error);
+      startingMessage = false;
+    }
   }
 
   async function queueMessage() {
@@ -2612,6 +2747,7 @@
       }
       draft = "";
       draftAttachments = [];
+      scheduleComposerTextareaResize();
       composerSettingsOpen = false;
       composerSecurityOpen = false;
       noticeText = m.queue_notice();
@@ -2641,6 +2777,7 @@
       if (clearComposer || draft.trim() === normalizedPrompt) {
         draft = "";
         draftAttachments = [];
+        scheduleComposerTextareaResize();
       }
       pendingSteerResume = null;
     } catch (error) {
@@ -2811,7 +2948,7 @@
   }
 
   async function uploadFiles(files: FileList | null) {
-    if (!selectedSessionId || !files || files.length === 0) {
+    if (!files || files.length === 0) {
       return;
     }
 
@@ -2820,7 +2957,12 @@
     noticeText = "";
 
     try {
-      const response = await api.uploadAttachments(selectedSessionId, Array.from(files));
+      const materialized = await ensureSessionForComposer();
+      if (!materialized) {
+        return;
+      }
+
+      const response = await api.uploadAttachments(materialized.sessionId, Array.from(files));
       draftAttachments = [...draftAttachments, ...response.attachments];
     } catch (error) {
       errorText = describeError(error);
@@ -4656,92 +4798,141 @@
   <title>{ui.appTitle}</title>
 </svelte:head>
 
-{#if authenticated === null}
-  <div class="flex min-h-[100dvh] w-full items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_top,_rgba(251,191,36,0.18),_transparent_32%),linear-gradient(180deg,_#fffaf1_0%,_#ffffff_58%,_#f8fafc_100%)] px-6 py-10 text-gray-900">
-    <div class="w-full max-w-xl rounded-[2rem] border border-white/70 bg-white/90 p-8 shadow-[0_30px_80px_rgba(15,23,42,0.12)] backdrop-blur-xl">
-      <div class="flex items-start justify-between gap-6">
-        <div class="space-y-3">
-          <p class="text-[11px] font-bold uppercase tracking-[0.28em] text-amber-700">{ui.privateGateway}</p>
-          <div>
-            <h1 class="text-3xl font-semibold tracking-tight text-gray-950 sm:text-4xl">{ui.appTitle}</h1>
-            <p class="mt-3 max-w-md text-sm leading-7 text-gray-500">{ui.loginLede}</p>
+{#if authenticated !== true}
+  <div class="relative flex h-[100dvh] min-h-[100dvh] w-full overflow-hidden bg-[radial-gradient(circle_at_top,_rgba(251,191,36,0.18),_transparent_28%),linear-gradient(180deg,_#fffaf1_0%,_#ffffff_58%,_#f8fafc_100%)] text-gray-900">
+    <div class={`flex h-full w-full transition-all duration-300 ${authenticated === false ? "scale-[0.995] blur-md saturate-[0.9]" : ""}`}>
+      <aside class="hidden h-full w-[18.5rem] shrink-0 border-r border-white/70 bg-white/70 px-4 py-5 lg:flex lg:flex-col">
+        <div class="mb-5 flex items-center justify-between gap-3">
+          <div class="space-y-2">
+            <div class="h-2.5 w-20 rounded-full bg-amber-200/80"></div>
+            <div class="h-6 w-32 rounded-full bg-gray-200/80"></div>
           </div>
+          <div class="h-10 w-10 rounded-2xl bg-amber-100/80"></div>
         </div>
-        <div class="hidden h-12 w-12 items-center justify-center rounded-2xl border border-amber-100 bg-amber-50 text-amber-600 shadow-sm sm:flex">
-          <RefreshCw size={18} class="animate-spin" />
+        <div class="mb-4 h-10 rounded-2xl bg-white/90 shadow-sm ring-1 ring-gray-100"></div>
+        <div class="mb-4 flex gap-2 rounded-2xl bg-white/70 p-1.5 shadow-sm ring-1 ring-gray-100">
+          <div class="h-9 flex-1 rounded-xl bg-white"></div>
+          <div class="h-9 flex-1 rounded-xl bg-gray-100/80"></div>
         </div>
-      </div>
-
-      <div class="mt-8 overflow-hidden rounded-2xl border border-gray-100 bg-gray-50/80">
-        <div class="h-1.5 w-full overflow-hidden bg-gray-100">
-          <div class="h-full w-1/2 animate-pulse rounded-full bg-amber-500/70"></div>
-        </div>
-        <div class="space-y-4 px-5 py-5">
-          <div class="h-3 w-32 rounded-full bg-gray-200"></div>
-          <div class="h-11 rounded-2xl bg-white shadow-inner ring-1 ring-gray-100"></div>
-          <div class="h-11 w-32 rounded-2xl bg-amber-100"></div>
-        </div>
-      </div>
-
-      {#if errorText}
-        <p class="mt-4 rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">{errorText}</p>
-      {/if}
-    </div>
-  </div>
-{:else if authenticated === false}
-  <div class="flex min-h-[100dvh] w-full items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_top,_rgba(251,191,36,0.18),_transparent_32%),linear-gradient(180deg,_#fffaf1_0%,_#ffffff_58%,_#f8fafc_100%)] px-6 py-10 text-gray-900">
-    <div class="w-full max-w-xl rounded-[2rem] border border-white/70 bg-white/90 p-8 shadow-[0_30px_80px_rgba(15,23,42,0.12)] backdrop-blur-xl sm:p-10">
-      <div class="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
-        <div class="space-y-3">
-          <p class="text-[11px] font-bold uppercase tracking-[0.28em] text-amber-700">{ui.privateGateway}</p>
-          <div>
-            <h1 class="text-3xl font-semibold tracking-tight text-gray-950 sm:text-4xl">{ui.appTitle}</h1>
-            <p class="mt-3 max-w-md text-sm leading-7 text-gray-500">{ui.loginLede}</p>
-          </div>
-        </div>
-        <div class="flex flex-wrap gap-2" role="group" aria-label={ui.language}>
-          {#each localeOptions as option (option.value)}
-            <button
-              class="rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors {$activeLocale === option.value
-                ? 'border-amber-200 bg-amber-50 text-amber-700'
-                : 'border-gray-200 bg-white text-gray-500 hover:border-amber-200 hover:text-amber-700'}"
-              onclick={() => updateLocale(option.value)}
-              type="button"
-            >
-              {option.label}
-            </button>
+        <div class="flex-1 space-y-2 overflow-hidden">
+          {#each Array(8) as _, index (`auth-skeleton-sidebar-${index}`)}
+            <div class="rounded-2xl bg-white/70 px-4 py-3 shadow-sm ring-1 ring-gray-100/80">
+              <div class="h-3 w-[72%] rounded-full bg-gray-200"></div>
+              <div class="mt-2 h-2.5 w-[46%] rounded-full bg-gray-100"></div>
+            </div>
           {/each}
         </div>
+      </aside>
+
+      <div class="flex min-w-0 flex-1 flex-col">
+        <div class="flex h-16 items-center justify-between border-b border-white/70 bg-white/65 px-4 shadow-sm shadow-amber-50/60 sm:px-6">
+          <div class="flex items-center gap-3">
+            <div class="h-9 w-9 rounded-2xl bg-amber-100/90"></div>
+            <div class="space-y-2">
+              <div class="h-2.5 w-20 rounded-full bg-gray-200"></div>
+              <div class="h-3 w-36 rounded-full bg-gray-100"></div>
+            </div>
+          </div>
+          <div class="hidden gap-2 sm:flex">
+            <div class="h-9 w-28 rounded-2xl bg-white/90 shadow-sm ring-1 ring-gray-100"></div>
+            <div class="h-9 w-10 rounded-2xl bg-white/90 shadow-sm ring-1 ring-gray-100"></div>
+          </div>
+        </div>
+
+        <div class="flex min-h-0 flex-1 flex-col gap-5 px-4 py-5 sm:px-6 sm:py-6 lg:px-8">
+          <div class="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-5">
+            <div class="space-y-4 pt-3">
+              {#each Array(4) as _, index (`auth-skeleton-turn-${index}`)}
+                <div class={`flex ${index % 2 === 0 ? "justify-start" : "justify-end"}`}>
+                  <div class={`rounded-[1.75rem] border border-white/80 bg-white/82 p-5 shadow-sm ${index % 2 === 0 ? "w-full max-w-2xl" : "w-full max-w-xl"}`}>
+                    <div class="space-y-3">
+                      <div class="h-3 rounded-full bg-gray-200" style={`width:${index % 2 === 0 ? 78 : 68}%`}></div>
+                      <div class="h-3 rounded-full bg-gray-100" style={`width:${index % 2 === 0 ? 54 : 48}%`}></div>
+                      <div class="h-3 rounded-full bg-gray-100" style={`width:${index % 2 === 0 ? 60 : 38}%`}></div>
+                    </div>
+                  </div>
+                </div>
+              {/each}
+            </div>
+
+            <div class="mt-auto rounded-[1.75rem] border border-white/80 bg-white/85 p-4 shadow-[0_24px_60px_rgba(15,23,42,0.08)]">
+              <div class="h-12 rounded-2xl bg-gray-100"></div>
+              <div class="mt-3 flex items-center justify-between gap-3">
+                <div class="flex items-center gap-2">
+                  <div class="h-9 w-9 rounded-2xl bg-gray-100"></div>
+                  <div class="h-9 w-28 rounded-2xl bg-gray-100"></div>
+                </div>
+                <div class="h-9 w-24 rounded-2xl bg-amber-100/90"></div>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
-
-      <form class="mt-8 space-y-5" onsubmit={(event) => {
-        event.preventDefault();
-        void handleLogin();
-      }}>
-        <label class="block space-y-2">
-          <span class="text-sm font-semibold text-gray-700">{ui.password}</span>
-          <input
-            bind:value={loginPassword}
-            autocomplete="current-password"
-            class="w-full rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-900 shadow-sm outline-none transition focus:border-amber-500 focus:ring-4 focus:ring-amber-100"
-            placeholder={ui.password}
-            type="password"
-          />
-        </label>
-
-        <button
-          class="inline-flex min-w-32 items-center justify-center rounded-2xl bg-amber-600 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-amber-200/70 transition hover:bg-amber-700 disabled:cursor-not-allowed disabled:bg-amber-300"
-          disabled={loginBusy}
-          type="submit"
-        >
-          {loginBusy ? ui.signingIn : ui.signIn}
-        </button>
-      </form>
-
-      {#if loginMessage}
-        <p class="mt-4 rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">{loginMessage}</p>
-      {/if}
     </div>
+
+    {#if authenticated === false}
+      <div class="absolute inset-0 bg-gray-950/30 backdrop-blur-sm"></div>
+      <div class="absolute inset-0 z-10 flex items-center justify-center p-4 sm:p-6">
+        <div class="w-full max-w-xl rounded-[2rem] border border-white/70 bg-white/92 p-6 shadow-[0_32px_90px_rgba(15,23,42,0.24)] backdrop-blur-2xl sm:p-8">
+          <div class="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
+            <div class="space-y-3">
+              <p class="text-[11px] font-bold uppercase tracking-[0.28em] text-amber-700">{ui.privateGateway}</p>
+              <div>
+                <h1 class="text-3xl font-semibold tracking-tight text-gray-950 sm:text-4xl">{ui.appTitle}</h1>
+                <p class="mt-3 max-w-md text-sm leading-7 text-gray-500">{ui.loginLede}</p>
+              </div>
+            </div>
+            <div class="flex flex-wrap gap-2" role="group" aria-label={ui.language}>
+              {#each localeOptions as option (option.value)}
+                <button
+                  class="rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors {$activeLocale === option.value
+                    ? 'border-amber-200 bg-amber-50 text-amber-700'
+                    : 'border-gray-200 bg-white text-gray-500 hover:border-amber-200 hover:text-amber-700'}"
+                  onclick={() => updateLocale(option.value)}
+                  type="button"
+                >
+                  {option.label}
+                </button>
+              {/each}
+            </div>
+          </div>
+
+          <form class="mt-8 space-y-5" onsubmit={(event) => {
+            event.preventDefault();
+            void handleLogin();
+          }}>
+            <label class="block space-y-2">
+              <span class="text-sm font-semibold text-gray-700">{ui.password}</span>
+              <input
+                bind:value={loginPassword}
+                autocomplete="current-password"
+                class="w-full rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-900 shadow-sm outline-none transition focus:border-amber-500 focus:ring-4 focus:ring-amber-100"
+                placeholder={ui.password}
+                type="password"
+              />
+            </label>
+
+            <button
+              class="inline-flex min-w-32 items-center justify-center rounded-2xl bg-amber-600 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-amber-200/70 transition hover:bg-amber-700 disabled:cursor-not-allowed disabled:bg-amber-300"
+              disabled={loginBusy}
+              type="submit"
+            >
+              {loginBusy ? ui.signingIn : ui.signIn}
+            </button>
+          </form>
+
+          {#if loginMessage}
+            <p class="mt-4 rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">{loginMessage}</p>
+          {/if}
+        </div>
+      </div>
+    {:else if errorText}
+      <div class="pointer-events-none absolute inset-x-0 bottom-0 z-10 flex justify-center px-4 pb-5 sm:px-6">
+        <p class="pointer-events-auto max-w-xl rounded-2xl border border-red-100 bg-red-50/95 px-4 py-3 text-sm text-red-700 shadow-lg shadow-red-100/70">
+          {errorText}
+        </p>
+      </div>
+    {/if}
   </div>
 {:else}
 <div class="flex h-[100dvh] min-h-[100dvh] w-full bg-white overflow-hidden font-sans text-gray-900">

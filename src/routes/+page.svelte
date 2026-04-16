@@ -1404,8 +1404,24 @@
       return;
     }
 
+    const scrollTranscript = (top: number) => {
+      if (!transcriptElement) {
+        return;
+      }
+
+      const previousBehavior = transcriptElement.style.scrollBehavior;
+      transcriptElement.style.scrollBehavior = "auto";
+      transcriptElement.scrollTo({ top, behavior: "auto" });
+
+      if (previousBehavior) {
+        transcriptElement.style.scrollBehavior = previousBehavior;
+      } else {
+        transcriptElement.style.removeProperty("scroll-behavior");
+      }
+    };
+
     if (typeof window === "undefined") {
-      transcriptElement.scrollTop = transcriptElement.scrollHeight;
+      scrollTranscript(transcriptElement.scrollHeight);
       forceTranscriptScroll = false;
       return;
     }
@@ -1436,7 +1452,7 @@
         }
 
         const nextHeight = transcriptElement.scrollHeight;
-        transcriptElement.scrollTop = nextHeight;
+        scrollTranscript(nextHeight);
 
         if (nextHeight === lastHeight) {
           stableFrames += 1;
@@ -4167,7 +4183,17 @@
 
       await tick();
       if (transcriptElement) {
-        transcriptElement.scrollTop = transcriptElement.scrollHeight - previousHeight + previousTop;
+        const previousBehavior = transcriptElement.style.scrollBehavior;
+        transcriptElement.style.scrollBehavior = "auto";
+        transcriptElement.scrollTo({
+          top: transcriptElement.scrollHeight - previousHeight + previousTop,
+          behavior: "auto"
+        });
+        if (previousBehavior) {
+          transcriptElement.style.scrollBehavior = previousBehavior;
+        } else {
+          transcriptElement.style.removeProperty("scroll-behavior");
+        }
       }
     } catch (error) {
       errorText = describeError(error);
@@ -4988,7 +5014,7 @@
     <div class="flex-1 overflow-hidden relative">
       {#if activeWorkspaceTabId === "chat"}
         <div class="h-full flex flex-col relative bg-white">
-          <div bind:this={transcriptElement} class="flex-1 overflow-y-auto pt-8 pb-8 scroll-smooth" onscroll={handleTranscriptScroll}>
+          <div bind:this={transcriptElement} class="flex-1 overflow-y-auto pt-8 pb-8" onscroll={handleTranscriptScroll}>
             <div bind:this={transcriptContentElement} class="max-w-3xl mx-auto px-6 space-y-12">
               {#if loading || loadingDetail}
                 <div class="space-y-6 animate-pulse mt-8">
@@ -5432,7 +5458,7 @@
 
               <div class="relative group">
                 <form class="bg-white border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden focus-within:border-amber-500/50 transition-all duration-300" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
-                  <textarea bind:this={composerTextareaElement} bind:value={draft} class="w-full min-h-[3.25rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 focus:ring-0 resize-none" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} rows="1"></textarea>
+                  <textarea bind:this={composerTextareaElement} bind:value={draft} class="w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 focus:ring-0 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} rows="1"></textarea>
                   
                   {#if draftAttachments.length > 0}
                     <div class="px-4 pb-2 flex flex-wrap gap-2">
@@ -5440,25 +5466,25 @@
                     </div>
                   {/if}
 
-                  <div class="flex items-center justify-between px-4 py-3 bg-gray-50/80 border-t border-gray-100">
-                    <div class="flex items-center gap-2">
+                  <div class="flex flex-wrap items-center gap-2 border-t border-gray-100 bg-gray-50/80 px-3 py-2.5 sm:px-4 sm:py-3">
+                    <div class="flex min-w-0 flex-1 items-center gap-1.5 sm:gap-2">
                       <input bind:this={filePickerElement} disabled={uploading} hidden multiple onchange={(event) => void uploadFiles((event.currentTarget as HTMLInputElement).files)} type="file" />
-                      <button class="p-2 text-gray-400 hover:text-amber-600 hover:bg-amber-50 rounded-xl transition-all" disabled={uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={18} class="animate-spin" />{:else}<Paperclip size={18} />{/if}</button>
+                      <button class="rounded-xl p-1.5 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 sm:p-2" disabled={uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={18} class="animate-spin" />{:else}<Paperclip size={18} />{/if}</button>
                       {#if conversation}
-                        <div class="w-px h-4 bg-gray-200"></div>
-                        <button class="flex items-center gap-2 px-3 py-1.5 rounded-xl text-[11px] font-bold text-gray-500 hover:text-gray-900 hover:bg-white hover:border-gray-200 border border-transparent transition-all max-w-[11rem] min-w-0" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button">
+                        <div class="mx-0.5 hidden h-4 w-px bg-gray-200 sm:block"></div>
+                        <button class="flex min-w-0 max-w-[8.5rem] items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 sm:max-w-[11rem] sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button">
                           <span class="truncate">{composerSettingsSummary.model}</span>
                           <ChevronDown size={14} class={`shrink-0 transition-transform ${composerSettingsOpen ? "rotate-180" : ""}`} />
                         </button>
-                        <button class="flex items-center gap-2 px-3 py-1.5 rounded-xl text-[11px] font-bold text-gray-500 hover:text-gray-900 hover:bg-white hover:border-gray-200 border border-transparent transition-all" onclick={() => { composerSecurityOpen = !composerSecurityOpen; composerSettingsOpen = false; }} title={ui.securitySession} type="button"><Zap size={14} /><span>{ui.securitySession}</span></button>
+                        <button class="flex shrink-0 items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSecurityOpen = !composerSecurityOpen; composerSettingsOpen = false; }} title={ui.securitySession} type="button"><Zap size={14} /><span class="hidden sm:inline">{ui.securitySession}</span></button>
                       {/if}
                     </div>
-                    <div class="flex items-center gap-2">
+                    <div class="flex w-full items-center justify-end gap-1.5 sm:w-auto sm:gap-2">
                       {#if running}
-                        <button class="px-4 py-2 text-red-600 font-bold text-xs hover:bg-red-50 rounded-xl transition-all" onclick={interruptTurn} type="button">{ui.stop}</button>
-                        <button class="px-4 py-2 bg-amber-50 text-amber-700 border border-amber-200 rounded-xl text-xs font-bold hover:bg-amber-100 transition-all disabled:opacity-50" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
+                        <button class="rounded-xl px-3 py-1.5 text-[11px] font-bold text-red-600 transition-all hover:bg-red-50 sm:px-4 sm:py-2 sm:text-xs" onclick={interruptTurn} type="button">{ui.stop}</button>
+                        <button class="rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] font-bold text-amber-700 transition-all hover:bg-amber-100 disabled:opacity-50 sm:px-4 sm:py-2 sm:text-xs" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
                       {/if}
-                      <button class="px-6 py-2 bg-gray-900 text-white rounded-xl text-xs font-bold hover:bg-gray-800 shadow-lg shadow-gray-200 transition-all disabled:opacity-50 disabled:shadow-none active:scale-[0.98]" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
+                      <button class="rounded-xl bg-gray-900 px-4 py-1.5 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:px-6 sm:py-2 sm:text-xs" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
                     </div>
                   </div>
                 </form>

@@ -55,7 +55,7 @@ In the comparison columns:
 | Password-protected remote access | Implemented | Different shape | Not targeted | Core web deployment feature rather than upstream app or extension parity. |
 | Base path and reverse-proxy support | Implemented | Different shape | Not targeted | Important for self-hosted setups. |
 | Configurable CORS | Implemented | Different shape | Not targeted | Needed for controlled remote browser access. |
-| System shutdown after queued work completes | Implemented | Different shape | Not targeted | Optional operational feature for self-hosted runs. |
+| System shutdown after queued work completes | Implemented | Different shape | Not targeted | Global server-side control that waits for all queues and active turns to settle, then persists and syncs the scheduled shutdown state across clients. |
 
 ## Areas Where codex-webui Intentionally Differs
 
@@ -77,6 +77,7 @@ Upstream Codex surfaces are not primarily optimized for a self-hosted browser de
 - reconnect-safe background execution
 - optional remote tunnel flow
 - password-gated access to a locally running Codex runtime
+- global operational controls, such as synchronized shutdown-after-queue-completion scheduling
 
 ### Git and workspace affordances
 

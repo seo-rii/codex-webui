@@ -98,6 +98,12 @@ The CLI starts the Rust gateway as a detached background process and injects the
 
 The CLI currently prints a URL ending in `/login`; that route redirects to the workspace root, so either URL is acceptable for end users.
 
+When system shutdown support is enabled, the actual armed and scheduled state is still runtime data rather than static CLI config:
+
+- arming "shutdown after queue completes" happens through the running app
+- the armed flag and any scheduled shutdown timestamp are persisted under `CODEX_WEBUI_DATA_DIR`
+- the backend remains authoritative, so the shutdown can still execute without an attached browser session
+
 ## Tunnel Behavior
 
 `codex-webui tunnel` ensures the server is running and then:

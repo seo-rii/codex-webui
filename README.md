@@ -31,6 +31,7 @@ The goal is not to replace upstream surfaces. The goal is to make Codex usable f
 - Git repository discovery, status, diff, commit inspection, branch checkout, and worktree management
 - Terminal tabs that survive page reloads as long as the server process stays up
 - Runtime install/update checks, quota display, plugin/skill catalog visibility, and `config.toml` editing
+- Global "shutdown after queue completes" control that is synchronized across clients and still executes with no browser attached
 - Base-path deployment, configurable CORS, dark/light themes, and Paraglide-based i18n
 
 ## Current Status
@@ -173,6 +174,9 @@ Meaning of the main fields:
 - Existing sessions keep their own persisted preferences; changing defaults mainly affects new sessions and future default state.
 - Queued follow-ups are stored server-side and can continue after the page closes as long as the server remains up.
 - Terminals also stay alive while the Rust gateway remains up.
+- "Shutdown after queue completes" is a server-global operational toggle, not a per-session preference.
+- When that toggle is armed, the gateway waits until every session queue is empty and no live Codex turn is still running before scheduling shutdown.
+- The scheduled shutdown timestamp is persisted in `codex-webui` state, synchronized to every connected client, and can still execute if no client is connected.
 
 ## Environment Overrides
 
@@ -206,6 +210,7 @@ See [.env.example](./.env.example) for a concise example set.
 - Do not expose the internal SvelteKit service directly.
 - Git actions are intentionally gated on explicit repository selection.
 - System shutdown support is disabled by default and must be explicitly enabled.
+- The shutdown control is global to the running server, so all connected clients see the same armed and scheduled state.
 
 ## Development
 
@@ -239,6 +244,15 @@ The detailed session view reconciles the persisted rollout with the live `thread
 ### A session appears in search but not in the sidebar
 
 The sidebar combines a local session index with live app-server data and loads progressively. A selected session is pinned back into view even if it was not part of the current list page yet.
+
+### Shutdown after queue completion did not trigger
+
+The shutdown timer arms only when both of these are true:
+
+- every persisted session queue is empty
+- no Codex thread is still live according to runtime state
+
+If new work is queued or a turn becomes active again, the pending shutdown is cancelled and must be re-armed by those conditions becoming true again.
 
 ### Attachments do not upload
 

@@ -114,6 +114,7 @@ This separation matters:
 
 - Codex rollout files remain Codex-owned
 - UI queue/draft/editor state remains `codex-webui`-owned
+- global operational state, such as a scheduled shutdown-after-queue-completion timer, remains `codex-webui`-owned
 - long-running work can survive browser disconnects because the server-side state is durable
 
 ## Session Listing And Search
@@ -153,6 +154,14 @@ Important properties:
 - restart flows can require user confirmation before resuming queued work
 - auto-resume can be enabled per session
 
+Queue state is also part of the global shutdown-after-completion story:
+
+- the shutdown toggle is global to the running server, not scoped to one thread
+- arming it writes the intent into persisted `codex-webui` state
+- scheduling only happens once all queues are empty and no live turn remains active
+- if new work appears, the pending shutdown is cancelled and the updated state is broadcast to all clients
+- because the schedule lives on disk and in the Rust/Node backend, it can still fire with zero connected browsers
+
 ## Terminal Model
 
 The Rust gateway owns terminal processes.
@@ -162,6 +171,17 @@ The Rust gateway owns terminal processes.
 - terminal input/output is streamed incrementally over WebSocket
 
 The terminal lifecycle is intentionally separate from Codex thread lifecycle.
+
+## Global Operational State
+
+Some UI-visible state is intentionally shared across every connected client rather than living inside one session.
+
+Current examples include:
+
+- queued-work resume prompts restored after restart
+- globally armed or scheduled shutdown-after-queue-completion state
+
+This state is persisted in `CODEX_WEBUI_DATA_DIR`, exposed through config payloads and global WebSocket notifications, and treated as authoritative by the backend so reconnecting clients do not need to rebuild it from local browser memory.
 
 ## Config Sources
 

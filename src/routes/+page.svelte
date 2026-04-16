@@ -32,9 +32,12 @@
     MessageSquare,
     RefreshCw,
     Search,
-    Copy
+    Copy,
+    SlidersHorizontal,
+    Shield
   } from "lucide-svelte";
   import { onMount, tick } from "svelte";
+  import { fly } from "svelte/transition";
   import { extractAttachmentPaths, stripAttachmentPreamble } from "$lib/attachments";
   import { api } from "$lib/api";
   import { applyStreamEvent, createConversationState, type ConversationState } from "$lib/chat-state";
@@ -323,7 +326,12 @@
       askCodex: m.ask_codex(),
       queueFollowUpPlaceholder: m.queue_follow_up_placeholder(),
       model: m.model(),
+      speed: m.speed(),
+      planMode: m.plan_mode(),
       autoDefault: m.auto_default(),
+      speedAuto: m.speed_auto(),
+      speedFast: m.speed_fast(),
+      speedFlex: m.speed_flex(),
       approvalMode: m.approval_mode(),
       manual: m.manual(),
       autoOnce: m.auto_once(),
@@ -1148,7 +1156,9 @@
     if (!inlineGenerationState && !loadingDetail && !sending) {
       return;
     }
-    forceTranscriptScroll = true;
+    if (!stickTranscriptToBottom && !forceTranscriptScroll) {
+      return;
+    }
     scheduleTranscriptScrollToBottom();
   });
 
@@ -5036,6 +5046,16 @@
     return getComposerSettingsSummary();
   });
 
+  function getSpeedOptionLabel(option: SessionPreferences["speed"]) {
+    if (option === "fast") {
+      return ui.speedFast;
+    }
+    if (option === "flex") {
+      return ui.speedFlex;
+    }
+    return ui.speedAuto;
+  }
+
   function getSecuritySettingsSummary() {
     if (!conversation) {
       return [] as Array<{ key: string; icon: string; label: string }>;
@@ -5164,19 +5184,25 @@
                 <p class="mt-3 max-w-md text-sm leading-7 text-gray-500">{ui.loginLede}</p>
               </div>
             </div>
-            <div class="flex flex-wrap gap-2" role="group" aria-label={ui.language}>
-              {#each localeOptions as option (option.value)}
-                <button
-                  class="rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors {$activeLocale === option.value
-                    ? 'border-amber-200 bg-amber-50 text-amber-700'
-                    : 'border-gray-200 bg-white text-gray-500 hover:border-amber-200 hover:text-amber-700'}"
-                  onclick={() => updateLocale(option.value)}
-                  type="button"
+            <label class="flex min-w-[12rem] flex-col gap-1.5">
+              <span class="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">{ui.language}</span>
+              <div class="relative">
+                <select
+                  aria-label={ui.language}
+                  class="w-full appearance-none rounded-2xl border border-gray-200 bg-white px-3.5 py-2.5 pr-9 text-sm font-semibold text-gray-700 shadow-sm outline-none transition focus:border-amber-400 focus:ring-4 focus:ring-amber-100"
+                  onchange={(event) =>
+                    updateLocale((event.currentTarget as HTMLSelectElement).value as (typeof localeOptions)[number]["value"])}
+                  value={$activeLocale}
                 >
-                  {option.label}
-                </button>
-              {/each}
-            </div>
+                  {#each localeOptions as option (option.value)}
+                    <option value={option.value}>{option.label}</option>
+                  {/each}
+                </select>
+                <div class="pointer-events-none absolute inset-y-0 right-3 flex items-center text-gray-400">
+                  <ChevronDown size={16} />
+                </div>
+              </div>
+            </label>
           </div>
 
           <form class="mt-8 space-y-5" onsubmit={(event) => {
@@ -5222,46 +5248,52 @@
     <div class="pointer-events-none fixed inset-x-0 top-0 z-[110] flex justify-center px-3 pt-3 sm:px-6">
       <div class="flex w-full max-w-xl flex-col gap-2">
         {#if showConnectionSnackbar}
-          <div
-            class="pointer-events-auto flex w-full items-center gap-3 rounded-2xl border px-4 py-3 shadow-xl backdrop-blur-xl transition-all duration-300 {connectionSnackbarTone === 'error'
-              ? 'border-red-200 bg-red-50/95 text-red-800 shadow-red-100/80'
-              : connectionSnackbarTone === 'warning'
-                ? 'border-amber-200 bg-amber-50/95 text-amber-800 shadow-amber-100/80'
-                : 'border-sky-200 bg-sky-50/95 text-sky-800 shadow-sky-100/80'}"
-            role="status"
-          >
-            {#if connectionState === "reconnecting"}
-              <RefreshCw size={16} class="shrink-0 animate-spin" />
-            {:else}
-              <AlertCircle size={16} class="shrink-0" />
-            {/if}
-            <span class="min-w-0 text-sm font-medium leading-5">{connectionBannerText}</span>
-          </div>
+          {#key `${connectionState}:${connectionBannerText}`}
+            <div
+              transition:fly={{ y: -18, duration: 220 }}
+              class="snackbar-card pointer-events-auto flex w-full items-center gap-3 rounded-2xl border px-4 py-3 shadow-xl backdrop-blur-xl transition-all duration-300 {connectionSnackbarTone === 'error'
+                ? 'border-red-200 bg-red-50/95 text-red-800 shadow-red-100/80'
+                : connectionSnackbarTone === 'warning'
+                  ? 'border-amber-200 bg-amber-50/95 text-amber-800 shadow-amber-100/80'
+                  : 'border-sky-200 bg-sky-50/95 text-sky-800 shadow-sky-100/80'}"
+              role="status"
+            >
+              {#if connectionState === "reconnecting"}
+                <RefreshCw size={16} class="shrink-0 animate-spin" />
+              {:else}
+                <AlertCircle size={16} class="shrink-0" />
+              {/if}
+              <span class="min-w-0 text-sm font-medium leading-5">{connectionBannerText}</span>
+            </div>
+          {/key}
         {/if}
 
         {#if feedbackSnackbar}
-          <div
-            class="pointer-events-auto flex w-full items-start gap-3 rounded-2xl border px-4 py-3 shadow-xl backdrop-blur-xl transition-all duration-300 {feedbackSnackbar.tone === 'error'
-              ? 'border-red-200 bg-red-50/95 text-red-800 shadow-red-100/80'
-              : 'border-emerald-200 bg-emerald-50/95 text-emerald-800 shadow-emerald-100/80'}"
-            role={feedbackSnackbar.tone === "error" ? "alert" : "status"}
-          >
-            {#if feedbackSnackbar.tone === "error"}
-              <AlertCircle size={16} class="mt-0.5 shrink-0" />
-            {:else}
-              <CheckCircle2 size={16} class="mt-0.5 shrink-0" />
-            {/if}
-            <span class="min-w-0 flex-1 text-sm font-medium leading-5">{feedbackSnackbar.text}</span>
-            <button
-              aria-label={ui.close}
-              class="rounded-lg p-1 text-current/70 transition-colors hover:bg-black/5 hover:text-current"
-              onclick={dismissFeedbackSnackbar}
-              title={ui.close}
-              type="button"
+          {#key `${feedbackSnackbar.tone}:${feedbackSnackbar.text}`}
+            <div
+              transition:fly={{ y: -14, duration: 220 }}
+              class="snackbar-card pointer-events-auto flex w-full items-start gap-3 rounded-2xl border px-4 py-3 shadow-xl backdrop-blur-xl transition-all duration-300 {feedbackSnackbar.tone === 'error'
+                ? 'border-red-200 bg-red-50/95 text-red-800 shadow-red-100/80'
+                : 'border-emerald-200 bg-emerald-50/95 text-emerald-800 shadow-emerald-100/80'}"
+              role={feedbackSnackbar.tone === "error" ? "alert" : "status"}
             >
-              <X size={14} />
-            </button>
-          </div>
+              {#if feedbackSnackbar.tone === "error"}
+                <AlertCircle size={16} class="mt-0.5 shrink-0" />
+              {:else}
+                <CheckCircle2 size={16} class="mt-0.5 shrink-0" />
+              {/if}
+              <span class="min-w-0 flex-1 text-sm font-medium leading-5">{feedbackSnackbar.text}</span>
+              <button
+                aria-label={ui.close}
+                class="ui-animated-button ui-animated-button--icon rounded-lg p-1 text-current/70 transition-colors hover:bg-black/5 hover:text-current"
+                onclick={dismissFeedbackSnackbar}
+                title={ui.close}
+                type="button"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          {/key}
         {/if}
       </div>
     </div>
@@ -5377,7 +5409,7 @@
         </div>
       </div>
 
-      <div class="flex items-center gap-2">
+      <div class="app-header-actions flex items-center gap-2">
         {#if conversation?.tokenUsage}
           <div class="hidden md:flex items-center gap-2 mr-2">
             <span class="px-2 py-0.5 bg-gray-50 text-[10px] font-bold text-gray-500 rounded border border-gray-100 uppercase tracking-tight">
@@ -5393,7 +5425,7 @@
 
         {#if selectedSessionId}
           <button
-            class="p-2 text-gray-400 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-all"
+            class="ui-animated-button ui-animated-button--icon p-2 text-gray-400 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-all"
             onclick={() => {
               if (showArchivedSessions) void unarchiveCurrentSession();
               else void archiveCurrentSession();
@@ -5409,7 +5441,7 @@
 
         <div class="relative">
           <button 
-            class="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-xs font-bold hover:bg-gray-800 transition-all shadow-sm active:scale-95"
+            class="ui-animated-button ui-animated-button--strong flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-xs font-bold hover:bg-gray-800 transition-all shadow-sm active:scale-95"
             onclick={() => (workspaceMenuOpen = !workspaceMenuOpen)}
           >
             <Plus size={14} />
@@ -5419,19 +5451,19 @@
 
           {#if workspaceMenuOpen}
             <div class="absolute top-10 right-0 w-56 bg-white border border-gray-200 rounded-xl shadow-2xl p-1 z-50">
-              <button class="w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" disabled={subagentTasks.length === 0} onclick={() => { activateTab("tasks"); workspaceMenuOpen = false; }} type="button">
+              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" disabled={subagentTasks.length === 0} onclick={() => { activateTab("tasks"); workspaceMenuOpen = false; }} type="button">
                 <History size={16} class="text-gray-400 group-hover:text-amber-600" />
                 <span>{ui.tasks}</span>
               </button>
-              <button class="w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" onclick={() => { openGitTab(); workspaceMenuOpen = false; }} type="button">
+              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" onclick={() => { openGitTab(); workspaceMenuOpen = false; }} type="button">
                 <GitBranch size={16} class="text-gray-400 group-hover:text-amber-600" />
                 <span>{ui.gitWorkspace}</span>
               </button>
-              <button class="w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" onclick={() => { openSettingsTab(); workspaceMenuOpen = false; }} type="button">
+              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" onclick={() => { openSettingsTab(); workspaceMenuOpen = false; }} type="button">
                 <Settings size={16} class="text-gray-400 group-hover:text-amber-600" />
                 <span>{ui.settingsSkills}</span>
               </button>
-              <button class="w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" onclick={() => { void createTerminalTab(); workspaceMenuOpen = false; }} type="button">
+              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" onclick={() => { void createTerminalTab(); workspaceMenuOpen = false; }} type="button">
                 <Terminal size={16} class="text-gray-400 group-hover:text-amber-600" />
                 <span>{ui.newTerminal}</span>
               </button>
@@ -5443,10 +5475,10 @@
 
     <!-- Workspace Tabs -->
     {#if workspaceTabs.length > 1}
-      <div class="flex items-center gap-1 px-4 py-1.5 bg-gray-50 border-b border-gray-200 overflow-x-auto scrollbar-none">
+      <div class="workspace-tab-strip flex items-center gap-1 px-4 py-1.5 bg-gray-50 border-b border-gray-200 overflow-x-auto scrollbar-none">
         {#each workspaceTabs as tab (tab.id)}
           <button
-            class="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all {activeWorkspaceTabId === tab.id ? 'bg-white text-gray-900 shadow-sm border border-gray-200' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100/50'}"
+            class="ui-animated-button ui-animated-button--soft flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all {activeWorkspaceTabId === tab.id ? 'bg-white text-gray-900 shadow-sm border border-gray-200' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100/50'}"
             onclick={() => activateTab(tab.id)}
             type="button"
           >
@@ -5945,27 +5977,70 @@
                     </div>
                   {/if}
 
-                  <div class="flex flex-wrap items-center gap-2 border-t border-gray-100 bg-gray-50/80 px-3 py-2.5 transition-colors duration-200 group-focus-within:border-amber-100 group-focus-within:bg-[linear-gradient(180deg,rgba(255,251,235,0.9),rgba(255,255,255,0.98))] sm:px-4 sm:py-3">
+                  <div class="composer-toolbar flex flex-wrap items-center gap-2 border-t border-gray-100 bg-gray-50/80 px-3 py-2.5 transition-colors duration-200 group-focus-within:border-amber-100 group-focus-within:bg-[linear-gradient(180deg,rgba(255,251,235,0.9),rgba(255,255,255,0.98))] sm:px-4 sm:py-3">
                     <div class="flex min-w-0 flex-1 items-center gap-1.5 sm:gap-2">
                       <input bind:this={filePickerElement} disabled={uploading} hidden multiple onchange={(event) => void uploadFiles((event.currentTarget as HTMLInputElement).files)} type="file" />
-                      <button class="rounded-xl p-1.5 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 group-focus-within:bg-white/90 group-focus-within:text-amber-700 sm:p-2" disabled={uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={18} class="animate-spin" />{:else}<Paperclip size={18} />{/if}</button>
+                      <button class="ui-animated-button ui-animated-button--icon rounded-xl p-1.5 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 group-focus-within:bg-white/90 group-focus-within:text-amber-700 sm:p-2" disabled={uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={18} class="animate-spin" />{:else}<Paperclip size={18} />{/if}</button>
                       {#if conversation}
                         <div class="mx-0.5 hidden h-4 w-px bg-gray-200 sm:block"></div>
-                        <button class="flex min-w-0 max-w-[8.5rem] items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:max-w-[11rem] sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button">
+                        <button class="ui-animated-button ui-animated-button--soft flex min-w-0 max-w-[8.5rem] items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:max-w-[11rem] sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button">
+                          <SlidersHorizontal size={13} class="shrink-0 text-gray-400" />
                           <span class="truncate">{composerSettingsSummary.model}</span>
                           <ChevronDown size={14} class={`shrink-0 transition-transform ${composerSettingsOpen ? "rotate-180" : ""}`} />
                         </button>
-                        <button class="flex shrink-0 items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSecurityOpen = !composerSecurityOpen; composerSettingsOpen = false; }} title={ui.securitySession} type="button"><Zap size={14} /><span class="hidden sm:inline">{ui.securitySession}</span></button>
+                        <button class="ui-animated-button ui-animated-button--soft flex shrink-0 items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSecurityOpen = !composerSecurityOpen; composerSettingsOpen = false; }} title={ui.securitySession} type="button"><Shield size={14} class="text-gray-400" /><span class="hidden sm:inline">{ui.securitySession}</span></button>
                       {/if}
                     </div>
                     <div class="flex w-full items-center justify-end gap-1.5 sm:w-auto sm:gap-2">
                       {#if running}
-                        <button class="rounded-xl px-3 py-1.5 text-[11px] font-bold text-red-600 transition-all hover:bg-red-50 sm:px-4 sm:py-2 sm:text-xs" onclick={interruptTurn} type="button">{ui.stop}</button>
-                        <button class="rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] font-bold text-amber-700 transition-all hover:bg-amber-100 disabled:opacity-50 sm:px-4 sm:py-2 sm:text-xs" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
+                        <button class="ui-animated-button ui-animated-button--soft rounded-xl px-3 py-1.5 text-[11px] font-bold text-red-600 transition-all hover:bg-red-50 sm:px-4 sm:py-2 sm:text-xs" onclick={interruptTurn} type="button">{ui.stop}</button>
+                        <button class="ui-animated-button ui-animated-button--soft rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] font-bold text-amber-700 transition-all hover:bg-amber-100 disabled:opacity-50 sm:px-4 sm:py-2 sm:text-xs" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
                       {/if}
-                      <button class="rounded-xl bg-gray-900 px-4 py-1.5 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:px-6 sm:py-2 sm:text-xs" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
+                      <button class="ui-animated-button ui-animated-button--strong rounded-xl bg-gray-900 px-4 py-1.5 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:px-6 sm:py-2 sm:text-xs" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
                     </div>
                   </div>
+                  {#if conversation}
+                    <div class="flex flex-wrap items-center gap-2 border-t border-gray-100/80 bg-white/72 px-3 pb-3 pt-2.5 sm:px-4">
+                      <button
+                        class={`ui-animated-button ui-animated-button--soft inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
+                          (conversation.preferences.mode ?? "default") === "plan"
+                            ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
+                            : "border-gray-200 bg-white text-gray-500 hover:border-gray-300 hover:text-gray-700"
+                        }`}
+                        onclick={() => {
+                          if (!conversation) {
+                            return;
+                          }
+                          setPreference("mode", (conversation.preferences.mode ?? "default") === "plan" ? "default" : "plan");
+                        }}
+                        type="button"
+                      >
+                        <ListTodo size={13} class="shrink-0" />
+                        <span>{ui.planMode}</span>
+                      </button>
+                      <div class="inline-flex min-w-0 flex-wrap items-center gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
+                        <span class="px-1.5 text-[9px] font-bold uppercase tracking-[0.14em] text-gray-400 sm:px-2">{ui.speed}</span>
+                        {#each speedOptions as option}
+                          <button
+                            class={`ui-animated-button ui-animated-button--soft rounded-lg px-2.5 py-1 text-[10px] font-bold transition-all sm:text-[11px] ${
+                              (conversation.preferences.speed ?? "auto") === option
+                                ? "bg-gray-900 text-white shadow-sm"
+                                : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"
+                            }`}
+                            onclick={() => {
+                              if (!conversation) {
+                                return;
+                              }
+                              setPreference("speed", option as SessionPreferences["speed"]);
+                            }}
+                            type="button"
+                          >
+                            {getSpeedOptionLabel(option as SessionPreferences["speed"])}
+                          </button>
+                        {/each}
+                      </div>
+                    </div>
+                  {/if}
                 </form>
 
                 <!-- Settings Popovers -->
@@ -6244,6 +6319,48 @@
     color: transparent;
     animation: thinking-shimmer 1.9s linear infinite;
   }
+
+  .snackbar-card {
+    will-change: transform, opacity, box-shadow;
+  }
+
+  .ui-animated-button {
+    will-change: transform, box-shadow, background-color, border-color, color, opacity;
+    transition:
+      transform 180ms cubic-bezier(0.22, 1, 0.36, 1),
+      box-shadow 220ms cubic-bezier(0.22, 1, 0.36, 1),
+      background-color 180ms ease,
+      border-color 180ms ease,
+      color 180ms ease,
+      opacity 180ms ease;
+  }
+
+  .ui-animated-button:hover:not(:disabled) {
+    transform: translateY(-1px);
+  }
+
+  .ui-animated-button:active:not(:disabled) {
+    transform: translateY(0) scale(0.98);
+    transition-duration: 110ms;
+  }
+
+  .ui-animated-button--soft:hover:not(:disabled) {
+    box-shadow: 0 14px 28px -24px rgba(15, 23, 42, 0.5);
+  }
+
+  .ui-animated-button--strong:hover:not(:disabled) {
+    box-shadow: 0 22px 36px -26px rgba(15, 23, 42, 0.45);
+  }
+
+  .ui-animated-button--icon:hover:not(:disabled) {
+    transform: translateY(-1px) scale(1.03);
+  }
+
+  .ui-animated-button:disabled {
+    transform: none;
+    box-shadow: none;
+  }
+
   .turn-card-header {
     position: sticky;
     top: 0.35rem;
@@ -6257,6 +6374,18 @@
 
   .turn-card-header--amber {
     background: linear-gradient(180deg, rgba(255, 251, 235, 0.98), rgba(255, 247, 237, 0.94));
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .thinking-indicator__label {
+      animation-duration: 0.01ms;
+      animation-iteration-count: 1;
+    }
+
+    .ui-animated-button,
+    .snackbar-card {
+      transition-duration: 0.01ms;
+    }
   }
 
 </style>
@@ -6329,9 +6458,30 @@
     </div>
   {:else if ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"].includes(item.type)}
     <div class="border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm hover:shadow-md transition-shadow">
-      <button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-4 py-3 hover:bg-gray-50 transition-colors" onclick={() => void toggleToolItem(turnId, item.id)}>
-        <div class="flex items-center gap-3"><div class="p-2 bg-gray-100 text-gray-500 rounded-xl">{#if item.type === 'commandExecution'}<Terminal size={14} />{:else if item.type === 'fileChange'}<FileDiff size={14} />{:else if item.type === 'webSearch'}<Layout size={14} />{:else}<Zap size={14} />{/if}</div><div class="text-left"><h4 class="text-xs font-bold text-gray-900 leading-tight">{getToolItemLabel(item)}</h4><p class="text-[10px] text-gray-500 mt-0.5 font-medium">{getToolItemSummary(item) || ui.executing}</p></div></div>
-        <div class="flex items-center gap-3">{#if item.type === "commandExecution" && item.exitCode !== null}<span class="px-1.5 py-0.5 bg-gray-100 text-[9px] font-bold text-gray-500 rounded uppercase tracking-tighter">Exit {item.exitCode}</span>{/if}<ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, item.id) ? 'rotate-180' : ''} transition-transform" /></div>
+      <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-3 px-4 py-3 hover:bg-gray-50 transition-colors" onclick={() => void toggleToolItem(turnId, item.id)}>
+        <div class="flex min-w-0 flex-1 items-center gap-3">
+          <div class="shrink-0 rounded-xl bg-gray-100 p-2 text-gray-500">
+            {#if item.type === 'commandExecution'}
+              <Terminal size={14} />
+            {:else if item.type === 'fileChange'}
+              <FileDiff size={14} />
+            {:else if item.type === 'webSearch'}
+              <Layout size={14} />
+            {:else}
+              <Zap size={14} />
+            {/if}
+          </div>
+          <div class="min-w-0 flex-1 text-left">
+            <h4 class="truncate text-xs font-bold leading-tight text-gray-900">{getToolItemLabel(item)}</h4>
+            <p class="mt-0.5 truncate text-[10px] font-medium text-gray-500">{getToolItemSummary(item) || ui.executing}</p>
+          </div>
+        </div>
+        <div class="flex shrink-0 items-center gap-3">
+          {#if item.type === "commandExecution" && item.exitCode !== null}
+            <span class="px-1.5 py-0.5 bg-gray-100 text-[9px] font-bold text-gray-500 rounded uppercase tracking-tighter">Exit {item.exitCode}</span>
+          {/if}
+          <ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, item.id) ? 'rotate-180' : ''} transition-transform" />
+        </div>
       </button>
       {#if isItemExpanded(turnId, item.id)}
         <div class="p-0 border-t border-gray-100 animate-in slide-in-from-top-2 duration-300">
@@ -6359,7 +6509,7 @@
   {#if entry.kind === "item"}{@render renderTurnItem(turnId, entry.item)}
   {:else if entry.kind === "readGroup"}
     <div class="border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm">
-      <button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-4 py-3 hover:bg-gray-50 transition-colors" onclick={() => void toggleReadOnlyCommandGroup(turnId, entry.key, entry.items)}><div class="flex items-center gap-3"><div class="p-2 bg-gray-100 text-gray-400 rounded-xl"><Search size={14} /></div><div class="text-left"><h4 class="text-xs font-bold text-gray-900 leading-tight">{getReadOnlyCommandGroupLabel(entry.items)}</h4><p class="text-[10px] text-gray-500 mt-0.5 font-medium">{summarizeReadOnlyCommandGroup(entry.items)}</p></div></div><div class="flex items-center gap-3"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{ui.opsCount(entry.items.length)}</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
+      <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-3 px-4 py-3 hover:bg-gray-50 transition-colors" onclick={() => void toggleReadOnlyCommandGroup(turnId, entry.key, entry.items)}><div class="flex min-w-0 flex-1 items-center gap-3"><div class="shrink-0 rounded-xl bg-gray-100 p-2 text-gray-400">{#if getReadOnlyCommandGroupKind(entry.items) === "git"}<GitBranch size={14} />{:else}<Search size={14} />{/if}</div><div class="min-w-0 flex-1 text-left"><h4 class="truncate text-xs font-bold leading-tight text-gray-900">{getReadOnlyCommandGroupLabel(entry.items)}</h4><p class="mt-0.5 truncate text-[10px] font-medium text-gray-500">{summarizeReadOnlyCommandGroup(entry.items)}</p></div></div><div class="flex shrink-0 items-center gap-3"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{ui.opsCount(entry.items.length)}</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
       {#if isItemExpanded(turnId, entry.key)}
         <div class="border-t border-gray-100 bg-gray-50/30">{#if isItemDetailLoading(turnId, entry.key)}<div class="p-6 flex justify-center text-gray-400 italic text-xs animate-pulse">{ui.readingFileData}</div>
           {:else}<div class="p-0">{#each entry.items as commandItem}<div class="p-4 border-b border-gray-100 last:border-0"><div class="flex items-center justify-between mb-2"><span class="text-[10px] font-bold text-gray-500 uppercase tracking-widest">{summarizeCommand(commandItem)}</span>{#if commandItem.exitCode !== null}<span class="text-[9px] font-mono text-gray-400">Exit {commandItem.exitCode}</span>{/if}</div><pre class="p-3 bg-white border border-gray-200 rounded-lg text-[10px] font-mono text-gray-600 overflow-x-auto max-h-60 leading-relaxed">{String(commandItem.aggregatedOutput ?? "")}</pre></div>{/each}</div>{/if}</div>

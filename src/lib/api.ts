@@ -285,7 +285,8 @@ export const api = {
     }
     return request<{ attachments: AttachmentRecord[] }>(apiPath(`/sessions/${sessionId}/attachments`), {
       method: "POST",
-      body: formData
+      body: formData,
+      credentials: "include"
     });
   },
 

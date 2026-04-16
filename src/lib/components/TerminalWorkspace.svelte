@@ -13,6 +13,30 @@
   let errorText = $state("");
   let summary = $state<TerminalSummary | null>(null);
   let loading = $state(true);
+  let ctrlModifierArmed = $state(false);
+  let terminalInputSender: ((data: string) => void) | null = null;
+  let focusTerminalViewport: (() => void) | null = null;
+  const mobileTerminalKeyRows = [
+    [
+      { label: "Esc", value: "\u001b", ariaLabel: "Escape" },
+      { label: "Tab", value: "\t", ariaLabel: "Tab" },
+      { label: "Ctrl", value: "__ctrl__", ariaLabel: "Control" },
+      { label: "Bksp", value: "\u007f", ariaLabel: "Backspace" }
+    ],
+    [
+      { label: "C", value: "c", ariaLabel: "C" },
+      { label: "D", value: "d", ariaLabel: "D" },
+      { label: "L", value: "l", ariaLabel: "L" },
+      { label: "Z", value: "z", ariaLabel: "Z" }
+    ],
+    [
+      { label: "↑", value: "\u001b[A", ariaLabel: "Arrow up" },
+      { label: "↓", value: "\u001b[B", ariaLabel: "Arrow down" },
+      { label: "←", value: "\u001b[D", ariaLabel: "Arrow left" },
+      { label: "→", value: "\u001b[C", ariaLabel: "Arrow right" },
+      { label: "Enter", value: "\r", ariaLabel: "Enter", wide: true }
+    ]
+  ] as const;
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
 
@@ -24,6 +48,23 @@
       loading: m.status_loading()
     };
   });
+
+  function handleMobileTerminalKey(value: string) {
+    if (value === "__ctrl__") {
+      ctrlModifierArmed = !ctrlModifierArmed;
+      focusTerminalViewport?.();
+      return;
+    }
+
+    let nextValue = value;
+    if (ctrlModifierArmed && /^[a-z]$/iu.test(value)) {
+      nextValue = String.fromCharCode(value.toUpperCase().charCodeAt(0) - 64);
+    }
+
+    ctrlModifierArmed = false;
+    terminalInputSender?.(nextValue);
+    focusTerminalViewport?.();
+  }
 
   function getTerminalTheme() {
     if (getResolvedTheme() === "dark") {
@@ -93,11 +134,17 @@
         xterm.open(container);
         fitAddon.fit();
         xterm.focus();
-
-        const dataListener = xterm.onData((data) => {
+        focusTerminalViewport = () => {
+          xterm?.focus();
+        };
+        terminalInputSender = (data: string) => {
           void api.sendTerminalInput(terminalId, data).catch((error) => {
             errorText = error instanceof Error ? error.message : ui.failedSendInput;
           });
+        };
+
+        const dataListener = xterm.onData((data) => {
+          terminalInputSender?.(data);
         });
 
         resizeObserver = new ResizeObserver(() => {
@@ -167,6 +214,9 @@
       }
       resizeObserver?.disconnect();
       releaseTerminal?.();
+      terminalInputSender = null;
+      focusTerminalViewport = null;
+      ctrlModifierArmed = false;
       xterm?.dispose();
       releaseThemeChange();
     };
@@ -200,11 +250,32 @@
     {/if}
     <div bind:this={container} class:hidden={loading} class="terminal-shell__viewport"></div>
   </div>
+
+  {#if !loading}
+    <div class="terminal-shell__mobile-keys" aria-label="Terminal mobile shortcuts">
+      {#each mobileTerminalKeyRows as row, rowIndex (`row-${rowIndex}`)}
+        <div class="terminal-shell__mobile-key-row">
+          {#each row as key (`${key.label}-${key.value}`)}
+            <button
+              aria-label={key.ariaLabel}
+              class={`terminal-shell__mobile-key ${key.value === "__ctrl__" && ctrlModifierArmed ? "terminal-shell__mobile-key--active" : ""} ${"wide" in key && key.wide ? "terminal-shell__mobile-key--wide" : ""}`}
+              onclick={() => handleMobileTerminalKey(key.value)}
+              onpointerdown={(event) => event.preventDefault()}
+              type="button"
+            >
+              {key.label}
+            </button>
+          {/each}
+        </div>
+      {/each}
+    </div>
+  {/if}
 </section>
 
 <style>
   .terminal-shell {
     display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
     gap: 1rem;
     min-height: 0;
     overflow: hidden;
@@ -255,6 +326,10 @@
     height: 100%;
   }
 
+  .terminal-shell__mobile-keys {
+    display: none;
+  }
+
   .hidden {
     display: none;
   }
@@ -278,6 +353,48 @@
 
     .terminal-shell__meta {
       justify-content: flex-start;
+    }
+
+    .terminal-shell__mobile-keys {
+      display: grid;
+      gap: 0.55rem;
+      padding-bottom: max(0.2rem, env(safe-area-inset-bottom));
+    }
+
+    .terminal-shell__mobile-key-row {
+      display: grid;
+      gap: 0.55rem;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .terminal-shell__mobile-key {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 0.9rem;
+      background: color-mix(in srgb, var(--panel-soft) 86%, transparent);
+      color: var(--ink);
+      padding: 0.75rem 0.35rem;
+      font: 700 0.82rem/1 var(--font-ui);
+      touch-action: manipulation;
+      transition:
+        background-color 140ms ease,
+        border-color 140ms ease,
+        transform 140ms ease,
+        color 140ms ease;
+    }
+
+    .terminal-shell__mobile-key:active {
+      transform: scale(0.98);
+    }
+
+    .terminal-shell__mobile-key--active {
+      border-color: color-mix(in srgb, var(--accent, #d85e2a) 48%, var(--line));
+      background: color-mix(in srgb, var(--accent, #d85e2a) 18%, var(--panel-strong));
+      color: var(--ink-strong);
+    }
+
+    .terminal-shell__mobile-key--wide {
+      grid-column: span 2;
     }
   }
 </style>

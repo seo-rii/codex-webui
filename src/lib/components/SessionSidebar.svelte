@@ -824,20 +824,21 @@
               <Settings size={10} /> {ui.language}
             </h4>
 
-            <div class="grid grid-cols-2 gap-2">
-              {#each localeOptions as option (option.value)}
-                <button
-                  class={`rounded-xl border px-2.5 py-2 text-[10px] font-bold transition-all ${
-                    $activeLocale === option.value
-                      ? "border-amber-300 bg-amber-50 text-amber-700 shadow-sm"
-                      : "border-gray-200 bg-gray-50 text-gray-500 hover:border-gray-300 hover:bg-white hover:text-gray-700"
-                  }`}
-                  onclick={() => updateLocale(option.value)}
-                  type="button"
-                >
-                  {option.label}
-                </button>
-              {/each}
+            <div class="relative">
+              <select
+                aria-label={ui.language}
+                class="w-full appearance-none rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5 pr-9 text-sm font-semibold text-gray-700 shadow-sm outline-none transition focus:border-amber-400 focus:bg-white focus:ring-4 focus:ring-amber-100"
+                onchange={(event) =>
+                  updateLocale((event.currentTarget as HTMLSelectElement).value as (typeof localeOptions)[number]["value"])}
+                value={$activeLocale}
+              >
+                {#each localeOptions as option (option.value)}
+                  <option value={option.value}>{option.label}</option>
+                {/each}
+              </select>
+              <div class="pointer-events-none absolute inset-y-0 right-3 flex items-center text-gray-400">
+                <ChevronDown size={16} />
+              </div>
             </div>
           </div>
 
@@ -884,17 +885,18 @@
                 <span class="text-gray-500">{ui.binary}</span>
                 <code class="px-1.5 py-0.5 bg-white border border-gray-200 rounded text-[10px]">{runtime?.configuredBin ?? "codex"}</code>
               </div>
-              
+
               <div class="flex gap-2 pt-1">
-                <button 
-                  class="flex-1 px-3 py-1.5 bg-white border border-gray-200 rounded-lg text-[10px] font-bold text-gray-600 hover:bg-gray-50 hover:border-gray-300 transition-all flex items-center justify-center gap-1.5"
-                  disabled={runtimeBusyAction === "check"}
-                  onclick={onRefreshRuntime}
-                >
-                  <RefreshCw size={10} class={runtimeBusyAction === "check" ? 'animate-spin' : ''} />
-                  {ui.check}
-                </button>
-                {#if runtime?.installed}
+                {#if !runtime?.installed}
+                  <button
+                    class="flex-1 px-3 py-1.5 bg-amber-600 rounded-lg text-[10px] font-bold text-white hover:bg-amber-700 transition-all flex items-center justify-center gap-1.5 shadow-sm"
+                    disabled={!runtime?.npmAvailable || runtimeBusyAction === "install"}
+                    onclick={onInstallRuntime}
+                  >
+                    <Plus size={10} />
+                    {ui.install}
+                  </button>
+                {:else if runtime?.updateAvailable === true}
                   <button 
                     class="flex-1 px-3 py-1.5 bg-amber-600 rounded-lg text-[10px] font-bold text-white hover:bg-amber-700 transition-all flex items-center justify-center gap-1.5 shadow-sm"
                     disabled={!runtime?.npmAvailable || runtimeBusyAction === "update"}
@@ -905,12 +907,12 @@
                   </button>
                 {:else}
                   <button 
-                    class="flex-1 px-3 py-1.5 bg-amber-600 rounded-lg text-[10px] font-bold text-white hover:bg-amber-700 transition-all flex items-center justify-center gap-1.5 shadow-sm"
-                    disabled={!runtime?.npmAvailable || runtimeBusyAction === "install"}
-                    onclick={onInstallRuntime}
+                    class="flex-1 px-3 py-1.5 bg-white border border-gray-200 rounded-lg text-[10px] font-bold text-gray-600 hover:bg-gray-50 hover:border-gray-300 transition-all flex items-center justify-center gap-1.5"
+                    disabled={runtimeBusyAction === "check"}
+                    onclick={onRefreshRuntime}
                   >
-                    <Plus size={10} />
-                    {ui.install}
+                    <RefreshCw size={10} class={runtimeBusyAction === "check" ? 'animate-spin' : ''} />
+                    {ui.check}
                   </button>
                 {/if}
               </div>

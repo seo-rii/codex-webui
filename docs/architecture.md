@@ -2,89 +2,185 @@
 
 ## Overview
 
-`codex-webui` is split into three layers:
+`codex-webui` is intentionally split into a public edge and a Codex-focused private layer:
 
-1. SvelteKit frontend
+1. browser UI
 2. Rust public gateway
-3. Internal Node/SvelteKit Codex proxy
+3. internal SvelteKit/Node service
+4. `codex app-server`
 
 The browser never talks to Codex directly.
 
-## Request Flow
+## Component Roles
 
-### Auth
+### Browser
 
-- Browser calls `POST /api/auth/login`
-- Rust validates the password and sets the signed auth cookie
-- Subsequent browser requests use that cookie
+The browser renders a single workspace page and keeps very little authoritative state locally.
 
-### Runtime RPC
+- credentialed HTTP is used for password login/logout and multipart attachment upload
+- WebSocket RPC is used for session activity, chat, queue operations, Git, terminals, account flows, and runtime actions
+- the UI is optimistic where it helps responsiveness, but server state remains authoritative
 
-- Browser opens `WebSocket /ws`
+### Rust gateway
+
+The Rust process is the public entrypoint.
+
+It is responsible for:
+
+- password validation and signed cookie issuance
+- static asset serving
+- public WebSocket upgrade handling and fan-out
+- long-lived terminal processes
+- runtime install/update checks
+- quota fetching
+- spawning and supervising the internal Node service
+- enforcing base path and CORS policy
+
+### Internal SvelteKit/Node service
+
+The internal service contains most Codex-specific application logic:
+
+- `codex app-server` client management
+- session hydration and turn shaping
+- queue persistence and dispatch
+- attachment storage
+- Git repository discovery and file operations
+- `config.toml` synchronization
+- plugin and skill catalog reads
+- local session indexing and search
+
+This service is not meant to be exposed directly.
+
+### Codex app-server
+
+`codex app-server` remains the source of truth for live Codex thread execution, thread metadata, and stream notifications.
+
+## Request And Event Flow
+
+### 1. Authentication
+
+- browser calls `POST /api/auth/login`
+- Rust validates the password
+- Rust sets the signed `codex_webui_auth` cookie
+- subsequent HTTP and WebSocket requests reuse that cookie
+
+### 2. Workspace control
+
+- browser opens the public WebSocket exposed by Rust
 - Rust authenticates the socket
-- Browser sends JSON-RPC-like requests
-- Rust either handles them locally or proxies them to the internal Node server
+- browser sends JSON-RPC-like requests
+- Rust either handles the request directly or forwards it to the internal Node service
 
-### Codex Execution
+### 3. Codex execution
 
-- Internal Node server wraps `codex app-server`
-- Session operations, turn streaming, queue state, attachments, and Git operations live there
-- Rust relays events back to every subscribed browser
+- Node talks to `codex app-server`
+- live notifications from `codex app-server` are normalized into UI events
+- Rust fans those events out to every subscribed browser client
 
-## Why split Rust and Node?
+### 4. Attachment uploads
 
-Rust owns the public edge because it is a better place for:
+Uploads are a deliberate exception to the WebSocket-first rule:
+
+- browser sends `multipart/form-data`
+- Rust proxies the upload path to the internal service
+- Node stores the upload and associates it with the target session
+
+## Why Rust + Node
+
+The split is deliberate rather than transitional.
+
+Rust is the public edge because it is a good fit for:
 
 - cookie auth
-- reconnect-safe WebSocket relays
+- WebSocket lifecycle management
 - terminal persistence
-- request caching
-- runtime install/update checks
-- tunnel-friendly single-binary serving
+- durable fan-out to multiple clients
+- runtime actions that should survive browser churn
+- packaging as the publicly exposed backend binary
 
-Node remains the Codex-facing layer because the existing proxy logic is already implemented there and closely matches the `codex app-server` model.
+Node remains the Codex-facing layer because it already matches the `codex app-server` model well and contains the higher-level session logic that is easier to iterate on there.
 
-## Persistence
+## Persistence Model
 
-Several kinds of state are persisted server-side:
+Several kinds of state live on disk:
 
 - Codex sessions under `~/.codex/sessions`
-- queued follow-ups and UI state under `CODEX_WEBUI_DATA_DIR`
+- user defaults under `~/.codex/config.toml`
+- `codex-webui` runtime state under `CODEX_WEBUI_DATA_DIR`
 - uploaded attachments under `CODEX_WEBUI_DATA_DIR/uploads`
-- CLI background-server metadata under `~/.codex/codex-webui/`
+- CLI background server metadata under `~/.codex/codex-webui/`
 
-This lets a session continue while the browser disconnects.
+This separation matters:
 
-## Session List Strategy
+- Codex rollout files remain Codex-owned
+- UI queue/draft/editor state remains `codex-webui`-owned
+- long-running work can survive browser disconnects because the server-side state is durable
 
-The sidebar combines:
+## Session Listing And Search
 
-- live `thread/list` data from Codex app-server
-- a local JSONL session index built from `~/.codex/sessions`
+The sidebar is built from two sources:
 
-The JSONL scan runs in a worker thread so long session histories do not block the main Node event loop.
+- live `thread/list` data from `codex app-server`
+- a local JSONL-style session index built from `~/.codex/sessions`
 
-## Terminals
+The local index is used because large session histories make direct thread enumeration expensive. The index work runs in a worker so the main Node event loop does not block while the sidebar updates.
+
+## Runtime Session Reconciliation
+
+Persisted rollout data can lag behind real runtime state. For example, a rollout may still contain `running` or `inProgress` markers after a crash or abrupt shutdown.
+
+To avoid mutating Codex-owned session files just to fix the UI:
+
+- `codex-webui` reads the rollout
+- it also queries `thread/loaded/list` from `codex app-server`
+- when a session looks live on disk but is not loaded in memory, the UI response is normalized to a stopped state
+
+This reconciliation is applied when loading:
+
+- session detail
+- older turn pages
+- individual turn expansion
+- queue dispatch decisions that depend on whether a turn is really still active
+
+## Queue Model
+
+Queued follow-ups are stored in `CODEX_WEBUI_DATA_DIR`, not in Codex rollout files.
+
+Important properties:
+
+- queue items survive page reloads and browser disconnects
+- queue draining happens server-side
+- restart flows can require user confirmation before resuming queued work
+- auto-resume can be enabled per session
+
+## Terminal Model
 
 The Rust gateway owns terminal processes.
 
-- terminal output is buffered in memory
-- terminal tabs survive page reloads while the gateway stays up
-- frontend writes are subscribed incrementally over WebSocket
+- terminal output is buffered server-side
+- terminal tabs survive browser reloads while the gateway stays up
+- terminal input/output is streamed incrementally over WebSocket
+
+The terminal lifecycle is intentionally separate from Codex thread lifecycle.
 
 ## Config Sources
 
-Session defaults come from:
+Session defaults are resolved from:
 
-1. environment variables
+1. `CODEX_WEBUI_*` environment overrides
 2. `~/.codex/config.toml`
 
-The UI can edit `config.toml`, and per-session preference changes also synchronize back into that file.
+The UI can edit `config.toml` directly. Session preference changes also write the relevant defaults back into that file so the web UI and Codex CLI do not silently drift apart.
 
 ## Security Model
 
-- public browser traffic only reaches the Rust gateway
-- the internal Node server is protected by a random internal header token
-- filesystem access is restricted to allowed roots plus Codex-owned configuration locations
+The trust boundary is narrow:
+
+- public browser traffic reaches only the Rust gateway
+- the internal Node service is protected behind the gateway
+- filesystem browsing is limited to allowed roots plus Codex-owned config/runtime paths
 - Git actions require explicit repository selection
-- cookies are HTTP-only and signed
+- cookies are signed and HTTP-only
+- cross-origin browser access must be explicitly allowed
+
+The model is designed to reduce accidental exposure, not to make an untrusted multi-tenant Codex host safe by default.

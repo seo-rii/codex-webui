@@ -1,93 +1,82 @@
 # codex-webui
 
-`codex-webui` is a web interface for Codex CLI.
+`codex-webui` is a reconnect-safe web workspace for Codex CLI.
 
-It serves a SvelteKit frontend behind a Rust gateway, keeps Codex turns running on the server when the browser disconnects, and exposes most of the workflow people expect from the Codex VS Code extension:
+It keeps Codex turns running on the server when the browser disconnects, exposes a Claude-like multi-panel UI, and covers most of the day-to-day workflow people expect from the Codex VS Code extension without requiring VS Code itself.
 
-- session and chat management
-- model, reasoning, plan, speed, sandbox, approval, and network controls
-- queue and steer flows
-- file attachments
-- Git status, diff, commits, worktrees, and file editing
-- terminal tabs that survive page reloads while the server stays up
-- runtime install/update checks and quota display
-- plugin and skill catalog visibility
+## Highlights
 
-## Status
+- Password-protected browser access with signed HTTP-only cookies
+- Reconnect-safe WebSocket control plane for chat, sessions, Git, terminals, runtime actions, and account flows
+- Session queue, explicit steer flow, persisted queued follow-ups, and resume prompts after restart
+- Attachments, Monaco-backed diff/file editing, aggregated live diff, live plan, and subagent activity views
+- Git repository discovery, status, diff, commit inspection, branch checkout, and worktree management
+- Terminal tabs that survive page reloads as long as the server process stays up
+- Runtime install/update checks, quota display, plugin/skill catalog visibility, and `config.toml` editing
+- Base-path deployment, configurable CORS, dark/light themes, and Paraglide-based i18n
 
-The project is usable today, but it is still moving quickly. Expect UI and API changes while the packaging and distribution story settles.
+## Project Status
 
-## Architecture
+The app is usable today and already supports real work, but the packaging and internal API are still evolving. Expect the UI and transport details to keep changing while the npm distribution path settles.
 
-The public surface is intentionally narrow:
+## How It Works
 
-- the browser uses HTTP for authentication only
-- everything else is driven through a reconnect-safe WebSocket RPC layer
-- a Rust gateway owns auth, session cookies, WebSocket fan-out, terminal persistence, and runtime management
-- the gateway starts an internal Node/SvelteKit server for the Codex-specific proxy logic
-- the internal server talks to `codex app-server` and manages session history, queue state, attachments, Git tooling, and Codex preferences
+`codex-webui` has a narrow public edge and a Codex-focused internal layer:
+
+- The browser loads a single workspace page.
+- Password login and attachment upload use credentialed HTTP requests.
+- Session activity, chat, Git, terminals, and runtime state use a reconnect-safe WebSocket RPC channel.
+- A Rust gateway owns auth, cookies, WebSocket fan-out, terminal persistence, runtime install/update actions, and static asset serving.
+- The Rust gateway starts an internal SvelteKit/Node service that talks to `codex app-server` and implements Codex-specific logic such as session hydration, queue persistence, Git operations, attachment storage, and `config.toml` synchronization.
 
 More detail is in [docs/architecture.md](./docs/architecture.md).
 
-## Features
+## Requirements
 
-- Password-protected web UI with signed HTTP-only cookies
-- Optional cross-origin API support for trusted origins
-- Case-insensitive session search
-- Session queue with persisted follow-up messages
-- Explicit `Steer now` flow for queued work
-- Resume prompts for queued work after a server restart
-- Browser notifications and sidebar highlighting for completed sessions and approval-required sessions
-- Aggregated live diff and plan panels above the transcript
-- Monaco diff views for inline change review and dedicated diff tabs
-- File editor backed by Monaco
-- Config editor for `~/.codex/config.toml`
-- Git repository discovery under allowed roots
-- Git worktree list, create, open, and remove
-- Persistent terminal tabs
-- Account login, device-code login, quota display, and runtime install/update actions
-- Plugin and skill catalog view sourced from the local Codex installation
+- Node.js with `pnpm`
+- Rust toolchain
+- A working `codex` installation on the machine that will host the server
+- Access to the Codex home directory you want to expose, typically `~/.codex`
 
-## Quick Start
-
-### 1. Install Codex CLI
-
-Make sure `codex` is installed and works on the machine where the server will run.
-
-### 2. Run the web UI
-
-For a local checkout:
+## Quick Start From Source
 
 ```bash
 pnpm install
 pnpm build
-cargo build --release --manifest-path backend/Cargo.toml
+pnpm gateway:build
 node ./bin/codex-webui.mjs
 ```
 
-The first launch opens an interactive setup and writes:
+On first launch the CLI opens an interactive setup flow and writes:
 
 - config: `~/.codex/codex-webui.yml`
 - runtime state: `~/.codex/codex-webui/`
 
-After that, running `codex-webui` again starts the background server and prints the URL, PID, config path, and log path.
+After setup, running `codex-webui` again starts the background server and prints:
 
-## `npx codex-webui`
+- launch URL
+- PID
+- config path
+- log path
 
-The package is designed to be published so users can run:
+The printed URL currently ends in `/login` for compatibility, but that route redirects to the main workspace and the login experience is handled inline by the workspace shell.
+
+## Using The Published CLI
+
+The intended distribution path is:
 
 ```bash
 npx codex-webui
 ```
 
-On first launch the CLI:
+On first run the CLI:
 
-1. asks for host, port, base path, Codex binary, `CODEX_HOME`, allowed roots, and password
-2. hashes the password
+1. asks for host, port, base path, Codex binary, `CODEX_HOME`, allowed roots, optional CORS origins, and password
+2. hashes the password with scrypt
 3. writes `~/.codex/codex-webui.yml`
-4. starts the background server
+4. starts the Rust gateway in the background
 
-Once configured, these commands are available:
+Once configured, the CLI supports:
 
 ```bash
 codex-webui
@@ -97,7 +86,7 @@ codex-webui stop
 codex-webui tunnel
 ```
 
-`tunnel` uses `cloudflared` when available and falls back to `ngrok`.
+`tunnel` prefers `cloudflared` and falls back to `ngrok`.
 
 ## CLI Config
 
@@ -120,9 +109,53 @@ corsAllowedOrigins: []
 backendBinaryPath: ""
 ```
 
+Meaning of the main fields:
+
+- `host` / `port`: public bind address for the Rust gateway
+- `basePath`: deployment prefix, for example `/absproxy/4173`
+- `codexBin`: path or command name for the Codex CLI binary
+- `codexHome`: Codex runtime/config/session directory
+- `dataDir`: `codex-webui` runtime state, uploads, queue state, and editor metadata
+- `allowedRoots`: filesystem roots the UI is allowed to browse
+- `passwordHash`: hashed login password
+- `sessionSecret`: cookie signing secret
+- `corsAllowedOrigins`: trusted origins allowed to use browser credentials against the gateway
+- `backendBinaryPath`: explicit Rust gateway path, mainly for packaged or custom deployments
+
+## Environment Overrides
+
+The Rust gateway and the internal Node service honor a focused set of `CODEX_WEBUI_*` environment variables. The most important ones are:
+
+- `CODEX_WEBUI_PASSWORD_HASH`
+- `CODEX_WEBUI_PASSWORD`
+- `CODEX_WEBUI_SESSION_SECRET`
+- `CODEX_WEBUI_CORS_ALLOWED_ORIGINS`
+- `CODEX_WEBUI_ALLOWED_ROOTS`
+- `CODEX_WEBUI_BASE_PATH`
+- `CODEX_WEBUI_DATA_DIR`
+- `CODEX_WEBUI_CODEX_BIN`
+- `CODEX_WEBUI_CODEX_HOME`
+- `CODEX_WEBUI_MAX_UPLOAD_MB`
+- `CODEX_WEBUI_DEFAULT_*` session defaults such as model, sandbox, approval, speed, effort, network, and steering resume mode
+- `CODEX_WEBUI_GIT_DISCOVERY_DEPTH`
+- `CODEX_WEBUI_ENABLE_SYSTEM_SHUTDOWN`
+- `CODEX_WEBUI_SHUTDOWN_DELAY_SECONDS`
+- `CODEX_WEBUI_SHUTDOWN_COMMAND`
+
+See [.env.example](./.env.example) for a concise example set.
+
+## Runtime And Config Behavior
+
+- Session defaults are sourced from `~/.codex/config.toml`.
+- The Settings workspace can edit `config.toml` directly.
+- Changing session/composer preferences syncs the relevant defaults back into `config.toml`.
+- Existing sessions keep their own persisted preferences; changing defaults mainly affects new sessions and future default state.
+- Queued follow-ups are stored server-side and can continue after the page closes as long as the server remains up.
+- Terminals also stay alive while the Rust gateway remains up.
+
 ## Development
 
-### Frontend only
+### Frontend dev server only
 
 ```bash
 pnpm dev
@@ -153,40 +186,38 @@ Build common targets with:
 pnpm build:cross
 ```
 
-The helper script prefers `cargo-zigbuild`, falls back to `cross`, and then to plain `cargo build` if needed.
+The helper prefers `cargo-zigbuild`, falls back to `cross`, and finally to plain `cargo build`.
 
 More detail is in [docs/distribution.md](./docs/distribution.md).
 
-## Security
+## Security Notes
 
-- Prefer `CODEX_WEBUI_PASSWORD_HASH` over plaintext password environment variables.
+- Prefer `CODEX_WEBUI_PASSWORD_HASH` over plaintext password variables.
 - Keep `CODEX_WEBUI_SESSION_SECRET` unique per deployment.
 - Restrict `CODEX_WEBUI_ALLOWED_ROOTS` to the smallest practical set.
 - Leave cookies on `SameSite=Strict` unless you explicitly need cross-site browser sessions.
 - Run behind HTTPS in production.
-- Do not expose the internal SvelteKit server directly.
+- Do not expose the internal SvelteKit service directly.
+- Git actions are intentionally gated on explicit repository selection.
 - System shutdown support is disabled by default and must be explicitly enabled.
-
-## Runtime and Config Notes
-
-- Session defaults are sourced from `~/.codex/config.toml`.
-- Changing composer preferences updates `config.toml`.
-- The Settings workspace tab lets you edit `config.toml` directly and reload the defaults visible in the UI.
-- Existing sessions keep their own persisted preferences; changing defaults mainly affects new sessions and future default state.
 
 ## Troubleshooting
 
-### Sessions appear in search but not in the sidebar
+### A session appears to still be running after Codex stopped
 
-The sidebar is built from a local session index plus live app-server data. If a session is selected directly, it is pinned back into the visible list even when it did not arrive in the current page yet.
+The detailed session view reconciles the persisted rollout with the live `thread/loaded/list` state from `codex app-server`. If a rollout still contains `running` or `inProgress` markers after an interrupted process, the UI marks that session as stopped without rewriting the session file.
+
+### A session appears in search but not in the sidebar
+
+The sidebar combines a local session index with live app-server data and loads progressively. A selected session is pinned back into view even if it was not part of the current list page yet.
 
 ### Attachments do not upload
 
-Uploads are sent as `multipart/form-data` to the internal attachment endpoint. Check:
+Attachment uploads use credentialed `multipart/form-data` requests. Check:
 
 - `CODEX_WEBUI_MAX_UPLOAD_MB`
 - allowed filesystem roots
-- reverse proxy request size limits
+- reverse-proxy body size limits
 
 ### `npx codex-webui` cannot start the gateway
 
@@ -197,7 +228,7 @@ Make sure one of these exists:
 - a matching prebuilt binary under `dist/backend/<target>/`
 - a locally built binary under `backend/target/release/`
 
-## References
+## Related Docs
 
 - [docs/architecture.md](./docs/architecture.md)
 - [docs/distribution.md](./docs/distribution.md)

@@ -2106,7 +2106,11 @@
         pendingQueueModeSessionId = null;
       }
       titleDraft = getDisplayThreadTitle(detail.thread.name, detail.thread.preview) ?? "";
-      upsertSessionSummary(buildSessionSummaryFromConversation(nextConversation));
+      const existingSummary = sessions.find((session) => session.id === detail.thread.id) ?? null;
+      upsertSessionSummary({
+        ...buildSessionSummaryFromConversation(nextConversation),
+        updatedAt: Math.max(nextConversation.thread.updatedAt, existingSummary?.updatedAt ?? 0)
+      });
       await loadSavedDraft(detail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
       const hasOnlyLiveTurnShell =
         nextConversation.thread.turns.length <= 1 &&

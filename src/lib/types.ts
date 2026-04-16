@@ -1,0 +1,485 @@
+export type ApprovalPolicy = "never" | "on-request" | "on-failure" | "untrusted";
+export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+export type CollaborationMode = "default" | "plan";
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ServiceSpeed = "auto" | "fast" | "flex";
+export type AttachmentKind = "image" | "file";
+export type AutoApproveMode = "manual" | "turn" | "session";
+export type ItemDetailState = "inline" | "deferred" | "loaded";
+export type SteeringResumeMode = "ask" | "auto";
+
+export type SessionPreferences = {
+  cwd: string;
+  model: string | null;
+  effort: ReasoningEffort | null;
+  speed: ServiceSpeed;
+  mode: CollaborationMode;
+  sandboxMode: SandboxMode;
+  approvalPolicy: ApprovalPolicy;
+  networkAccess: boolean;
+  autoApproveMode: AutoApproveMode;
+  steeringResumeMode: SteeringResumeMode;
+  shutdownOnCompletion: boolean;
+  gitRepoPath: string | null;
+};
+
+export type SessionSummary = {
+  id: string;
+  name: string | null;
+  preview: string;
+  cwd: string;
+  archived: boolean;
+  createdAt: number;
+  updatedAt: number;
+  status: string;
+  agentNickname: string | null;
+  agentRole: string | null;
+  preferences: SessionPreferences | null;
+};
+
+export type SessionListPayload = {
+  sessions: SessionSummary[];
+  nextCursor: string | null;
+};
+
+export type AttachmentRecord = {
+  id: string;
+  originalName: string;
+  path: string;
+  mimeType: string;
+  size: number;
+  kind: AttachmentKind;
+  createdAt: string;
+};
+
+export type CodexItem = {
+  id: string;
+  type: string;
+  detailState?: ItemDetailState;
+  detailPreview?: string | null;
+  title?: string | null;
+  [key: string]: unknown;
+};
+
+export type CodexTurn = {
+  id: string;
+  items: CodexItem[];
+  status: string;
+  error: { message?: string } | null;
+  startedAt: number | null;
+  completedAt: number | null;
+  durationMs: number | null;
+  detailState?: "summary" | "full";
+  hiddenItemCount?: number;
+};
+
+export type CodexThread = {
+  id: string;
+  preview: string;
+  name: string | null;
+  cwd: string;
+  status: string;
+  createdAt: number;
+  updatedAt: number;
+  agentNickname: string | null;
+  agentRole: string | null;
+  turns: CodexTurn[];
+};
+
+export type TokenUsageBreakdown = {
+  totalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+};
+
+export type ThreadTokenUsage = {
+  total: TokenUsageBreakdown;
+  last: TokenUsageBreakdown;
+  modelContextWindow: number | null;
+};
+
+export type PendingServerRequest = {
+  id: string;
+  method: string;
+  params: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type DirectoryEntry = {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+};
+
+export type DirectoryPayload = {
+  allowedRoots: DirectoryEntry[];
+  currentPath: string | null;
+  parentPath: string | null;
+  entries: DirectoryEntry[];
+};
+
+export type ModelOption = {
+  id: string;
+  displayName: string;
+  description: string;
+  defaultReasoningEffort: string;
+  supportedReasoningEfforts: string[];
+  additionalSpeedTiers: string[];
+  inputModalities: string[];
+  isDefault: boolean;
+};
+
+export type CollaborationModeOption = {
+  name: string;
+  mode: CollaborationMode | null;
+  model: string | null;
+  reasoning_effort: string | null;
+};
+
+export type StartupPausedQueueAlert = {
+  sessionId: string;
+  name: string | null;
+  cwd: string;
+  pendingCount: number;
+  updatedAt: number | null;
+};
+
+export type StartupScheduledShutdownAlert = {
+  sessionId: string | null;
+  scheduledFor: number;
+  delaySeconds: number;
+};
+
+export type AppConfigPayload = {
+  models: ModelOption[];
+  collaborationModes: CollaborationModeOption[];
+  allowedRoots: DirectoryEntry[];
+  defaults: SessionPreferences;
+  paths: {
+    codexHome: string;
+    configFilePath: string;
+  };
+  git: {
+    discoveryDepth: number;
+  };
+  systemShutdown: {
+    available: boolean;
+    delaySeconds: number;
+  };
+  startup: {
+    pausedQueues: StartupPausedQueueAlert[];
+    scheduledShutdown: StartupScheduledShutdownAlert | null;
+  };
+  account: {
+    type: "apiKey" | "chatgpt" | null;
+    email: string | null;
+    planType: string | null;
+    requiresOpenaiAuth: boolean;
+  };
+};
+
+export type SessionSearchScope = "summary" | "full";
+
+export type CodexAccountLoginResponse =
+  | {
+      type: "apiKey";
+    }
+  | {
+      type: "chatgpt";
+      loginId: string;
+      authUrl: string;
+    }
+  | {
+      type: "chatgptDeviceCode";
+      loginId: string;
+      verificationUrl: string;
+      userCode: string;
+    }
+  | {
+      type: "chatgptAuthTokens";
+    };
+
+export type CodexAccountLoginFlow =
+  | {
+      type: "chatgpt";
+      loginId: string;
+      authUrl: string;
+      busy: boolean;
+      error: string | null;
+    }
+  | {
+      type: "chatgptDeviceCode";
+      loginId: string;
+      verificationUrl: string;
+      userCode: string;
+      busy: boolean;
+      error: string | null;
+    };
+
+export type SessionDetailPayload = {
+  thread: CodexThread;
+  preferences: SessionPreferences;
+  attachments: AttachmentRecord[];
+  queue: SessionQueuePayload;
+  pendingRequests: PendingServerRequest[];
+  activeTurnId: string | null;
+  tokenUsage: ThreadTokenUsage | null;
+  hydration: {
+    state: "idle" | "loading" | "complete" | "error";
+    loadedTurns: number;
+    totalTurns: number | null;
+    remainingTurns: number;
+    message: string | null;
+  };
+};
+
+export type SessionTurnsPagePayload = {
+  turns: CodexTurn[];
+  loadedTurns: number;
+  totalTurns: number | null;
+  remainingTurns: number;
+};
+
+export type SessionTurnPayload = {
+  turn: CodexTurn;
+};
+
+export type SessionItemDetailPayload = {
+  item: CodexItem;
+};
+
+export type SessionDraftPayload = {
+  sessionId: string;
+  draft: string;
+  intent: "message" | "steer" | "queue" | null;
+  updatedAt: number | null;
+};
+
+export type SessionQueueItem = {
+  id: string;
+  prompt: string;
+  attachmentIds: string[];
+  attachmentNames: string[];
+  createdAt: number;
+};
+
+export type SessionQueuePayload = {
+  sessionId: string;
+  items: SessionQueueItem[];
+  resumeRequired: boolean;
+  updatedAt: number | null;
+};
+
+export type StreamEvent =
+  | {
+      kind: "notification";
+      method: string;
+      params: Record<string, unknown>;
+    }
+  | {
+      kind: "serverRequest";
+      id: string;
+      method: string;
+      params: Record<string, unknown>;
+    };
+
+export type GlobalStreamEvent = {
+  kind: "notification";
+  method: string;
+  params: Record<string, unknown>;
+};
+
+export type TerminalSummary = {
+  id: string;
+  title: string;
+  cwd: string;
+  createdAt: number;
+  lastActivityAt: number;
+  status: "running" | "exited";
+  exitCode: number | null;
+};
+
+export type TerminalListPayload = {
+  terminals: TerminalSummary[];
+};
+
+export type TerminalSnapshotPayload = {
+  terminal: TerminalSummary;
+  snapshot: string;
+};
+
+export type TerminalEvent =
+  | {
+      kind: "notification";
+      method: "terminal/output";
+      params: {
+        text: string;
+      };
+    }
+  | {
+      kind: "notification";
+      method: "terminal/exit";
+      params: {
+        exitCode: number | null;
+      };
+    };
+
+export type GitFileReferencePayload = {
+  repoPath: string;
+  filePath: string | null;
+};
+
+export type GitOpenRequest = {
+  repoPath: string;
+  filePath: string | null;
+  filePaths?: string[] | null;
+  title?: string | null;
+  requestId: number;
+};
+
+export type WsConnectionState = "idle" | "connecting" | "connected" | "reconnecting" | "disconnected";
+
+export type CodexRuntimeStatus = {
+  installed: boolean;
+  configuredBin: string;
+  resolvedBinPath: string | null;
+  npmAvailable: boolean;
+  version: string | null;
+  latestVersion: string | null;
+  updateAvailable: boolean | null;
+  installCommand: string;
+  updateCommand: string;
+  lastCheckedAt: string | null;
+  issues: string[];
+};
+
+export type CodexRuntimeActionPayload = {
+  ok: true;
+  message: string;
+  runtime: CodexRuntimeStatus;
+};
+
+export type CodexQuotaWindow = {
+  usedPercent: number;
+  remainingPercent: number;
+  resetAfterSeconds: number | null;
+  resetAt: number | null;
+};
+
+export type CodexQuotaStatus = {
+  available: boolean;
+  source: "backend-api" | null;
+  fetchedAt: number | null;
+  account: string | null;
+  plan: string | null;
+  fiveHour: CodexQuotaWindow | null;
+  weekly: CodexQuotaWindow | null;
+  error: string | null;
+};
+
+export type GitRepository = {
+  path: string;
+  name: string;
+  rootPath: string;
+  relativePath: string;
+  currentBranch: string | null;
+};
+
+export type GitBranch = {
+  name: string;
+  current: boolean;
+  upstream: string | null;
+};
+
+export type GitWorktree = {
+  path: string;
+  branch: string | null;
+  head: string | null;
+  bare: boolean;
+  detached: boolean;
+  locked: boolean;
+  prunable: boolean;
+  current: boolean;
+};
+
+export type GitWorktreePayload = {
+  repoPath: string;
+  worktrees: GitWorktree[];
+};
+
+export type GitCommit = {
+  hash: string;
+  shortHash: string;
+  author: string;
+  authoredAt: string;
+  subject: string;
+};
+
+export type GitFileStatus = {
+  path: string;
+  originalPath: string | null;
+  stagedCode: string;
+  unstagedCode: string;
+  stagedLabel: string;
+  unstagedLabel: string;
+  hasStagedChanges: boolean;
+  hasUnstagedChanges: boolean;
+  isUntracked: boolean;
+};
+
+export type GitStatusPayload = {
+  repo: GitRepository;
+  branch: string | null;
+  ahead: number;
+  behind: number;
+  clean: boolean;
+  files: GitFileStatus[];
+  branches: GitBranch[];
+  commits: GitCommit[];
+};
+
+export type GitFilePayload = {
+  repoPath: string;
+  filePath: string;
+  originalPath: string | null;
+  originalContent: string;
+  modifiedContent: string;
+  language: string;
+  isBinary: boolean;
+  status: GitFileStatus | null;
+};
+
+export type EditableFilePayload = {
+  path: string;
+  displayName: string;
+  content: string;
+  language: string;
+  writable: boolean;
+};
+
+export type PluginCatalogEntry = {
+  name: string;
+  displayName: string;
+  description: string;
+  version: string | null;
+  developerName: string | null;
+  category: string | null;
+  path: string;
+  skills: string[];
+};
+
+export type SkillCatalogEntry = {
+  id: string;
+  name: string;
+  description: string;
+  path: string;
+  source: "local" | "system" | "plugin";
+  pluginName: string | null;
+};
+
+export type CatalogPayload = {
+  plugins: PluginCatalogEntry[];
+  skills: SkillCatalogEntry[];
+};

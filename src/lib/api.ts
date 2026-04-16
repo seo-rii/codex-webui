@@ -1,0 +1,409 @@
+import { base } from "$app/paths";
+
+import type {
+  AppConfigPayload,
+  AttachmentRecord,
+  CatalogPayload,
+  CodexAccountLoginResponse,
+  CodexQuotaStatus,
+  CodexRuntimeActionPayload,
+  CodexRuntimeStatus,
+  DirectoryPayload,
+  EditableFilePayload,
+  GlobalStreamEvent,
+  GitFilePayload,
+  GitFileReferencePayload,
+  GitRepository,
+  GitStatusPayload,
+  GitWorktreePayload,
+  SessionDetailPayload,
+  SessionDraftPayload,
+  SessionItemDetailPayload,
+  SessionListPayload,
+  SessionPreferences,
+  SessionSearchScope,
+  SessionSummary,
+  TerminalEvent,
+  TerminalListPayload,
+  TerminalSnapshotPayload,
+  SessionTurnPayload,
+  SessionTurnsPagePayload,
+  StreamEvent,
+  WsConnectionState
+} from "$lib/types";
+import { WebSocketRpcClient } from "$lib/ws-client";
+
+function appPath(pathname: string) {
+  const normalized = pathname.startsWith("/") ? pathname : `/${pathname}`;
+  return `${base}${normalized}` || "/";
+}
+
+function apiPath(pathname: string) {
+  const normalized = pathname.startsWith("/") ? pathname : `/${pathname}`;
+  return `${base}/api${normalized}`;
+}
+
+async function request<T>(input: string, init?: RequestInit) {
+  const headers = new Headers(init?.headers ?? {});
+  if (!(init?.body instanceof FormData) && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+
+  const response = await fetch(input, {
+    ...init,
+    credentials: init?.credentials ?? "include",
+    headers
+  });
+
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || `${response.status} ${response.statusText}`);
+  }
+
+  return (await response.json()) as T;
+}
+
+const ws = new WebSocketRpcClient();
+
+export const api = {
+  login(password: string) {
+    return request<{ ok: true }>(apiPath("/auth/login"), {
+      method: "POST",
+      body: JSON.stringify({ password })
+    });
+  },
+
+  async logout() {
+    const response = await request<{ ok: true }>(apiPath("/auth/logout"), {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    ws.disconnect("Logged out.");
+    return response;
+  },
+
+  disconnect() {
+    ws.disconnect();
+  },
+
+  onReconnect(listener: () => void) {
+    return ws.onReconnect(listener);
+  },
+
+  onConnectionState(listener: (state: WsConnectionState) => void) {
+    return ws.onConnectionState(listener);
+  },
+
+  subscribeGlobal(listener: (event: GlobalStreamEvent) => void) {
+    return ws.subscribeGlobal(listener);
+  },
+
+  subscribeSession(sessionId: string, listener: (event: StreamEvent) => void) {
+    return ws.subscribeSession(sessionId, listener);
+  },
+
+  subscribeTerminal(terminalId: string, listener: (event: TerminalEvent) => void) {
+    return ws.subscribeTerminal(terminalId, listener);
+  },
+
+  getConfig() {
+    return ws.request<AppConfigPayload>("config/get");
+  },
+
+  getRuntimeStatus() {
+    return ws.request<CodexRuntimeStatus>("runtime/status");
+  },
+
+  getCatalog() {
+    return ws.request<CatalogPayload>("catalog/get");
+  },
+
+  getEditableFile(filePath: string) {
+    return ws.request<EditableFilePayload>("editor/file/get", { filePath });
+  },
+
+  saveEditableFile(filePath: string, content: string) {
+    return ws.request<EditableFilePayload>("editor/file/save", { filePath, content });
+  },
+
+  getQuota(refresh = false) {
+    return ws.request<CodexQuotaStatus>("runtime/quota", { refresh });
+  },
+
+  checkRuntimeUpdate() {
+    return ws.request<CodexRuntimeStatus>("runtime/checkUpdate");
+  },
+
+  installRuntime() {
+    return ws.request<CodexRuntimeActionPayload>("runtime/install");
+  },
+
+  updateRuntime() {
+    return ws.request<CodexRuntimeActionPayload>("runtime/update");
+  },
+
+  getSessions(archived = false, cursor: string | null = null, limit = 20) {
+    return ws.request<SessionListPayload>("sessions/list", { archived, cursor, limit });
+  },
+
+  searchSessions(query: string, scope: SessionSearchScope, archived = false, cursor: string | null = null, limit = 20) {
+    return ws.request<SessionListPayload>("sessions/search", { query, scope, archived, cursor, limit });
+  },
+
+  createSession(preferences: Partial<SessionPreferences>, name: string | null = null) {
+    return ws.request<SessionSummary>("session/create", { preferences, name });
+  },
+
+  getSession(sessionId: string, limit = 20) {
+    return ws.request<SessionDetailPayload>("session/get", { sessionId, limit });
+  },
+
+  getSessionDraft(sessionId: string) {
+    return ws.request<SessionDraftPayload>("session/draft/get", { sessionId });
+  },
+
+  saveSessionDraft(sessionId: string, draft: string, intent: "message" | "steer" | "queue") {
+    return ws.request<SessionDraftPayload>("session/draft/save", { sessionId, draft, intent });
+  },
+
+  getSessionQueue(sessionId: string) {
+    return ws.request<SessionDetailPayload["queue"]>("session/queue/get", { sessionId });
+  },
+
+  enqueueSessionMessage(sessionId: string, payload: { prompt: string; attachmentIds: string[] }) {
+    return ws.request<SessionDetailPayload["queue"]>("session/queue/enqueue", {
+      sessionId,
+      prompt: payload.prompt,
+      attachmentIds: payload.attachmentIds
+    });
+  },
+
+  resumeSessionQueue(sessionId: string) {
+    return ws.request<SessionDetailPayload["queue"]>("session/queue/resume", { sessionId });
+  },
+
+  removeQueuedMessage(sessionId: string, queueId: string) {
+    return ws.request<SessionDetailPayload["queue"]>("session/queue/remove", { sessionId, queueId });
+  },
+
+  updateQueuedMessage(sessionId: string, queueId: string, payload: { prompt: string; attachmentIds?: string[] }) {
+    return ws.request<SessionDetailPayload["queue"]>("session/queue/update", {
+      sessionId,
+      queueId,
+      prompt: payload.prompt,
+      attachmentIds: payload.attachmentIds
+    });
+  },
+
+  dispatchQueuedMessage(sessionId: string, queueId: string, mode: "message" | "steer") {
+    return ws.request<SessionDetailPayload["queue"]>("session/queue/dispatch", {
+      sessionId,
+      queueId,
+      mode
+    });
+  },
+
+  clearSessionDraft(sessionId: string) {
+    return ws.request<SessionDraftPayload>("session/draft/clear", { sessionId });
+  },
+
+  getSessionOlderTurns(sessionId: string, beforeTurnId: string, limit = 20) {
+    return ws.request<SessionTurnsPagePayload>("session/olderTurns/get", { sessionId, beforeTurnId, limit });
+  },
+
+  getSessionTurn(sessionId: string, turnId: string) {
+    return ws.request<SessionTurnPayload>("session/turn/get", { sessionId, turnId });
+  },
+
+  getSessionItemDetail(sessionId: string, turnId: string, itemId: string) {
+    return ws.request<SessionItemDetailPayload>("session/itemDetail/get", { sessionId, turnId, itemId });
+  },
+
+  savePreferences(sessionId: string, preferences: Partial<SessionPreferences>) {
+    return ws.request<SessionPreferences>("session/savePreferences", { sessionId, preferences });
+  },
+
+  renameSession(sessionId: string, name: string) {
+    return ws.request<{ ok: true }>("session/rename", { sessionId, name });
+  },
+
+  archiveSession(sessionId: string) {
+    return ws.request<{ ok: true }>("session/archive", { sessionId });
+  },
+
+  unarchiveSession(sessionId: string) {
+    return ws.request<{ ok: true; session: SessionSummary }>("session/unarchive", { sessionId });
+  },
+
+  getAccount() {
+    return ws.request<{
+      account: Record<string, unknown>;
+      requiresOpenaiAuth: boolean;
+    }>("account/get");
+  },
+
+  startAccountLogin(type: "chatgpt" | "chatgptDeviceCode" | "apiKey", apiKey?: string | null) {
+    return ws.request<CodexAccountLoginResponse>("account/login/start", { type, apiKey: apiKey ?? null });
+  },
+
+  cancelAccountLogin(loginId: string) {
+    return ws.request<{ status: "canceled" | "notFound" }>("account/login/cancel", { loginId });
+  },
+
+  logoutAccount() {
+    return ws.request<Record<string, never>>("account/logout");
+  },
+
+  sendMessage(sessionId: string, payload: { prompt: string; attachmentIds: string[]; preferences: Partial<SessionPreferences> }) {
+    return ws.request<{ ok: true }>("turn/send", {
+      sessionId,
+      prompt: payload.prompt,
+      attachmentIds: payload.attachmentIds,
+      preferences: payload.preferences
+    });
+  },
+
+  steerTurn(sessionId: string, prompt: string, attachmentIds: string[] = []) {
+    return ws.request<{ ok: true }>("turn/steer", {
+      sessionId,
+      prompt,
+      attachmentIds
+    });
+  },
+
+  async uploadAttachments(sessionId: string, files: File[]) {
+    const formData = new FormData();
+    for (const file of files) {
+      formData.append("files", file);
+    }
+    return request<{ attachments: AttachmentRecord[] }>(apiPath(`/sessions/${sessionId}/attachments`), {
+      method: "POST",
+      body: formData
+    });
+  },
+
+  deleteAttachment(sessionId: string, attachmentId: string) {
+    return ws.request<{ ok: true }>("attachments/delete", {
+      sessionId,
+      attachmentId
+    });
+  },
+
+  resolveRequest(sessionId: string, requestId: string, result: unknown) {
+    return ws.request<{ ok: true }>("approval/resolve", {
+      sessionId,
+      requestId,
+      result
+    });
+  },
+
+  abortTurn(sessionId: string) {
+    return ws.request<{ interrupted: boolean }>("turn/abort", {
+      sessionId
+    });
+  },
+
+  browseDirectories(currentPath: string | null) {
+    return ws.request<DirectoryPayload>("directories/browse", { currentPath });
+  },
+
+  listRepositories() {
+    return ws.request<{ repositories: GitRepository[] }>("git/repositories/list");
+  },
+
+  getGitStatus(repoPath: string) {
+    return ws.request<GitStatusPayload>("git/status", { repoPath });
+  },
+
+  getGitWorktrees(repoPath: string) {
+    return ws.request<GitWorktreePayload>("git/worktrees/list", { repoPath });
+  },
+
+  createGitWorktree(repoPath: string, payload: { worktreePath: string; branchName: string | null; createBranch: boolean; detach: boolean }) {
+    return ws.request<GitWorktreePayload>("git/worktrees/create", {
+      repoPath,
+      worktreePath: payload.worktreePath,
+      branchName: payload.branchName,
+      createBranch: payload.createBranch,
+      detach: payload.detach
+    });
+  },
+
+  removeGitWorktree(repoPath: string, worktreePath: string, force = false) {
+    return ws.request<GitWorktreePayload>("git/worktrees/remove", {
+      repoPath,
+      worktreePath,
+      force
+    });
+  },
+
+  getGitFile(repoPath: string, filePath: string) {
+    return ws.request<GitFilePayload>("git/file/get", { repoPath, filePath });
+  },
+
+  resolveGitFile(filePath: string) {
+    return ws.request<GitFileReferencePayload>("git/file/resolve", { filePath });
+  },
+
+  saveGitFile(repoPath: string, filePath: string, content: string) {
+    return ws.request<GitFilePayload>("git/file/save", {
+      repoPath,
+      filePath,
+      content
+    });
+  },
+
+  stageGitFile(repoPath: string, filePath: string | null = null) {
+    return ws.request<GitStatusPayload>("git/stage", {
+      repoPath,
+      filePath
+    });
+  },
+
+  unstageGitFile(repoPath: string, filePath: string | null = null) {
+    return ws.request<GitStatusPayload>("git/unstage", {
+      repoPath,
+      filePath
+    });
+  },
+
+  commitGit(repoPath: string, message: string) {
+    return ws.request<GitStatusPayload>("git/commit", {
+      repoPath,
+      message
+    });
+  },
+
+  checkoutGitBranch(repoPath: string, branchName: string, create = false) {
+    return ws.request<GitStatusPayload>("git/checkout", {
+      repoPath,
+      branchName,
+      create
+    });
+  },
+
+  listTerminals() {
+    return ws.request<TerminalListPayload>("terminal/list");
+  },
+
+  createTerminal(cwd: string | null = null, title: string | null = null) {
+    return ws.request<TerminalSnapshotPayload>("terminal/create", {
+      cwd,
+      title
+    });
+  },
+
+  readTerminal(terminalId: string) {
+    return ws.request<TerminalSnapshotPayload>("terminal/read", { terminalId });
+  },
+
+  sendTerminalInput(terminalId: string, data: string) {
+    return ws.request<{ ok: true }>("terminal/input", { terminalId, data });
+  },
+
+  closeTerminal(terminalId: string) {
+    return ws.request<{ ok: true }>("terminal/close", { terminalId });
+  }
+};
+
+export { appPath, apiPath };

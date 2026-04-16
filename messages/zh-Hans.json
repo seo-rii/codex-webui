@@ -275,5 +275,7 @@
   "computing_diffs": "Computing diffs...",
   "open_in_new_tab": "Open in new tab",
   "render_diff_failed": "Failed to render the diff.",
-  "init_diff_editor_failed": "Failed to initialize the diff editor."
+  "init_diff_editor_failed": "Failed to initialize the diff editor.",
+  "session_archived_notice": "Thread archived.",
+  "session_restored_notice": "Thread restored."
 }

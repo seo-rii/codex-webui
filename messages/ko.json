@@ -275,5 +275,7 @@
   "computing_diffs": "diff를 계산하는 중...",
   "open_in_new_tab": "새 탭에서 열기",
   "render_diff_failed": "diff를 렌더링하지 못했습니다.",
-  "init_diff_editor_failed": "diff 에디터를 초기화하지 못했습니다."
+  "init_diff_editor_failed": "diff 에디터를 초기화하지 못했습니다.",
+  "session_archived_notice": "스레드를 아카이브했습니다.",
+  "session_restored_notice": "스레드를 복구했습니다."
 }

@@ -5,6 +5,7 @@
     MessageSquare, 
     Search, 
     Archive, 
+    RotateCcw,
     User, 
     Settings, 
     LogOut, 
@@ -46,6 +47,7 @@
     onSearchQueryChange,
     onSearchScopeChange,
     onArchivedChange,
+    onToggleArchive,
     account,
     quota,
     quotaBusy,
@@ -82,6 +84,7 @@
     onSearchQueryChange: (query: string) => void;
     onSearchScopeChange: (scope: SessionSearchScope) => void;
     onArchivedChange: (nextValue: boolean) => void;
+    onToggleArchive: (session: SessionSummary) => void;
     account:
       | {
           type: "apiKey" | "chatgpt" | null;
@@ -131,6 +134,8 @@
       searchScopeSummary: m.search_scope_summary(),
       searchScopeFull: m.search_scope_full(),
       noArchivedSessions: m.no_archived_sessions(),
+      archiveThread: m.archive_thread(),
+      restoreThread: m.restore_thread(),
       noSessions: m.no_sessions(),
       noThreadsMatchingSearch: m.no_threads_matching_search(),
       createNewThreadPrompt: m.create_new_thread_prompt(),
@@ -501,48 +506,67 @@
       {/if}
 
       {#each sessions as session (session.id)}
-        <button
-          class="w-full text-left p-3 rounded-xl transition-all group relative { session.id === selectedId ? 'bg-white shadow-sm border border-gray-200 ring-1 ring-gray-200/50' : sessionHighlights[session.id]?.kind === 'attention' ? 'bg-amber-50 border border-amber-200/80 ring-1 ring-amber-200/60' : sessionHighlights[session.id]?.kind === 'completed' ? 'bg-emerald-50 border border-emerald-200/80 ring-1 ring-emerald-200/60' : 'hover:bg-gray-200/50 border border-transparent' }"
-          onclick={() => onSelect(session.id)}
-        >
-          <div class="flex flex-col gap-1.5">
-            <div class="flex items-start justify-between gap-2">
-              <span class="min-w-0 flex-1 truncate text-sm font-medium text-gray-900 transition-colors group-hover:text-amber-700">
-                {displaySessionTitle(session)}
-              </span>
-              <div class="flex shrink-0 flex-nowrap items-center gap-1.5 whitespace-nowrap">
-                {#if session.queueCount > 0}
-                  <span class="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-slate-600">
-                    Q {session.queueCount}
+        <div class="group relative">
+          <button
+            class="w-full text-left p-3 pr-11 rounded-xl transition-all relative { session.id === selectedId ? 'bg-white shadow-sm border border-gray-200 ring-1 ring-gray-200/50' : sessionHighlights[session.id]?.kind === 'attention' ? 'bg-amber-50 border border-amber-200/80 ring-1 ring-amber-200/60' : sessionHighlights[session.id]?.kind === 'completed' ? 'bg-emerald-50 border border-emerald-200/80 ring-1 ring-emerald-200/60' : 'hover:bg-gray-200/50 border border-transparent' }"
+            onclick={() => onSelect(session.id)}
+            type="button"
+          >
+            <div class="flex flex-col gap-1.5">
+              <div class="flex items-start justify-between gap-2">
+                <span class="min-w-0 flex-1 truncate text-sm font-medium text-gray-900 transition-colors group-hover:text-amber-700">
+                  {displaySessionTitle(session)}
+                </span>
+                <div class="flex shrink-0 flex-nowrap items-center gap-1.5 whitespace-nowrap">
+                  {#if session.queueCount > 0}
+                    <span class="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-slate-600">
+                      Q {session.queueCount}
+                    </span>
+                  {/if}
+                  {#if sessionHighlights[session.id]?.kind === "attention"}
+                    <span class="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 font-bold uppercase tracking-widest">{ui.needsInput}</span>
+                  {:else if sessionHighlights[session.id]?.kind === "completed"}
+                    <span class="text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 font-bold uppercase tracking-widest">{ui.done}</span>
+                  {/if}
+                  {#if isSessionRunning(session)}
+                    <span class="flex-shrink-0 w-2 h-2 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.5)] animate-pulse mt-1.5"></span>
+                  {/if}
+                </div>
+              </div>
+              
+              <p class="text-xs text-gray-500 line-clamp-1 break-all">
+                {session.preview || ui.newCodexSession}
+              </p>
+              
+              <div class="flex items-center justify-between gap-2 mt-1">
+                <span class="text-[10px] text-gray-400 font-medium tracking-tight">
+                  {formatUpdated(session.updatedAt)}
+                </span>
+                {#if session.agentNickname}
+                  <span class="text-[10px] px-1.5 py-0.5 bg-gray-100 text-gray-500 rounded font-semibold uppercase tracking-wider">
+                    {session.agentNickname}
                   </span>
-                {/if}
-                {#if sessionHighlights[session.id]?.kind === "attention"}
-                  <span class="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 font-bold uppercase tracking-widest">{ui.needsInput}</span>
-                {:else if sessionHighlights[session.id]?.kind === "completed"}
-                  <span class="text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 font-bold uppercase tracking-widest">{ui.done}</span>
-                {/if}
-                {#if isSessionRunning(session)}
-                  <span class="flex-shrink-0 w-2 h-2 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.5)] animate-pulse mt-1.5"></span>
                 {/if}
               </div>
             </div>
-            
-            <p class="text-xs text-gray-500 line-clamp-1 break-all">
-              {session.preview || ui.newCodexSession}
-            </p>
-            
-            <div class="flex items-center justify-between gap-2 mt-1">
-              <span class="text-[10px] text-gray-400 font-medium tracking-tight">
-                {formatUpdated(session.updatedAt)}
-              </span>
-              {#if session.agentNickname}
-                <span class="text-[10px] px-1.5 py-0.5 bg-gray-100 text-gray-500 rounded font-semibold uppercase tracking-wider">
-                  {session.agentNickname}
-                </span>
-              {/if}
-            </div>
-          </div>
-        </button>
+          </button>
+          <button
+            aria-label={showArchived ? ui.restoreThread : ui.archiveThread}
+            class="absolute right-2 top-2 z-10 rounded-lg border border-gray-200 bg-white/95 p-1.5 text-gray-400 opacity-0 shadow-sm transition-all pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 hover:border-amber-200 hover:bg-amber-50 hover:text-amber-700"
+            onclick={(event) => {
+              event.stopPropagation();
+              onToggleArchive(session);
+            }}
+            title={showArchived ? ui.restoreThread : ui.archiveThread}
+            type="button"
+          >
+            {#if showArchived}
+              <RotateCcw size={14} />
+            {:else}
+              <Archive size={14} />
+            {/if}
+          </button>
+        </div>
       {/each}
 
       {#if sessionsLoadingMore && loadMoreOrigin === "auto"}

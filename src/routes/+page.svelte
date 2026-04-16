@@ -2997,6 +2997,26 @@
     }
   }
 
+  async function archiveSessionFromSidebar(session: SessionSummary) {
+    try {
+      if (showArchivedSessions || session.archived) {
+        const response = await api.unarchiveSession(session.id);
+        applySessionSummaryUpdate(response.session);
+        noticeText = m.session_restored_notice();
+      } else {
+        await api.archiveSession(session.id);
+        applySessionSummaryUpdate({
+          ...session,
+          archived: true,
+          updatedAt: Math.floor(Date.now() / 1000)
+        });
+        noticeText = m.session_archived_notice();
+      }
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
   async function archiveCurrentSession() {
     if (!selectedSessionId || showArchivedSessions) {
       return;
@@ -3006,6 +3026,7 @@
       await api.archiveSession(selectedSessionId);
       showArchivedSessions = true;
       await refreshSessions();
+      noticeText = m.session_archived_notice();
     } catch (error) {
       errorText = describeError(error);
     }
@@ -3020,6 +3041,7 @@
       const response = await api.unarchiveSession(selectedSessionId);
       showArchivedSessions = false;
       await refreshSessions(response.session);
+      noticeText = m.session_restored_notice();
     } catch (error) {
       errorText = describeError(error);
     }
@@ -5048,6 +5070,9 @@
       onSearchScopeChange={updateSessionSearchScope}
       onSelect={(sessionId) => {
         void selectSession(sessionId);
+      }}
+      onToggleArchive={(session) => {
+        void archiveSessionFromSidebar(session);
       }}
       onStartAccountLogin={(type) => {
         void startAccountLogin(type);

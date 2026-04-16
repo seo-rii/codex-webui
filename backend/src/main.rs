@@ -672,6 +672,12 @@ async fn execute_ws_method(
 ) -> Result<Value> {
     match method {
         "config/get" => internal_json_request(state, Method::GET, "/api/config", None).await,
+        "config/update" => {
+            let payload = json!({
+                "systemShutdown": params.get("systemShutdown").cloned().unwrap_or_else(|| json!({}))
+            });
+            internal_json_request(state, Method::PATCH, "/api/config", Some(payload)).await
+        }
         "runtime/status" => codex_runtime_status(state, false).await,
         "runtime/checkUpdate" => codex_runtime_status(state, true).await,
         "runtime/quota" => codex_quota_status(

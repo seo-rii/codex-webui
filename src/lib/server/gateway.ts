@@ -19,6 +19,7 @@ import type {
   SessionQueueItem,
   SessionQueuePayload,
   SessionSummary,
+  StartupScheduledShutdownAlert,
   SessionTurnPayload,
   SessionTurnsPagePayload,
   StreamEvent,
@@ -435,10 +436,10 @@ export class CodexGateway {
   private loadedThreadIdsPromise: Promise<Set<string>> | null = null;
   private shutdownTimer: ReturnType<typeof setTimeout> | null = null;
   private shutdownScheduledFor: number | null = null;
-  private shutdownScheduledThreadId: string | null = null;
 
   constructor() {
     void uiStateStore.markQueuesPendingResume();
+    void this.restorePersistedShutdownState();
     this.client.onNotification((payload) => this.handleNotification(payload.method, payload.params));
     this.client.onServerRequest((payload) => {
       void this.handleServerRequest(payload);
@@ -471,7 +472,7 @@ export class CodexGateway {
       this.client.request("collaborationMode/list", {}),
       this.client.request("account/read", { refreshToken: false })
     ]);
-    const pausedQueueEntries = await uiStateStore.listResumePendingQueues();
+    const [pausedQueueEntries, globalState] = await Promise.all([uiStateStore.listResumePendingQueues(), uiStateStore.getGlobal()]);
     const preferences: Record<string, SessionPreferences> = pausedQueueEntries.length > 0 ? await uiStateStore.getAll() : {};
     const indexedSessions =
       pausedQueueEntries.length > 0 ? await sessionIndexClient.list(getRuntimeConfig().codexHome).catch(() => []) : [];
@@ -542,17 +543,16 @@ export class CodexGateway {
       },
       systemShutdown: {
         available: getRuntimeConfig().systemShutdownEnabled,
-        delaySeconds: getRuntimeConfig().systemShutdownDelaySeconds
+        delaySeconds: getRuntimeConfig().systemShutdownDelaySeconds,
+        armed: getRuntimeConfig().systemShutdownEnabled && globalState.shutdownAfterQueueCompletes
       },
       startup: {
         pausedQueues,
         scheduledShutdown:
-          this.shutdownScheduledFor && this.shutdownScheduledFor > Date.now()
-            ? {
-                sessionId: this.shutdownScheduledThreadId,
-                scheduledFor: this.shutdownScheduledFor,
-                delaySeconds: getRuntimeConfig().systemShutdownDelaySeconds
-              }
+          getRuntimeConfig().systemShutdownEnabled &&
+          globalState.scheduledShutdown &&
+          globalState.scheduledShutdown.scheduledFor > Date.now()
+            ? globalState.scheduledShutdown
             : null
       },
       account: {
@@ -1016,15 +1016,26 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         preferences: nextPreferences
       }
     });
-    this.emitGlobal({
-      kind: "notification",
-      method: "codex-webui/configUpdated",
-      params: {
-        defaults: getRuntimeConfig().defaults
-      }
-    });
+    void this.emitConfigUpdated();
     void this.emitSessionSummaryUpdated(threadId, null, nextPreferences);
     return nextPreferences;
+  }
+
+  async saveSystemShutdownAfterQueueCompletes(enabled: boolean) {
+    const runtimeConfig = getRuntimeConfig();
+    if (!runtimeConfig.systemShutdownEnabled && enabled) {
+      throw new Error("System shutdown support is disabled.");
+    }
+
+    await uiStateStore.setGlobalShutdownAfterQueueCompletes(Boolean(enabled));
+
+    if (!enabled) {
+      await this.clearScheduledShutdown();
+    } else {
+      await this.maybeScheduleGlobalShutdown(null);
+    }
+
+    return this.getConfig();
   }
 
   async getDraft(threadId: string): Promise<SessionDraftPayload> {
@@ -1085,6 +1096,8 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       throw new Error("Provide a prompt or at least one attachment.");
     }
 
+    await this.cancelScheduledShutdownForActivity();
+
     const nextItem = {
       id: crypto.randomUUID(),
       prompt: trimmedPrompt,
@@ -1111,6 +1124,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     await uiStateStore.removeQueueItem(threadId, queueId);
     const queue = await this.getQueue(threadId);
     this.emitQueueUpdated(threadId, queue);
+    await this.maybeScheduleGlobalShutdown(null);
     return queue;
   }
 
@@ -1207,6 +1221,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   async sendMessage(threadId: string, prompt: string, attachments: AttachmentRecord[], preferences: Partial<SessionPreferences>) {
+    await this.cancelScheduledShutdownForActivity();
     const inferredTitle = inferPersistedSessionTitle(prompt);
     const nextPreferences = await this.preparePreferences(preferences);
     const defaultModel = nextPreferences.model ?? (await this.getDefaultModel());
@@ -2072,6 +2087,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       this.activeTurns.set(threadId, String(turn.id ?? ""));
       this.loadedThreadIds.add(threadId);
       this.loadedThreadIdsLoadedAt = Date.now();
+      void this.cancelScheduledShutdownForActivity();
       void this.emitSessionSummaryUpdated(threadId, null, null, null, "running", Math.floor(Date.now() / 1000));
     } else if (method === "turn/completed") {
       const turn = asRecord(params.turn);
@@ -2079,7 +2095,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         this.activeTurns.delete(threadId);
       }
       void this.maybeDrainQueue(threadId);
-      void this.maybeScheduleShutdown(threadId, String(turn.id ?? ""));
+      void this.maybeScheduleGlobalShutdown(String(turn.id ?? ""));
       this.emitGlobal({
         kind: "notification",
         method: "codex-webui/sessionAttention",
@@ -2094,6 +2110,9 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       if (nextStatus !== "running" && nextStatus !== "active") {
         this.activeTurns.delete(threadId);
         void this.maybeDrainQueue(threadId);
+        void this.maybeScheduleGlobalShutdown(null);
+      } else {
+        void this.cancelScheduledShutdownForActivity();
       }
       if (nextStatus === "notLoaded") {
         this.loadedThreadIds.delete(threadId);
@@ -2292,11 +2311,190 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     }
   }
 
+  private async emitConfigUpdated() {
+    const runtimeConfig = getRuntimeConfig();
+    const globalState = await uiStateStore.getGlobal();
+    this.emitGlobal({
+      kind: "notification",
+      method: "codex-webui/configUpdated",
+      params: {
+        defaults: runtimeConfig.defaults,
+        systemShutdown: {
+          available: runtimeConfig.systemShutdownEnabled,
+          delaySeconds: runtimeConfig.systemShutdownDelaySeconds,
+          armed: runtimeConfig.systemShutdownEnabled && globalState.shutdownAfterQueueCompletes
+        },
+        startup: {
+          scheduledShutdown:
+            runtimeConfig.systemShutdownEnabled &&
+            globalState.scheduledShutdown &&
+            globalState.scheduledShutdown.scheduledFor > Date.now()
+              ? globalState.scheduledShutdown
+              : null
+        }
+      }
+    });
+  }
+
+  private armScheduledShutdown(shutdown: StartupScheduledShutdownAlert) {
+    if (this.shutdownTimer) {
+      clearTimeout(this.shutdownTimer);
+      this.shutdownTimer = null;
+    }
+
+    this.shutdownScheduledFor = shutdown.scheduledFor;
+
+    const delayMs = Math.max(0, shutdown.scheduledFor - Date.now());
+    this.shutdownTimer = setTimeout(() => {
+      void this.executeScheduledShutdown();
+    }, delayMs);
+  }
+
+  private async clearScheduledShutdown() {
+    if (this.shutdownTimer) {
+      clearTimeout(this.shutdownTimer);
+      this.shutdownTimer = null;
+    }
+
+    this.shutdownScheduledFor = null;
+    await uiStateStore.setScheduledShutdown(null);
+    await this.emitConfigUpdated();
+  }
+
+  private async executeScheduledShutdown() {
+    const runtimeConfig = getRuntimeConfig();
+    this.shutdownTimer = null;
+    this.shutdownScheduledFor = null;
+    await uiStateStore.setScheduledShutdown(null);
+    await this.emitConfigUpdated();
+
+    const command =
+      runtimeConfig.systemShutdownCommandOverride ??
+      (process.platform === "darwin"
+        ? "osascript"
+        : process.platform === "win32"
+          ? "shutdown"
+          : "shutdown");
+    const args =
+      runtimeConfig.systemShutdownCommandOverride
+        ? []
+        : process.platform === "darwin"
+          ? ["-e", 'tell app "System Events" to shut down']
+          : process.platform === "win32"
+            ? ["/s", "/t", "0"]
+            : ["-h", "now"];
+
+    execFile(command, args, (error) => {
+      if (!error) {
+        return;
+      }
+
+      this.emitGlobal({
+        kind: "notification",
+        method: "codex-webui/shutdownFailed",
+        params: {
+          message: error.message
+        }
+      });
+    });
+  }
+
+  private async restorePersistedShutdownState() {
+    const runtimeConfig = getRuntimeConfig();
+    const globalState = await uiStateStore.getGlobal();
+
+    if (!runtimeConfig.systemShutdownEnabled) {
+      if (globalState.scheduledShutdown || globalState.shutdownAfterQueueCompletes) {
+        await uiStateStore.setGlobalShutdownAfterQueueCompletes(false);
+        await uiStateStore.setScheduledShutdown(null);
+      }
+      return;
+    }
+
+    if (globalState.scheduledShutdown) {
+      this.armScheduledShutdown(globalState.scheduledShutdown);
+    } else if (globalState.shutdownAfterQueueCompletes) {
+      await this.maybeScheduleGlobalShutdown(null);
+    }
+  }
+
+  private async hasOutstandingQueuedWork() {
+    const queueCounts = await uiStateStore.getQueueCounts();
+    return Object.values(queueCounts).some((count) => count > 0);
+  }
+
+  private async hasActiveWorkAcrossThreads() {
+    if (this.activeTurns.size > 0) {
+      return true;
+    }
+
+    let cursor: string | null = null;
+    do {
+      const response = asRecord(await this.client.request("thread/list", { limit: 200, archived: false, cursor }));
+      const threads = (response.data as Array<Record<string, unknown>> | undefined) ?? [];
+      if (threads.some((thread) => LIVE_THREAD_STATUSES.has(String(normalizeThreadStatus(thread.status) ?? "unknown")))) {
+        return true;
+      }
+      cursor = typeof response.nextCursor === "string" && response.nextCursor.trim() ? String(response.nextCursor) : null;
+    } while (cursor);
+
+    return false;
+  }
+
+  private async maybeScheduleGlobalShutdown(completedTurnId: string | null) {
+    const runtimeConfig = getRuntimeConfig();
+    if (!runtimeConfig.systemShutdownEnabled || this.shutdownTimer) {
+      return;
+    }
+
+    const globalState = await uiStateStore.getGlobal();
+    if (!globalState.shutdownAfterQueueCompletes) {
+      return;
+    }
+
+    if (await this.hasOutstandingQueuedWork()) {
+      return;
+    }
+
+    if (await this.hasActiveWorkAcrossThreads()) {
+      return;
+    }
+
+    const scheduledShutdown = {
+      sessionId: null,
+      scheduledFor: Date.now() + runtimeConfig.systemShutdownDelaySeconds * 1000,
+      delaySeconds: runtimeConfig.systemShutdownDelaySeconds
+    } satisfies StartupScheduledShutdownAlert;
+
+    await uiStateStore.setScheduledShutdown(scheduledShutdown);
+    this.armScheduledShutdown(scheduledShutdown);
+    this.emitGlobal({
+      kind: "notification",
+      method: "codex-webui/shutdownScheduled",
+      params: {
+        delaySeconds: runtimeConfig.systemShutdownDelaySeconds,
+        turnId: completedTurnId,
+        scheduledFor: scheduledShutdown.scheduledFor,
+        sessionId: null
+      }
+    });
+    await this.emitConfigUpdated();
+  }
+
+  private async cancelScheduledShutdownForActivity() {
+    const globalState = await uiStateStore.getGlobal();
+    if (!globalState.shutdownAfterQueueCompletes || !globalState.scheduledShutdown) {
+      return;
+    }
+
+    await this.clearScheduledShutdown();
+  }
+
   private async maybeDrainQueue(threadId: string) {
     await this.withQueueDispatchLock(threadId, async () => {
       const queue = await this.getQueue(threadId);
       if (queue.items.length === 0) {
-        await this.maybeScheduleShutdown(threadId, null);
+        await this.maybeScheduleGlobalShutdown(null);
         return;
       }
       if (queue.resumeRequired) {
@@ -2329,90 +2527,6 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         });
       }
     });
-  }
-
-  private async maybeScheduleShutdown(threadId: string, completedTurnId: string | null) {
-    const runtimeConfig = getRuntimeConfig();
-    if (!runtimeConfig.systemShutdownEnabled || this.shutdownTimer) {
-      return;
-    }
-
-    const queue = await this.getQueue(threadId);
-    if (queue.items.length > 0) {
-      return;
-    }
-
-    const activeTurnId = await this.resolveActiveTurnId(threadId);
-    if (activeTurnId) {
-      return;
-    }
-
-    const stored = await uiStateStore.get(threadId);
-    if (!stored || !coercePreferences(stored).shutdownOnCompletion) {
-      return;
-    }
-
-    const nextPreferences = {
-      ...coercePreferences(stored),
-      shutdownOnCompletion: false
-    };
-    await uiStateStore.set(threadId, nextPreferences);
-    this.emit(threadId, {
-      kind: "notification",
-      method: "codex-webui/preferencesUpdated",
-      params: {
-        preferences: nextPreferences
-      }
-    });
-
-    const delayMs = runtimeConfig.systemShutdownDelaySeconds * 1000;
-    this.shutdownScheduledThreadId = threadId;
-    this.shutdownScheduledFor = Date.now() + delayMs;
-    this.emit(threadId, {
-      kind: "notification",
-      method: "codex-webui/shutdownScheduled",
-      params: {
-        delaySeconds: runtimeConfig.systemShutdownDelaySeconds,
-        turnId: completedTurnId,
-        scheduledFor: this.shutdownScheduledFor
-      }
-    });
-
-    this.shutdownTimer = setTimeout(() => {
-      this.shutdownTimer = null;
-      this.shutdownScheduledFor = null;
-      this.shutdownScheduledThreadId = null;
-
-      const command =
-        runtimeConfig.systemShutdownCommandOverride ??
-        (process.platform === "darwin"
-          ? "osascript"
-          : process.platform === "win32"
-            ? "shutdown"
-            : "shutdown");
-      const args =
-        runtimeConfig.systemShutdownCommandOverride
-          ? []
-          : process.platform === "darwin"
-            ? ["-e", 'tell app "System Events" to shut down']
-            : process.platform === "win32"
-              ? ["/s", "/t", "0"]
-              : ["-h", "now"];
-
-      execFile(command, args, (error) => {
-        if (!error) {
-          return;
-        }
-
-        this.emit(threadId, {
-          kind: "notification",
-          method: "codex-webui/shutdownFailed",
-          params: {
-            message: error.message
-          }
-        });
-      });
-    }, delayMs);
   }
 
   private emit(threadId: string, event: StreamEvent) {

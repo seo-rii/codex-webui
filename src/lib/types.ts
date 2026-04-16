@@ -170,6 +170,7 @@ export type AppConfigPayload = {
   systemShutdown: {
     available: boolean;
     delaySeconds: number;
+    armed: boolean;
   };
   startup: {
     pausedQueues: StartupPausedQueueAlert[];

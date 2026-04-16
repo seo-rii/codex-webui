@@ -2166,38 +2166,6 @@
   function connectStream(sessionId: string) {
     disconnectStream();
     releaseSessionStream = api.subscribeSession(sessionId, (payload: StreamEvent) => {
-      if (payload.kind === "notification" && payload.method === "codex-webui/shutdownScheduled") {
-        noticeText = ui.shutdownScheduledNotice(Number(payload.params.delaySeconds ?? 0));
-        if (config) {
-          config = {
-            ...config,
-            startup: {
-              ...config.startup,
-              scheduledShutdown: {
-                sessionId,
-                scheduledFor: Number(payload.params.scheduledFor ?? Date.now()),
-                delaySeconds: Number(payload.params.delaySeconds ?? config.systemShutdown.delaySeconds)
-              }
-            }
-          };
-          syncStartupAlertModal(config, true);
-        }
-      }
-
-      if (payload.kind === "notification" && payload.method === "codex-webui/shutdownFailed") {
-        errorText = m.shutdown_failed({ message: String(payload.params.message ?? m.unknown_error()) });
-        if (config?.startup.scheduledShutdown?.sessionId === sessionId) {
-          config = {
-            ...config,
-            startup: {
-              ...config.startup,
-              scheduledShutdown: null
-            }
-          };
-          syncStartupAlertModal(config);
-        }
-      }
-
       if (payload.kind === "notification" && payload.method === "codex-webui/queueDispatchFailed") {
         errorText = m.queue_dispatch_failed({ message: String(payload.params.message ?? m.unknown_error()) });
       }
@@ -2410,8 +2378,51 @@
       if (config) {
         config = {
           ...config,
-          defaults: event.params.defaults as SessionPreferences
+          defaults: (event.params.defaults as SessionPreferences | undefined) ?? config.defaults,
+          systemShutdown:
+            (event.params.systemShutdown as AppConfigPayload["systemShutdown"] | undefined) ?? config.systemShutdown,
+          startup: event.params.startup
+            ? {
+                ...config.startup,
+                ...(event.params.startup as Partial<AppConfigPayload["startup"]>)
+              }
+            : config.startup
         };
+        syncStartupAlertModal(config);
+      }
+      return;
+    }
+
+    if (event.method === "codex-webui/shutdownScheduled") {
+      noticeText = ui.shutdownScheduledNotice(Number(event.params.delaySeconds ?? config?.systemShutdown.delaySeconds ?? 0));
+      if (config) {
+        config = {
+          ...config,
+          startup: {
+            ...config.startup,
+            scheduledShutdown: {
+              sessionId: typeof event.params.sessionId === "string" ? String(event.params.sessionId) : null,
+              scheduledFor: Number(event.params.scheduledFor ?? Date.now()),
+              delaySeconds: Number(event.params.delaySeconds ?? config.systemShutdown.delaySeconds)
+            }
+          }
+        };
+        syncStartupAlertModal(config, true);
+      }
+      return;
+    }
+
+    if (event.method === "codex-webui/shutdownFailed") {
+      errorText = m.shutdown_failed({ message: String(event.params.message ?? m.unknown_error()) });
+      if (config) {
+        config = {
+          ...config,
+          startup: {
+            ...config.startup,
+            scheduledShutdown: null
+          }
+        };
+        syncStartupAlertModal(config);
       }
       return;
     }
@@ -2655,6 +2666,16 @@
         errorText = describeError(error);
       }
     }, 350);
+  }
+
+  async function saveSystemShutdownAfterQueueCompletes(armed: boolean) {
+    try {
+      const nextConfig = await api.saveSystemShutdownAfterQueueCompletes(armed);
+      config = nextConfig;
+      syncStartupAlertModal(nextConfig, Boolean(nextConfig.startup.scheduledShutdown));
+    } catch (error) {
+      errorText = describeError(error);
+    }
   }
 
   async function saveTitle() {
@@ -5079,13 +5100,6 @@
         label: m.network_enabled()
       });
     }
-    if (conversation.preferences.shutdownOnCompletion ?? false) {
-      indicators.push({
-        key: "shutdown",
-        icon: "power_settings_new",
-        label: m.shutdown_after_completion()
-      });
-    }
     return indicators;
   }
 
@@ -5316,6 +5330,9 @@
       {quotaBusy}
       {runtime}
       {runtimeBusyAction}
+      systemShutdownArmed={config?.systemShutdown.armed ?? false}
+      systemShutdownAvailable={config?.systemShutdown.available ?? false}
+      systemShutdownDelaySeconds={config?.systemShutdown.delaySeconds ?? 0}
       {themeMode}
       {resolvedTheme}
       {sessions}
@@ -5350,6 +5367,9 @@
       }}
       onRefreshRuntime={() => {
         void refreshRuntimeStatus(true);
+      }}
+      onSystemShutdownArmedChange={(armed) => {
+        void saveSystemShutdownAfterQueueCompletes(armed);
       }}
       onInstallRuntime={() => {
         void installCodex();
@@ -5441,7 +5461,7 @@
 
         <div class="relative">
           <button 
-            class="ui-animated-button ui-animated-button--strong flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-xs font-bold hover:bg-gray-800 transition-all shadow-sm active:scale-95"
+            class="surface-contrast-button ui-animated-button ui-animated-button--strong flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-xs font-bold hover:bg-gray-800 transition-all shadow-sm active:scale-95"
             onclick={() => (workspaceMenuOpen = !workspaceMenuOpen)}
           >
             <Plus size={14} />
@@ -5725,7 +5745,7 @@
           </div>
 
           <!-- Bottom Area -->
-          <div class="flex-shrink-0 px-6 pb-6 pt-4 bg-gradient-to-t from-white via-white/95 to-transparent z-10">
+          <div class="transcript-dock flex-shrink-0 px-6 pb-6 pt-4 z-10">
             <div class="max-w-3xl mx-auto w-full space-y-4">
               {#if pendingSteerResume && pendingSteerResume.sessionId === selectedSessionId}
                 <div class="p-4 bg-amber-600 text-white rounded-2xl shadow-xl flex flex-col md:flex-row items-center gap-4 animate-in slide-in-from-bottom-8 duration-500">
@@ -5735,9 +5755,9 @@
               {/if}
 
               {#if showQueueResumeBanner && conversation}
-                <div class="p-4 bg-gray-900 text-white rounded-2xl shadow-xl flex flex-col md:flex-row items-center gap-4 animate-in slide-in-from-bottom-8 duration-500">
+                <div class="queue-resume-banner p-4 bg-gray-900 text-white rounded-2xl shadow-xl flex flex-col md:flex-row items-center gap-4 animate-in slide-in-from-bottom-8 duration-500">
                   <div class="flex-1"><p class="text-sm font-bold flex items-center gap-2"><RefreshCw size={16} /> {ui.queuedWorkPaused}</p><p class="text-xs opacity-80 mt-0.5">{m.tasks_waiting({ count: String(conversation.queue.items.length) })}</p></div>
-                  <div class="flex gap-2"><button class="px-4 py-1.5 bg-amber-600 text-white rounded-lg text-xs font-bold hover:bg-amber-700 shadow-sm" onclick={() => void resumeQueuedMessages()}>{ui.resumeQueue}</button><button class="px-4 py-1.5 bg-gray-800 hover:bg-gray-700 text-white rounded-lg text-xs font-bold transition-colors" onclick={() => { if (!selectedSessionId) return; dismissedQueueResumeBySessionId = { ...dismissedQueueResumeBySessionId, [selectedSessionId]: true }; }}>{ui.ignore}</button></div>
+                  <div class="flex gap-2"><button class="px-4 py-1.5 bg-amber-600 text-white rounded-lg text-xs font-bold hover:bg-amber-700 shadow-sm" onclick={() => void resumeQueuedMessages()}>{ui.resumeQueue}</button><button class="queue-resume-ignore px-4 py-1.5 bg-gray-800 hover:bg-gray-700 text-white rounded-lg text-xs font-bold transition-colors" onclick={() => { if (!selectedSessionId) return; dismissedQueueResumeBySessionId = { ...dismissedQueueResumeBySessionId, [selectedSessionId]: true }; }}>{ui.ignore}</button></div>
                 </div>
               {/if}
 
@@ -5968,8 +5988,8 @@
               {/if}
 
               <div class="relative group">
-                <form class="bg-white/95 border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200 focus-within:-translate-y-0.5 focus-within:border-amber-400/70 focus-within:bg-white focus-within:shadow-[0_24px_60px_-34px_rgba(245,158,11,0.65)]" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
-                  <textarea bind:this={composerTextareaElement} bind:value={draft} class="w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 transition-colors duration-150 focus:ring-0 focus:placeholder:text-amber-500/70 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} rows="1"></textarea>
+                <form class="composer-panel bg-white/95 border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200 focus-within:-translate-y-0.5 focus-within:border-amber-400/70 focus-within:bg-white focus-within:shadow-[0_24px_60px_-34px_rgba(245,158,11,0.65)]" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
+                  <textarea bind:this={composerTextareaElement} bind:value={draft} class="composer-textarea w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 transition-colors duration-150 focus:ring-0 focus:placeholder:text-amber-500/70 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} rows="1"></textarea>
                   
                   {#if draftAttachments.length > 0}
                     <div class="px-4 pb-2 flex flex-wrap gap-2">
@@ -5983,12 +6003,12 @@
                       <button class="ui-animated-button ui-animated-button--icon rounded-xl p-1.5 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 group-focus-within:bg-white/90 group-focus-within:text-amber-700 sm:p-2" disabled={uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={18} class="animate-spin" />{:else}<Paperclip size={18} />{/if}</button>
                       {#if conversation}
                         <div class="mx-0.5 hidden h-4 w-px bg-gray-200 sm:block"></div>
-                        <button class="ui-animated-button ui-animated-button--soft flex min-w-0 max-w-[8.5rem] items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:max-w-[11rem] sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button">
+                        <button class="composer-compact-trigger ui-animated-button ui-animated-button--soft flex min-w-0 max-w-[8.5rem] items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:max-w-[11rem] sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button">
                           <SlidersHorizontal size={13} class="shrink-0 text-gray-400" />
                           <span class="truncate">{composerSettingsSummary.model}</span>
                           <ChevronDown size={14} class={`shrink-0 transition-transform ${composerSettingsOpen ? "rotate-180" : ""}`} />
                         </button>
-                        <button class="ui-animated-button ui-animated-button--soft flex shrink-0 items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSecurityOpen = !composerSecurityOpen; composerSettingsOpen = false; }} title={ui.securitySession} type="button"><Shield size={14} class="text-gray-400" /><span class="hidden sm:inline">{ui.securitySession}</span></button>
+                        <button class="composer-compact-trigger ui-animated-button ui-animated-button--soft flex shrink-0 items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSecurityOpen = !composerSecurityOpen; composerSettingsOpen = false; }} title={ui.securitySession} type="button"><Shield size={14} class="text-gray-400" /><span class="hidden sm:inline">{ui.securitySession}</span></button>
                       {/if}
                     </div>
                     <div class="flex w-full items-center justify-end gap-1.5 sm:w-auto sm:gap-2">
@@ -5996,11 +6016,11 @@
                         <button class="ui-animated-button ui-animated-button--soft rounded-xl px-3 py-1.5 text-[11px] font-bold text-red-600 transition-all hover:bg-red-50 sm:px-4 sm:py-2 sm:text-xs" onclick={interruptTurn} type="button">{ui.stop}</button>
                         <button class="ui-animated-button ui-animated-button--soft rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] font-bold text-amber-700 transition-all hover:bg-amber-100 disabled:opacity-50 sm:px-4 sm:py-2 sm:text-xs" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
                       {/if}
-                      <button class="ui-animated-button ui-animated-button--strong rounded-xl bg-gray-900 px-4 py-1.5 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:px-6 sm:py-2 sm:text-xs" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
+                      <button class="surface-contrast-button ui-animated-button ui-animated-button--strong rounded-xl bg-gray-900 px-4 py-1.5 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:px-6 sm:py-2 sm:text-xs" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
                     </div>
                   </div>
                   {#if conversation}
-                    <div class="flex flex-wrap items-center gap-2 border-t border-gray-100/80 bg-white/72 px-3 pb-3 pt-2.5 sm:px-4">
+                    <div class="composer-meta-row flex flex-wrap items-center gap-2 border-t border-gray-100/80 bg-white/72 px-3 pb-3 pt-2.5 sm:px-4">
                       <button
                         class={`ui-animated-button ui-animated-button--soft inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
                           (conversation.preferences.mode ?? "default") === "plan"
@@ -6022,7 +6042,7 @@
                         <span class="px-1.5 text-[9px] font-bold uppercase tracking-[0.14em] text-gray-400 sm:px-2">{ui.speed}</span>
                         {#each speedOptions as option}
                           <button
-                            class={`ui-animated-button ui-animated-button--soft rounded-lg px-2.5 py-1 text-[10px] font-bold transition-all sm:text-[11px] ${
+                            class={`ui-animated-button ui-animated-button--soft ${ (conversation.preferences.speed ?? "auto") === option ? "surface-contrast-button" : "" } rounded-lg px-2.5 py-1 text-[10px] font-bold transition-all sm:text-[11px] ${
                               (conversation.preferences.speed ?? "auto") === option
                                 ? "bg-gray-900 text-white shadow-sm"
                                 : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"
@@ -6069,21 +6089,6 @@
                         <span aria-hidden="true" class="checkbox-control"></span>
                         <span class="checkbox-copy">
                           <span class="checkbox-title">{ui.allowNetworkAccess}</span>
-                        </span>
-                      </label>
-                      <label class:checkbox-card--disabled={!config?.systemShutdown.available} class="checkbox-card" for="shutdown-on-completion">
-                        <input
-                          class="checkbox-input"
-                          checked={conversation.preferences.shutdownOnCompletion ?? false}
-                          disabled={!config?.systemShutdown.available}
-                          onchange={(event) => setPreference("shutdownOnCompletion", (event.currentTarget as HTMLInputElement).checked)}
-                          type="checkbox"
-                          id="shutdown-on-completion"
-                        />
-                        <span aria-hidden="true" class="checkbox-control"></span>
-                        <span class="checkbox-copy">
-                          <span class="checkbox-title">{ui.shutdownAfterQueueCompletes}</span>
-                          <span class="checkbox-description">{m.shutdown_wait_description({ seconds: String(config?.systemShutdown.delaySeconds ?? 30) })}</span>
                         </span>
                       </label>
                     </div>
@@ -6359,6 +6364,98 @@
   .ui-animated-button:disabled {
     transform: none;
     box-shadow: none;
+  }
+
+  .transcript-dock {
+    background: linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0) 0%,
+      rgba(255, 255, 255, 0.92) 22%,
+      rgba(255, 255, 255, 0.97) 58%,
+      rgba(255, 255, 255, 0.99) 100%
+    );
+  }
+
+  .composer-panel {
+    backdrop-filter: blur(18px);
+  }
+
+  .composer-meta-row {
+    backdrop-filter: blur(12px);
+  }
+
+  :global(:root[data-theme="dark"]) .transcript-dock {
+    background: linear-gradient(
+      180deg,
+      rgba(11, 18, 32, 0) 0%,
+      rgba(11, 18, 32, 0.82) 20%,
+      rgba(11, 18, 32, 0.95) 56%,
+      rgba(11, 18, 32, 0.99) 100%
+    );
+  }
+
+  :global(:root[data-theme="dark"]) .queue-resume-banner {
+    background: linear-gradient(135deg, rgba(17, 24, 39, 0.96), rgba(15, 23, 42, 0.98)) !important;
+    border: 1px solid rgba(71, 85, 105, 0.55);
+    box-shadow: 0 26px 54px -34px rgba(2, 6, 23, 0.82) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .queue-resume-ignore {
+    background-color: rgba(51, 65, 85, 0.92) !important;
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .queue-resume-ignore:hover {
+    background-color: rgba(71, 85, 105, 0.98) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-panel {
+    background: linear-gradient(180deg, rgba(17, 24, 39, 0.96), rgba(11, 18, 32, 0.985)) !important;
+    border-color: rgba(71, 85, 105, 0.58) !important;
+    box-shadow: 0 30px 72px -38px rgba(2, 6, 23, 0.88) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-panel:focus-within {
+    background: linear-gradient(180deg, rgba(17, 24, 39, 0.98), rgba(11, 18, 32, 1)) !important;
+    border-color: rgba(245, 158, 11, 0.45) !important;
+    box-shadow: 0 30px 72px -36px rgba(245, 158, 11, 0.28) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-textarea {
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-toolbar {
+    border-color: rgba(71, 85, 105, 0.42) !important;
+    background: linear-gradient(180deg, rgba(17, 24, 39, 0.9), rgba(11, 18, 32, 0.97)) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-meta-row {
+    border-color: rgba(71, 85, 105, 0.36) !important;
+    background: linear-gradient(180deg, rgba(15, 23, 42, 0.94), rgba(11, 18, 32, 0.985)) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-compact-trigger {
+    color: #cbd5e1 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-compact-trigger:hover,
+  :global(:root[data-theme="dark"]) .composer-panel:focus-within .composer-compact-trigger {
+    background-color: rgba(255, 255, 255, 0.06) !important;
+    border-color: rgba(148, 163, 184, 0.22) !important;
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .surface-contrast-button {
+    background: linear-gradient(180deg, rgba(51, 65, 85, 0.96), rgba(30, 41, 59, 0.98)) !important;
+    color: #f8fafc !important;
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    box-shadow: 0 18px 34px -26px rgba(2, 6, 23, 0.72) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .surface-contrast-button:hover {
+    background: linear-gradient(180deg, rgba(71, 85, 105, 0.98), rgba(51, 65, 85, 1)) !important;
+    color: #f8fafc !important;
   }
 
   .turn-card-header {

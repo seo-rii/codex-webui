@@ -1,10 +1,14 @@
 import fsp from "node:fs/promises";
 
-import type { SessionPreferences, SessionQueueItem } from "$lib/types";
+import type { SessionPreferences, SessionQueueItem, StartupScheduledShutdownAlert } from "$lib/types";
 
 import { ensureDataDirectories, getStoreFilePath, pathExists } from "./fs";
 
 type UiState = {
+  global: {
+    shutdownAfterQueueCompletes: boolean;
+    scheduledShutdown: StartupScheduledShutdownAlert | null;
+  };
   preferencesByThreadId: Record<string, SessionPreferences>;
   draftsByThreadId: Record<
     string,
@@ -36,7 +40,15 @@ class UiStateStore {
     await ensureDataDirectories();
     const storePath = getStoreFilePath();
     if (!(await pathExists(storePath))) {
-      this.state = { preferencesByThreadId: {}, draftsByThreadId: {}, queuesByThreadId: {} };
+      this.state = {
+        global: {
+          shutdownAfterQueueCompletes: false,
+          scheduledShutdown: null
+        },
+        preferencesByThreadId: {},
+        draftsByThreadId: {},
+        queuesByThreadId: {}
+      };
       return this.state;
     }
 
@@ -44,6 +56,10 @@ class UiStateStore {
       const raw = await fsp.readFile(storePath, "utf8");
       const parsed = JSON.parse(raw) as UiState;
       this.state = {
+        global: {
+          shutdownAfterQueueCompletes: Boolean(parsed.global?.shutdownAfterQueueCompletes),
+          scheduledShutdown: parsed.global?.scheduledShutdown ?? null
+        },
         preferencesByThreadId: parsed.preferencesByThreadId ?? {},
         draftsByThreadId: parsed.draftsByThreadId ?? {},
         queuesByThreadId: parsed.queuesByThreadId ?? {}
@@ -55,7 +71,15 @@ class UiStateStore {
         // Ignore rename failures and continue with a clean in-memory state.
       }
 
-      this.state = { preferencesByThreadId: {}, draftsByThreadId: {}, queuesByThreadId: {} };
+      this.state = {
+        global: {
+          shutdownAfterQueueCompletes: false,
+          scheduledShutdown: null
+        },
+        preferencesByThreadId: {},
+        draftsByThreadId: {},
+        queuesByThreadId: {}
+      };
       await this.flush();
     }
 
@@ -70,6 +94,32 @@ class UiStateStore {
   async get(threadId: string) {
     const state = await this.load();
     return state.preferencesByThreadId[threadId] ?? null;
+  }
+
+  async getGlobal() {
+    const state = await this.load();
+    return {
+      shutdownAfterQueueCompletes: Boolean(state.global.shutdownAfterQueueCompletes),
+      scheduledShutdown: state.global.scheduledShutdown ?? null
+    };
+  }
+
+  async setGlobalShutdownAfterQueueCompletes(enabled: boolean) {
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      state.global.shutdownAfterQueueCompletes = enabled;
+      await this.flush();
+    });
+    return this.writeChain;
+  }
+
+  async setScheduledShutdown(scheduledShutdown: StartupScheduledShutdownAlert | null) {
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      state.global.scheduledShutdown = scheduledShutdown;
+      await this.flush();
+    });
+    return this.writeChain;
   }
 
   async getAll() {

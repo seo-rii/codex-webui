@@ -283,12 +283,52 @@
     background-color: color-mix(in srgb, var(--panel-strong) 82%, transparent) !important;
   }
 
+  :root[data-theme="dark"] .bg-white\/95 {
+    background-color: color-mix(in srgb, var(--panel-strong) 95%, transparent) !important;
+  }
+
+  :root[data-theme="dark"] .bg-white\/90 {
+    background-color: color-mix(in srgb, var(--panel-strong) 90%, transparent) !important;
+  }
+
+  :root[data-theme="dark"] .bg-white\/85 {
+    background-color: color-mix(in srgb, var(--panel-strong) 86%, transparent) !important;
+  }
+
+  :root[data-theme="dark"] .bg-white\/82 {
+    background-color: color-mix(in srgb, var(--panel-strong) 82%, transparent) !important;
+  }
+
+  :root[data-theme="dark"] .bg-white\/72 {
+    background-color: color-mix(in srgb, var(--panel-strong) 74%, transparent) !important;
+  }
+
+  :root[data-theme="dark"] .bg-white\/65 {
+    background-color: color-mix(in srgb, var(--panel-strong) 66%, transparent) !important;
+  }
+
   :root[data-theme="dark"] .bg-white\/50 {
     background-color: color-mix(in srgb, var(--panel-strong) 52%, transparent) !important;
   }
 
   :root[data-theme="dark"] .hover\:bg-white:hover {
     background-color: var(--panel-strong) !important;
+  }
+
+  :root[data-theme="dark"] .focus-within\:bg-white:focus-within {
+    background-color: var(--panel-strong) !important;
+  }
+
+  :root[data-theme="dark"] .group:focus-within .group-focus-within\:bg-white\/90 {
+    background-color: color-mix(in srgb, var(--panel-strong) 90%, transparent) !important;
+  }
+
+  :root[data-theme="dark"] .border-white\/80 {
+    border-color: color-mix(in srgb, var(--line) 92%, transparent) !important;
+  }
+
+  :root[data-theme="dark"] .border-white\/70 {
+    border-color: color-mix(in srgb, var(--line) 80%, transparent) !important;
   }
 
   :root[data-theme="dark"] .placeholder-gray-400::placeholder {

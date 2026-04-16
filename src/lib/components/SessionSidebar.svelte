@@ -53,11 +53,15 @@
     quotaBusy,
     runtime,
     runtimeBusyAction,
+    systemShutdownArmed,
+    systemShutdownAvailable,
+    systemShutdownDelaySeconds,
     themeMode,
     resolvedTheme,
     accountLoginFlow,
     onRefreshQuota,
     onRefreshRuntime,
+    onSystemShutdownArmedChange,
     onInstallRuntime,
     onUpdateRuntime,
     onThemeModeChange,
@@ -97,11 +101,15 @@
     quotaBusy: boolean;
     runtime: CodexRuntimeStatus | null;
     runtimeBusyAction: "install" | "update" | "check" | null;
+    systemShutdownArmed: boolean;
+    systemShutdownAvailable: boolean;
+    systemShutdownDelaySeconds: number;
     themeMode: ThemeMode;
     resolvedTheme: ResolvedTheme;
     accountLoginFlow: CodexAccountLoginFlow | null;
     onRefreshQuota: () => void;
     onRefreshRuntime: () => void;
+    onSystemShutdownArmedChange: (armed: boolean) => void;
     onInstallRuntime: () => void;
     onUpdateRuntime: () => void;
     onThemeModeChange: (mode: ThemeMode) => void;
@@ -159,6 +167,8 @@
       runtime: m.runtime(),
       version: m.version(),
       binary: m.binary(),
+      shutdownAfterQueueCompletes: m.shutdown_after_queue_completes(),
+      shutdownWaitDescription: (seconds: number) => m.shutdown_wait_description({ seconds: String(seconds) }),
       missing: m.missing(),
       check: m.check(),
       update: m.update(),
@@ -885,6 +895,21 @@
                 <span class="text-gray-500">{ui.binary}</span>
                 <code class="px-1.5 py-0.5 bg-white border border-gray-200 rounded text-[10px]">{runtime?.configuredBin ?? "codex"}</code>
               </div>
+              <label class:checkbox-card--disabled={!systemShutdownAvailable} class="checkbox-card checkbox-card--compact" for="global-shutdown-after-queue">
+                <input
+                  class="checkbox-input"
+                  checked={systemShutdownArmed}
+                  disabled={!systemShutdownAvailable}
+                  id="global-shutdown-after-queue"
+                  onchange={(event) => onSystemShutdownArmedChange((event.currentTarget as HTMLInputElement).checked)}
+                  type="checkbox"
+                />
+                <span aria-hidden="true" class="checkbox-control"></span>
+                <span class="checkbox-copy">
+                  <span class="checkbox-title">{ui.shutdownAfterQueueCompletes}</span>
+                  <span class="checkbox-description">{ui.shutdownWaitDescription(systemShutdownDelaySeconds)}</span>
+                </span>
+              </label>
 
               <div class="flex gap-2 pt-1">
                 {#if !runtime?.installed}

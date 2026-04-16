@@ -117,6 +117,14 @@ export const api = {
     return ws.request<AppConfigPayload>("config/get");
   },
 
+  saveSystemShutdownAfterQueueCompletes(armed: boolean) {
+    return ws.request<AppConfigPayload>("config/update", {
+      systemShutdown: {
+        armed
+      }
+    });
+  },
+
   getRuntimeStatus() {
     return ws.request<CodexRuntimeStatus>("runtime/status");
   },

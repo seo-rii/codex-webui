@@ -114,7 +114,11 @@
   } = $props();
 
   let accountMenuOpen = $state(false);
+  let searchPanelOpen = $state(false);
   let listElement = $state<HTMLDivElement | undefined>(undefined);
+  let searchTriggerElement = $state<HTMLButtonElement | undefined>(undefined);
+  let searchPanelElement = $state<HTMLDivElement | undefined>(undefined);
+  let searchInputElement = $state<HTMLInputElement | undefined>(undefined);
   let accountButtonElement = $state<HTMLButtonElement | undefined>(undefined);
   let accountPopoverElement = $state<HTMLDivElement | undefined>(undefined);
   let accountPopoverStyle = $state("");
@@ -159,6 +163,7 @@
       check: m.check(),
       update: m.update(),
       install: m.install(),
+      close: m.close(),
       refreshQuota: m.refresh_quota(),
       switchAccount: m.switch_account(),
       signInAction: m.sign_in_action(),
@@ -311,12 +316,52 @@
     onLoadMore();
   }
 
+  function toggleSearchPanel() {
+    searchPanelOpen = !searchPanelOpen;
+  }
+
+  function closeSearchPanel() {
+    searchPanelOpen = false;
+  }
+
+  function clearSearchQuery() {
+    onSearchQueryChange("");
+  }
+
+  function searchTriggerLabel() {
+    const query = searchQuery.trim();
+    if (query) {
+      return query;
+    }
+    return showArchived ? ui.searchArchived : ui.searchThreads;
+  }
+
+  function searchTriggerSubLabel() {
+    if (searchScope === "full") {
+      return ui.searchScopeFull;
+    }
+    if (searchQuery.trim()) {
+      return ui.searchScopeSummary;
+    }
+    return null;
+  }
+
   $effect(() => {
     searchQuery;
     searchScope;
     showArchived;
     boundedAutoloadPasses = 0;
     loadMoreOrigin = null;
+  });
+
+  $effect(() => {
+    if (!searchPanelOpen) {
+      return;
+    }
+    void tick().then(() => {
+      searchInputElement?.focus();
+      searchInputElement?.select();
+    });
   });
 
   $effect(() => {
@@ -388,12 +433,47 @@
       }
     };
 
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (
+        searchPanelOpen &&
+        target &&
+        !searchPanelElement?.contains(target) &&
+        !searchTriggerElement?.contains(target)
+      ) {
+        closeSearchPanel();
+      }
+      if (
+        accountMenuOpen &&
+        target &&
+        !accountPopoverElement?.contains(target) &&
+        !accountButtonElement?.contains(target)
+      ) {
+        accountMenuOpen = false;
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        if (searchPanelOpen) {
+          closeSearchPanel();
+        }
+        if (accountMenuOpen) {
+          accountMenuOpen = false;
+        }
+      }
+    };
+
     window.addEventListener("resize", update);
     window.addEventListener("scroll", update, true);
+    window.addEventListener("mousedown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
 
     return () => {
       window.removeEventListener("resize", update);
       window.removeEventListener("scroll", update, true);
+      window.removeEventListener("mousedown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
     };
   });
 </script>
@@ -439,34 +519,97 @@
       </button>
     </div>
 
-    <div class="relative group">
-      <div class="absolute inset-y-0 left-3 flex items-center pointer-events-none text-gray-400 group-focus-within:text-amber-600 transition-colors">
-        <Search size={16} />
-      </div>
-      <input
-        class="w-full pl-10 pr-4 py-2 bg-white/50 border border-gray-200 rounded-xl text-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500/50 transition-all"
-        oninput={(event) => onSearchQueryChange((event.currentTarget as HTMLInputElement).value)}
-        placeholder={showArchived ? ui.searchArchived : ui.searchThreads}
-        type="search"
-        value={searchQuery}
-      />
-    </div>
+    <div class="relative">
+      <button
+        bind:this={searchTriggerElement}
+        aria-expanded={searchPanelOpen}
+        class={`flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition-all ${
+          searchPanelOpen
+            ? "border-amber-300 bg-white shadow-lg shadow-amber-100/40"
+            : searchQuery.trim() || searchScope === "full"
+              ? "border-amber-200/80 bg-amber-50/70 shadow-sm"
+              : "border-gray-200 bg-white/70 hover:border-gray-300 hover:bg-white hover:shadow-sm"
+        }`}
+        onclick={toggleSearchPanel}
+        type="button"
+      >
+        <div class={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${
+          searchPanelOpen || searchQuery.trim() || searchScope === "full"
+            ? "border-amber-200 bg-amber-50 text-amber-700"
+            : "border-gray-200 bg-gray-50 text-gray-400"
+        }`}>
+          <Search size={15} />
+        </div>
+        <div class="min-w-0 flex-1">
+          <p class={`truncate text-sm font-medium ${searchQuery.trim() ? "text-gray-900" : "text-gray-500"}`}>
+            {searchTriggerLabel()}
+          </p>
+          {#if searchTriggerSubLabel()}
+            <p class="mt-0.5 truncate text-[11px] font-medium text-gray-400">{searchTriggerSubLabel()}</p>
+          {/if}
+        </div>
+        <ChevronDown size={15} class={`shrink-0 text-gray-400 transition-transform ${searchPanelOpen ? "rotate-180" : ""}`} />
+      </button>
 
-    <div class="flex gap-1 rounded-lg bg-gray-200/50 p-1">
-      <button
-        class="flex-1 rounded-md px-2 py-1.5 text-[11px] font-semibold transition-all {searchScope === 'summary' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}"
-        onclick={() => onSearchScopeChange("summary")}
-        type="button"
-      >
-        {ui.searchScopeSummary}
-      </button>
-      <button
-        class="flex-1 rounded-md px-2 py-1.5 text-[11px] font-semibold transition-all {searchScope === 'full' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}"
-        onclick={() => onSearchScopeChange("full")}
-        type="button"
-      >
-        {ui.searchScopeFull}
-      </button>
+      {#if searchPanelOpen}
+        <div
+          bind:this={searchPanelElement}
+          class="absolute left-0 right-0 top-[calc(100%+0.55rem)] z-20 overflow-hidden rounded-2xl border border-amber-200/80 bg-white shadow-[0_20px_48px_-28px_rgba(217,119,6,0.45)]"
+        >
+          <div class="space-y-3 p-3.5">
+            <div class="relative group">
+              <div class="absolute inset-y-0 left-3 flex items-center pointer-events-none text-gray-400 transition-colors group-focus-within:text-amber-600">
+                <Search size={16} />
+              </div>
+              <input
+                bind:this={searchInputElement}
+                class="w-full rounded-xl border border-gray-200 bg-gray-50/80 py-2.5 pl-10 pr-10 text-sm text-gray-700 placeholder-gray-400 transition-all focus:border-amber-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500/10"
+                oninput={(event) => onSearchQueryChange((event.currentTarget as HTMLInputElement).value)}
+                onkeydown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    closeSearchPanel();
+                  }
+                }}
+                placeholder={showArchived ? ui.searchArchived : ui.searchThreads}
+                type="search"
+                value={searchQuery}
+              />
+              {#if searchQuery.trim()}
+                <button
+                  class="absolute inset-y-0 right-2 my-auto flex h-7 w-7 items-center justify-center rounded-lg text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600"
+                  onclick={clearSearchQuery}
+                  title={ui.close}
+                  type="button"
+                >
+                  <X size={14} />
+                </button>
+              {/if}
+            </div>
+
+            <div class="flex gap-1 rounded-xl bg-gray-100 p-1">
+              <button
+                class={`flex-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-all ${
+                  searchScope === "summary" ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"
+                }`}
+                onclick={() => onSearchScopeChange("summary")}
+                type="button"
+              >
+                {ui.searchScopeSummary}
+              </button>
+              <button
+                class={`flex-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-all ${
+                  searchScope === "full" ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"
+                }`}
+                onclick={() => onSearchScopeChange("full")}
+                type="button"
+              >
+                {ui.searchScopeFull}
+              </button>
+            </div>
+          </div>
+        </div>
+      {/if}
     </div>
   </div>
 

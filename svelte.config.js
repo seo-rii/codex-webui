@@ -17,9 +17,7 @@ function normalizeBasePath(value) {
 }
 
 const env = loadEnv(process.env.NODE_ENV ?? "development", process.cwd(), "");
-const basePath = normalizeBasePath(
-  process.env.CODEX_WEBUI_BASE_PATH ?? env.CODEX_WEBUI_BASE_PATH ?? process.env.VITE_BASE_PATH ?? env.VITE_BASE_PATH
-);
+const basePath = normalizeBasePath(process.env.CODEX_WEBUI_BASE_PATH ?? env.CODEX_WEBUI_BASE_PATH);
 const trustedOrigins = [
   ...new Set(
     String(process.env.CODEX_WEBUI_CORS_ALLOWED_ORIGINS ?? env.CODEX_WEBUI_CORS_ALLOWED_ORIGINS ?? "")

@@ -27,6 +27,7 @@ export type SessionSummary = {
   id: string;
   name: string | null;
   preview: string;
+  queueCount: number;
   cwd: string;
   archived: boolean;
   createdAt: number;
@@ -415,6 +416,12 @@ export type GitCommit = {
   author: string;
   authoredAt: string;
   subject: string;
+};
+
+export type GitCommitDiffPayload = {
+  repoPath: string;
+  commitHash: string;
+  diff: string;
 };
 
 export type GitFileStatus = {

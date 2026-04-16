@@ -6,7 +6,16 @@ import { promisify } from "node:util";
 
 import { error } from "@sveltejs/kit";
 
-import type { GitBranch, GitCommit, GitFilePayload, GitFileStatus, GitRepository, GitStatusPayload, GitWorktree } from "$lib/types";
+import type {
+  GitBranch,
+  GitCommit,
+  GitCommitDiffPayload,
+  GitFilePayload,
+  GitFileStatus,
+  GitRepository,
+  GitStatusPayload,
+  GitWorktree
+} from "$lib/types";
 
 import { getRuntimeConfig } from "./env";
 import { realPathSafe } from "./fs";
@@ -574,6 +583,21 @@ export async function getGitFile(repoPath: string, filePath: string): Promise<Gi
     language: inferLanguage(filePath),
     isBinary: original.isBinary || modified.isBinary,
     status
+  };
+}
+
+export async function getGitCommitDiff(repoPath: string, commitHash: string): Promise<GitCommitDiffPayload> {
+  const repository = await resolveGitRepository(repoPath);
+  const normalizedCommitHash = commitHash.trim();
+  if (!normalizedCommitHash) {
+    throw error(400, "commitHash is required.");
+  }
+
+  const diff = await runGitText(repository.path, ["show", "--format=", "--find-renames", "--find-copies", "--no-ext-diff", normalizedCommitHash]);
+  return {
+    repoPath: repository.path,
+    commitHash: normalizedCommitHash,
+    diff
   };
 }
 

@@ -1,12 +1,12 @@
 import { base } from "$app/paths";
-import { error, redirect, type Handle } from "@sveltejs/kit";
+import { error, type Handle } from "@sveltejs/kit";
 
 import { getTextDirection } from "$lib/paraglide/runtime.js";
 import { paraglideMiddleware } from "$lib/paraglide/server.js";
 import { isAuthenticated } from "$lib/server/auth";
 import { getRuntimeConfig } from "$lib/server/env";
 
-const PUBLIC_PATHS = new Set(["/login", "/api/auth/login", "/api/auth/session"]);
+const PUBLIC_API_PATHS = new Set(["/api/auth/login", "/api/auth/logout", "/api/auth/session"]);
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 const CORS_METHODS = "GET,HEAD,POST,PATCH,PUT,DELETE,OPTIONS";
@@ -77,14 +77,6 @@ function stripBase(pathname: string) {
   return pathname;
 }
 
-function withBase(pathname: string) {
-  if (!base) {
-    return pathname;
-  }
-
-  return pathname === "/" ? base : `${base}${pathname}`;
-}
-
 function appendVaryHeader(headers: Headers, value: string) {
   const current = headers.get("vary");
   if (!current) {
@@ -136,7 +128,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 
       const routePath = stripBase(event.url.pathname);
       const isApiRoute = routePath.startsWith("/api/");
-      const isPublicPath = PUBLIC_PATHS.has(routePath);
+      const isPublicApiPath = PUBLIC_API_PATHS.has(routePath);
       const requestOrigin = normalizeOrigin(event.request.headers.get("origin") ?? "");
       const corsOrigin = isCorsAllowedOrigin(requestOrigin) ? requestOrigin : null;
       const requestedCorsHeaders = event.request.headers.get("access-control-request-headers");
@@ -162,15 +154,12 @@ export const handle: Handle = async ({ event, resolve }) => {
         }
       }
 
-      if (!isPublicPath && !event.locals.authenticated) {
-        if (isApiRoute) {
-          const response = new Response("Authentication required.", { status: 401 });
-          if (corsOrigin) {
-            applyCorsHeaders(response.headers, corsOrigin, requestedCorsHeaders);
-          }
-          return response;
+      if (isApiRoute && !isPublicApiPath && !event.locals.authenticated) {
+        const response = new Response("Authentication required.", { status: 401 });
+        if (corsOrigin) {
+          applyCorsHeaders(response.headers, corsOrigin, requestedCorsHeaders);
         }
-        throw redirect(303, withBase("/login"));
+        return response;
       }
 
       const response = await resolve(event, {

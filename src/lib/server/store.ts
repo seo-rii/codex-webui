@@ -137,6 +137,13 @@ class UiStateStore {
     return state.queuesByThreadId[threadId] ?? null;
   }
 
+  async getQueueCounts() {
+    const state = await this.load();
+    return Object.fromEntries(
+      Object.entries(state.queuesByThreadId).map(([threadId, queue]) => [threadId, queue.items.length])
+    );
+  }
+
   async listResumePendingQueues() {
     const state = await this.load();
     return Object.entries(state.queuesByThreadId)

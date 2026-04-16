@@ -84,6 +84,7 @@ async function parseSessionFile(filePath) {
   let createdAt = null;
   let preview = "";
   let explicitName = null;
+  let isSubagent = false;
   let lineCount = 0;
 
   try {
@@ -104,6 +105,13 @@ async function parseSessionFile(filePath) {
         const payload = asObject(entry.payload);
         sessionId = typeof payload.id === "string" ? payload.id : sessionId;
         cwd = typeof payload.cwd === "string" ? payload.cwd : cwd;
+        const source = asObject(payload.source);
+        const subagent = asObject(source.subagent);
+        isSubagent =
+          isSubagent ||
+          Object.keys(subagent).length > 0 ||
+          normalizeText(payload.agent_nickname).length > 0 ||
+          normalizeText(payload.agent_role).length > 0;
         createdAt =
           typeof payload.timestamp === "string" && payload.timestamp
             ? Math.floor(new Date(payload.timestamp).getTime() / 1000)
@@ -141,6 +149,7 @@ async function parseSessionFile(filePath) {
     name: !isPlaceholderTitle(explicitName) ? explicitName : inferTitle(preview),
     preview,
     cwd: cwd || "",
+    isSubagent,
     createdAt: createdAt || Math.floor(stat.birthtimeMs / 1000) || Math.floor(stat.mtimeMs / 1000),
     updatedAt: Math.floor(stat.mtimeMs / 1000),
     status: "unknown"
@@ -185,6 +194,7 @@ async function loadIndex(codexHome) {
             ? entry.preview
             : "",
       cwd: current.cwd || entry.cwd || "",
+      isSubagent: Boolean(current.isSubagent || entry.isSubagent),
       createdAt:
         current.createdAt && entry.createdAt
           ? Math.min(current.createdAt, entry.createdAt)

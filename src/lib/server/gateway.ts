@@ -88,14 +88,37 @@ function normalizeThreadStatus(value: unknown) {
   return asText(value);
 }
 
+function getThreadSpawnMetadata(source: unknown) {
+  return asRecord(asRecord(asRecord(source).subagent).thread_spawn);
+}
+
+function getThreadAgentNickname(thread: Record<string, unknown>) {
+  return (
+    asText(thread.agentNickname) ??
+    asText(thread.agent_nickname) ??
+    asText(getThreadSpawnMetadata(thread.source).agent_nickname)
+  );
+}
+
+function getThreadAgentRole(thread: Record<string, unknown>) {
+  return asText(thread.agentRole) ?? asText(thread.agent_role) ?? asText(getThreadSpawnMetadata(thread.source).agent_role);
+}
+
+function isSubagentThread(thread: Record<string, unknown>) {
+  const subagentSource = asRecord(asRecord(thread.source).subagent);
+  return Boolean(
+    Object.keys(subagentSource).length > 0 || (getThreadAgentNickname(thread) ?? "").trim() || (getThreadAgentRole(thread) ?? "").trim()
+  );
+}
+
 function normalizeThread(thread: Record<string, unknown>): Record<string, unknown> {
   return {
     ...thread,
     name: asText(thread.name),
     preview: stripAttachmentPreamble(asText(thread.preview) ?? ""),
     status: normalizeThreadStatus(thread.status),
-    agentNickname: asText(thread.agentNickname),
-    agentRole: asText(thread.agentRole),
+    agentNickname: getThreadAgentNickname(thread),
+    agentRole: getThreadAgentRole(thread),
     turns: Array.isArray(thread.turns) ? thread.turns : []
   };
 }
@@ -143,13 +166,19 @@ function coercePreferences(preferences: Partial<SessionPreferences> | null | und
   } satisfies SessionPreferences;
 }
 
-function toSummary(thread: Record<string, unknown>, preferences: SessionPreferences | null, archived = false): SessionSummary {
+function toSummary(
+  thread: Record<string, unknown>,
+  preferences: SessionPreferences | null,
+  archived = false,
+  queueCount = 0
+): SessionSummary {
   const normalized = normalizeThread(thread);
   const preview = asText(normalized.preview) ?? "";
   return {
     id: String(normalized.id),
     name: getDisplayThreadName(asText(normalized.name), preview),
     preview,
+    queueCount: Math.max(0, queueCount),
     cwd: (normalized.cwd as string | null) ?? preferences?.cwd ?? getRuntimeConfig().defaults.cwd,
     archived,
     createdAt: Number(normalized.createdAt ?? 0),
@@ -430,6 +459,7 @@ export class CodexGateway {
     const threads = (response.data as Array<Record<string, unknown>> | undefined) ?? [];
     return {
       sessions: threads
+        .filter((thread) => !isSubagentThread(thread))
         .map((thread) => {
           const stored = preferences[String(thread.id)];
           return toSummary(thread, stored ? coercePreferences(stored) : null, archived);
@@ -485,12 +515,15 @@ export class CodexGateway {
 
   private async collectListableSessions(archived: boolean): Promise<SessionSummary[]> {
     const preferences = await uiStateStore.getAll();
+    const queueCounts = await uiStateStore.getQueueCounts();
     if (archived) {
-      return this.listAllThreadSessions(true, preferences);
+      return this.listAllThreadSessions(true, preferences, queueCounts);
     }
 
-    const indexedSessions = await sessionIndexClient.list(getRuntimeConfig().codexHome).catch(() => []);
-    const liveThreads = await this.listAllThreadSessions(false, preferences);
+    const indexedSessions = (await sessionIndexClient.list(getRuntimeConfig().codexHome).catch(() => [])).filter(
+      (session) => !session.isSubagent
+    );
+    const liveThreads = await this.listAllThreadSessions(false, preferences, queueCounts);
     const liveById = new Map(liveThreads.map((session) => [session.id, session]));
     const mergedSessions = indexedSessions.map((session) => {
       const live = liveById.get(session.id);
@@ -510,6 +543,7 @@ export class CodexGateway {
         id: session.id,
         name: session.name,
         preview: session.preview,
+        queueCount: queueCounts[session.id] ?? 0,
         cwd: session.cwd || stored?.cwd || getRuntimeConfig().defaults.cwd,
         archived: false,
         createdAt: session.createdAt,
@@ -537,7 +571,8 @@ export class CodexGateway {
 
   private async listAllThreadSessions(
     archived: boolean,
-    preferences: Record<string, Awaited<ReturnType<typeof uiStateStore.getAll>>[string]>
+    preferences: Record<string, Awaited<ReturnType<typeof uiStateStore.getAll>>[string]>,
+    queueCounts: Record<string, number>
   ): Promise<SessionSummary[]> {
     const sessions: SessionSummary[] = [];
     let cursor: string | null = null;
@@ -546,10 +581,14 @@ export class CodexGateway {
       const response = asRecord(await this.client.request("thread/list", { limit: 200, archived, cursor }));
       const threads = (response.data as Array<Record<string, unknown>> | undefined) ?? [];
       sessions.push(
-        ...threads.map((thread) => {
-          const stored = preferences[String(thread.id)];
-          return toSummary(thread, stored ? coercePreferences(stored) : null, archived);
-        }).filter((session) => !isSubagentSessionSummary(session))
+        ...threads
+          .filter((thread) => !isSubagentThread(thread))
+          .map((thread) => {
+            const threadId = String(thread.id);
+            const stored = preferences[threadId];
+            return toSummary(thread, stored ? coercePreferences(stored) : null, archived, queueCounts[threadId] ?? 0);
+          })
+          .filter((session) => !isSubagentSessionSummary(session))
       );
       cursor = typeof response.nextCursor === "string" && response.nextCursor.trim() ? String(response.nextCursor) : null;
     } while (cursor);
@@ -920,23 +959,31 @@ export class CodexGateway {
   }
 
   async dispatchQueuedMessage(threadId: string, queueId: string, mode: "message" | "steer"): Promise<SessionQueuePayload> {
-    const stored = await uiStateStore.getQueue(threadId);
-    const queuedItem = stored?.items.find((item) => item.id === queueId);
-    if (!queuedItem) {
-      throw new Error("Queued message not found.");
+    const queue = await this.withQueueDispatchLock(threadId, async () => {
+      const stored = await uiStateStore.getQueue(threadId);
+      const queuedItem = stored?.items.find((item) => item.id === queueId);
+      if (!queuedItem) {
+        throw new Error("Queued message not found.");
+      }
+
+      const attachments = (await listAttachments(threadId)).filter((attachment) => queuedItem.attachmentIds.includes(attachment.id));
+      if (mode === "steer") {
+        await this.steer(threadId, queuedItem.prompt, attachments);
+      } else {
+        await this.sendMessage(threadId, queuedItem.prompt, attachments, {});
+      }
+
+      await uiStateStore.removeQueueItem(threadId, queueId);
+      await uiStateStore.setQueueResumePending(threadId, false);
+      const nextQueue = await this.getQueue(threadId);
+      this.emitQueueUpdated(threadId, nextQueue);
+      return nextQueue;
+    });
+
+    if (!queue) {
+      throw new Error("Queue is already dispatching.");
     }
 
-    const attachments = (await listAttachments(threadId)).filter((attachment) => queuedItem.attachmentIds.includes(attachment.id));
-    if (mode === "steer") {
-      await this.steer(threadId, queuedItem.prompt, attachments);
-    } else {
-      await this.sendMessage(threadId, queuedItem.prompt, attachments, {});
-    }
-
-    await uiStateStore.removeQueueItem(threadId, queueId);
-    await uiStateStore.setQueueResumePending(threadId, false);
-    const queue = await this.getQueue(threadId);
-    this.emitQueueUpdated(threadId, queue);
     return queue;
   }
 
@@ -1878,51 +1925,60 @@ export class CodexGateway {
           queue: nextQueue
         }
       });
+      void this.emitSessionSummaryUpdated(threadId, null, null, nextQueue.items.length);
     })();
   }
 
-  private async maybeDrainQueue(threadId: string) {
+  private async withQueueDispatchLock<T>(threadId: string, work: () => Promise<T>) {
     if (this.drainingQueues.has(threadId)) {
-      return;
-    }
-
-    const queue = await this.getQueue(threadId);
-    if (queue.items.length === 0) {
-      await this.maybeScheduleShutdown(threadId, null);
-      return;
-    }
-    if (queue.resumeRequired) {
-      return;
-    }
-
-    const activeTurnId = await this.resolveActiveTurnId(threadId);
-    if (activeTurnId) {
-      return;
-    }
-
-    const queuedItem = queue.items[0];
-    if (!queuedItem) {
-      return;
+      return null;
     }
 
     this.drainingQueues.add(threadId);
     try {
-      const attachments = (await listAttachments(threadId)).filter((attachment) => queuedItem.attachmentIds.includes(attachment.id));
-      await this.sendMessage(threadId, queuedItem.prompt, attachments, {});
-      await uiStateStore.removeQueueItem(threadId, queuedItem.id);
-      this.emitQueueUpdated(threadId);
-    } catch (error) {
-      this.emit(threadId, {
-        kind: "notification",
-        method: "codex-webui/queueDispatchFailed",
-        params: {
-          queueId: queuedItem.id,
-          message: error instanceof Error ? error.message : "Failed to dispatch queued message."
-        }
-      });
+      return await work();
     } finally {
       this.drainingQueues.delete(threadId);
     }
+  }
+
+  private async maybeDrainQueue(threadId: string) {
+    await this.withQueueDispatchLock(threadId, async () => {
+      const queue = await this.getQueue(threadId);
+      if (queue.items.length === 0) {
+        await this.maybeScheduleShutdown(threadId, null);
+        return;
+      }
+      if (queue.resumeRequired) {
+        return;
+      }
+
+      const activeTurnId = await this.resolveActiveTurnId(threadId);
+      if (activeTurnId) {
+        return;
+      }
+
+      const queuedItem = queue.items[0];
+      if (!queuedItem) {
+        return;
+      }
+
+      try {
+        const attachments = (await listAttachments(threadId)).filter((attachment) => queuedItem.attachmentIds.includes(attachment.id));
+        await this.sendMessage(threadId, queuedItem.prompt, attachments, {});
+        await uiStateStore.removeQueueItem(threadId, queuedItem.id);
+        this.emitQueueUpdated(threadId);
+      } catch (error) {
+        this.emit(threadId, {
+          kind: "notification",
+          method: "codex-webui/queueDispatchFailed",
+          params: {
+            queueId: queuedItem.id,
+            message: error instanceof Error ? error.message : "Failed to dispatch queued message."
+          }
+        });
+      }
+    });
   }
 
   private async maybeScheduleShutdown(threadId: string, completedTurnId: string | null) {
@@ -2028,12 +2084,14 @@ export class CodexGateway {
   private async emitSessionSummaryUpdated(
     threadId: string,
     thread: Record<string, unknown> | null = null,
-    preferences: SessionPreferences | null = null
+    preferences: SessionPreferences | null = null,
+    queueCount: number | null = null
   ) {
     try {
       const resolvedThread = normalizeThread(thread ?? (await this.readThread(threadId, false)));
       const resolvedPreferences = preferences ?? (await this.getPreferences(threadId, resolvedThread));
-      const summary = toSummary(resolvedThread, resolvedPreferences);
+      const resolvedQueueCount = queueCount ?? (await this.getQueue(threadId)).items.length;
+      const summary = toSummary(resolvedThread, resolvedPreferences, false, resolvedQueueCount);
       if (isSubagentSessionSummary(summary)) {
         return;
       }

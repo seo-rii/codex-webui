@@ -4,7 +4,13 @@
   import { createLowlight, common } from "lowlight";
   import { toHtml } from "hast-util-to-html";
 
-  let { text = "" }: { text?: string | null } = $props();
+  let {
+    text = "",
+    compact = false
+  }: {
+    text?: string | null;
+    compact?: boolean;
+  } = $props();
 
   const dispatch = createEventDispatcher<{
     openLocalPath: {
@@ -140,7 +146,7 @@
   }
 </script>
 
-<div bind:this={rootElement} class="markdown-body">
+<div bind:this={rootElement} class={`markdown-body ${compact ? "markdown-body--compact" : ""}`}>
   {@html html}
 </div>
 
@@ -153,6 +159,10 @@
 
   .markdown-body :global(p) {
     margin: 0 0 1rem;
+  }
+
+  .markdown-body :global(p:last-child) {
+    margin-bottom: 0;
   }
 
   .markdown-body :global(h1),
@@ -256,6 +266,29 @@
   .markdown-body :global(.hljs-selector-tag) {
     color: rgb(217 119 6);
     font-weight: 500;
+  }
+
+  .markdown-body--compact {
+    font-size: 0.9375rem;
+    line-height: 1.55;
+  }
+
+  .markdown-body--compact :global(p) {
+    margin: 0 0 0.5rem;
+  }
+
+  .markdown-body--compact :global(ul),
+  .markdown-body--compact :global(ol),
+  .markdown-body--compact :global(blockquote),
+  .markdown-body--compact :global(table) {
+    margin-bottom: 0.75rem;
+  }
+
+  .markdown-body--compact :global(h1),
+  .markdown-body--compact :global(h2),
+  .markdown-body--compact :global(h3),
+  .markdown-body--compact :global(h4) {
+    margin: 1rem 0 0.5rem;
   }
 
   .markdown-body :global(.hljs-string),

@@ -507,10 +507,15 @@
         >
           <div class="flex flex-col gap-1.5">
             <div class="flex items-start justify-between gap-2">
-              <span class="text-sm font-medium truncate text-gray-900 group-hover:text-amber-700 transition-colors">
+              <span class="min-w-0 flex-1 truncate text-sm font-medium text-gray-900 transition-colors group-hover:text-amber-700">
                 {displaySessionTitle(session)}
               </span>
-              <div class="flex items-center gap-1.5">
+              <div class="flex shrink-0 flex-nowrap items-center gap-1.5 whitespace-nowrap">
+                {#if session.queueCount > 0}
+                  <span class="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-slate-600">
+                    Q {session.queueCount}
+                  </span>
+                {/if}
                 {#if sessionHighlights[session.id]?.kind === "attention"}
                   <span class="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 font-bold uppercase tracking-widest">{ui.needsInput}</span>
                 {:else if sessionHighlights[session.id]?.kind === "completed"}

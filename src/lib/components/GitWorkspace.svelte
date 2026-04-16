@@ -7,18 +7,20 @@
   import { localeSignal } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
   import { getLocale } from "$lib/paraglide/runtime.js";
-  import type { GitFilePayload, GitFileStatus, GitOpenRequest, GitRepository, GitStatusPayload, GitWorktree } from "$lib/types";
+  import type { GitCommit, GitFilePayload, GitFileStatus, GitOpenRequest, GitRepository, GitStatusPayload, GitWorktree } from "$lib/types";
 
   let {
     selectedRepoPath,
     onSelectRepo,
     openRequest = null,
-    onOpenDiffTab = null
+    onOpenDiffTab = null,
+    onOpenCommitDiff = null
   }: {
     selectedRepoPath: string | null;
     onSelectRepo: (repoPath: string | null) => void;
     openRequest?: GitOpenRequest | null;
     onOpenDiffTab?: ((repoPath: string, filePath: string) => void) | null;
+    onOpenCommitDiff?: ((repoPath: string, commit: GitCommit) => Promise<void> | void) | null;
   } = $props();
 
   let repositories = $state<GitRepository[]>([]);
@@ -41,6 +43,7 @@
   let savingFile = $state(false);
   let gitBusy = $state(false);
   let worktreeBusy = $state(false);
+  let openingCommitHash = $state<string | null>(null);
   let errorText = $state("");
   let lastRepoPath: string | null = null;
   let lastOpenRequestId = $state<number | null>(null);
@@ -169,6 +172,25 @@
     }
 
     await openFileByPath(selectedRepoPath, fileStatus.path);
+  }
+
+  async function openCommit(commit: GitCommit) {
+    if (!selectedRepoPath || !onOpenCommitDiff) {
+      return;
+    }
+
+    openingCommitHash = commit.hash;
+    errorText = "";
+
+    try {
+      await onOpenCommitDiff(selectedRepoPath, commit);
+    } catch (error) {
+      errorText = describeError(error);
+    } finally {
+      if (openingCommitHash === commit.hash) {
+        openingCommitHash = null;
+      }
+    }
   }
 
   function clearDetailPanels() {
@@ -649,9 +671,11 @@
           <div class="commit-list">
             {#each status.commits as commit (commit.hash)}
               <article class="commit-row">
-                <strong>{commit.shortHash}</strong>
-                <p>{commit.subject}</p>
-                <small>{commit.author} · {new Date(commit.authoredAt).toLocaleString(getDateLocale())}</small>
+                <button class="commit-link" disabled={openingCommitHash === commit.hash} type="button" onclick={() => void openCommit(commit)}>
+                  <strong>{commit.shortHash}</strong>
+                  <p>{commit.subject}</p>
+                  <small>{commit.author} · {new Date(commit.authoredAt).toLocaleString(getDateLocale())}</small>
+                </button>
               </article>
             {/each}
           </div>
@@ -823,6 +847,24 @@
     text-align: left;
   }
 
+  .commit-link {
+    width: 100%;
+    display: grid;
+    gap: 0.2rem;
+    min-width: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    padding: 0;
+    text-align: left;
+  }
+
+  .commit-link:disabled {
+    cursor: progress;
+    opacity: 0.6;
+  }
+
   .file-link strong,
   .commit-row strong {
     color: var(--ink-strong);
@@ -878,7 +920,8 @@
     .toolbar-row,
     .file-row,
     .commit-row,
-    .file-link {
+    .file-link,
+    .commit-link {
       flex-direction: column;
       align-items: stretch;
     }

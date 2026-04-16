@@ -13,7 +13,11 @@ export const localeOptions = [
   { value: "zh-Hant", label: "繁體中文" },
   { value: "ja", label: "日本語" },
   { value: "fr", label: "français" },
-  { value: "es", label: "español" }
+  { value: "es", label: "español" },
+  { value: "de", label: "Deutsch" },
+  { value: "it", label: "italiano" },
+  { value: "pt-BR", label: "português (Brasil)" },
+  { value: "ru", label: "Русский" }
 ] as const satisfies ReadonlyArray<{ value: Locale; label: string }>;
 
 function applyLocaleToDocument(locale: Locale) {

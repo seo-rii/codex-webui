@@ -227,7 +227,7 @@
   "realtime_disconnected": "Real-time connection is offline. Work may still be running on the server.",
   "queueing_follow_up": "Queueing follow-up",
   "steering_current_turn": "Steering current turn",
-  "generating_response": "Generating response",
+  "generating_response": "Thinking",
   "task_completed_notification_title": "Task completed",
   "task_completed_notification_body": "A session finished running.",
   "input_required_notification_title": "Input required",

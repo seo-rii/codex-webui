@@ -11,6 +11,7 @@ import type {
   DirectoryPayload,
   EditableFilePayload,
   GlobalStreamEvent,
+  GitCommitDiffPayload,
   GitFilePayload,
   GitFileReferencePayload,
   GitRepository,
@@ -66,6 +67,12 @@ async function request<T>(input: string, init?: RequestInit) {
 const ws = new WebSocketRpcClient();
 
 export const api = {
+  getAuthSession() {
+    return request<{ authenticated: boolean }>(apiPath("/auth/session"), {
+      method: "GET"
+    });
+  },
+
   login(password: string) {
     return request<{ ok: true }>(apiPath("/auth/login"), {
       method: "POST",
@@ -339,6 +346,10 @@ export const api = {
 
   getGitFile(repoPath: string, filePath: string) {
     return ws.request<GitFilePayload>("git/file/get", { repoPath, filePath });
+  },
+
+  getGitCommitDiff(repoPath: string, commitHash: string) {
+    return ws.request<GitCommitDiffPayload>("git/commit/diff", { repoPath, commitHash });
   },
 
   resolveGitFile(filePath: string) {

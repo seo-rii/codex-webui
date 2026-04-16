@@ -335,11 +335,7 @@ impl Config {
         let cwd = env::current_dir().context("failed to read current directory")?;
         load_dotenv(&cwd);
         let project_root = resolve_project_root(&cwd);
-        let base_path = normalize_base_path(
-            env::var("CODEX_WEBUI_BASE_PATH")
-                .ok()
-                .or_else(|| env::var("VITE_BASE_PATH").ok()),
-        );
+        let base_path = normalize_base_path(env::var("CODEX_WEBUI_BASE_PATH").ok());
         let public_host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let public_port = parse_port(env::var("PORT").ok(), 4173)?;
         let internal_port = parse_port(env::var("CODEX_WEBUI_INTERNAL_PORT").ok(), choose_free_port()?)?;
@@ -396,10 +392,6 @@ async fn handle_http(
 
             if route_path.starts_with("/api/") {
                 return (StatusCode::NOT_FOUND, "This backend only exposes auth over HTTP.").into_response();
-            }
-
-            if !is_public_proxy_path(&route_path) && !is_authenticated(&state.config, &jar) {
-                return Redirect::temporary(&with_base(&state.config.base_path, "/login")).into_response();
             }
 
             return proxy_to_internal(state, method, uri, headers, request).await;
@@ -604,11 +596,16 @@ async fn websocket_session(socket: WebSocket, state: AppState) {
                     }
                 };
 
-                if let Err(error) =
-                    handle_ws_message(&state, &out_tx, &subscriptions, payload).await
-                {
-                    error!("websocket request failed: {error:#}");
-                }
+                let state = state.clone();
+                let out_tx = out_tx.clone();
+                let subscriptions = Arc::clone(&subscriptions);
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        handle_ws_message(&state, &out_tx, &subscriptions, payload).await
+                    {
+                        error!("websocket request failed: {error:#}");
+                    }
+                });
             }
             Message::Ping(payload) => {
                 let _ = out_tx.send(ServerEnvelope::Pong {
@@ -1158,6 +1155,19 @@ async fn execute_ws_method(
                 "message": require_string(&params, "message")?
             });
             internal_json_request(state, Method::POST, "/api/git/commit", Some(payload)).await
+        }
+        "git/commit/diff" => {
+            let repo_path_raw = require_string(&params, "repoPath")?;
+            let commit_hash_raw = require_string(&params, "commitHash")?;
+            let repo_path = urlencoding::encode(&repo_path_raw);
+            let commit_hash = urlencoding::encode(&commit_hash_raw);
+            internal_json_request(
+                state,
+                Method::GET,
+                &format!("/api/git/commit/diff?repoPath={repo_path}&commitHash={commit_hash}"),
+                None,
+            )
+            .await
         }
         "git/checkout" => {
             let payload = json!({
@@ -2481,10 +2491,6 @@ fn with_base(base_path: &str, route_path: &str) -> String {
     format!("{base_path}{route_path}")
 }
 
-fn is_public_proxy_path(route_path: &str) -> bool {
-    route_path == "/login" || route_path.starts_with("/_app/")
-}
-
 fn parse_port(value: Option<String>, fallback: u16) -> Result<u16> {
     match value {
         Some(value) => value.parse::<u16>().with_context(|| format!("invalid port: {value}")),
@@ -2607,7 +2613,7 @@ async fn wait_for_internal_node(config: &Config, http: &reqwest::Client) -> Resu
     let target = format!(
         "{}{}",
         config.internal_base_url,
-        with_base(&config.base_path, "/login")
+        with_base(&config.base_path, "/")
     );
 
     for _ in 0..100 {

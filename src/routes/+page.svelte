@@ -35,9 +35,6 @@
     Copy
   } from "lucide-svelte";
   import { onMount, tick } from "svelte";
-  import { resolve } from "$app/paths";
-  import { goto } from "$app/navigation";
-
   import { extractAttachmentPaths, stripAttachmentPreamble } from "$lib/attachments";
   import { api } from "$lib/api";
   import { applyStreamEvent, createConversationState, type ConversationState } from "$lib/chat-state";
@@ -47,7 +44,7 @@
   import SessionSidebar from "$lib/components/SessionSidebar.svelte";
   import SettingsWorkspace from "$lib/components/SettingsWorkspace.svelte";
   import TerminalWorkspace from "$lib/components/TerminalWorkspace.svelte";
-  import { localeSignal } from "$lib/i18n";
+  import { activeLocale, localeOptions, localeSignal, updateLocale } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
   import {
     applyThemeMode,
@@ -65,6 +62,7 @@
     CodexQuotaStatus,
     CodexRuntimeStatus,
     DirectoryPayload,
+    GitCommit,
     GitOpenRequest,
     GlobalStreamEvent,
     PendingServerRequest,
@@ -123,13 +121,18 @@
   let sessionsLoadingMore = $state(false);
   let conversation = $state<ConversationState | null>(null);
   let selectedSessionId = $state<string | null>(null);
+  let authenticated = $state<boolean | null>(null);
   let loading = $state(true);
   let loadingDetail = $state(false);
   let sessionsBusy = $state(false);
   let sending = $state(false);
+  let startingMessage = $state(false);
   let uploading = $state(false);
   let errorText = $state("");
   let noticeText = $state("");
+  let loginPassword = $state("");
+  let loginBusy = $state(false);
+  let loginMessage = $state("");
   let draft = $state("");
   let draftAttachments = $state<AttachmentRecord[]>([]);
   let titleDraft = $state("");
@@ -225,12 +228,23 @@
   const olderTurnAutoLoadWindowMs = 1500;
   const olderTurnAutoLoadBurstLimit = 3;
   const sessionQueryParamKey = "session";
+  const notificationPromptStorageKey = "codex-webui.notifications.permission-prompted";
 
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
 
     return {
       appTitle: m.app_title(),
+      loginTitle: m.login_page_title(),
+      privateGateway: m.private_gateway(),
+      loginLede: m.login_lede(),
+      password: m.password(),
+      signIn: m.sign_in(),
+      signingIn: m.signing_in(),
+      enterPassword: m.enter_password(),
+      loginFailed: m.login_failed(),
+      language: m.language(),
+      close: m.close(),
       newThread: m.new_thread(),
       loadingOlderTurns: m.loading_previous_conversation_history(),
       loadingSessions: m.loading_sessions(),
@@ -629,7 +643,7 @@
     }
     return "";
   });
-  const showConnectionSnackbar = $derived(Boolean(connectionBannerText));
+  const showConnectionSnackbar = $derived(Boolean(connectionBannerText) && authenticated === true);
   const connectionSnackbarTone = $derived.by(() => {
     if (connectionState === "disconnected") {
       return "error";
@@ -638,6 +652,24 @@
       return "warning";
     }
     return "info";
+  });
+  const feedbackSnackbar = $derived.by(() => {
+    if (authenticated !== true) {
+      return null;
+    }
+    if (errorText) {
+      return {
+        tone: "error" as const,
+        text: errorText
+      };
+    }
+    if (noticeText) {
+      return {
+        tone: "success" as const,
+        text: noticeText
+      };
+    }
+    return null;
   });
   const sessionLoadPercent = $derived.by(() => {
     if (sessionsLoadingMore) {
@@ -759,6 +791,38 @@
     startupScheduledShutdown ? Math.max(0, Math.ceil((startupScheduledShutdown.scheduledFor - startupAlertNow) / 1000)) : null
   );
 
+  function dismissFeedbackSnackbar() {
+    errorText = "";
+    noticeText = "";
+  }
+
+  $effect(() => {
+    if (authenticated !== true || typeof window === "undefined") {
+      return;
+    }
+
+    const snackbar = feedbackSnackbar;
+    if (!snackbar) {
+      return;
+    }
+
+    const timeoutMs = snackbar.tone === "error" ? 6400 : 3600;
+    const capturedError = errorText;
+    const capturedNotice = noticeText;
+    const timer = window.setTimeout(() => {
+      if (capturedError && errorText === capturedError) {
+        errorText = "";
+      }
+      if (!capturedError && capturedNotice && noticeText === capturedNotice) {
+        noticeText = "";
+      }
+    }, timeoutMs);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  });
+
   onMount(() => {
     themeMode = readThemeMode();
     resolvedTheme = getResolvedTheme();
@@ -774,11 +838,10 @@
         mobileSidebarOpen = false;
       }
     };
-    releaseGlobalStream = api.subscribeGlobal((event) => {
-      handleGlobalEvent(event);
-    });
     releaseReconnectListener = api.onReconnect(() => {
-      void recoverFromReconnect();
+      if (authenticated === true) {
+        void recoverFromReconnect();
+      }
     });
     releaseConnectionStateListener = api.onConnectionState((state) => {
       connectionState = state;
@@ -791,8 +854,21 @@
         void updateComposerSecurityPopoverPosition();
       }
     };
+    let notificationPromptRecorded = false;
+    try {
+      notificationPromptRecorded = window.localStorage.getItem(notificationPromptStorageKey) !== null;
+      if (typeof Notification !== "undefined" && Notification.permission !== "default") {
+        window.localStorage.setItem(notificationPromptStorageKey, Notification.permission);
+        notificationPromptRecorded = true;
+      }
+    } catch {
+      notificationPromptRecorded = false;
+    }
     const requestNotificationPermissionFromGesture = () => {
       if (typeof Notification === "undefined" || Notification.permission !== "default") {
+        return;
+      }
+      if (notificationPromptRecorded) {
         return;
       }
       if (notificationPermissionRequested) {
@@ -800,6 +876,14 @@
       }
       notificationPermissionRequested = true;
       void Notification.requestPermission()
+        .then((permission) => {
+          try {
+            window.localStorage.setItem(notificationPromptStorageKey, permission);
+            notificationPromptRecorded = true;
+          } catch {
+            notificationPromptRecorded = true;
+          }
+        })
         .catch(() => {})
         .finally(() => {
           notificationPermissionRequested = false;
@@ -1432,6 +1516,7 @@
       id: state.thread.id,
       name: getDisplayThreadTitle(state.thread.name, state.thread.preview),
       preview: state.thread.preview,
+      queueCount: state.queue.items.length,
       cwd: state.thread.cwd,
       archived: selectedSessionSummary?.archived ?? showArchivedSessions,
       createdAt: state.thread.createdAt,
@@ -1502,23 +1587,130 @@
     }
   }
 
+  function resetWorkspaceState() {
+    disconnectStream();
+    clearHydrationRefresh();
+
+    if (sessionRefreshTimer) {
+      clearTimeout(sessionRefreshTimer);
+      sessionRefreshTimer = null;
+    }
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+
+    for (const timer of itemDetailRefreshTimers.values()) {
+      clearTimeout(timer);
+    }
+    itemDetailRefreshTimers.clear();
+
+    config = null;
+    quota = null;
+    sessions = [];
+    sessionsCursor = null;
+    sessionsHasMore = false;
+    sessionsLoadingMore = false;
+    conversation = null;
+    selectedSessionId = null;
+    loadingDetail = false;
+    sessionsBusy = false;
+    sending = false;
+    startingMessage = false;
+    uploading = false;
+    errorText = "";
+    noticeText = "";
+    draft = "";
+    draftAttachments = [];
+    titleDraft = "";
+    browserOpen = false;
+    browserBusy = false;
+    directoryPayload = null;
+    requestAnswers = {};
+    rawRequestResponses = {};
+    pendingSessionEvents = {};
+    expandedItems = {};
+    expandedFileChangeEntries = {};
+    loadingItemDetails = {};
+    itemDetailErrors = {};
+    expandedTurnLogs = {};
+    loadingTurns = {};
+    turnLoadErrors = {};
+    sessionSearchQuery = "";
+    sessionSearchScope = "summary";
+    showArchivedSessions = false;
+    accountLoginFlow = null;
+    composerSettingsOpen = false;
+    composerSecurityOpen = false;
+    composerSettingsPopoverStyle = "";
+    composerSecurityPopoverStyle = "";
+    loadingOlderTurns = false;
+    olderTurnsAutoLoadEnabled = true;
+    olderTurnsAutoLoadPaused = false;
+    olderTurnsAutoTriggerTimestamps = [];
+    terminals = [];
+    activeWorkspaceTabId = "chat";
+    workspaceMenuOpen = false;
+    gitTabOpen = false;
+    settingsTabOpen = false;
+    gitDiffTabs = [];
+    codeDiffTabs = [];
+    pendingSteerResume = null;
+    dismissedQueueResumeBySessionId = {};
+    draftPersistencePaused = false;
+    mobileSidebarOpen = false;
+    optimisticMessage = null;
+    pendingQueueModeSessionId = null;
+    liveTurnCardExpanded = false;
+    sendIntent = null;
+    editingQueueId = null;
+    editingQueuePrompt = "";
+    sessionHighlights = {};
+    startupAlertModalOpen = false;
+    startupAlertDismissed = false;
+    syncSelectedSessionInUrl(null);
+  }
+
+  function clearWorkspaceForLoggedOut() {
+    resetWorkspaceState();
+    authenticated = false;
+    runtime = null;
+    loginBusy = false;
+    releaseGlobalStream?.();
+    releaseGlobalStream = null;
+    api.disconnect();
+    connectionState = "idle";
+  }
+
+  function ensureGlobalStreamSubscription() {
+    if (releaseGlobalStream) {
+      return;
+    }
+
+    releaseGlobalStream = api.subscribeGlobal((event) => {
+      handleGlobalEvent(event);
+    });
+  }
+
   async function bootstrap() {
     loading = true;
     errorText = "";
     noticeText = "";
 
     try {
+      const authSession = await api.getAuthSession();
+      if (!authSession.authenticated) {
+        clearWorkspaceForLoggedOut();
+        loading = false;
+        return;
+      }
+
+      authenticated = true;
+      loginMessage = "";
+      ensureGlobalStreamSubscription();
       runtime = await api.getRuntimeStatus();
       if (!runtime.installed) {
-        config = null;
-        quota = null;
-        sessions = [];
-        conversation = null;
-        selectedSessionId = null;
-        startupAlertModalOpen = false;
-        startupAlertDismissed = false;
-        syncSelectedSessionInUrl(null);
-        terminals = [];
+        resetWorkspaceState();
         loading = false;
         return;
       }
@@ -1719,6 +1911,7 @@
         id: detail.thread.id,
         name: getDisplayThreadTitle(detail.thread.name, detail.thread.preview),
         preview: detail.thread.preview,
+        queueCount: detail.queue.items.length,
         cwd: detail.thread.cwd,
         archived: showArchivedSessions,
         createdAt: detail.thread.createdAt,
@@ -1932,18 +2125,21 @@
   }
 
   async function recoverFromReconnect() {
+    if (authenticated !== true) {
+      return;
+    }
+
     try {
+      const authSession = await api.getAuthSession();
+      if (!authSession.authenticated) {
+        clearWorkspaceForLoggedOut();
+        return;
+      }
+
+      ensureGlobalStreamSubscription();
       runtime = await api.getRuntimeStatus();
       if (!runtime.installed) {
-        config = null;
-        quota = null;
-        sessions = [];
-        conversation = null;
-        selectedSessionId = null;
-        startupAlertModalOpen = false;
-        startupAlertDismissed = false;
-        syncSelectedSessionInUrl(null);
-        terminals = [];
+        resetWorkspaceState();
         return;
       }
 
@@ -2285,6 +2481,7 @@
         id: selectedSessionId,
         name: nextTitle,
         preview: conversation?.thread.preview ?? "",
+        queueCount: conversation?.queue.items.length ?? selectedSessionSummary?.queueCount ?? 0,
         cwd: conversation?.thread.cwd ?? config?.defaults.cwd ?? "",
         archived,
         createdAt: conversation?.thread.createdAt ?? Math.floor(Date.now() / 1000),
@@ -2311,47 +2508,62 @@
   }
 
   async function sendMessage() {
-    if (!selectedSessionId || !conversation || sending || uploading || queueModeActive) {
+    if (!selectedSessionId || !conversation || sending || startingMessage || uploading || queueModeActive) {
       return;
     }
 
+    const sessionId = selectedSessionId;
     const prompt = draft.trim();
-    sending = true;
-    sendIntent = "message";
+    const draftText = draft;
+    const attachmentIds = draftAttachments.map((attachment) => attachment.id);
+    const attachmentNames = draftAttachments.map((attachment) => attachment.originalName);
+    const attachmentSnapshot = [...draftAttachments];
+    const preferences = conversation.preferences;
+    startingMessage = true;
     errorText = "";
     noticeText = "";
     optimisticMessage = {
-      sessionId: selectedSessionId,
+      sessionId,
       prompt,
-      attachmentNames: draftAttachments.map((attachment) => attachment.originalName),
+      attachmentNames,
       createdAt: Date.now(),
       baselineTurnId: conversation.thread.turns.at(-1)?.id ?? null,
       baselineTurnCount: conversation.thread.turns.length
     };
     stickTranscriptToBottom = true;
     forceTranscriptScroll = true;
+    pendingQueueModeSessionId = sessionId;
+    recordComposerHistory(prompt);
+    draft = "";
+    draftAttachments = [];
+    composerSettingsOpen = false;
+    composerSecurityOpen = false;
 
-    try {
-      await api.sendMessage(selectedSessionId, {
-        prompt: draft,
-        attachmentIds: draftAttachments.map((attachment) => attachment.id),
-        preferences: conversation.preferences
+    void api
+      .sendMessage(sessionId, {
+        prompt: draftText,
+        attachmentIds,
+        preferences
+      })
+      .then(() => {
+        scheduleSessionRefresh(80);
+      })
+      .catch((error) => {
+        if (pendingQueueModeSessionId === sessionId) {
+          pendingQueueModeSessionId = null;
+        }
+        if (optimisticMessage?.sessionId === sessionId && optimisticMessage.prompt === prompt) {
+          optimisticMessage = null;
+        }
+        if (selectedSessionId === sessionId && !draft.trim() && draftAttachments.length === 0) {
+          draft = draftText;
+          draftAttachments = attachmentSnapshot;
+        }
+        errorText = describeError(error);
+      })
+      .finally(() => {
+        startingMessage = false;
       });
-      pendingQueueModeSessionId = selectedSessionId;
-      recordComposerHistory(prompt);
-      draft = "";
-      draftAttachments = [];
-      composerSettingsOpen = false;
-      composerSecurityOpen = false;
-      await refreshSessions(shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null);
-    } catch (error) {
-      pendingQueueModeSessionId = null;
-      optimisticMessage = null;
-      errorText = describeError(error);
-    } finally {
-      sending = false;
-      sendIntent = null;
-    }
   }
 
   async function queueMessage() {
@@ -2651,8 +2863,34 @@
   }
 
   async function logoutWebUi() {
-    await api.logout();
-    await goto(resolve("/login"));
+    try {
+      await api.logout();
+    } finally {
+      loginPassword = "";
+      loginMessage = "";
+      clearWorkspaceForLoggedOut();
+    }
+  }
+
+  async function handleLogin() {
+    if (!loginPassword.trim()) {
+      loginMessage = ui.enterPassword;
+      return;
+    }
+
+    loginBusy = true;
+    loginMessage = "";
+
+    try {
+      await api.login(loginPassword.trim());
+      loginPassword = "";
+      await bootstrap();
+    } catch (error) {
+      authenticated = false;
+      loginMessage = error instanceof Error ? error.message : ui.loginFailed;
+    } finally {
+      loginBusy = false;
+    }
   }
 
   async function startAccountLogin(type: "chatgpt" | "chatgptDeviceCode") {
@@ -2872,6 +3110,30 @@
     gitDiffTabs = [...gitDiffTabs, nextTab];
     activeWorkspaceTabId = nextTab.id;
     workspaceMenuOpen = false;
+  }
+
+  async function openGitCommitDiffTab(repoPath: string, commit: GitCommit) {
+    errorText = "";
+    const payload = await api.getGitCommitDiff(repoPath, commit.hash);
+    const views = parseAggregatedDiffViews(payload.diff);
+    openCodeDiffTab(
+      `git-commit:${repoPath}:${commit.hash}`,
+      commit.shortHash,
+      `${commit.shortHash} ${commit.subject}`,
+      views.length > 0
+        ? views
+        : [
+            {
+              path: `${commit.shortHash}.diff`,
+              kind: "update",
+              movePath: null,
+              diff: payload.diff,
+              original: "",
+              modified: payload.diff,
+              renderable: false
+            }
+          ]
+    );
   }
 
   function openCodeDiffTab(tabKey: string, label: string, title: string, views: FileChangeView[]) {
@@ -3194,7 +3456,15 @@
       return null;
     }
 
-    const percent = Math.min(100, Math.round((tokenUsage.total.totalTokens / tokenUsage.modelContextWindow) * 100));
+    if (tokenUsage.total.totalTokens <= 0 || tokenUsage.total.totalTokens >= tokenUsage.modelContextWindow) {
+      return null;
+    }
+
+    const percent = Math.min(99, Math.round((tokenUsage.total.totalTokens / tokenUsage.modelContextWindow) * 100));
+    if (percent <= 0) {
+      return null;
+    }
+
     return `${percent}% of context`;
   }
 
@@ -3682,6 +3952,7 @@
     stickTranscriptToBottom = remaining <= scrollBottomThreshold;
 
     if (
+      !forceTranscriptScroll &&
       transcriptElement.scrollTop <= transcriptTopLoadThreshold &&
       sessionHydrationRemainingTurns > 0 &&
       olderTurnsAutoLoadEnabled &&
@@ -4305,6 +4576,11 @@
     };
   }
 
+  const composerSettingsSummary = $derived.by(() => {
+    const _locale = $localeSignal;
+    return getComposerSettingsSummary();
+  });
+
   function getSecuritySettingsSummary() {
     if (!conversation) {
       return [] as Array<{ key: string; icon: string; label: string }>;
@@ -4349,29 +4625,154 @@
   <title>{ui.appTitle}</title>
 </svelte:head>
 
+{#if authenticated === null}
+  <div class="flex min-h-[100dvh] w-full items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_top,_rgba(251,191,36,0.18),_transparent_32%),linear-gradient(180deg,_#fffaf1_0%,_#ffffff_58%,_#f8fafc_100%)] px-6 py-10 text-gray-900">
+    <div class="w-full max-w-xl rounded-[2rem] border border-white/70 bg-white/90 p-8 shadow-[0_30px_80px_rgba(15,23,42,0.12)] backdrop-blur-xl">
+      <div class="flex items-start justify-between gap-6">
+        <div class="space-y-3">
+          <p class="text-[11px] font-bold uppercase tracking-[0.28em] text-amber-700">{ui.privateGateway}</p>
+          <div>
+            <h1 class="text-3xl font-semibold tracking-tight text-gray-950 sm:text-4xl">{ui.appTitle}</h1>
+            <p class="mt-3 max-w-md text-sm leading-7 text-gray-500">{ui.loginLede}</p>
+          </div>
+        </div>
+        <div class="hidden h-12 w-12 items-center justify-center rounded-2xl border border-amber-100 bg-amber-50 text-amber-600 shadow-sm sm:flex">
+          <RefreshCw size={18} class="animate-spin" />
+        </div>
+      </div>
+
+      <div class="mt-8 overflow-hidden rounded-2xl border border-gray-100 bg-gray-50/80">
+        <div class="h-1.5 w-full overflow-hidden bg-gray-100">
+          <div class="h-full w-1/2 animate-pulse rounded-full bg-amber-500/70"></div>
+        </div>
+        <div class="space-y-4 px-5 py-5">
+          <div class="h-3 w-32 rounded-full bg-gray-200"></div>
+          <div class="h-11 rounded-2xl bg-white shadow-inner ring-1 ring-gray-100"></div>
+          <div class="h-11 w-32 rounded-2xl bg-amber-100"></div>
+        </div>
+      </div>
+
+      {#if errorText}
+        <p class="mt-4 rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">{errorText}</p>
+      {/if}
+    </div>
+  </div>
+{:else if authenticated === false}
+  <div class="flex min-h-[100dvh] w-full items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_top,_rgba(251,191,36,0.18),_transparent_32%),linear-gradient(180deg,_#fffaf1_0%,_#ffffff_58%,_#f8fafc_100%)] px-6 py-10 text-gray-900">
+    <div class="w-full max-w-xl rounded-[2rem] border border-white/70 bg-white/90 p-8 shadow-[0_30px_80px_rgba(15,23,42,0.12)] backdrop-blur-xl sm:p-10">
+      <div class="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
+        <div class="space-y-3">
+          <p class="text-[11px] font-bold uppercase tracking-[0.28em] text-amber-700">{ui.privateGateway}</p>
+          <div>
+            <h1 class="text-3xl font-semibold tracking-tight text-gray-950 sm:text-4xl">{ui.appTitle}</h1>
+            <p class="mt-3 max-w-md text-sm leading-7 text-gray-500">{ui.loginLede}</p>
+          </div>
+        </div>
+        <div class="flex flex-wrap gap-2" role="group" aria-label={ui.language}>
+          {#each localeOptions as option (option.value)}
+            <button
+              class="rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors {$activeLocale === option.value
+                ? 'border-amber-200 bg-amber-50 text-amber-700'
+                : 'border-gray-200 bg-white text-gray-500 hover:border-amber-200 hover:text-amber-700'}"
+              onclick={() => updateLocale(option.value)}
+              type="button"
+            >
+              {option.label}
+            </button>
+          {/each}
+        </div>
+      </div>
+
+      <form class="mt-8 space-y-5" onsubmit={(event) => {
+        event.preventDefault();
+        void handleLogin();
+      }}>
+        <label class="block space-y-2">
+          <span class="text-sm font-semibold text-gray-700">{ui.password}</span>
+          <input
+            bind:value={loginPassword}
+            autocomplete="current-password"
+            class="w-full rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-900 shadow-sm outline-none transition focus:border-amber-500 focus:ring-4 focus:ring-amber-100"
+            placeholder={ui.password}
+            type="password"
+          />
+        </label>
+
+        <button
+          class="inline-flex min-w-32 items-center justify-center rounded-2xl bg-amber-600 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-amber-200/70 transition hover:bg-amber-700 disabled:cursor-not-allowed disabled:bg-amber-300"
+          disabled={loginBusy}
+          type="submit"
+        >
+          {loginBusy ? ui.signingIn : ui.signIn}
+        </button>
+      </form>
+
+      {#if loginMessage}
+        <p class="mt-4 rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">{loginMessage}</p>
+      {/if}
+    </div>
+  </div>
+{:else}
 <div class="flex h-[100dvh] min-h-[100dvh] w-full bg-white overflow-hidden font-sans text-gray-900">
-  {#if showConnectionSnackbar}
+  {#if showConnectionSnackbar || feedbackSnackbar}
     <div class="pointer-events-none fixed inset-x-0 top-0 z-[110] flex justify-center px-3 pt-3 sm:px-6">
-      <div
-        class="pointer-events-auto flex w-full max-w-xl items-center gap-3 rounded-2xl border px-4 py-3 shadow-xl backdrop-blur-xl transition-all duration-300 {connectionSnackbarTone === 'error'
-          ? 'border-red-200 bg-red-50/95 text-red-800 shadow-red-100/80'
-          : connectionSnackbarTone === 'warning'
-            ? 'border-amber-200 bg-amber-50/95 text-amber-800 shadow-amber-100/80'
-            : 'border-sky-200 bg-sky-50/95 text-sky-800 shadow-sky-100/80'}"
-        role="status"
-      >
-        {#if connectionState === "reconnecting"}
-          <RefreshCw size={16} class="shrink-0 animate-spin" />
-        {:else}
-          <AlertCircle size={16} class="shrink-0" />
+      <div class="flex w-full max-w-xl flex-col gap-2">
+        {#if showConnectionSnackbar}
+          <div
+            class="pointer-events-auto flex w-full items-center gap-3 rounded-2xl border px-4 py-3 shadow-xl backdrop-blur-xl transition-all duration-300 {connectionSnackbarTone === 'error'
+              ? 'border-red-200 bg-red-50/95 text-red-800 shadow-red-100/80'
+              : connectionSnackbarTone === 'warning'
+                ? 'border-amber-200 bg-amber-50/95 text-amber-800 shadow-amber-100/80'
+                : 'border-sky-200 bg-sky-50/95 text-sky-800 shadow-sky-100/80'}"
+            role="status"
+          >
+            {#if connectionState === "reconnecting"}
+              <RefreshCw size={16} class="shrink-0 animate-spin" />
+            {:else}
+              <AlertCircle size={16} class="shrink-0" />
+            {/if}
+            <span class="min-w-0 text-sm font-medium leading-5">{connectionBannerText}</span>
+          </div>
         {/if}
-        <span class="min-w-0 text-sm font-medium leading-5">{connectionBannerText}</span>
+
+        {#if feedbackSnackbar}
+          <div
+            class="pointer-events-auto flex w-full items-start gap-3 rounded-2xl border px-4 py-3 shadow-xl backdrop-blur-xl transition-all duration-300 {feedbackSnackbar.tone === 'error'
+              ? 'border-red-200 bg-red-50/95 text-red-800 shadow-red-100/80'
+              : 'border-emerald-200 bg-emerald-50/95 text-emerald-800 shadow-emerald-100/80'}"
+            role={feedbackSnackbar.tone === "error" ? "alert" : "status"}
+          >
+            {#if feedbackSnackbar.tone === "error"}
+              <AlertCircle size={16} class="mt-0.5 shrink-0" />
+            {:else}
+              <CheckCircle2 size={16} class="mt-0.5 shrink-0" />
+            {/if}
+            <span class="min-w-0 flex-1 text-sm font-medium leading-5">{feedbackSnackbar.text}</span>
+            <button
+              aria-label={ui.close}
+              class="rounded-lg p-1 text-current/70 transition-colors hover:bg-black/5 hover:text-current"
+              onclick={dismissFeedbackSnackbar}
+              title={ui.close}
+              type="button"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}
 
   <!-- Sidebar -->
-  <aside class:hidden={!mobileSidebarOpen && isMobileLayout} class="flex-shrink-0 z-30 h-full border-r border-gray-200 transition-all duration-300">
+  <aside
+    class:hidden={!mobileSidebarOpen && isMobileLayout}
+    class={[
+      "h-full border-r border-gray-200 transition-all duration-300",
+      isMobileLayout
+        ? "fixed inset-y-0 left-0 z-40 max-w-[calc(100vw-1.5rem)] shadow-2xl"
+        : "flex-shrink-0 z-30"
+    ]}
+  >
     <SessionSidebar
       account={config?.account ?? null}
       {accountLoginFlow}
@@ -4620,8 +5021,8 @@
                           <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors" onclick={() => editMessageText(getUserText(item))} title={ui.editInComposer} type="button"><MessageSquare size={13} /></button>
                           <button class="p-1.5 rounded-lg text-gray-400 hover:text-amber-700 hover:bg-amber-50 transition-colors" onclick={() => void branchFromMessage(getUserText(item))} title={ui.branchIntoNewThread} type="button"><GitBranch size={13} /></button>
                         </div>
-                        <div class="px-5 py-3.5 bg-gray-100 rounded-2xl text-gray-800 shadow-sm border border-gray-200/50">
-                          <MarkdownMessage on:openLocalPath={(event: CustomEvent<{ href: string }>) => void openGitFileFromMessage(event.detail.href)} text={getUserText(item)} />
+                        <div class="px-5 py-3 bg-gray-100 rounded-2xl text-gray-800 shadow-sm border border-gray-200/50">
+                          <MarkdownMessage compact on:openLocalPath={(event: CustomEvent<{ href: string }>) => void openGitFileFromMessage(event.detail.href)} text={getUserText(item)} />
                           {#if getUserAttachmentNames(item).length > 0}
                             <div class="mt-3 flex flex-wrap gap-2">
                               {#each getUserAttachmentNames(item) as name}<span class="px-2 py-1 bg-white/80 rounded-lg border border-gray-200 text-[10px] font-bold text-gray-600 flex items-center gap-1.5"><FileText size={10} />{name}</span>{/each}
@@ -4721,14 +5122,23 @@
 
                 {#if visibleOptimisticMessage}
                   <div class="flex flex-col items-end gap-3 max-w-[85%] ml-auto opacity-70">
-                    <div class="px-5 py-3.5 bg-gray-100 rounded-2xl text-gray-800 shadow-sm border border-gray-200/50">
-                      <MarkdownMessage text={visibleOptimisticMessage.prompt} />
+                    <div class="px-5 py-3 bg-gray-100 rounded-2xl text-gray-800 shadow-sm border border-gray-200/50">
+                      <MarkdownMessage compact text={visibleOptimisticMessage.prompt} />
                     </div>
                   </div>
                 {/if}
 
                 {#if inlineGenerationState}
-                  <div class="flex items-center gap-3 py-4 text-amber-600 italic text-sm"><RefreshCw size={16} class="animate-spin" /><span>{inlineGenerationState.label}</span></div>
+                  <div class="flex py-3">
+                    <div class="thinking-indicator inline-flex items-center gap-3 rounded-2xl border border-gray-200/80 bg-white/90 px-4 py-3 shadow-sm">
+                      <div class="flex items-center gap-1.5" aria-hidden="true">
+                        <span class="thinking-indicator__dot"></span>
+                        <span class="thinking-indicator__dot"></span>
+                        <span class="thinking-indicator__dot"></span>
+                      </div>
+                      <span class="thinking-indicator__label text-sm font-medium">{inlineGenerationState.label}</span>
+                    </div>
+                  </div>
                 {/if}
 
                 {#if conversation.pendingRequests.length > 0}
@@ -5030,19 +5440,22 @@
                     </div>
                   {/if}
 
-                  <div class="px-4 py-3 bg-gray-50/80 border-t border-gray-100 flex items-center justify-between">
+                  <div class="flex items-center justify-between px-4 py-3 bg-gray-50/80 border-t border-gray-100">
                     <div class="flex items-center gap-2">
                       <input bind:this={filePickerElement} disabled={uploading} hidden multiple onchange={(event) => void uploadFiles((event.currentTarget as HTMLInputElement).files)} type="file" />
                       <button class="p-2 text-gray-400 hover:text-amber-600 hover:bg-amber-50 rounded-xl transition-all" disabled={uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={18} class="animate-spin" />{:else}<Paperclip size={18} />{/if}</button>
                       {#if conversation}
-                        <div class="w-px h-4 bg-gray-200 mx-1"></div>
-                        <button class="flex items-center gap-2 px-3 py-1.5 text-[11px] font-bold text-gray-500 hover:text-gray-900 hover:bg-white rounded-xl transition-all border border-transparent hover:border-gray-200" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button"><Settings size={14} /><span>{ui.settings}</span></button>
-                        <button class="flex items-center gap-2 px-3 py-1.5 text-[11px] font-bold text-gray-500 hover:text-gray-900 hover:bg-white rounded-xl transition-all border border-transparent hover:border-gray-200" onclick={() => { composerSecurityOpen = !composerSecurityOpen; composerSettingsOpen = false; }} type="button"><Zap size={14} /><span>{ui.securitySession}</span></button>
+                        <div class="w-px h-4 bg-gray-200"></div>
+                        <button class="flex items-center gap-2 px-3 py-1.5 rounded-xl text-[11px] font-bold text-gray-500 hover:text-gray-900 hover:bg-white hover:border-gray-200 border border-transparent transition-all max-w-[11rem] min-w-0" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button">
+                          <span class="truncate">{composerSettingsSummary.model}</span>
+                          <ChevronDown size={14} class={`shrink-0 transition-transform ${composerSettingsOpen ? "rotate-180" : ""}`} />
+                        </button>
+                        <button class="flex items-center gap-2 px-3 py-1.5 rounded-xl text-[11px] font-bold text-gray-500 hover:text-gray-900 hover:bg-white hover:border-gray-200 border border-transparent transition-all" onclick={() => { composerSecurityOpen = !composerSecurityOpen; composerSettingsOpen = false; }} title={ui.securitySession} type="button"><Zap size={14} /><span>{ui.securitySession}</span></button>
                       {/if}
                     </div>
                     <div class="flex items-center gap-2">
                       {#if running}
-                        <button class="px-4 py-2 text-red-600 hover:bg-red-50 rounded-xl text-xs font-bold transition-all" onclick={interruptTurn} type="button">{ui.stop}</button>
+                        <button class="px-4 py-2 text-red-600 font-bold text-xs hover:bg-red-50 rounded-xl transition-all" onclick={interruptTurn} type="button">{ui.stop}</button>
                         <button class="px-4 py-2 bg-amber-50 text-amber-700 border border-amber-200 rounded-xl text-xs font-bold hover:bg-amber-100 transition-all disabled:opacity-50" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
                       {/if}
                       <button class="px-6 py-2 bg-gray-900 text-white rounded-xl text-xs font-bold hover:bg-gray-800 shadow-lg shadow-gray-200 transition-all disabled:opacity-50 disabled:shadow-none active:scale-[0.98]" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
@@ -5102,9 +5515,20 @@
           </div>
         </div>
       {:else if activeWorkspaceTabId === "git"}
-        <GitWorkspace onSelectRepo={handleRepoSelect} onOpenDiffTab={openGitDiffTab} selectedRepoPath={conversation?.preferences.gitRepoPath ?? null} />
+        <GitWorkspace
+          onOpenCommitDiff={openGitCommitDiffTab}
+          onOpenDiffTab={openGitDiffTab}
+          onSelectRepo={handleRepoSelect}
+          selectedRepoPath={conversation?.preferences.gitRepoPath ?? null}
+        />
       {:else if activeGitDiffTab}
-        <GitWorkspace onOpenDiffTab={openGitDiffTab} onSelectRepo={(repoPath) => handleGitDiffTabRepoSelect(activeGitDiffTab.id, repoPath)} openRequest={activeGitDiffTab.request} selectedRepoPath={activeGitDiffTab.repoPath} />
+        <GitWorkspace
+          onOpenCommitDiff={openGitCommitDiffTab}
+          onOpenDiffTab={openGitDiffTab}
+          onSelectRepo={(repoPath) => handleGitDiffTabRepoSelect(activeGitDiffTab.id, repoPath)}
+          openRequest={activeGitDiffTab.request}
+          selectedRepoPath={activeGitDiffTab.repoPath}
+        />
       {:else if activeCodeDiffTab}
         <div class="h-full overflow-y-auto bg-gray-50/30 p-8"><div class="max-w-5xl mx-auto space-y-8"><div class="flex items-end justify-between"><div><h2 class="text-2xl font-bold text-gray-900">{activeCodeDiffTab.title}</h2><p class="text-sm text-gray-500 mt-1">{m.files_count({ count: String(activeCodeDiffTab.views.length) })}</p></div><button class="p-2 text-gray-400 hover:text-red-600 rounded-xl transition-all" onclick={() => closeCodeDiffTab(activeCodeDiffTab.id)}><X size={20} /></button></div><div class="space-y-6">{#each activeCodeDiffTab.views as change}<div class="bg-white border border-gray-200 rounded-2xl overflow-hidden shadow-sm"><div class="px-5 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between"><div class="flex items-center gap-3"><span class="text-sm font-bold text-gray-900">{change.path}</span><span class="px-2 py-0.5 bg-amber-100 text-[10px] font-bold text-amber-700 rounded uppercase tracking-widest">{change.kind}</span></div></div><div class="p-0">{#if change.renderable}<MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-6 text-xs font-mono text-gray-600 bg-gray-50/50 overflow-x-auto">{change.diff}</pre>{/if}</div></div>{/each}</div></div></div>
       {:else}
@@ -5264,6 +5688,69 @@
     </div>
   </div>
 {/if}
+{/if}
+
+<style>
+  @keyframes thinking-shimmer {
+    0% {
+      background-position: 200% 50%;
+      opacity: 0.72;
+    }
+
+    50% {
+      opacity: 1;
+    }
+
+    100% {
+      background-position: -15% 50%;
+      opacity: 0.78;
+    }
+  }
+
+  @keyframes thinking-dot {
+    0%,
+    80%,
+    100% {
+      transform: translateY(0) scale(0.78);
+      opacity: 0.28;
+    }
+
+    40% {
+      transform: translateY(-1px) scale(1);
+      opacity: 1;
+    }
+  }
+
+  .thinking-indicator {
+    backdrop-filter: blur(10px);
+  }
+
+  .thinking-indicator__label {
+    background-image: linear-gradient(90deg, rgba(107, 114, 128, 0.62) 0%, rgba(17, 24, 39, 0.96) 34%, rgba(16, 185, 129, 0.82) 52%, rgba(17, 24, 39, 0.96) 68%, rgba(107, 114, 128, 0.62) 100%);
+    background-size: 220% 100%;
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+    animation: thinking-shimmer 1.9s linear infinite;
+  }
+
+  .thinking-indicator__dot {
+    height: 0.4rem;
+    width: 0.4rem;
+    border-radius: 9999px;
+    background: linear-gradient(180deg, rgba(16, 185, 129, 0.95), rgba(5, 150, 105, 0.7));
+    box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.08), 0 0 16px rgba(16, 185, 129, 0.22);
+    animation: thinking-dot 1.15s ease-in-out infinite;
+  }
+
+  .thinking-indicator__dot:nth-child(2) {
+    animation-delay: 0.16s;
+  }
+
+  .thinking-indicator__dot:nth-child(3) {
+    animation-delay: 0.32s;
+  }
+</style>
 
 {#snippet renderTurnItem(turnId: string, item: CodexItem)}
   {#if item.type === "agentMessage"}
@@ -5274,20 +5761,26 @@
       <div class="prose prose-sm max-w-none text-gray-800 leading-relaxed animate-in fade-in slide-in-from-left-2 duration-700"><MarkdownMessage on:openLocalPath={(event: CustomEvent<{ href: string }>) => void openGitFileFromMessage(event.detail.href)} text={String(item.text ?? "")} /></div>
     </div>
   {:else if item.type === "reasoning"}
-    <details class="group rounded-2xl border border-amber-100 bg-amber-50/40 overflow-hidden">
-      <summary class="list-none cursor-pointer px-4 py-3 flex items-start justify-between gap-3 hover:bg-amber-50 transition-colors">
-        <div class="flex items-start gap-3 min-w-0">
-          <div class="mt-0.5 flex-shrink-0 w-8 h-8 rounded-lg bg-white border border-amber-100 text-amber-600 flex items-center justify-center"><Zap size={16} /></div>
-          <div class="min-w-0">
-            <h4 class="text-[10px] font-bold text-amber-700 uppercase tracking-widest leading-none">{m.reasoning()}</h4>
-            {#if Array.isArray(item.summary) && item.summary.length > 0}
-              <p class="mt-1 text-xs text-amber-700/80 leading-relaxed break-words">{m.steps_count({ count: String(item.summary.length) })}</p>
-            {/if}
-          </div>
+    <div class="overflow-hidden rounded-2xl border border-amber-100 bg-amber-50/40 shadow-sm">
+      <div class="flex items-start gap-3 border-b border-amber-100 bg-amber-50/70 px-4 py-3">
+        <div class="mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg border border-amber-100 bg-white text-amber-600">
+          <Zap size={16} />
         </div>
-        <ChevronDown size={14} class="mt-1 flex-shrink-0 text-amber-500 group-open:rotate-180 transition-transform" />
-      </summary>
-      <div class="border-t border-amber-100 bg-white/80 px-4 py-3 space-y-3">
+        <div class="min-w-0">
+          <h4 class="text-[10px] font-bold uppercase tracking-widest leading-none text-amber-700">{m.reasoning()}</h4>
+          {#if Array.isArray(item.summary) && item.summary.length > 0}
+            <p class="mt-1 text-xs leading-relaxed text-amber-700/80 break-words">
+              {m.steps_count({ count: String(item.summary.length) })}
+            </p>
+          {/if}
+        </div>
+      </div>
+      <div class="space-y-3 bg-white/85 px-4 py-3">
+        {#if String(item.text ?? "").trim()}
+          <div class="rounded-xl border border-amber-100 bg-white px-3 py-3">
+            <pre class="whitespace-pre-wrap text-xs leading-relaxed text-gray-700">{String(item.text ?? "")}</pre>
+          </div>
+        {/if}
         {#if Array.isArray(item.summary) && item.summary.length > 0}
           <div class="space-y-2">
             {#each item.summary as summaryEntry, index (`${item.id}:summary:${index}`)}
@@ -5297,13 +5790,8 @@
             {/each}
           </div>
         {/if}
-        {#if String(item.text ?? "").trim() && (!Array.isArray(item.summary) || item.summary.join(" ").trim() !== String(item.text ?? "").trim())}
-          <div class="rounded-xl border border-amber-100 bg-white px-3 py-3">
-            <pre class="whitespace-pre-wrap text-xs leading-relaxed text-gray-600">{String(item.text ?? "")}</pre>
-          </div>
-        {/if}
       </div>
-    </details>
+    </div>
   {:else if item.type === "plan"}
     <div class="border border-amber-100 rounded-2xl bg-amber-50/20 overflow-hidden shadow-sm"><div class="px-4 py-2.5 bg-amber-100/50 border-b border-amber-100 flex items-center gap-3"><ListTodo size={14} class="text-amber-700" /><span class="text-[10px] font-bold text-amber-700 uppercase tracking-widest">{ui.plannedStrategy}</span></div><pre class="p-5 text-xs font-mono text-gray-700 leading-relaxed whitespace-pre-wrap">{String(item.text ?? "")}</pre></div>
   {:else if ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"].includes(item.type)}

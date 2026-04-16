@@ -6,6 +6,7 @@ export type IndexedSessionSummary = {
   name: string | null;
   preview: string;
   cwd: string;
+  isSubagent: boolean;
   createdAt: number;
   updatedAt: number;
   status: string;

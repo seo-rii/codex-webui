@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import readline from "node:readline";
 import type { Readable } from "node:stream";
 
+import type { RuntimeProfileConfig } from "../env";
 import { getRuntimeConfig } from "../env";
 import { ensureDataDirectories } from "../fs";
 
@@ -25,7 +26,19 @@ type ServerRequestPayload = {
   params: Record<string, unknown>;
 };
 
+const INVALID_REFRESH_TOKEN_PATTERN = /(TokenRefreshFailed|invalid_grant:\s*Invalid refresh token)/iu;
+
+function stripAnsi(value: string) {
+  return value.replace(/\u001b\[[0-9;]*m/gu, "");
+}
+
+function isInvalidRefreshTokenStderr(value: string) {
+  return INVALID_REFRESH_TOKEN_PATTERN.test(stripAnsi(value));
+}
+
 export class AppServerClient {
+  constructor(private readonly profile: RuntimeProfileConfig) {}
+
   private child: ChildProcessWithoutNullStreams | null = null;
   private lineReader: readline.Interface | null = null;
   private startPromise: Promise<void> | null = null;
@@ -38,6 +51,8 @@ export class AppServerClient {
     }
   >();
   private readonly events = new EventEmitter();
+  private stderrBuffer = "";
+  private suppressedInvalidRefreshTokenWarning = false;
 
   onNotification(listener: (payload: NotificationPayload) => void) {
     this.events.on("notification", listener);
@@ -79,22 +94,21 @@ export class AppServerClient {
   }
 
   private async start() {
-    await ensureDataDirectories();
-    const { codexBin, codexHome } = getRuntimeConfig();
+    await ensureDataDirectories(this.profile);
+    const { codexBin } = getRuntimeConfig();
 
     this.child = spawn(codexBin, ["app-server", "--listen", "stdio://"], {
       env: {
         ...process.env,
-        CODEX_HOME: codexHome
+        CODEX_HOME: this.profile.codexHome
       },
       stdio: ["pipe", "pipe", "pipe"]
     });
 
+    this.stderrBuffer = "";
+    this.suppressedInvalidRefreshTokenWarning = false;
     this.child.stderr.on("data", (chunk: Buffer | string) => {
-      const message = chunk.toString().trim();
-      if (message) {
-        console.error(`[codex app-server] ${message}`);
-      }
+      this.handleStderrChunk(chunk.toString());
     });
 
     this.child.once("error", (error: Error) => {
@@ -102,6 +116,7 @@ export class AppServerClient {
     });
 
     this.child.once("exit", (code: number | null, signal: NodeJS.Signals | null) => {
+      this.flushStderrBuffer();
       this.failPending(new Error(`codex app-server exited (${signal ?? code ?? "unknown"})`));
       this.child = null;
       this.lineReader = null;
@@ -189,5 +204,43 @@ export class AppServerClient {
       pending.reject(reason);
     }
     this.pending.clear();
+  }
+
+  private handleStderrChunk(chunk: string) {
+    this.stderrBuffer += chunk;
+    const lines = this.stderrBuffer.split(/\r?\n/u);
+    this.stderrBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      this.logStderrLine(line);
+    }
+  }
+
+  private flushStderrBuffer() {
+    if (!this.stderrBuffer.trim()) {
+      this.stderrBuffer = "";
+      return;
+    }
+    this.logStderrLine(this.stderrBuffer);
+    this.stderrBuffer = "";
+  }
+
+  private logStderrLine(line: string) {
+    const message = line.trim();
+    if (!message) {
+      return;
+    }
+
+    if (isInvalidRefreshTokenStderr(message)) {
+      if (this.suppressedInvalidRefreshTokenWarning) {
+        return;
+      }
+      this.suppressedInvalidRefreshTokenWarning = true;
+      console.warn(
+        `[codex app-server] ${this.profile.label}: invalid refresh token detected; suppressing repeated refresh-token errors until re-authentication.`
+      );
+      return;
+    }
+
+    console.error(`[codex app-server] ${message}`);
   }
 }

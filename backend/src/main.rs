@@ -46,6 +46,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 const AUTH_COOKIE: &str = "codex_webui_auth";
+const PROFILE_COOKIE: &str = "codex_webui_profile";
+const PROFILE_HEADER: &str = "x-codex-webui-profile-id";
 const LOGIN_WINDOW_MS: u128 = 10 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS: usize = 8;
 const INTERNAL_HEADER: &str = "x-codex-webui-internal-token";
@@ -61,10 +63,27 @@ const QUOTA_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const TERMINAL_BUFFER_LIMIT: usize = 500_000;
 const TERMINAL_RELAY_PREFIX: &str = "__terminal__:";
 
+tokio::task_local! {
+    static ACTIVE_PROFILE_ID: String;
+}
+
+fn session_relay_key(profile_id: &str, session_id: &str) -> String {
+    format!("profile::{profile_id}::session::{session_id}")
+}
+
+fn global_relay_key(profile_id: &str) -> String {
+    format!("profile::{profile_id}::{GLOBAL_RELAY_KEY}")
+}
+
+fn request_cache_key(profile_id: &str, request_id: &str) -> String {
+    format!("profile::{profile_id}::request::{request_id}")
+}
+
 #[derive(Clone, Debug)]
 struct Config {
     project_root: PathBuf,
-    codex_home: PathBuf,
+    default_profile_id: String,
+    profiles: HashMap<String, RuntimeProfile>,
     data_dir: PathBuf,
     base_path: String,
     public_host: String,
@@ -83,6 +102,11 @@ struct Config {
     cookie_same_site: SameSiteMode,
     cookie_secure_mode: CookieSecureMode,
     cors_allowed_origins: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeProfile {
+    codex_home: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +133,7 @@ enum UserRole {
 #[derive(Clone, Debug)]
 struct AuthContext {
     role: UserRole,
+    profile_id: String,
 }
 
 #[derive(Clone)]
@@ -117,7 +142,8 @@ struct AppState {
     http: reqwest::Client,
     login_attempts: Arc<Mutex<HashMap<String, Vec<u128>>>>,
     response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>,
-    quota_cache: Arc<Mutex<Option<CachedQuota>>>,
+    inflight_requests: Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<ServerEnvelope>>>>>,
+    quota_cache: Arc<Mutex<HashMap<String, CachedQuota>>>,
     relays: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
     terminals: Arc<Mutex<HashMap<String, Arc<TerminalSession>>>>,
 }
@@ -132,6 +158,13 @@ struct CachedResponse {
 struct CachedQuota {
     created_at: Instant,
     payload: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeProfileShape {
+    id: Option<String>,
+    #[serde(alias = "codex_home", alias = "codexHome")]
+    codex_home: Option<String>,
 }
 
 struct TerminalSession {
@@ -346,7 +379,8 @@ async fn main() -> Result<()> {
         http,
         login_attempts: Arc::new(Mutex::new(HashMap::new())),
         response_cache: Arc::new(Mutex::new(HashMap::new())),
-        quota_cache: Arc::new(Mutex::new(None)),
+        inflight_requests: Arc::new(Mutex::new(HashMap::new())),
+        quota_cache: Arc::new(Mutex::new(HashMap::new())),
         relays: Arc::new(Mutex::new(HashMap::new())),
         terminals: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -392,9 +426,13 @@ impl Config {
             ));
         }
 
+        let codex_home = resolve_codex_home()?;
+        let (default_profile_id, profiles) = parse_runtime_profiles(&codex_home)?;
+
         Ok(Self {
             project_root,
-            codex_home: resolve_codex_home()?,
+            default_profile_id,
+            profiles,
             data_dir: env::var("CODEX_WEBUI_DATA_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| cwd.join(".data")),
@@ -423,6 +461,80 @@ impl Config {
             )?,
         })
     }
+}
+
+fn sanitize_profile_id(input: &str) -> String {
+    let sanitized = input
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | '0'..='9' | '.' | '_' | '-' => character,
+            _ => '-',
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if sanitized.is_empty() {
+        "default".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn parse_runtime_profiles(
+    default_codex_home: &PathBuf,
+) -> Result<(String, HashMap<String, RuntimeProfile>)> {
+    let default_profile_id =
+        sanitize_profile_id(&env::var("CODEX_WEBUI_DEFAULT_PROFILE_ID").unwrap_or_else(|_| "default".to_string()));
+    let raw_profiles = env::var("CODEX_WEBUI_PROFILES_JSON").ok();
+
+    let Some(raw_profiles) = raw_profiles.filter(|value| !value.trim().is_empty()) else {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            default_profile_id.clone(),
+            RuntimeProfile {
+                codex_home: default_codex_home.clone(),
+            },
+        );
+        return Ok((default_profile_id, profiles));
+    };
+
+    let parsed: Vec<RuntimeProfileShape> =
+        serde_json::from_str(&raw_profiles).context("invalid CODEX_WEBUI_PROFILES_JSON")?;
+    let mut profiles = HashMap::new();
+
+    for entry in parsed {
+        let id = sanitize_profile_id(entry.id.as_deref().unwrap_or("default"));
+        profiles.entry(id.clone()).or_insert_with(|| RuntimeProfile {
+            codex_home: entry
+                .codex_home
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_codex_home.clone()),
+        });
+    }
+
+    if profiles.is_empty() {
+        profiles.insert(
+            default_profile_id.clone(),
+            RuntimeProfile {
+                codex_home: default_codex_home.clone(),
+            },
+        );
+    }
+
+    let resolved_default_profile_id = if profiles.contains_key(&default_profile_id) {
+        default_profile_id
+    } else {
+        profiles
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "default".to_string())
+    };
+
+    Ok((resolved_default_profile_id, profiles))
 }
 
 async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Request) -> Response {
@@ -499,12 +611,23 @@ async fn handle_auth_http(
     let result = match (method, route_path.as_str()) {
         (Method::POST, "/api/auth/login") => auth_login(state.clone(), jar, headers, request).await,
         (Method::POST, "/api/auth/logout") => Ok(auth_logout(jar)),
+        (Method::POST, "/api/auth/profile") => {
+            let Some(auth) = auth_context(&state.config, &jar) else {
+                return json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+            };
+            select_profile(state.config.clone(), jar, headers, request, auth).await
+        }
         (Method::GET, "/api/auth/session") => {
             let auth = auth_context(&state.config, &jar);
+            let active_profile_id = auth
+                .as_ref()
+                .map(|context| context.profile_id.as_str())
+                .unwrap_or(&state.config.default_profile_id);
             Ok((
                 jar,
                 Json(json!({
                     "authenticated": auth.is_some(),
+                    "activeProfileId": active_profile_id,
                     "role": auth.map(|context| match context.role {
                         UserRole::Admin => "admin",
                         UserRole::Viewer => "viewer",
@@ -617,7 +740,14 @@ fn auth_logout(jar: CookieJar) -> Response {
     let mut cookie = Cookie::new(AUTH_COOKIE, "");
     cookie.set_path("/");
     cookie.set_max_age(CookieDuration::seconds(0));
-    (jar.remove(cookie), Json(json!({ "ok": true }))).into_response()
+    let mut profile_cookie = Cookie::new(PROFILE_COOKIE, "");
+    profile_cookie.set_path("/");
+    profile_cookie.set_max_age(CookieDuration::seconds(0));
+    (
+        jar.remove(cookie).remove(profile_cookie),
+        Json(json!({ "ok": true })),
+    )
+        .into_response()
 }
 
 async fn proxy_to_internal(
@@ -697,11 +827,15 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
                 let subscriptions = Arc::clone(&subscriptions);
                 let auth = auth.clone();
                 tokio::spawn(async move {
-                    if let Err(error) =
-                        handle_ws_message(&state, &out_tx, &subscriptions, &auth, payload).await
-                    {
-                        error!("websocket request failed: {error:#}");
-                    }
+                    ACTIVE_PROFILE_ID
+                        .scope(auth.profile_id.clone(), async move {
+                            if let Err(error) =
+                                handle_ws_message(&state, &out_tx, &subscriptions, &auth, payload).await
+                            {
+                                error!("websocket request failed: {error:#}");
+                            }
+                        })
+                        .await;
                 });
             }
             Message::Ping(payload) => {
@@ -733,8 +867,14 @@ async fn handle_ws_message(
             let _ = out_tx.send(ServerEnvelope::Pong { nonce });
         }
         ClientEnvelope::Request { id, method, params } => {
-            if let Some(cached) = cached_response(state, &id).await {
+            let request_key = request_cache_key(&auth.profile_id, &id);
+
+            if let Some(cached) = cached_response(state, &request_key).await {
                 let _ = out_tx.send(cached);
+                return Ok(());
+            }
+
+            if !register_inflight_request(state, &request_key, out_tx).await {
                 return Ok(());
             }
 
@@ -792,8 +932,8 @@ async fn handle_ws_message(
                 });
             }
 
-            cache_response(state, &id, message.clone()).await;
-            let _ = out_tx.send(message);
+            cache_response(state, &request_key, message.clone()).await;
+            resolve_inflight_request(state, &request_key, message).await;
         }
     }
 
@@ -1055,6 +1195,7 @@ async fn execute_ws_method(
                     .get("refresh")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                &auth.profile_id,
             )
             .await
         }
@@ -1190,6 +1331,23 @@ async fn execute_ws_method(
             )
             .await
         }
+        "session/search" => {
+            let session_id = require_string(&params, "sessionId")?;
+            let query_raw = require_string(&params, "query")?;
+            let query = urlencoding::encode(&query_raw);
+            let cursor = params
+                .get("cursor")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(urlencoding::encode);
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
+            let mut path =
+                format!("/api/sessions/{session_id}/search?query={query}&limit={limit}");
+            if let Some(cursor) = cursor {
+                path.push_str(&format!("&cursor={cursor}"));
+            }
+            internal_json_request(state, Method::GET, &path, None).await
+        }
         "session/olderTurns/get" => {
             let session_id = require_string(&params, "sessionId")?;
             let before_turn_id = require_string(&params, "beforeTurnId")?;
@@ -1318,6 +1476,19 @@ async fn execute_ws_method(
                 state,
                 Method::PATCH,
                 &format!("/api/sessions/{session_id}/queue/{queue_id}"),
+                Some(payload),
+            )
+            .await
+        }
+        "session/queue/reorder" => {
+            let session_id = require_string(&params, "sessionId")?;
+            let payload = json!({
+                "queueIds": params.get("queueIds").cloned().unwrap_or_else(|| json!([]))
+            });
+            internal_json_request(
+                state,
+                Method::POST,
+                &format!("/api/sessions/{session_id}/queue/reorder"),
                 Some(payload),
             )
             .await
@@ -1645,6 +1816,7 @@ async fn execute_ws_method(
                 state.clone(),
                 out_tx.clone(),
                 subscriptions.clone(),
+                auth.profile_id.clone(),
                 session_id.clone(),
             )
             .await?;
@@ -1653,7 +1825,7 @@ async fn execute_ws_method(
         "session/unsubscribe" => {
             let session_id = require_string(&params, "sessionId")?;
             let mut current = subscriptions.lock().await;
-            if let Some(handle) = current.remove(&session_id) {
+            if let Some(handle) = current.remove(&session_relay_key(&auth.profile_id, &session_id)) {
                 handle.abort();
             }
             Ok(json!({ "subscribed": false, "sessionId": session_id }))
@@ -1678,12 +1850,18 @@ async fn execute_ws_method(
             Ok(json!({ "subscribed": false, "terminalId": terminal_id }))
         }
         "events/subscribe" => {
-            subscribe_global(state.clone(), out_tx.clone(), subscriptions.clone()).await?;
+            subscribe_global(
+                state.clone(),
+                out_tx.clone(),
+                subscriptions.clone(),
+                auth.profile_id.clone(),
+            )
+            .await?;
             Ok(json!({ "subscribed": true, "scope": "global" }))
         }
         "events/unsubscribe" => {
             let mut current = subscriptions.lock().await;
-            if let Some(handle) = current.remove(GLOBAL_RELAY_KEY) {
+            if let Some(handle) = current.remove(&global_relay_key(&auth.profile_id)) {
                 handle.abort();
             }
             Ok(json!({ "subscribed": false, "scope": "global" }))
@@ -1696,9 +1874,10 @@ async fn subscribe_session(
     state: AppState,
     out_tx: mpsc::UnboundedSender<ServerEnvelope>,
     subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    profile_id: String,
     session_id: String,
 ) -> Result<()> {
-    let relay = ensure_stream_relay(&state, &session_id).await?;
+    let relay = ensure_stream_relay(&state, &profile_id, &session_id).await?;
     let mut receiver = relay.subscribe();
     let session_key = session_id.clone();
     let handle = tokio::spawn(async move {
@@ -1719,7 +1898,7 @@ async fn subscribe_session(
     });
 
     let mut current = subscriptions.lock().await;
-    if let Some(existing) = current.insert(session_id, handle) {
+    if let Some(existing) = current.insert(session_relay_key(&profile_id, &session_id), handle) {
         existing.abort();
     }
     Ok(())
@@ -1765,8 +1944,9 @@ async fn subscribe_global(
     state: AppState,
     out_tx: mpsc::UnboundedSender<ServerEnvelope>,
     subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    profile_id: String,
 ) -> Result<()> {
-    let relay = ensure_global_relay(&state).await?;
+    let relay = ensure_global_relay(&state, &profile_id).await?;
     let mut receiver = relay.subscribe();
     let handle = tokio::spawn(async move {
         loop {
@@ -1783,7 +1963,7 @@ async fn subscribe_global(
     });
 
     let mut current = subscriptions.lock().await;
-    if let Some(existing) = current.insert(GLOBAL_RELAY_KEY.to_string(), handle) {
+    if let Some(existing) = current.insert(global_relay_key(&profile_id), handle) {
         existing.abort();
     }
     Ok(())
@@ -1791,23 +1971,31 @@ async fn subscribe_global(
 
 async fn ensure_stream_relay(
     state: &AppState,
+    profile_id: &str,
     session_id: &str,
 ) -> Result<broadcast::Sender<Value>> {
+    let relay_key = session_relay_key(profile_id, session_id);
     let mut relays = state.relays.lock().await;
-    if let Some(existing) = relays.get(session_id) {
+    if let Some(existing) = relays.get(&relay_key) {
         return Ok(existing.clone());
     }
 
     let (sender, _) = broadcast::channel(256);
-    relays.insert(session_id.to_string(), sender.clone());
+    relays.insert(relay_key, sender.clone());
 
     let state = state.clone();
     let session_id = session_id.to_string();
+    let profile_id = profile_id.to_string();
     let relay_sender = sender.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(error) =
-                stream_session_events(state.clone(), relay_sender.clone(), session_id.clone()).await
+            if let Err(error) = stream_session_events(
+                state.clone(),
+                relay_sender.clone(),
+                profile_id.clone(),
+                session_id.clone(),
+            )
+            .await
             {
                 warn!("session stream relay failed for {session_id}: {error:#}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1818,20 +2006,27 @@ async fn ensure_stream_relay(
     Ok(sender)
 }
 
-async fn ensure_global_relay(state: &AppState) -> Result<broadcast::Sender<Value>> {
+async fn ensure_global_relay(
+    state: &AppState,
+    profile_id: &str,
+) -> Result<broadcast::Sender<Value>> {
+    let relay_key = global_relay_key(profile_id);
     let mut relays = state.relays.lock().await;
-    if let Some(existing) = relays.get(GLOBAL_RELAY_KEY) {
+    if let Some(existing) = relays.get(&relay_key) {
         return Ok(existing.clone());
     }
 
     let (sender, _) = broadcast::channel(256);
-    relays.insert(GLOBAL_RELAY_KEY.to_string(), sender.clone());
+    relays.insert(relay_key, sender.clone());
 
     let state = state.clone();
+    let profile_id = profile_id.to_string();
     let relay_sender = sender.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(error) = stream_global_events(state.clone(), relay_sender.clone()).await {
+            if let Err(error) =
+                stream_global_events(state.clone(), relay_sender.clone(), profile_id.clone()).await
+            {
                 warn!("global stream relay failed: {error:#}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -1844,6 +2039,7 @@ async fn ensure_global_relay(state: &AppState) -> Result<broadcast::Sender<Value
 async fn stream_session_events(
     state: AppState,
     sender: broadcast::Sender<Value>,
+    profile_id: String,
     session_id: String,
 ) -> Result<()> {
     let target = internal_url(&state.config, &format!("/api/sessions/{session_id}/stream"));
@@ -1851,6 +2047,7 @@ async fn stream_session_events(
         .http
         .get(target)
         .header(INTERNAL_HEADER, &state.config.internal_proxy_token)
+        .header(PROFILE_HEADER, &profile_id)
         .send()
         .await
         .context("failed to connect to internal SSE stream")?;
@@ -1877,12 +2074,17 @@ async fn stream_session_events(
     Err(anyhow!("internal SSE stream ended"))
 }
 
-async fn stream_global_events(state: AppState, sender: broadcast::Sender<Value>) -> Result<()> {
+async fn stream_global_events(
+    state: AppState,
+    sender: broadcast::Sender<Value>,
+    profile_id: String,
+) -> Result<()> {
     let target = internal_url(&state.config, "/api/events/stream");
     let response = state
         .http
         .get(target)
         .header(INTERNAL_HEADER, &state.config.internal_proxy_token)
+        .header(PROFILE_HEADER, &profile_id)
         .send()
         .await
         .context("failed to connect to internal global SSE stream")?;
@@ -2261,17 +2463,17 @@ async fn install_or_update_codex(state: &AppState, install_if_missing: bool) -> 
     }))
 }
 
-async fn codex_quota_status(state: &AppState, refresh: bool) -> Result<Value> {
+async fn codex_quota_status(state: &AppState, refresh: bool, profile_id: &str) -> Result<Value> {
     if !refresh {
         let cache = state.quota_cache.lock().await;
-        if let Some(cached) = cache.as_ref() {
+        if let Some(cached) = cache.get(profile_id) {
             if cached.created_at.elapsed() < QUOTA_CACHE_TTL {
                 return Ok(cached.payload.clone());
             }
         }
     }
 
-    let payload = match fetch_codex_quota(state).await {
+    let payload = match fetch_codex_quota(state, profile_id).await {
         Ok(payload) => payload,
         Err(error) => json!({
             "available": false,
@@ -2286,7 +2488,7 @@ async fn codex_quota_status(state: &AppState, refresh: bool) -> Result<Value> {
     };
 
     let mut cache = state.quota_cache.lock().await;
-    *cache = Some(CachedQuota {
+    cache.insert(profile_id.to_string(), CachedQuota {
         created_at: Instant::now(),
         payload: payload.clone(),
     });
@@ -2294,8 +2496,9 @@ async fn codex_quota_status(state: &AppState, refresh: bool) -> Result<Value> {
     Ok(payload)
 }
 
-async fn fetch_codex_quota(state: &AppState) -> Result<Value> {
-    let auth = read_codex_auth(&state.config)?;
+async fn fetch_codex_quota(state: &AppState, profile_id: &str) -> Result<Value> {
+    let profile = resolve_runtime_profile(&state.config, profile_id);
+    let auth = read_codex_auth(&profile.codex_home)?;
     let access_token = auth
         .tokens
         .as_ref()
@@ -2363,8 +2566,8 @@ async fn fetch_codex_quota(state: &AppState) -> Result<Value> {
     }))
 }
 
-fn read_codex_auth(config: &Config) -> Result<AuthFile> {
-    let auth_path = config.codex_home.join("auth.json");
+fn read_codex_auth(codex_home: &PathBuf) -> Result<AuthFile> {
+    let auth_path = codex_home.join("auth.json");
     let raw = fs::read_to_string(&auth_path)
         .with_context(|| format!("missing Codex auth file at {}.", auth_path.display()))?;
     serde_json::from_str(&raw).context("invalid Codex auth.json")
@@ -2388,6 +2591,20 @@ fn normalize_quota_window(window: Option<&UsageWindowShape>) -> Option<Value> {
         "resetAfterSeconds": reset_after_seconds,
         "resetAt": reset_at,
     }))
+}
+
+fn resolve_runtime_profile<'a>(config: &'a Config, profile_id: &str) -> &'a RuntimeProfile {
+    config
+        .profiles
+        .get(profile_id)
+        .or_else(|| config.profiles.get(&config.default_profile_id))
+        .unwrap_or_else(|| {
+            config
+                .profiles
+                .values()
+                .next()
+                .expect("at least one runtime profile must exist")
+        })
 }
 
 async fn read_codex_version(state: &AppState) -> Result<String> {
@@ -2623,6 +2840,12 @@ async fn upload_attachments(
         .http
         .post(target)
         .header(INTERNAL_HEADER, &state.config.internal_proxy_token)
+        .header(
+            PROFILE_HEADER,
+            ACTIVE_PROFILE_ID
+                .try_with(|profile_id| profile_id.clone())
+                .unwrap_or_else(|_| state.config.default_profile_id.clone()),
+        )
         .multipart(form)
         .send()
         .await
@@ -2645,6 +2868,10 @@ async fn internal_json_request(
             target,
         )
         .header(INTERNAL_HEADER, &state.config.internal_proxy_token);
+
+    if let Ok(profile_id) = ACTIVE_PROFILE_ID.try_with(|profile_id| profile_id.clone()) {
+        request = request.header(PROFILE_HEADER, profile_id);
+    }
 
     if let Some(body) = body {
         request = request.json(&body);
@@ -2683,10 +2910,15 @@ async fn forward_request(
         )
         .header(INTERNAL_HEADER, &state.config.internal_proxy_token);
 
+    if let Ok(profile_id) = ACTIVE_PROFILE_ID.try_with(|profile_id| profile_id.clone()) {
+        request = request.header(PROFILE_HEADER, profile_id);
+    }
+
     for (name, value) in headers.iter() {
         if name == header::HOST
             || name == header::CONTENT_LENGTH
             || name.as_str() == INTERNAL_HEADER
+            || name.as_str() == PROFILE_HEADER
         {
             continue;
         }
@@ -2737,6 +2969,34 @@ async fn cache_response(state: &AppState, request_id: &str, message: ServerEnvel
             message,
         },
     );
+}
+
+async fn register_inflight_request(
+    state: &AppState,
+    request_id: &str,
+    out_tx: &mpsc::UnboundedSender<ServerEnvelope>,
+) -> bool {
+    let mut inflight = state.inflight_requests.lock().await;
+    inflight.retain(|_, waiters| !waiters.is_empty());
+
+    if let Some(waiters) = inflight.get_mut(request_id) {
+        waiters.push(out_tx.clone());
+        return false;
+    }
+
+    inflight.insert(request_id.to_string(), vec![out_tx.clone()]);
+    true
+}
+
+async fn resolve_inflight_request(state: &AppState, request_id: &str, message: ServerEnvelope) {
+    let waiters = {
+        let mut inflight = state.inflight_requests.lock().await;
+        inflight.remove(request_id).unwrap_or_default()
+    };
+
+    for waiter in waiters {
+        let _ = waiter.send(message.clone());
+    }
 }
 
 async fn check_rate_limit(state: &AppState, identifier: &str) -> bool {
@@ -2848,6 +3108,26 @@ fn issue_auth_cookie(
     Ok(jar.add(cookie))
 }
 
+fn issue_profile_cookie(
+    config: &Config,
+    jar: CookieJar,
+    secure_request: bool,
+    profile_id: &str,
+) -> Result<CookieJar> {
+    let secure = resolve_cookie_secure(config, secure_request)?;
+    let mut cookie = Cookie::new(PROFILE_COOKIE, profile_id.to_string());
+    cookie.set_path("/");
+    cookie.set_http_only(true);
+    cookie.set_same_site(match config.cookie_same_site {
+        SameSiteMode::Strict => SameSite::Strict,
+        SameSiteMode::Lax => SameSite::Lax,
+        SameSiteMode::None => SameSite::None,
+    });
+    cookie.set_secure(secure);
+    cookie.set_max_age(CookieDuration::days(30));
+    Ok(jar.add(cookie))
+}
+
 fn resolve_cookie_secure(config: &Config, secure_request: bool) -> Result<bool> {
     if config.cookie_same_site == SameSiteMode::None
         && config.cookie_secure_mode == CookieSecureMode::Never
@@ -2888,6 +3168,57 @@ fn make_auth_token(config: &Config, role: UserRole) -> Result<String> {
     Ok(format!("{payload}.{signature}"))
 }
 
+async fn select_profile(
+    config: Arc<Config>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    request: Request,
+    auth: AuthContext,
+) -> std::result::Result<Response, String> {
+    let secure_request = request_is_secure(&headers);
+    let body = to_bytes(request.into_body(), usize::MAX)
+        .await
+        .map_err(|_| "Invalid request body.".to_string())?;
+    let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    let requested_profile_id = payload
+        .get("profileId")
+        .and_then(Value::as_str)
+        .map(sanitize_profile_id)
+        .unwrap_or_else(|| config.default_profile_id.clone());
+
+    if !config.profiles.contains_key(&requested_profile_id) {
+        return Ok(json_error(StatusCode::BAD_REQUEST, "Unknown profile."));
+    }
+
+    let next_jar = issue_profile_cookie(&config, jar, secure_request, &requested_profile_id)
+        .map_err(|error| error.to_string())?;
+    let _ = append_audit_log(
+        &config,
+        AuditLogEntry {
+            id: Uuid::new_v4().to_string(),
+            at: now_unix_ms(),
+            role: match auth.role {
+                UserRole::Admin => "admin".to_string(),
+                UserRole::Viewer => "viewer".to_string(),
+            },
+            method: "auth/profile".to_string(),
+            target: Some(requested_profile_id.clone()),
+            ok: true,
+            error: None,
+        },
+    )
+    .await;
+
+    Ok((
+        next_jar,
+        Json(json!({
+            "ok": true,
+            "activeProfileId": requested_profile_id,
+        })),
+    )
+        .into_response())
+}
+
 fn auth_context(config: &Config, jar: &CookieJar) -> Option<AuthContext> {
     let Some(cookie) = jar.get(AUTH_COOKIE) else {
         return None;
@@ -2923,7 +3254,13 @@ fn auth_context(config: &Config, jar: &CookieJar) -> Option<AuthContext> {
         UserRole::Admin
     };
 
-    Some(AuthContext { role })
+    let profile_id = jar
+        .get(PROFILE_COOKIE)
+        .map(|cookie| sanitize_profile_id(cookie.value()))
+        .filter(|value| config.profiles.contains_key(value))
+        .unwrap_or_else(|| config.default_profile_id.clone());
+
+    Some(AuthContext { role, profile_id })
 }
 
 fn sign(config: &Config, payload: &str) -> Result<String> {

@@ -29,6 +29,7 @@ import type {
   SessionSummary,
   SessionSummaryHighlight,
   StartupScheduledShutdownAlert,
+  SessionTurnSearchPayload,
   SessionTurnPayload,
   SessionTurnsPagePayload,
   StreamEvent,
@@ -40,9 +41,10 @@ import { createAppError, parseAppError } from "$lib/errors";
 import { listAttachments } from "./attachments";
 import { AppServerClient } from "./app-server/client";
 import { configTomlPath, syncCodexTomlWithPreferences } from "./codex-config";
-import { getRuntimeConfig } from "./env";
+import { getCurrentRuntimeProfile, getRuntimeConfig, getRuntimeProfile, type RuntimeProfileConfig } from "./env";
 import { buildSandboxPolicy, listDirectoryPayload, resolveAllowedDirectory } from "./fs";
 import { resolveGitRepository } from "./git";
+import { runWithProfile } from "./profile-context";
 import { sessionIndexClient, type IndexedSessionSummary } from "./session-index";
 import { uiStateStore } from "./store";
 
@@ -58,11 +60,18 @@ const SESSION_WINDOW_SIZE = 20;
 const RECENT_LIVE_THREAD_WINDOW_SIZE = 120;
 const RECENT_LIVE_THREAD_CACHE_TTL_MS = 2500;
 const LOADED_THREAD_CACHE_TTL_MS = 1500;
+const ACCOUNT_STATE_CACHE_TTL_MS = 30_000;
+const INVALID_REFRESH_TOKEN_PATTERN = /(TokenRefreshFailed|invalid_grant:\s*Invalid refresh token)/iu;
 const HYDRATION_CACHE_LIMIT = 2;
 const DEFERRED_ITEM_TYPES = new Set(["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"]);
 const DEFAULT_THREAD_NAME = "New thread";
 const LIVE_THREAD_STATUSES = new Set(["running", "active"]);
 const DEFAULT_NOTIFICATION_LIMIT = 80;
+
+type GatewayAccountState = {
+  account: Record<string, unknown>;
+  requiresOpenaiAuth: boolean;
+};
 
 function asRecord(value: unknown) {
   return (value ?? {}) as Record<string, unknown>;
@@ -179,8 +188,13 @@ function isUnmaterializedThreadError(error: unknown) {
   return error instanceof Error && /not materialized yet|includeTurns is unavailable before first user message/iu.test(error.message);
 }
 
+function isInvalidRefreshTokenError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return INVALID_REFRESH_TOKEN_PATTERN.test(message);
+}
+
 function coercePreferences(preferences: Partial<SessionPreferences> | null | undefined) {
-  const defaults = getRuntimeConfig().defaults;
+  const defaults = getCurrentRuntimeProfile().defaults;
   return {
     ...defaults,
     ...preferences
@@ -204,7 +218,7 @@ function toSummary(
     highlight,
     pinned: false,
     tags: [],
-    cwd: (normalized.cwd as string | null) ?? preferences?.cwd ?? getRuntimeConfig().defaults.cwd,
+    cwd: (normalized.cwd as string | null) ?? preferences?.cwd ?? getCurrentRuntimeProfile().defaults.cwd,
     archived,
     createdAt: Number(normalized.createdAt ?? 0),
     updatedAt: Number(normalized.updatedAt ?? 0),
@@ -230,7 +244,7 @@ function indexedSessionToSummary(
     highlight,
     pinned: false,
     tags: [],
-    cwd: indexed.cwd || preferences?.cwd || getRuntimeConfig().defaults.cwd,
+    cwd: indexed.cwd || preferences?.cwd || getCurrentRuntimeProfile().defaults.cwd,
     archived: false,
     createdAt: indexed.createdAt,
     updatedAt: indexed.updatedAt,
@@ -552,7 +566,8 @@ function describeNotification(notification: AppNotification) {
 }
 
 export class CodexGateway {
-  private readonly client = new AppServerClient();
+  private readonly client: AppServerClient;
+  private readonly runtimeConfig = getRuntimeConfig();
   private readonly streamSubscribers = new Map<string, Set<(event: StreamEvent) => void>>();
   private readonly globalSubscribers = new Set<(event: GlobalStreamEvent) => void>();
   private readonly pendingRequests = new Map<string, Map<string, InternalPendingRequest>>();
@@ -570,15 +585,19 @@ export class CodexGateway {
   private loadedThreadIds = new Set<string>();
   private loadedThreadIdsLoadedAt = 0;
   private loadedThreadIdsPromise: Promise<Set<string>> | null = null;
+  private accountStateCache: { value: GatewayAccountState; expiresAt: number } | null = null;
   private shutdownTimer: ReturnType<typeof setTimeout> | null = null;
   private shutdownScheduledFor: number | null = null;
 
-  constructor() {
+  constructor(private readonly profile: RuntimeProfileConfig) {
+    this.client = new AppServerClient(profile);
     void uiStateStore.markQueuesPendingResume();
     void this.restorePersistedShutdownState();
-    this.client.onNotification((payload) => this.handleNotification(payload.method, payload.params));
+    this.client.onNotification((payload) => {
+      void runWithProfile(this.profile.id, () => this.handleNotification(payload.method, payload.params));
+    });
     this.client.onServerRequest((payload) => {
-      void this.handleServerRequest(payload);
+      void runWithProfile(this.profile.id, () => this.handleServerRequest(payload));
     });
   }
 
@@ -603,10 +622,10 @@ export class CodexGateway {
   }
 
   async getConfig(): Promise<AppConfigPayload> {
-    const [modelsResponse, collaborationResponse, accountResponse] = await Promise.all([
+    const [modelsResponse, collaborationResponse, accountState] = await Promise.all([
       this.client.request("model/list", { includeHidden: false }),
       this.client.request("collaborationMode/list", {}),
-      this.client.request("account/read", { refreshToken: false })
+      this.readAccountState()
     ]);
     const [pausedQueueEntries, globalState, notifications, savedFilters, knownTags, promptPresets] = await Promise.all([
       uiStateStore.listResumePendingQueues(),
@@ -617,14 +636,13 @@ export class CodexGateway {
       uiStateStore.getPromptPresets()
     ]);
     const preferences: Record<string, SessionPreferences> = pausedQueueEntries.length > 0 ? await uiStateStore.getAll() : {};
-    const indexedSessions =
-      pausedQueueEntries.length > 0 ? await sessionIndexClient.list(getRuntimeConfig().codexHome).catch(() => []) : [];
+    const indexedSessions = pausedQueueEntries.length > 0 ? await sessionIndexClient.list(this.profile.codexHome).catch(() => []) : [];
     const indexedById = new Map(indexedSessions.map((session) => [session.id, session]));
     const pausedQueues = await Promise.all(
       pausedQueueEntries.map(async (entry) => {
         const indexedSession = indexedById.get(entry.threadId) ?? null;
         let name = getDisplayThreadName(indexedSession?.name ?? null, indexedSession?.preview ?? null);
-        let cwd = indexedSession?.cwd || preferences[entry.threadId]?.cwd || getRuntimeConfig().defaults.cwd;
+        let cwd = indexedSession?.cwd || preferences[entry.threadId]?.cwd || this.profile.defaults.cwd;
 
         if (!name || !indexedSession?.cwd) {
           try {
@@ -648,7 +666,7 @@ export class CodexGateway {
 
     const models = asRecord(modelsResponse).data as Array<Record<string, unknown>> | undefined;
     const collabModes = asRecord(collaborationResponse).data as Array<Record<string, unknown>> | undefined;
-    const account = asRecord(asRecord(accountResponse).account);
+    const account = accountState.account;
 
     return {
       models:
@@ -676,23 +694,23 @@ export class CodexGateway {
           reasoning_effort: (mode.reasoning_effort as string | null) ?? null
         })) ?? [],
       allowedRoots: (await listDirectoryPayload(null)).allowedRoots,
-      defaults: getRuntimeConfig().defaults,
+      defaults: this.profile.defaults,
       paths: {
-        codexHome: getRuntimeConfig().codexHome,
-        configFilePath: configTomlPath(getRuntimeConfig().codexHome)
+        codexHome: this.profile.codexHome,
+        configFilePath: configTomlPath(this.profile.codexHome)
       },
       git: {
-        discoveryDepth: getRuntimeConfig().gitDiscoveryDepth
+        discoveryDepth: this.runtimeConfig.gitDiscoveryDepth
       },
       systemShutdown: {
-        available: getRuntimeConfig().systemShutdownEnabled,
-        delaySeconds: getRuntimeConfig().systemShutdownDelaySeconds,
-        armed: getRuntimeConfig().systemShutdownEnabled && globalState.shutdownAfterQueueCompletes
+        available: this.runtimeConfig.systemShutdownEnabled,
+        delaySeconds: this.runtimeConfig.systemShutdownDelaySeconds,
+        armed: this.runtimeConfig.systemShutdownEnabled && globalState.shutdownAfterQueueCompletes
       },
       startup: {
         pausedQueues,
         scheduledShutdown:
-          getRuntimeConfig().systemShutdownEnabled &&
+          this.runtimeConfig.systemShutdownEnabled &&
           globalState.scheduledShutdown &&
           globalState.scheduledShutdown.scheduledFor > Date.now()
             ? globalState.scheduledShutdown
@@ -711,8 +729,14 @@ export class CodexGateway {
         type: (account.type as "apiKey" | "chatgpt" | null) ?? null,
         email: (account.email as string | null) ?? null,
         planType: (account.planType as string | null) ?? null,
-        requiresOpenaiAuth: Boolean(asRecord(accountResponse).requiresOpenaiAuth)
-      }
+        requiresOpenaiAuth: accountState.requiresOpenaiAuth
+      },
+      profiles: this.runtimeConfig.profiles.map((profile) => ({
+        id: profile.id,
+        label: profile.label,
+        codexHome: profile.codexHome,
+        active: profile.id === this.profile.id
+      }))
     };
   }
 
@@ -842,7 +866,7 @@ export class CodexGateway {
         uiStateStore.getAllSessionMeta(),
         uiStateStore.getQueueCounts(),
         uiStateStore.getSessionHighlights(),
-        sessionIndexClient.page(getRuntimeConfig().codexHome, cursor, limit, null),
+        sessionIndexClient.page(this.profile.codexHome, cursor, limit, null),
         this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>())
       ]);
 
@@ -906,7 +930,7 @@ export class CodexGateway {
         uiStateStore.getAllSessionMeta(),
         uiStateStore.getQueueCounts(),
         uiStateStore.getSessionHighlights(),
-        sessionIndexClient.page(getRuntimeConfig().codexHome, cursor, limit, needle),
+        sessionIndexClient.page(this.profile.codexHome, cursor, limit, needle),
         this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>())
       ]);
 
@@ -970,7 +994,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       return this.listAllThreadSessions(true, preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, filter);
     }
 
-    const indexedSessions = (await sessionIndexClient.list(getRuntimeConfig().codexHome).catch(() => [])).filter(
+    const indexedSessions = (await sessionIndexClient.list(this.profile.codexHome).catch(() => [])).filter(
       (session) => !session.isSubagent
     );
     const liveThreads = await this.listAllThreadSessions(false, preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, filter);
@@ -997,7 +1021,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         highlight: highlightsByThreadId[session.id] ?? null,
         pinned: false,
         tags: [],
-        cwd: session.cwd || stored?.cwd || getRuntimeConfig().defaults.cwd,
+        cwd: session.cwd || stored?.cwd || this.profile.defaults.cwd,
         archived: false,
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
@@ -1177,14 +1201,11 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   async getAccount() {
-    const response = asRecord(await this.client.request("account/read", { refreshToken: false }));
-    return {
-      account: asRecord(response.account),
-      requiresOpenaiAuth: Boolean(response.requiresOpenaiAuth)
-    };
+    return this.readAccountState(true);
   }
 
   async startAccountLogin(type: "chatgpt" | "chatgptDeviceCode" | "apiKey", apiKey?: string | null) {
+    this.invalidateAccountStateCache();
     if (type === "apiKey") {
       if (!apiKey?.trim()) {
         throw new Error("API key is required.");
@@ -1196,10 +1217,12 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   async cancelAccountLogin(loginId: string) {
+    this.invalidateAccountStateCache();
     return this.client.request("account/login/cancel", { loginId });
   }
 
   async logoutAccount() {
+    this.invalidateAccountStateCache();
     return this.client.request("account/logout", {});
   }
 
@@ -1334,6 +1357,148 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     };
   }
 
+  async searchSessionTurns(
+    threadId: string,
+    query: string,
+    cursor: string | null = null,
+    limit = SESSION_WINDOW_SIZE
+  ): Promise<SessionTurnSearchPayload> {
+    const needle = query.trim().toLowerCase();
+    if (!needle) {
+      return {
+        matches: [],
+        nextCursor: null,
+        totalMatches: 0
+      };
+    }
+
+    const hydration = await this.ensureSessionHistory(threadId);
+    const thread = await this.readThread(threadId, false);
+    const runtimeState = await this.resolveRuntimeSessionState(threadId, thread, hydration.turns, this.activeTurns.get(threadId) ?? null);
+    const fullTurnMap = this.fullTurnsByThread.get(threadId) ?? new Map<string, CodexTurn>();
+    const summaryItemIdsByTurn = new Map(runtimeState.turns.map((turn) => [turn.id, new Set(turn.items.map((item) => item.id))]));
+    const matches: SessionTurnSearchPayload["matches"] = [];
+
+    for (const [turnIndex, summaryTurn] of runtimeState.turns.entries()) {
+      const turn = fullTurnMap.get(summaryTurn.id) ?? summaryTurn;
+      const visibleItemIds = summaryItemIdsByTurn.get(turn.id) ?? new Set<string>();
+
+      for (const item of turn.items) {
+        const fragments: string[] = [];
+
+        if (item.type === "userMessage" || item.type === "agentMessage" || item.type === "plan") {
+          const text = asText(item.text) ?? "";
+          if (text.trim()) {
+            fragments.push(text);
+          }
+        } else if (item.type === "reasoning") {
+          const text = asText(item.text) ?? "";
+          if (text.trim()) {
+            fragments.push(text);
+          }
+          if (Array.isArray(item.summary)) {
+            for (const summaryEntry of item.summary) {
+              const text = asText(summaryEntry) ?? "";
+              if (text.trim()) {
+                fragments.push(text);
+              }
+            }
+          }
+        } else if (item.type === "commandExecution") {
+          const command = summarizeCommand(item.command);
+          if (command.trim()) {
+            fragments.push(command);
+          }
+          const aggregatedOutput = asText(item.aggregatedOutput) ?? "";
+          if (aggregatedOutput.trim()) {
+            fragments.push(aggregatedOutput);
+          }
+        } else if (item.type === "fileChange") {
+          if (Array.isArray(item.changes)) {
+            for (const change of item.changes) {
+              const normalizedChange = asRecord(change);
+              const changePath = asText(normalizedChange.path) ?? "";
+              if (changePath.trim()) {
+                fragments.push(changePath);
+              }
+              const diff = asText(normalizedChange.diff) ?? "";
+              if (diff.trim()) {
+                fragments.push(diff);
+              }
+            }
+          }
+        } else if (item.type === "mcpToolCall" || item.type === "dynamicToolCall") {
+          const invocation = summarizeToolInvocation(item.invocation);
+          if (invocation.trim()) {
+            fragments.push(invocation);
+          }
+          const result = asText(item.result) ?? "";
+          if (result.trim()) {
+            fragments.push(result);
+          }
+        } else if (item.type === "webSearch") {
+          const searchQuery = asText(item.query) ?? "";
+          if (searchQuery.trim()) {
+            fragments.push(searchQuery);
+          }
+        } else if (item.type === "contextCompaction") {
+          const text = asText(item.text) ?? asText(item.detailPreview) ?? "";
+          if (text.trim()) {
+            fragments.push(text);
+          }
+        } else {
+          const text = asText(item.text) ?? "";
+          if (text.trim()) {
+            fragments.push(text);
+          }
+        }
+
+        let preview: string | null = null;
+        for (const fragment of fragments) {
+          const normalized = fragment.replace(/\s+/g, " ").trim();
+          if (!normalized) {
+            continue;
+          }
+
+          const lower = normalized.toLowerCase();
+          const matchIndex = lower.indexOf(needle);
+          if (matchIndex < 0) {
+            continue;
+          }
+
+          const snippetStart = Math.max(0, matchIndex - 54);
+          const snippetEnd = Math.min(normalized.length, matchIndex + needle.length + 54);
+          preview = `${snippetStart > 0 ? "..." : ""}${normalized.slice(snippetStart, snippetEnd).trim()}${snippetEnd < normalized.length ? "..." : ""}`;
+          break;
+        }
+
+        if (!preview) {
+          continue;
+        }
+
+        matches.push({
+          turnId: turn.id,
+          turnIndex,
+          itemId: item.id,
+          itemType: item.type,
+          preview,
+          startedAt: turn.startedAt ?? null,
+          requiresFullTurn: !visibleItemIds.has(item.id),
+          requiresItemDetail: DEFERRED_ITEM_TYPES.has(item.type)
+        });
+      }
+    }
+
+    const start = Math.max(0, Number.parseInt(cursor ?? "0", 10) || 0);
+    const windowSize = Math.max(1, limit);
+    const nextIndex = start + windowSize;
+    return {
+      matches: matches.slice(start, nextIndex),
+      nextCursor: nextIndex < matches.length ? String(nextIndex) : null,
+      totalMatches: matches.length
+    };
+  }
+
   async getSessionItemDetail(threadId: string, turnId: string, itemId: string): Promise<SessionItemDetailPayload> {
     const cached = this.itemDetailsByThread.get(threadId)?.get(itemCacheKey(turnId, itemId));
     if (cached) {
@@ -1367,7 +1532,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   async savePreferences(threadId: string, preferences: Partial<SessionPreferences>) {
     const nextPreferences = await this.preparePreferences(preferences);
     await uiStateStore.set(threadId, nextPreferences);
-    await syncCodexTomlWithPreferences(getRuntimeConfig().codexHome, nextPreferences);
+    await syncCodexTomlWithPreferences(this.profile.codexHome, nextPreferences);
     this.emit(threadId, {
       kind: "notification",
       method: "codex-webui/preferencesUpdated",
@@ -1381,7 +1546,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   async saveSystemShutdownAfterQueueCompletes(enabled: boolean) {
-    const runtimeConfig = getRuntimeConfig();
+    const runtimeConfig = this.runtimeConfig;
     if (!runtimeConfig.systemShutdownEnabled && enabled) {
       throw new Error("System shutdown support is disabled.");
     }
@@ -1508,6 +1673,22 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       attachmentNames: attachments.map((attachment) => attachment.originalName)
     });
     if (!updated) {
+      throw createAppError("QUEUE_ITEM_NOT_FOUND");
+    }
+
+    const queue = await this.getQueue(threadId);
+    this.emitQueueUpdated(threadId, queue);
+    return queue;
+  }
+
+  async reorderQueuedMessages(threadId: string, orderedIds: string[]): Promise<SessionQueuePayload> {
+    const stored = await uiStateStore.getQueue(threadId);
+    if (!stored || stored.items.length === 0) {
+      throw createAppError("QUEUE_ITEM_NOT_FOUND");
+    }
+
+    const reordered = await uiStateStore.reorderQueueItems(threadId, orderedIds);
+    if (!reordered) {
       throw createAppError("QUEUE_ITEM_NOT_FOUND");
     }
 
@@ -1704,7 +1885,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       return coercePreferences(stored);
     }
     return this.preparePreferences({
-      cwd: String(thread.cwd ?? getRuntimeConfig().defaults.cwd)
+      cwd: String(thread.cwd ?? this.profile.defaults.cwd)
     });
   }
 
@@ -1867,6 +2048,19 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     const created = new Map<string, CodexTurn>();
     this.fullTurnsByThread.set(threadId, created);
     return created;
+  }
+
+  private cacheFullTurns(threadId: string, turns: CodexTurn[]) {
+    const fullTurns = this.getFullTurnMap(threadId);
+    fullTurns.clear();
+
+    for (const turn of turns) {
+      const prepared = this.prepareTurnForClient(threadId, {
+        ...turn,
+        items: [...turn.items]
+      });
+      fullTurns.set(turn.id, structuredClone(prepared));
+    }
   }
 
   private cacheItemDetail(threadId: string, turnId: string, item: CodexItem) {
@@ -2034,7 +2228,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       initial.turns = [];
 
       try {
-        const codexHome = getRuntimeConfig().codexHome;
+        const codexHome = this.profile.codexHome;
         const liveThread = String(threadSummary?.status ?? "") === "active" || String(threadSummary?.status ?? "") === "running" || this.activeTurns.has(threadId);
         let rolloutPath = this.rolloutPaths.get(threadId) ?? null;
         if (rolloutPath === null && !this.rolloutPaths.has(threadId)) {
@@ -2380,12 +2574,12 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
             }
           }
 
-          initial.turns = [...turnsById.values()].map((turn) =>
-            this.prepareSummaryTurnForClient(threadId, {
-              ...turn,
-              items: [...turn.items]
-            })
-          );
+          const fullTurns = [...turnsById.values()].map((turn) => ({
+            ...turn,
+            items: [...turn.items]
+          }));
+          this.cacheFullTurns(threadId, fullTurns);
+          initial.turns = fullTurns.map((turn) => this.prepareSummaryTurnForClient(threadId, turn));
           initial.state = "complete";
           initial.totalTurns = turnsById.size;
           initial.loadedTurns = initial.turns.length;
@@ -2404,6 +2598,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         const thread = await this.readThread(threadId, true);
         const turns = Array.isArray(thread.turns) ? (thread.turns as SessionDetailPayload["thread"]["turns"]) : [];
         const totalTurns = turns.length;
+        this.cacheFullTurns(threadId, turns);
         initial.turns = turns.map((turn) => this.prepareSummaryTurnForClient(threadId, turn));
         initial.state = "complete";
         initial.totalTurns = totalTurns;
@@ -2675,7 +2870,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     threadId: string,
     payload: { id: string | number; method: string; params: Record<string, unknown> }
   ) {
-    const preferences = (await uiStateStore.get(threadId)) ?? getRuntimeConfig().defaults;
+    const preferences = (await uiStateStore.get(threadId)) ?? this.profile.defaults;
     if (preferences.autoApproveMode === "manual") {
       return false;
     }
@@ -2738,7 +2933,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   private async emitConfigUpdated() {
-    const runtimeConfig = getRuntimeConfig();
+    const runtimeConfig = this.runtimeConfig;
     const [globalState, notifications, savedFilters, knownTags, promptPresets] = await Promise.all([
       uiStateStore.getGlobal(),
       uiStateStore.getNotifications(1),
@@ -2750,7 +2945,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       kind: "notification",
       method: "codex-webui/configUpdated",
       params: {
-        defaults: runtimeConfig.defaults,
+        defaults: this.profile.defaults,
         systemShutdown: {
           available: runtimeConfig.systemShutdownEnabled,
           delaySeconds: runtimeConfig.systemShutdownDelaySeconds,
@@ -2775,6 +2970,54 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         promptPresets
       }
     });
+  }
+
+  private invalidateAccountStateCache() {
+    this.accountStateCache = null;
+  }
+
+  private async readAccountState(force = false): Promise<GatewayAccountState> {
+    const now = Date.now();
+    const cached = this.accountStateCache;
+    if (!force && cached && cached.expiresAt > now) {
+      return {
+        account: { ...cached.value.account },
+        requiresOpenaiAuth: cached.value.requiresOpenaiAuth
+      };
+    }
+
+    try {
+      const response = asRecord(await this.client.request("account/read", { refreshToken: false }));
+      const value = {
+        account: asRecord(response.account),
+        requiresOpenaiAuth: Boolean(response.requiresOpenaiAuth)
+      } satisfies GatewayAccountState;
+      this.accountStateCache = {
+        value,
+        expiresAt: now + ACCOUNT_STATE_CACHE_TTL_MS
+      };
+      return {
+        account: { ...value.account },
+        requiresOpenaiAuth: value.requiresOpenaiAuth
+      };
+    } catch (error) {
+      if (!isInvalidRefreshTokenError(error)) {
+        throw error;
+      }
+
+      const fallback = {
+        account: {},
+        requiresOpenaiAuth: true
+      } satisfies GatewayAccountState;
+      this.accountStateCache = {
+        value: fallback,
+        expiresAt: now + 5_000
+      };
+      return {
+        account: {},
+        requiresOpenaiAuth: true
+      };
+    }
   }
 
   private async enqueueAppNotification(notification: AppNotification) {
@@ -2860,7 +3103,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   private async executeScheduledShutdown() {
-    const runtimeConfig = getRuntimeConfig();
+    const runtimeConfig = this.runtimeConfig;
     this.shutdownTimer = null;
     this.shutdownScheduledFor = null;
     await uiStateStore.setScheduledShutdown(null);
@@ -2898,7 +3141,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   private async restorePersistedShutdownState() {
-    const runtimeConfig = getRuntimeConfig();
+    const runtimeConfig = this.runtimeConfig;
     const globalState = await uiStateStore.getGlobal();
 
     if (!runtimeConfig.systemShutdownEnabled) {
@@ -2940,7 +3183,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   private async maybeScheduleGlobalShutdown(completedTurnId: string | null) {
-    const runtimeConfig = getRuntimeConfig();
+    const runtimeConfig = this.runtimeConfig;
     if (!runtimeConfig.systemShutdownEnabled || this.shutdownTimer) {
       return;
     }
@@ -3137,4 +3380,31 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 }
 
-export const codexGateway = new CodexGateway();
+const gatewayInstances = new Map<string, CodexGateway>();
+
+function getGatewayForProfile(profileId: string | null = null) {
+  const resolvedProfile = getRuntimeProfile(profileId ?? getCurrentRuntimeProfile().id);
+  let gateway = gatewayInstances.get(resolvedProfile.id);
+  if (!gateway) {
+    gateway = new CodexGateway(resolvedProfile);
+    gatewayInstances.set(resolvedProfile.id, gateway);
+  }
+  return {
+    gateway,
+    profile: resolvedProfile
+  };
+}
+
+export const codexGateway = new Proxy(
+  {} as CodexGateway,
+  {
+    get(_target, property) {
+      const { gateway, profile } = getGatewayForProfile();
+      const value = Reflect.get(gateway, property);
+      if (typeof value !== "function") {
+        return value;
+      }
+      return (...args: unknown[]) => runWithProfile(profile.id, () => Reflect.apply(value, gateway, args));
+    }
+  }
+);

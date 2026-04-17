@@ -32,6 +32,7 @@ It is responsible for:
 - admin/viewer role resolution for browser sessions
 - static asset serving
 - public WebSocket upgrade handling and fan-out
+- request-ID response caching and in-flight dedupe for reconnect-safe RPC replay
 - long-lived terminal processes
 - runtime install/update checks
 - quota fetching
@@ -76,6 +77,7 @@ This service is not meant to be exposed directly.
 - Rust authenticates the socket
 - browser sends JSON-RPC-like requests
 - Rust either handles the request directly or forwards it to the internal Node service
+- mutating requests are keyed by profile-scoped request ID, so reconnect replays wait on the original in-flight result instead of executing a second time
 
 ### 3. Codex execution
 
@@ -98,6 +100,7 @@ The split is deliberate rather than transitional.
 Rust is the public edge because it is a good fit for:
 
 - cookie auth
+- profile-scoped cookie routing
 - WebSocket lifecycle management
 - terminal persistence
 - durable fan-out to multiple clients
@@ -106,12 +109,30 @@ Rust is the public edge because it is a good fit for:
 
 Node remains the Codex-facing layer because it already matches the `codex app-server` model well and contains the higher-level session logic that is easier to iterate on there.
 
+## Multi-Account Runtime Model
+
+Multi-account support is implemented as runtime profiles rather than by mutating one shared `~/.codex/auth.json`.
+
+- each profile has its own `CODEX_HOME`
+- each profile therefore has its own `auth.json`, `config.toml`, session tree, skills, and plugins
+- the browser chooses an active profile through a signed HTTP-only profile cookie
+- Rust forwards that profile identity to the internal Node service for HTTP proxy requests and WebSocket-driven relays
+- Node resolves a profile-local `codex app-server` client and profile-local UI state store for the current request context
+- account bootstrap reads are profile-local and use a degraded `requiresOpenaiAuth` fallback if an upstream refresh token is no longer valid
+
+This makes simultaneous use practical:
+
+- browser A can stay connected to profile `work`
+- browser B can stay connected to profile `personal`
+- both can stream, queue, inspect quota, and browse sessions without clobbering each other's Codex state
+
 ## Persistence Model
 
 Several kinds of state live on disk:
 
-- Codex sessions under `~/.codex/sessions`
-- user defaults under `~/.codex/config.toml`
+- per-profile Codex sessions under `<CODEX_HOME>/sessions`
+- per-profile user defaults under `<CODEX_HOME>/config.toml`
+- per-profile auth under `<CODEX_HOME>/auth.json`
 - `codex-webui` runtime state under `CODEX_WEBUI_DATA_DIR`
 - uploaded attachments under `CODEX_WEBUI_DATA_DIR/uploads`
 - privileged-action audit history under `CODEX_WEBUI_DATA_DIR/audit-log.jsonl`
@@ -217,7 +238,7 @@ This state is persisted in `CODEX_WEBUI_DATA_DIR`, exposed through config payloa
 Session defaults are resolved from:
 
 1. `CODEX_WEBUI_*` environment overrides
-2. `~/.codex/config.toml`
+2. the active profile's `<CODEX_HOME>/config.toml`
 
 The UI can edit `config.toml` directly. Session preference changes also write the relevant defaults back into that file so the web UI and Codex CLI do not silently drift apart.
 

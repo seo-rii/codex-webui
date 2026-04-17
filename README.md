@@ -25,7 +25,9 @@ The goal is not to replace upstream surfaces. The goal is to make Codex usable f
 ## Highlights
 
 - Password-protected browser access with signed HTTP-only cookies
+- Multi-account profile switching backed by separate `CODEX_HOME` directories and profile-scoped `codex app-server` instances
 - Reconnect-safe WebSocket control plane for chat, sessions, Git, terminals, runtime actions, and account flows
+- Request-ID dedupe at the public gateway so reconnect replays do not execute queue or other mutating RPC calls twice
 - Session queue, explicit steer flow, persisted queued follow-ups, and resume prompts after restart
 - Composer history recall with keyboard navigation, a quick "reuse last message" chip, and one-click resend/queue for the most recent prompt
 - Session completion and input-required badges are persisted server-side, so they survive reconnects and show up consistently across multiple clients
@@ -85,7 +87,7 @@ More detail is in [docs/architecture.md](./docs/architecture.md).
 - Node.js with `pnpm`
 - Rust toolchain
 - a working `codex` installation on the machine that will host the server
-- access to the Codex home directory you want to expose, usually `~/.codex`
+- access to the Codex home directory or directories you want to expose, usually `~/.codex` for a single profile or separate paths such as `~/.codex-work` and `~/.codex-personal` for multiple profiles
 
 ## Quick Start From Source
 
@@ -120,7 +122,7 @@ npx codex-webui
 
 On first run the CLI:
 
-1. asks for host, port, base path, Codex binary, `CODEX_HOME`, allowed roots, optional CORS origins, and password
+1. asks for host, port, base path, Codex binary, the global data directory, one or more profile-specific `CODEX_HOME` paths, allowed roots, optional CORS origins, and password
 2. hashes the password with scrypt
 3. writes `~/.codex/codex-webui.yml`
 4. starts the Rust gateway in the background
@@ -133,9 +135,12 @@ codex-webui config
 codex-webui restart
 codex-webui stop
 codex-webui tunnel
+codex-webui tunnel status
+codex-webui tunnel stop
+codex-webui tunnel logs
 ```
 
-`tunnel` prefers `cloudflared` and falls back to `ngrok`.
+`tunnel` supports provider selection, background or foreground execution, status inspection, and log inspection. It prefers `cloudflared` when available and falls back to `ngrok`.
 
 More detail is in [docs/distribution.md](./docs/distribution.md).
 
@@ -150,14 +155,31 @@ host: 127.0.0.1
 port: 4173
 basePath: /absproxy/4173
 codexBin: codex
-codexHome: /home/user/.codex
 dataDir: /home/user/.codex/codex-webui/data
+defaultProfileId: work
+profiles:
+  - id: work
+    label: Work
+    codexHome: /home/user/.codex-work
+    dataDir: /home/user/.codex/codex-webui/data/profiles/work
+  - id: personal
+    label: Personal
+    codexHome: /home/user/.codex-personal
+    dataDir: /home/user/.codex/codex-webui/data/profiles/personal
 allowedRoots:
   - /home/user/work
 passwordHash: scrypt$...
 sessionSecret: ...
 corsAllowedOrigins: []
 backendBinaryPath: ""
+tunnel:
+  provider: auto
+  background: true
+  hostname: ""
+  name: ""
+  overwriteDns: false
+  logLevel: info
+  extraArgs: []
 ```
 
 Meaning of the main fields:
@@ -165,17 +187,31 @@ Meaning of the main fields:
 - `host` / `port`: public bind address for the Rust gateway
 - `basePath`: deployment prefix, for example `/absproxy/4173`
 - `codexBin`: path or command name for the Codex CLI binary
-- `codexHome`: Codex runtime, config, and session directory
-- `dataDir`: `codex-webui` runtime state, uploads, queue state, and editor metadata
+- `dataDir`: global `codex-webui` runtime state, uploads, queue state, notifications, and editor metadata
+- `defaultProfileId`: the profile selected for new browser sessions unless a different profile cookie is already set
+- `profiles`: named Codex runtimes, each with its own `CODEX_HOME` and profile-local data directory
 - `allowedRoots`: filesystem roots the UI is allowed to browse
 - `passwordHash`: hashed login password
 - `sessionSecret`: cookie signing secret
 - `corsAllowedOrigins`: trusted origins allowed to use browser credentials against the gateway
 - `backendBinaryPath`: explicit Rust gateway path, mainly for packaged or custom deployments
+- `tunnel`: optional CLI defaults for tunnel provider selection, run mode, and provider-specific arguments
+
+## Multi-Account Profiles
+
+`codex-webui` supports multiple Codex accounts by treating each account as a profile with its own `CODEX_HOME`.
+
+- A profile should point at a distinct directory such as `~/.codex-work` or `~/.codex-personal`.
+- Codex stores `auth.json`, `config.toml`, sessions, plugins, and skills under `CODEX_HOME`, so separating profiles at that level avoids account collisions.
+- The web UI starts a separate `codex app-server` client per profile on demand and lets each browser client choose its active profile independently.
+- This means two browsers can stay connected to different accounts at the same time without swapping a shared `~/.codex/auth.json` file.
+
+If you only want one account at a time, you can still keep a single profile and swap `auth.json` manually before restart. For simultaneous multi-account use, separate `CODEX_HOME` directories are the intended model.
 
 ## Runtime And Config Behavior
 
-- Session defaults are sourced from `~/.codex/config.toml`.
+- Session defaults are sourced from the active profile's `CODEX_HOME/config.toml`.
+- With multiple profiles, each profile reads and writes its own `CODEX_HOME/config.toml` and `CODEX_HOME/auth.json`.
 - The Settings workspace can edit `config.toml` directly.
 - Changing session or composer preferences syncs the relevant defaults back into `config.toml`.
 - Existing sessions keep their own persisted preferences; changing defaults mainly affects new sessions and future default state.
@@ -205,6 +241,8 @@ The Rust gateway and the internal Node service honor a focused set of `CODEX_WEB
 - `CODEX_WEBUI_DATA_DIR`
 - `CODEX_WEBUI_CODEX_BIN`
 - `CODEX_WEBUI_CODEX_HOME`
+- `CODEX_WEBUI_DEFAULT_PROFILE_ID`
+- `CODEX_WEBUI_PROFILES_JSON`
 - `CODEX_WEBUI_MAX_UPLOAD_MB`
 - `CODEX_WEBUI_DEFAULT_*` session defaults such as model, sandbox, approval, speed, effort, network, and steering resume mode
 - `CODEX_WEBUI_GIT_DISCOVERY_DEPTH`
@@ -261,6 +299,10 @@ The detailed session view reconciles the persisted rollout with the live `thread
 
 The sidebar combines a local session index with live app-server data and loads progressively. A selected session is pinned back into view even if it was not part of the current list page yet.
 
+### A queued follow-up was sent twice after a reconnect
+
+The public WebSocket gateway treats request IDs as reconnect-safe replay keys. If the browser reconnects and resends a request with the same ID before the first response arrives, the gateway now waits for the original result instead of executing the same mutating action twice.
+
 ### A session shows "Done" or "Needs input" on one device but not another
 
 Those sidebar badges are backend-owned state, not browser-local UI markers. `codex-webui` persists them in its own runtime store and includes them in session summaries, so reconnecting browsers and newly opened clients see the same completion or attention state until the session is acknowledged.
@@ -285,6 +327,10 @@ Attachment uploads use credentialed `multipart/form-data` requests. Check:
 - `CODEX_WEBUI_MAX_UPLOAD_MB`
 - allowed filesystem roots
 - reverse-proxy body size limits
+
+### The server keeps logging `invalid_grant: Invalid refresh token`
+
+`codex app-server` can surface that error when the stored ChatGPT refresh token is no longer valid. `codex-webui` now degrades account reads to `requiresOpenaiAuth` so the workspace still loads, but the affected profile must be re-authenticated before account-specific features recover.
 
 ### `npx codex-webui` cannot start the gateway
 

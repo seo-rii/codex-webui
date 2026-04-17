@@ -22,6 +22,8 @@ import type {
   SavedSessionFilter,
   SessionDetailPayload,
   SessionDraftPayload,
+  SessionForkMode,
+  SessionForkPayload,
   SessionItemDetailPayload,
   SessionListPayload,
   SessionPreferences,
@@ -459,6 +461,40 @@ function inferSessionDisplayTitle(prompt: string) {
   }
 
   return candidate.length > 60 ? `${candidate.slice(0, 60).trimEnd()}...` : candidate;
+}
+
+function extractDraftTextFromItem(item: CodexItem) {
+  const flatten = (value: unknown): string => {
+    if (typeof value === "string") {
+      return value;
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) => flatten(entry)).filter((entry) => entry.trim().length > 0).join("\n\n");
+    }
+    if (!value || typeof value !== "object") {
+      return "";
+    }
+
+    const record = asRecord(value);
+    return (
+      flatten(record.text) ||
+      flatten(record.content) ||
+      flatten(record.value) ||
+      flatten(record.message) ||
+      flatten(record.title) ||
+      flatten(record.path) ||
+      ""
+    );
+  };
+
+  const content = Array.isArray(item.content) ? (item.content as Array<Record<string, unknown>>) : [];
+  const fragments = content.map((entry) => flatten(entry)).filter((entry) => entry.trim().length > 0);
+  const contentText = stripAttachmentPreamble(fragments.join("\n\n")).trim();
+  if (contentText) {
+    return contentText;
+  }
+
+  return stripAttachmentPreamble(flatten(item.text) || flatten(item.message) || flatten(item.value) || flatten(item)).trim();
 }
 
 function inferPersistedSessionTitle(prompt: string) {
@@ -1420,6 +1456,104 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       }
     });
     return summary;
+  }
+
+  async forkSession(
+    sourceThreadId: string,
+    options: {
+      mode: SessionForkMode;
+      turnId?: string | null;
+      messageText?: string | null;
+    }
+  ): Promise<SessionForkPayload> {
+    const thread = await this.readThread(sourceThreadId, false);
+    const preferences = await this.getPreferences(sourceThreadId, thread);
+    const hydration = await this.ensureSessionHistory(sourceThreadId, thread);
+    const anchorIndex = options.turnId ? hydration.turns.findIndex((turn) => turn.id === options.turnId) : hydration.turns.length - 1;
+    const turns = anchorIndex >= 0 ? hydration.turns.slice(0, anchorIndex + 1) : hydration.turns;
+
+    let selectedMessageText = options.messageText?.trim() || null;
+    if (!selectedMessageText) {
+      for (let turnIndex = turns.length - 1; turnIndex >= 0 && !selectedMessageText; turnIndex -= 1) {
+        const turn = turns[turnIndex];
+        for (let itemIndex = turn.items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+          const item = turn.items[itemIndex];
+          if (item.type !== "userMessage") {
+            continue;
+          }
+          const text = extractDraftTextFromItem(item);
+          if (text) {
+            selectedMessageText = text;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!selectedMessageText) {
+      selectedMessageText = stripAttachmentPreamble(asText(thread.preview) ?? "").trim() || null;
+    }
+
+    let draft = stripAttachmentPreamble(selectedMessageText ?? "").trim();
+    if (options.mode === "handoff") {
+      const sourceName = getDisplayThreadName(asText(thread.name), asText(thread.preview)) ?? "Source thread";
+      const preview = stripAttachmentPreamble(asText(thread.preview) ?? "").trim();
+      const entries: Array<{ role: "User" | "Assistant"; text: string }> = [];
+      for (const turn of turns) {
+        for (const item of turn.items ?? []) {
+          if (item.type !== "userMessage" && item.type !== "agentMessage") {
+            continue;
+          }
+
+          const text = extractDraftTextFromItem(item);
+          if (!text) {
+            continue;
+          }
+
+          entries.push({
+            role: item.type === "userMessage" ? "User" : "Assistant",
+            text
+          });
+        }
+      }
+
+      const sections = [
+        `Continue this task in a fresh thread.\n\nSource thread: ${sourceName}\nWorking directory: ${String(thread.cwd ?? "")}`.trim()
+      ];
+      if (preview) {
+        sections.push(`Current goal:\n${preview}`);
+      }
+      if (selectedMessageText?.trim()) {
+        sections.push(`Focus request:\n${selectedMessageText.trim()}`);
+      }
+      if (entries.length > 0) {
+        sections.push(
+          `Recent context:\n${entries
+            .slice(-8)
+            .map((entry) => `- ${entry.role}: ${entry.text.replace(/\s+/gu, " ").trim()}`)
+            .join("\n")}`
+        );
+      }
+      sections.push("Continue from this handoff, preserve any existing constraints, and begin with the most sensible next step.");
+      draft = sections.filter((section) => section.trim().length > 0).join("\n\n").trim();
+    }
+    if (!draft) {
+      throw new Error(options.mode === "handoff" ? "There is no thread context to hand off yet." : "There is no message to fork yet.");
+    }
+
+    const sourceName = getDisplayThreadName(asText(thread.name), asText(thread.preview));
+    const nextName =
+      options.mode === "handoff"
+        ? `${sourceName && !isPlaceholderThreadName(sourceName) ? sourceName : inferSessionDisplayTitle(draft) ?? "Thread"} · Handoff`
+        : inferSessionDisplayTitle(selectedMessageText ?? draft) ?? sourceName ?? null;
+
+    const session = await this.createSession(preferences, nextName);
+    const savedDraft = await this.saveDraft(session.id, draft, "message");
+    return {
+      session,
+      draft: savedDraft.draft,
+      mode: options.mode
+    };
   }
 
   async getSession(threadId: string, limit = SESSION_WINDOW_SIZE): Promise<SessionDetailPayload> {

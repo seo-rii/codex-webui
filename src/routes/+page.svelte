@@ -35,6 +35,7 @@
     Search,
     Pencil,
     Copy,
+    ArrowRightLeft,
     SlidersHorizontal,
     Shield
   } from "lucide-svelte";
@@ -314,6 +315,7 @@
       copyMessage: m.copy_message(),
       editInComposer: m.edit_in_composer(),
       branchIntoNewThread: m.branch_into_new_thread(),
+      handoffToNewThread: m.handoff_to_new_thread(),
       livePlan: m.live_plan(),
       aggregatedDiff: m.aggregated_diff(),
       openTab: m.open_tab(),
@@ -4498,27 +4500,34 @@
     forceTranscriptScroll = true;
   }
 
-  async function branchFromMessage(text: string) {
-    if (!config) {
+  async function forkCurrentThread(
+    mode: "fork" | "handoff",
+    options: {
+      turnId?: string | null;
+      messageText?: string | null;
+    } = {}
+  ) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    if (!selectedSessionId) {
       return;
     }
     try {
-      const created = await api.createSession(config.defaults, inferBranchTitle(text));
-      await refreshSessions(created);
-      await selectSession(created.id);
-      draft = text;
-      noticeText = m.opened_branch_thread();
+      const response = await api.forkSession(selectedSessionId, {
+        mode,
+        turnId: options.turnId ?? null,
+        messageText: options.messageText ?? null
+      });
+      upsertSessionSummary(response.session);
+      await selectSession(response.session.id);
+      draft = response.draft;
+      scheduleComposerTextareaResize();
+      noticeText = mode === "handoff" ? m.opened_handoff_thread() : m.opened_branch_thread();
     } catch (error) {
       errorText = describeError(error);
     }
-  }
-
-  function inferBranchTitle(text: string) {
-    const title = inferDisplayThreadTitle(text);
-    if (!title) {
-      return getDefaultThreadTitle();
-    }
-    return title;
   }
 
   function updateRawRequestResponse(requestId: string, value: string) {
@@ -6300,6 +6309,15 @@
 
         {#if selectedSessionId}
           <button
+            class="ui-animated-button ui-animated-button--icon p-2 rounded-lg text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={readOnlyRole}
+            onclick={() => void forkCurrentThread("handoff")}
+            title={ui.handoffToNewThread}
+            type="button"
+          >
+            <ArrowRightLeft size={18} />
+          </button>
+          <button
             class={`ui-animated-button ui-animated-button--icon p-2 rounded-lg transition-all ${
               selectedSessionSummary?.pinned
                 ? "bg-amber-50 text-amber-600 hover:bg-amber-100"
@@ -6468,7 +6486,8 @@
                         <div class="flex items-center gap-1 opacity-0 group-hover/user-message:opacity-100 transition-opacity">
                           <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors" onclick={() => void copyMessageText(getUserText(item))} title={ui.copyMessage} type="button"><Copy size={13} /></button>
                           <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors" onclick={() => editMessageText(getUserText(item))} title={ui.editInComposer} type="button"><MessageSquare size={13} /></button>
-                          <button class="p-1.5 rounded-lg text-gray-400 hover:text-amber-700 hover:bg-amber-50 transition-colors" onclick={() => void branchFromMessage(getUserText(item))} title={ui.branchIntoNewThread} type="button"><GitBranch size={13} /></button>
+                          <button class="p-1.5 rounded-lg text-gray-400 hover:text-amber-700 hover:bg-amber-50 transition-colors" onclick={() => void forkCurrentThread("fork", { turnId: turn.id, messageText: getUserText(item) })} title={ui.branchIntoNewThread} type="button"><GitBranch size={13} /></button>
+                          <button class="p-1.5 rounded-lg text-gray-400 hover:text-amber-700 hover:bg-amber-50 transition-colors" onclick={() => void forkCurrentThread("handoff", { turnId: turn.id, messageText: getUserText(item) })} title={ui.handoffToNewThread} type="button"><ArrowRightLeft size={13} /></button>
                         </div>
                         <div class="px-5 py-3 bg-gray-100 rounded-2xl text-gray-800 shadow-sm border border-gray-200/50">
                           <MarkdownMessage compact on:openLocalPath={(event: CustomEvent<{ href: string }>) => void openGitFileFromMessage(event.detail.href)} text={getUserText(item)} />

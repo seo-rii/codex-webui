@@ -11,6 +11,7 @@ export type UserRole = "admin" | "viewer";
 export type AutomationScheduleMode = "manual" | "interval";
 export type AutomationExecutionTarget = "local" | "worktree";
 export type AutomationRunStatus = "running" | "started" | "completed" | "failed";
+export type SessionForkMode = "fork" | "handoff";
 
 export type SessionPreferences = {
   cwd: string;
@@ -366,6 +367,12 @@ export type SessionTurnsPagePayload = {
 
 export type SessionTurnPayload = {
   turn: CodexTurn;
+};
+
+export type SessionForkPayload = {
+  session: SessionSummary;
+  draft: string;
+  mode: SessionForkMode;
 };
 
 export type SessionItemDetailPayload = {

@@ -27,6 +27,7 @@ import type {
   SessionDetailPayload,
   SessionDraftPayload,
   SessionItemDetailPayload,
+  SessionForkPayload,
   SessionListPayload,
   SessionPreferences,
   SessionSearchScope,
@@ -225,6 +226,17 @@ export const api = {
 
   getSession(sessionId: string, limit = 20) {
     return ws.request<SessionDetailPayload>("session/get", { sessionId, limit });
+  },
+
+  forkSession(
+    sessionId: string,
+    payload: {
+      mode: "fork" | "handoff";
+      turnId?: string | null;
+      messageText?: string | null;
+    }
+  ) {
+    return ws.request<SessionForkPayload>("session/fork", { sessionId, ...payload });
   },
 
   getSessionDraft(sessionId: string) {

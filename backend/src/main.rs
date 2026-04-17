@@ -1360,6 +1360,21 @@ async fn execute_ws_method(
             )
             .await
         }
+        "session/fork" => {
+            let session_id = require_string(&params, "sessionId")?;
+            let payload = json!({
+                "mode": params.get("mode").cloned().unwrap_or_else(|| Value::String("fork".to_string())),
+                "turnId": params.get("turnId").cloned().unwrap_or(Value::Null),
+                "messageText": params.get("messageText").cloned().unwrap_or(Value::Null)
+            });
+            internal_json_request(
+                state,
+                Method::POST,
+                &format!("/api/sessions/{session_id}/fork"),
+                Some(payload),
+            )
+            .await
+        }
         "session/search" => {
             let session_id = require_string(&params, "sessionId")?;
             let query_raw = require_string(&params, "query")?;

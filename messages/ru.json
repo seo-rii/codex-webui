@@ -186,7 +186,7 @@
   "load_older_turns": "Load Older Turns",
   "copy_message": "Copy message",
   "edit_in_composer": "Edit in composer",
-  "branch_into_new_thread": "Branch into a new thread",
+  "branch_into_new_thread": "Fork into a new thread",
   "steps_count": "{count} steps",
   "work_steps_count": "{count} work items",
   "approval_required": "Approval Required",
@@ -314,7 +314,7 @@
   "web_search": "Web search",
   "load_details": "Load details",
   "search_details": "Search details",
-  "opened_branch_thread": "Opened a new branch thread with this message.",
+  "opened_branch_thread": "Opened a forked thread from this message.",
   "select_folder": "Select Folder",
   "copy_reply": "Copy reply",
   "planned_strategy": "Planned strategy",
@@ -385,5 +385,7 @@
   "no_automation_runs": "No automation runs yet.",
   "automation_saved": "Automation saved.",
   "automation_deleted": "Automation deleted.",
-  "automation_started": "Automation started."
+  "automation_started": "Automation started.",
+  "handoff_to_new_thread": "Handoff to a new thread",
+  "opened_handoff_thread": "Opened a new handoff thread with the current context."
 }

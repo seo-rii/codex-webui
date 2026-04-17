@@ -186,7 +186,7 @@
   "load_older_turns": "이전 턴 불러오기",
   "copy_message": "메시지 복사",
   "edit_in_composer": "입력창에서 수정",
-  "branch_into_new_thread": "새 스레드로 분기",
+  "branch_into_new_thread": "새 스레드로 포크",
   "steps_count": "{count}단계",
   "work_steps_count": "작업 과정 {count}개",
   "approval_required": "승인 필요",
@@ -314,7 +314,7 @@
   "web_search": "웹 검색",
   "load_details": "상세 불러오기",
   "search_details": "검색 상세",
-  "opened_branch_thread": "이 메시지로 새 분기 스레드를 열었습니다.",
+  "opened_branch_thread": "이 메시지로 새 포크 스레드를 열었습니다.",
   "select_folder": "폴더 선택",
   "copy_reply": "응답 복사",
   "planned_strategy": "계획된 전략",
@@ -385,5 +385,7 @@
   "no_automation_runs": "자동화 실행 기록이 없습니다.",
   "automation_saved": "자동화를 저장했습니다.",
   "automation_deleted": "자동화를 삭제했습니다.",
-  "automation_started": "자동화를 시작했습니다."
+  "automation_started": "자동화를 시작했습니다.",
+  "handoff_to_new_thread": "새 스레드로 핸드오프",
+  "opened_handoff_thread": "현재 컨텍스트로 새 핸드오프 스레드를 열었습니다."
 }

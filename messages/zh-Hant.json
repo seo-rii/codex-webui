@@ -390,5 +390,17 @@
   "opened_handoff_thread": "Opened a new handoff thread with the current context.",
   "attach_terminal_context": "Attach terminal to chat",
   "terminal_context_requires_thread": "Select a thread before attaching terminal context.",
-  "terminal_context_attached": "Attached {name} to the current thread."
+  "terminal_context_attached": "Attached {name} to the current thread.",
+  "pull_requests": "Pull requests",
+  "loading_pull_requests": "Loading pull requests…",
+  "no_pull_requests": "No pull requests found for this repository.",
+  "pull_requests_open": "Open",
+  "pull_requests_closed": "Closed",
+  "pull_requests_all": "All",
+  "checkout_pr": "Checkout PR",
+  "checking_out_pr": "Checking out…",
+  "open_on_github": "Open on GitHub",
+  "pull_request_overview": "Pull request overview",
+  "pull_request_files": "Changed files",
+  "pull_request_body_empty": "This pull request does not include a description."
 }

@@ -17,6 +17,8 @@ import type {
   GitCommitDiffPayload,
   GitFilePayload,
   GitFileReferencePayload,
+  GitHubPullRequestDetailPayload,
+  GitHubPullRequestListPayload,
   GitRepository,
   GitStatusPayload,
   GitWorktreePayload,
@@ -449,6 +451,18 @@ export const api = {
 
   getGitCommitDiff(repoPath: string, commitHash: string) {
     return ws.request<GitCommitDiffPayload>("git/commit/diff", { repoPath, commitHash });
+  },
+
+  listGitHubPullRequests(repoPath: string, state: "open" | "closed" | "all" = "open", limit = 20) {
+    return ws.request<GitHubPullRequestListPayload>("git/github/pulls", { repoPath, state, limit });
+  },
+
+  getGitHubPullRequest(repoPath: string, number: number) {
+    return ws.request<GitHubPullRequestDetailPayload>("git/github/pull", { repoPath, number });
+  },
+
+  checkoutGitHubPullRequest(repoPath: string, number: number) {
+    return ws.request<GitStatusPayload>("git/github/pull/checkout", { repoPath, number });
   },
 
   resolveGitFile(filePath: string) {

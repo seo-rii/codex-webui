@@ -390,5 +390,17 @@
   "opened_handoff_thread": "현재 컨텍스트로 새 핸드오프 스레드를 열었습니다.",
   "attach_terminal_context": "채팅에 터미널 첨부",
   "terminal_context_requires_thread": "터미널 컨텍스트를 붙일 스레드를 먼저 선택하세요.",
-  "terminal_context_attached": "{name}을(를) 현재 스레드에 첨부했습니다."
+  "terminal_context_attached": "{name}을(를) 현재 스레드에 첨부했습니다.",
+  "pull_requests": "풀 리퀘스트",
+  "loading_pull_requests": "풀 리퀘스트를 불러오는 중입니다…",
+  "no_pull_requests": "이 저장소에서 표시할 풀 리퀘스트가 없습니다.",
+  "pull_requests_open": "열림",
+  "pull_requests_closed": "닫힘",
+  "pull_requests_all": "전체",
+  "checkout_pr": "PR 체크아웃",
+  "checking_out_pr": "체크아웃 중…",
+  "open_on_github": "GitHub에서 열기",
+  "pull_request_overview": "PR 개요",
+  "pull_request_files": "변경된 파일",
+  "pull_request_body_empty": "이 풀 리퀘스트에는 설명이 없습니다."
 }

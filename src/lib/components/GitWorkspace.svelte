@@ -1,14 +1,27 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { ExternalLink, GitPullRequest, RefreshCw } from "lucide-svelte";
 
   import { api } from "$lib/api";
+  import MarkdownMessage from "$lib/components/MarkdownMessage.svelte";
   import MonacoDiffEditor from "$lib/components/MonacoDiffEditor.svelte";
   import MonacoTextEditor from "$lib/components/MonacoTextEditor.svelte";
   import { localeSignal } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
   import { getLocale } from "$lib/paraglide/runtime.js";
   import { describeUiError } from "$lib/ui-errors";
-  import type { GitCommit, GitFilePayload, GitFileStatus, GitOpenRequest, GitRepository, GitStatusPayload, GitWorktree } from "$lib/types";
+  import type {
+    GitCommit,
+    GitFilePayload,
+    GitFileStatus,
+    GitHubPullRequestDetailPayload,
+    GitHubPullRequestSummary,
+    GitHubRepositoryInfo,
+    GitOpenRequest,
+    GitRepository,
+    GitStatusPayload,
+    GitWorktree
+  } from "$lib/types";
 
   let {
     selectedRepoPath,
@@ -43,17 +56,31 @@
   let loadingStatus = $state(false);
   let loadingWorktrees = $state(false);
   let loadingFile = $state(false);
+  let loadingPullRequests = $state(false);
+  let loadingPullRequestDetail = $state(false);
   let savingFile = $state(false);
   let gitBusy = $state(false);
   let gitBusyAction = $state<"fetch" | "pull" | null>(null);
+  let githubBusyAction = $state<"checkout" | null>(null);
+  let githubBusyPullRequestNumber = $state<number | null>(null);
   let worktreeBusy = $state(false);
   let openingCommitHash = $state<string | null>(null);
   let errorText = $state("");
+  let githubErrorText = $state("");
   let lastRepoPath: string | null = null;
   let lastOpenRequestId = $state<number | null>(null);
+  let lastPullRequestQueryKey: string | null = null;
   let isMobileLayout = $state(false);
-  let mobileSection = $state<"repository" | "worktrees" | "changes" | "commits" | "detail">("repository");
-  const hasDetailPanel = $derived(groupedFilePayloads.length > 0 || Boolean(filePayload));
+  let mobileSection = $state<"repository" | "worktrees" | "changes" | "pulls" | "commits" | "detail">("repository");
+  let githubRepo = $state<GitHubRepositoryInfo | null>(null);
+  let pullRequests = $state<GitHubPullRequestSummary[]>([]);
+  let pullRequestState = $state<"open" | "closed" | "all">("open");
+  let pullRequestDetail = $state<GitHubPullRequestDetailPayload | null>(null);
+  let selectedPullRequestFilePath = $state<string | null>(null);
+  const hasDetailPanel = $derived(groupedFilePayloads.length > 0 || Boolean(filePayload) || Boolean(pullRequestDetail));
+  const selectedPullRequestFile = $derived.by(
+    () => pullRequestDetail?.pullRequest.files.find((file) => file.path === selectedPullRequestFilePath) ?? null
+  );
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
 
@@ -106,7 +133,19 @@
       saving: m.saving(),
       recentCommits: m.recent_commits(),
       openTab: m.open_tab(),
-      gitErrorGeneric: m.git_error_generic()
+      gitErrorGeneric: m.git_error_generic(),
+      pullRequests: m.pull_requests(),
+      pullRequestsLoading: m.loading_pull_requests(),
+      noPullRequests: m.no_pull_requests(),
+      pullRequestsOpen: m.pull_requests_open(),
+      pullRequestsClosed: m.pull_requests_closed(),
+      pullRequestsAll: m.pull_requests_all(),
+      checkoutPr: m.checkout_pr(),
+      checkingOutPr: m.checking_out_pr(),
+      openOnGitHub: m.open_on_github(),
+      pullRequestOverview: m.pull_request_overview(),
+      pullRequestFiles: m.pull_request_files(),
+      pullRequestBodyEmpty: m.pull_request_body_empty()
     };
   });
 
@@ -150,10 +189,30 @@
 
     if (!repoPath) {
       status = null;
+      pullRequests = [];
+      githubRepo = null;
+      pullRequestDetail = null;
+      selectedPullRequestFilePath = null;
+      githubErrorText = "";
+      lastPullRequestQueryKey = null;
       return;
     }
 
     void refreshStatus(repoPath);
+  });
+
+  $effect(() => {
+    if (!selectedRepoPath) {
+      return;
+    }
+
+    const key = `${selectedRepoPath}:${pullRequestState}`;
+    if (lastPullRequestQueryKey === key) {
+      return;
+    }
+
+    lastPullRequestQueryKey = key;
+    void refreshPullRequests(selectedRepoPath);
   });
 
   async function bootstrap() {
@@ -188,6 +247,25 @@
     } finally {
       loadingStatus = false;
       loadingWorktrees = false;
+    }
+  }
+
+  async function refreshPullRequests(repoPath: string) {
+    loadingPullRequests = true;
+    githubErrorText = "";
+    pullRequestDetail = null;
+    selectedPullRequestFilePath = null;
+
+    try {
+      const payload = await api.listGitHubPullRequests(repoPath, pullRequestState, 20);
+      githubRepo = payload.repository;
+      pullRequests = payload.pullRequests;
+    } catch (error) {
+      githubRepo = null;
+      pullRequests = [];
+      githubErrorText = describeError(error);
+    } finally {
+      loadingPullRequests = false;
     }
   }
 
@@ -226,11 +304,56 @@
     }
   }
 
+  async function openPullRequest(pullRequestNumber: number) {
+    if (!selectedRepoPath) {
+      return;
+    }
+
+    loadingPullRequestDetail = true;
+    githubErrorText = "";
+
+    try {
+      pullRequestDetail = await api.getGitHubPullRequest(selectedRepoPath, pullRequestNumber);
+      selectedPullRequestFilePath = pullRequestDetail.pullRequest.files[0]?.path ?? null;
+      mobileSection = "detail";
+    } catch (error) {
+      githubErrorText = describeError(error);
+    } finally {
+      loadingPullRequestDetail = false;
+    }
+  }
+
+  async function checkoutPullRequest(pullRequestNumber: number) {
+    if (!selectedRepoPath || readOnly) {
+      return;
+    }
+
+    githubBusyAction = "checkout";
+    githubBusyPullRequestNumber = pullRequestNumber;
+    githubErrorText = "";
+
+    try {
+      status = await api.checkoutGitHubPullRequest(selectedRepoPath, pullRequestNumber);
+      await bootstrap();
+      await refreshPullRequests(selectedRepoPath);
+      if (pullRequestDetail?.pullRequest.number === pullRequestNumber) {
+        await openPullRequest(pullRequestNumber);
+      }
+    } catch (error) {
+      githubErrorText = describeError(error);
+    } finally {
+      githubBusyAction = null;
+      githubBusyPullRequestNumber = null;
+    }
+  }
+
   function clearDetailPanels() {
     filePayload = null;
     groupedFilePayloads = [];
     groupedFileTitle = "";
     editorValue = "";
+    pullRequestDetail = null;
+    selectedPullRequestFilePath = null;
   }
 
   async function openFileByPath(repoPath: string | null, filePath: string) {
@@ -443,9 +566,10 @@
   }
 
   function closeEditor() {
+    const nextMobileSection = pullRequestDetail ? "pulls" : "changes";
     clearDetailPanels();
     if (isMobileLayout) {
-      mobileSection = "changes";
+      mobileSection = nextMobileSection;
     }
   }
 
@@ -465,6 +589,7 @@
 
     try {
       status = await api.fetchGitRepository(selectedRepoPath);
+      await refreshPullRequests(selectedRepoPath);
     } catch (error) {
       errorText = describeError(error);
     } finally {
@@ -484,6 +609,7 @@
 
     try {
       status = await api.pullGitRepository(selectedRepoPath);
+      await refreshPullRequests(selectedRepoPath);
     } catch (error) {
       errorText = describeError(error);
     } finally {
@@ -562,6 +688,7 @@
         <button class:git-mobile-nav__button--active={mobileSection === "repository"} class="git-mobile-nav__button" type="button" onclick={() => (mobileSection = "repository")}>{ui.repository}</button>
         <button class:git-mobile-nav__button--active={mobileSection === "worktrees"} class="git-mobile-nav__button" type="button" onclick={() => (mobileSection = "worktrees")}>{ui.worktrees}</button>
         <button class:git-mobile-nav__button--active={mobileSection === "changes"} class="git-mobile-nav__button" type="button" onclick={() => (mobileSection = "changes")}>{ui.changes}</button>
+        <button class:git-mobile-nav__button--active={mobileSection === "pulls"} class="git-mobile-nav__button" type="button" onclick={() => (mobileSection = "pulls")}>{ui.pullRequests}</button>
         <button class:git-mobile-nav__button--active={mobileSection === "commits"} class="git-mobile-nav__button" type="button" onclick={() => (mobileSection = "commits")}>{ui.recentCommits}</button>
         <button class:git-mobile-nav__button--active={mobileSection === "detail"} class="git-mobile-nav__button" disabled={!hasDetailPanel} type="button" onclick={() => (mobileSection = "detail")}>{ui.edit}</button>
       </div>
@@ -686,6 +813,63 @@
         </section>
       {/if}
 
+      {#if !isMobileLayout || mobileSection === "pulls"}
+        <section class="panel">
+          <div class="panel__header">
+            <div class="panel__title">
+              <div class="panel__title-row">
+                <GitPullRequest size={16} />
+                <h3>{ui.pullRequests}</h3>
+              </div>
+              {#if githubRepo}
+                <span>{githubRepo.owner}/{githubRepo.name}</span>
+              {/if}
+            </div>
+            <div class="git-actions">
+              <label class="field field--inline field--compact">
+                <span>{ui.pullRequests}</span>
+                <select bind:value={pullRequestState} disabled={loadingPullRequests || loadingPullRequestDetail}>
+                  <option value="open">{ui.pullRequestsOpen}</option>
+                  <option value="closed">{ui.pullRequestsClosed}</option>
+                  <option value="all">{ui.pullRequestsAll}</option>
+                </select>
+              </label>
+              <button class="ghost-button small" disabled={!selectedRepoPath || loadingPullRequests} type="button" onclick={() => selectedRepoPath && refreshPullRequests(selectedRepoPath)}>
+                <RefreshCw class={loadingPullRequests ? "spin" : ""} size={14} />
+              </button>
+            </div>
+          </div>
+
+          {#if githubErrorText}
+            <div class="field-note">{githubErrorText}</div>
+          {:else if loadingPullRequests}
+            <div class="placeholder-card">{ui.pullRequestsLoading}</div>
+          {:else if pullRequests.length === 0}
+            <p class="field-note">{ui.noPullRequests}</p>
+          {:else}
+            <div class="file-list">
+              {#each pullRequests as pullRequest (pullRequest.number)}
+                <article class="file-row file-row--stacked">
+                  <button class="file-link file-link--stacked" type="button" onclick={() => void openPullRequest(pullRequest.number)}>
+                    <strong>#{pullRequest.number} {pullRequest.title}</strong>
+                    <small>{pullRequest.author ?? "unknown"} · {pullRequest.baseRefName} ← {pullRequest.headRefName}</small>
+                  </button>
+                  <div class="file-actions">
+                    <span class={`meta-pill ${pullRequest.state === "merged" ? "" : "subtle"}`}>{pullRequest.state}</span>
+                    {#if pullRequest.isDraft}
+                      <span class="meta-pill subtle">draft</span>
+                    {/if}
+                    <button class="ghost-button small" disabled={readOnly || githubBusyAction === "checkout"} type="button" onclick={() => void checkoutPullRequest(pullRequest.number)}>
+                      {githubBusyPullRequestNumber === pullRequest.number ? ui.checkingOutPr : ui.checkoutPr}
+                    </button>
+                  </div>
+                </article>
+              {/each}
+            </div>
+          {/if}
+        </section>
+      {/if}
+
       {#if !isMobileLayout || mobileSection === "commits" || mobileSection === "detail"}
         <section class="panel panel--detail">
         {#if loadingFile}
@@ -767,6 +951,98 @@
               </section>
             </div>
           {/if}
+        {:else if loadingPullRequestDetail}
+          <div class="placeholder-card">{ui.pullRequestsLoading}</div>
+        {:else if pullRequestDetail && (!isMobileLayout || mobileSection === "detail")}
+          {@const activePullRequest = pullRequestDetail.pullRequest}
+          <div class="panel__header">
+            <div class="panel__title">
+              <h3>#{activePullRequest.number} {activePullRequest.title}</h3>
+              <span>{activePullRequest.baseRefName} ← {activePullRequest.headRefName}</span>
+            </div>
+            <div class="git-actions">
+              <a class="ghost-button" href={activePullRequest.url} rel="noreferrer noopener" target="_blank">
+                <ExternalLink size={14} />
+                <span>{ui.openOnGitHub}</span>
+              </a>
+              <button class="ghost-button" disabled={readOnly || githubBusyAction === "checkout"} type="button" onclick={() => void checkoutPullRequest(activePullRequest.number)}>
+                {githubBusyPullRequestNumber === activePullRequest.number ? ui.checkingOutPr : ui.checkoutPr}
+              </button>
+              <button class="ghost-button" type="button" onclick={closeEditor}>{ui.close}</button>
+            </div>
+          </div>
+
+          <div class="editor-stack">
+            <section class="panel">
+              <div class="panel__header">
+                <h3>{ui.pullRequestOverview}</h3>
+                <span>{activePullRequest.changedFiles} files · +{activePullRequest.additions} / -{activePullRequest.deletions}</span>
+              </div>
+              <div class="space-y-3">
+                <div class="git-meta">
+                  <div class="meta-pill">{activePullRequest.state}</div>
+                  {#if activePullRequest.isDraft}
+                    <div class="meta-pill subtle">draft</div>
+                  {/if}
+                  {#if activePullRequest.reviewDecision}
+                    <div class="meta-pill subtle">{activePullRequest.reviewDecision}</div>
+                  {/if}
+                </div>
+                {#if activePullRequest.body.trim()}
+                  <div class="git-markdown-body">
+                    <MarkdownMessage text={activePullRequest.body} />
+                  </div>
+                {:else}
+                  <p class="field-note">{ui.pullRequestBodyEmpty}</p>
+                {/if}
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel__header">
+                <h3>{ui.pullRequestFiles}</h3>
+                <span>{activePullRequest.files.length}</span>
+              </div>
+
+              <div class="grouped-diff-list">
+                <div class="file-list">
+                  {#each activePullRequest.files as file (file.path)}
+                    <article class="file-row">
+                      <button class="file-link file-link--stacked" type="button" onclick={() => (selectedPullRequestFilePath = file.path)}>
+                        <strong>{file.path}</strong>
+                        <small>{file.status}{file.previousPath ? ` · ${file.previousPath}` : ""}</small>
+                      </button>
+                      <div class="file-actions">
+                        <span class="meta-pill subtle">+{file.additions}</span>
+                        <span class="meta-pill subtle">-{file.deletions}</span>
+                      </div>
+                    </article>
+                  {/each}
+                </div>
+
+                {#if selectedPullRequestFile}
+                  <section class="panel grouped-diff-panel">
+                    <div class="panel__header">
+                      <div class="panel__title">
+                        <h3>{selectedPullRequestFile.path}</h3>
+                        <span>{selectedPullRequestFile.status}</span>
+                      </div>
+                      <div class="git-actions">
+                        <span class="meta-pill subtle">+{selectedPullRequestFile.additions}</span>
+                        <span class="meta-pill subtle">-{selectedPullRequestFile.deletions}</span>
+                      </div>
+                    </div>
+
+                    {#if selectedPullRequestFile.patch}
+                      <MonacoTextEditor height={320} path={`${selectedPullRequestFile.path}.diff`} readonly value={selectedPullRequestFile.patch} />
+                    {:else}
+                      <div class="placeholder-card">{ui.binaryDiffNotPreviewable}</div>
+                    {/if}
+                  </section>
+                {/if}
+              </div>
+            </section>
+          </div>
         {:else if isMobileLayout && mobileSection === "detail"}
           <div class="placeholder-card">{ui.loadingFile}</div>
         {:else}
@@ -848,6 +1124,11 @@
     flex: 1 1 28rem;
   }
 
+  .field--compact {
+    grid-template-columns: auto minmax(0, 1fr);
+    min-width: 0;
+  }
+
   .field span {
     color: var(--muted);
     font-size: 0.82rem;
@@ -885,7 +1166,7 @@
   }
 
   .panel-grid {
-    grid-template-columns: minmax(20rem, 0.92fr) minmax(0, 1.45fr);
+    grid-template-columns: minmax(17rem, 0.82fr) minmax(17rem, 0.86fr) minmax(0, 1.42fr);
   }
 
   .git-mobile-nav {
@@ -917,6 +1198,26 @@
     justify-content: space-between;
   }
 
+  .panel__title {
+    display: grid;
+    gap: 0.22rem;
+    min-width: 0;
+  }
+
+  .panel__title-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+  }
+
+  .panel__title span {
+    color: var(--muted);
+    font-size: 0.75rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .file-list,
   .commit-list {
     display: grid;
@@ -935,6 +1236,10 @@
     padding: 0.62rem 0.72rem;
   }
 
+  .file-row--stacked {
+    align-items: flex-start;
+  }
+
   .file-link {
     display: flex;
     gap: 0.75rem;
@@ -946,6 +1251,12 @@
     cursor: pointer;
     padding: 0;
     text-align: left;
+  }
+
+  .file-link--stacked {
+    display: grid;
+    gap: 0.22rem;
+    align-items: flex-start;
   }
 
   .commit-link {
@@ -995,6 +1306,16 @@
     justify-content: flex-end;
   }
 
+  .git-markdown-body {
+    border-radius: 1rem;
+    background: rgba(249, 245, 239, 0.72);
+    padding: 0.85rem 0.95rem;
+  }
+
+  .spin {
+    animation: git-workspace-spin 0.9s linear infinite;
+  }
+
   .commit-row p {
     min-width: 0;
     margin: 0;
@@ -1010,6 +1331,12 @@
 
   .error-banner.small {
     margin: 0;
+  }
+
+  @media (max-width: 1480px) {
+    .panel-grid {
+      grid-template-columns: minmax(18rem, 0.92fr) minmax(0, 1.2fr);
+    }
   }
 
   @media (max-width: 1120px) {
@@ -1082,6 +1409,15 @@
     .panel,
     .git-shell {
       padding: 0.85rem;
+    }
+  }
+
+  @keyframes git-workspace-spin {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
     }
   }
 </style>

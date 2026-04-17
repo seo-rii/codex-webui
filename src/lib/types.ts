@@ -560,6 +560,56 @@ export type GitCommitDiffPayload = {
   diff: string;
 };
 
+export type GitHubRepositoryInfo = {
+  host: string;
+  owner: string;
+  name: string;
+  remoteName: string;
+  url: string;
+};
+
+export type GitHubPullRequestSummary = {
+  number: number;
+  title: string;
+  state: "open" | "closed" | "merged";
+  isDraft: boolean;
+  url: string;
+  author: string | null;
+  authorUrl: string | null;
+  baseRefName: string;
+  headRefName: string;
+  updatedAt: string | null;
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  labels: string[];
+};
+
+export type GitHubPullRequestListPayload = {
+  repository: GitHubRepositoryInfo;
+  pullRequests: GitHubPullRequestSummary[];
+};
+
+export type GitHubPullRequestFile = {
+  path: string;
+  previousPath: string | null;
+  status: string;
+  additions: number;
+  deletions: number;
+  patch: string | null;
+};
+
+export type GitHubPullRequestDetailPayload = {
+  repository: GitHubRepositoryInfo;
+  pullRequest: GitHubPullRequestSummary & {
+    body: string;
+    reviewDecision: string | null;
+    mergeStateStatus: string | null;
+    commits: number;
+    files: GitHubPullRequestFile[];
+  };
+};
+
 export type GitFileStatus = {
   path: string;
   originalPath: string | null;

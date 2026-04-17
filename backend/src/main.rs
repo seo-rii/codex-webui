@@ -966,6 +966,8 @@ fn is_ws_method_allowed(role: UserRole, method: &str) -> bool {
             | "account/get"
             | "git/repositories/list"
             | "git/status"
+            | "git/github/pulls"
+            | "git/github/pull"
             | "git/commit/diff"
             | "git/file/get"
             | "git/file/resolve"
@@ -1004,6 +1006,8 @@ fn should_audit_ws_method(method: &str) -> bool {
             | "account/get"
             | "git/repositories/list"
             | "git/status"
+            | "git/github/pulls"
+            | "git/github/pull"
             | "git/commit/diff"
             | "git/file/get"
             | "git/file/resolve"
@@ -1711,6 +1715,59 @@ async fn execute_ws_method(
                 Method::GET,
                 &format!("/api/git/status?repoPath={repo_path}"),
                 None,
+            )
+            .await
+        }
+        "git/github/pulls" => {
+            let repo_path_raw = require_string(&params, "repoPath")?;
+            let repo_path = urlencoding::encode(&repo_path_raw);
+            let pr_state = params
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("open");
+            let pr_state = urlencoding::encode(pr_state);
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(20);
+            internal_json_request(
+                state,
+                Method::GET,
+                &format!(
+                    "/api/git/github/pulls?repoPath={repo_path}&state={pr_state}&limit={limit}"
+                ),
+                None,
+            )
+            .await
+        }
+        "git/github/pull" => {
+            let repo_path_raw = require_string(&params, "repoPath")?;
+            let repo_path = urlencoding::encode(&repo_path_raw);
+            let number = params
+                .get("number")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("number is required"))?;
+            internal_json_request(
+                state,
+                Method::GET,
+                &format!("/api/git/github/pulls/{number}?repoPath={repo_path}"),
+                None,
+            )
+            .await
+        }
+        "git/github/pull/checkout" => {
+            let payload = json!({
+                "repoPath": require_string(&params, "repoPath")?
+            });
+            let number = params
+                .get("number")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("number is required"))?;
+            internal_json_request(
+                state,
+                Method::POST,
+                &format!("/api/git/github/pulls/{number}/checkout"),
+                Some(payload),
             )
             .await
         }

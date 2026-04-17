@@ -18,6 +18,7 @@
     RefreshCw,
     AlertCircle,
     CheckCircle2,
+    Bell,
     ExternalLink,
     Monitor,
     Moon,
@@ -28,10 +29,13 @@
   import { m } from "$lib/paraglide/messages.js";
   import { getLocale } from "$lib/paraglide/runtime.js";
   import type { ResolvedTheme, ThemeMode } from "$lib/theme";
-  import type { CodexAccountLoginFlow, CodexQuotaStatus, CodexRuntimeStatus, SessionSearchScope, SessionSummary } from "$lib/types";
+  import type { AppNotification, CodexAccountLoginFlow, CodexQuotaStatus, CodexRuntimeStatus, SessionSearchScope, SessionSummary } from "$lib/types";
 
   let {
     sessions,
+    notifications,
+    notificationsBusy,
+    notificationsUnreadCount,
     sessionHighlights,
     selectedId,
     sessionsBusy,
@@ -60,6 +64,9 @@
     resolvedTheme,
     accountLoginFlow,
     onRefreshQuota,
+    onRefreshNotifications,
+    onMarkNotificationsRead,
+    onClearNotifications,
     onRefreshRuntime,
     onSystemShutdownArmedChange,
     onInstallRuntime,
@@ -73,6 +80,9 @@
     onClose = () => {}
   }: {
     sessions: SessionSummary[];
+    notifications: AppNotification[];
+    notificationsBusy: boolean;
+    notificationsUnreadCount: number;
     sessionHighlights: Record<string, { kind: "completed" | "attention"; at: number }>;
     selectedId: string | null;
     sessionsBusy: boolean;
@@ -108,6 +118,9 @@
     resolvedTheme: ResolvedTheme;
     accountLoginFlow: CodexAccountLoginFlow | null;
     onRefreshQuota: () => void;
+    onRefreshNotifications: () => void;
+    onMarkNotificationsRead: (ids: string[] | null) => void;
+    onClearNotifications: () => void;
     onRefreshRuntime: () => void;
     onSystemShutdownArmedChange: (armed: boolean) => void;
     onInstallRuntime: () => void;
@@ -122,11 +135,14 @@
   } = $props();
 
   let accountMenuOpen = $state(false);
+  let notificationsOpen = $state(false);
   let searchPanelOpen = $state(false);
   let listElement = $state<HTMLDivElement | undefined>(undefined);
   let searchTriggerElement = $state<HTMLButtonElement | undefined>(undefined);
   let searchPanelElement = $state<HTMLDivElement | undefined>(undefined);
   let searchInputElement = $state<HTMLInputElement | undefined>(undefined);
+  let notificationButtonElement = $state<HTMLButtonElement | undefined>(undefined);
+  let notificationPanelElement = $state<HTMLDivElement | undefined>(undefined);
   let accountButtonElement = $state<HTMLButtonElement | undefined>(undefined);
   let accountPopoverElement = $state<HTMLDivElement | undefined>(undefined);
   let accountPopoverStyle = $state("");
@@ -158,6 +174,15 @@
       autoloadingMoreThreads: m.autoloading_more_threads(),
       loadMoreThreads: m.load_more_threads(),
       loadingNextSessionList: m.loading_next_session_list(),
+      notifications: m.notifications(),
+      notificationCenter: m.notification_center(),
+      noNotifications: m.no_notifications(),
+      markAllRead: m.mark_all_read(),
+      clearAll: m.clear_all(),
+      notificationSessionCompleted: m.notification_session_completed(),
+      notificationInputRequired: m.notification_input_required(),
+      notificationQueueFailed: m.notification_queue_failed(),
+      notificationShutdownScheduled: m.notification_shutdown_scheduled(),
       account: m.account(),
       appearance: m.appearance(),
       language: m.language(),
@@ -284,6 +309,46 @@
       return account?.email || account?.type ? ui.connected : ui.signInRequired;
     }
     return ui.localRuntime;
+  }
+
+  function toggleNotifications() {
+    notificationsOpen = !notificationsOpen;
+    if (notificationsOpen) {
+      onRefreshNotifications();
+    }
+  }
+
+  function closeNotifications() {
+    notificationsOpen = false;
+  }
+
+  function notificationTitle(notification: AppNotification) {
+    if (notification.type === "sessionCompleted") {
+      return ui.notificationSessionCompleted;
+    }
+    if (notification.type === "sessionAttention") {
+      return ui.notificationInputRequired;
+    }
+    if (notification.type === "queueDispatchFailed") {
+      return ui.notificationQueueFailed;
+    }
+    return ui.notificationShutdownScheduled;
+  }
+
+  function notificationBody(notification: AppNotification) {
+    const sessionLabel = notification.sessionName?.trim();
+    if (notification.type === "sessionCompleted") {
+      return sessionLabel ? `${sessionLabel} · ${ui.done}` : ui.done;
+    }
+    if (notification.type === "sessionAttention") {
+      return sessionLabel ? `${sessionLabel} · ${ui.needsInput}` : ui.needsInput;
+    }
+    if (notification.type === "queueDispatchFailed") {
+      const message = typeof notification.payload.message === "string" ? notification.payload.message.trim() : "";
+      return sessionLabel && message ? `${sessionLabel} · ${message}` : sessionLabel || message || ui.notificationQueueFailed;
+    }
+    const delaySeconds = Number(notification.payload.delaySeconds ?? 0);
+    return delaySeconds > 0 ? `${delaySeconds}s` : ui.notificationShutdownScheduled;
   }
 
   const themeOptions: Array<{ mode: ThemeMode; key: "system" | "light" | "dark"; icon: typeof Monitor }> = [
@@ -446,6 +511,14 @@
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target as Node | null;
       if (
+        notificationsOpen &&
+        target &&
+        !notificationPanelElement?.contains(target) &&
+        !notificationButtonElement?.contains(target)
+      ) {
+        closeNotifications();
+      }
+      if (
         searchPanelOpen &&
         target &&
         !searchPanelElement?.contains(target) &&
@@ -467,6 +540,9 @@
       if (event.key === "Escape") {
         if (searchPanelOpen) {
           closeSearchPanel();
+        }
+        if (notificationsOpen) {
+          closeNotifications();
         }
         if (accountMenuOpen) {
           accountMenuOpen = false;
@@ -490,15 +566,96 @@
 
 <aside class="sidebar flex flex-col h-full bg-gray-50/80 border-r border-gray-200/50 w-72 min-w-[18rem] transition-all">
   <div class="p-4 flex flex-col gap-4">
-    <div class="flex items-center justify-between">
+    <div class="relative flex items-center justify-between">
       <div class="flex items-center gap-2 px-1">
         <div class="w-8 h-8 bg-amber-600 rounded-lg flex items-center justify-center text-white font-bold">C</div>
         <h1 class="text-lg font-semibold tracking-tight text-gray-900">{ui.appShortName}</h1>
       </div>
-      {#if showCloseButton}
-        <button class="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors" onclick={onClose}>
-          <X size={20} />
+      <div class="flex items-center gap-1.5">
+        <button
+          bind:this={notificationButtonElement}
+          aria-expanded={notificationsOpen}
+          class="relative rounded-lg p-2 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600"
+          onclick={toggleNotifications}
+          type="button"
+        >
+          <Bell size={18} />
+          {#if notificationsUnreadCount > 0}
+            <span class="absolute -right-0.5 -top-0.5 min-w-[1rem] rounded-full bg-amber-500 px-1 py-0.5 text-[9px] font-bold leading-none text-white shadow-sm">
+              {Math.min(notificationsUnreadCount, 99)}
+            </span>
+          {/if}
         </button>
+        {#if showCloseButton}
+          <button class="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors" onclick={onClose}>
+            <X size={20} />
+          </button>
+        {/if}
+      </div>
+
+      {#if notificationsOpen}
+        <div
+          bind:this={notificationPanelElement}
+          class="absolute right-0 top-[calc(100%+0.6rem)] z-30 grid w-[22rem] gap-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-[0_24px_54px_-28px_rgba(15,23,42,0.35)]"
+        >
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.notifications}</p>
+              <p class="text-sm font-semibold text-gray-900">{ui.notificationCenter}</p>
+            </div>
+            <button class="rounded-lg p-1.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600" onclick={closeNotifications} type="button">
+              <X size={14} />
+            </button>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <button class="rounded-lg border border-gray-200 bg-gray-50 px-2.5 py-1.5 text-[11px] font-semibold text-gray-600 transition-colors hover:bg-white hover:text-gray-800" onclick={() => onMarkNotificationsRead(null)} type="button">
+              {ui.markAllRead}
+            </button>
+            <button class="rounded-lg border border-gray-200 bg-gray-50 px-2.5 py-1.5 text-[11px] font-semibold text-gray-600 transition-colors hover:bg-white hover:text-gray-800" onclick={onClearNotifications} type="button">
+              {ui.clearAll}
+            </button>
+          </div>
+
+          <div class="max-h-80 overflow-y-auto pr-1 scrollbar-thin">
+            {#if notificationsBusy}
+              <div class="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-xs text-gray-500">{ui.loadingMoreThreads}</div>
+            {:else if notifications.length === 0}
+              <div class="rounded-xl border border-dashed border-gray-200 bg-gray-50/80 px-3 py-4 text-center text-xs text-gray-500">{ui.noNotifications}</div>
+            {:else}
+              <div class="grid gap-2">
+                {#each notifications as notification (notification.id)}
+                  <button
+                    class={`rounded-xl border px-3 py-2.5 text-left transition-colors ${
+                      notification.readAt === null ? "border-amber-200 bg-amber-50/70" : "border-gray-200 bg-gray-50/70 hover:bg-white"
+                    }`}
+                    onclick={() => {
+                      onMarkNotificationsRead([notification.id]);
+                      if (notification.sessionId) {
+                        onSelect(notification.sessionId);
+                        closeNotifications();
+                      }
+                    }}
+                    type="button"
+                  >
+                    <div class="flex items-start justify-between gap-3">
+                      <div class="min-w-0">
+                        <p class="truncate text-xs font-semibold text-gray-900">{notificationTitle(notification)}</p>
+                        <p class="mt-1 line-clamp-2 text-[11px] leading-5 text-gray-500">{notificationBody(notification)}</p>
+                      </div>
+                      <div class="flex shrink-0 flex-col items-end gap-1">
+                        {#if notification.readAt === null}
+                          <span class="h-2 w-2 rounded-full bg-amber-500"></span>
+                        {/if}
+                        <span class="text-[10px] font-medium text-gray-400">{formatUpdated(Math.floor(notification.createdAt / 1000))}</span>
+                      </div>
+                    </div>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        </div>
       {/if}
     </div>
 

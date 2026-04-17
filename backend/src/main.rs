@@ -678,6 +678,30 @@ async fn execute_ws_method(
             });
             internal_json_request(state, Method::PATCH, "/api/config", Some(payload)).await
         }
+        "notifications/list" => {
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(80);
+            internal_json_request(state, Method::GET, &format!("/api/notifications?limit={limit}"), None).await
+        }
+        "notifications/markRead" => {
+            let payload = json!({
+                "ids": params.get("ids").cloned().unwrap_or(Value::Null)
+            });
+            internal_json_request(state, Method::PATCH, "/api/notifications", Some(payload)).await
+        }
+        "notifications/clear" => {
+            internal_json_request(state, Method::DELETE, "/api/notifications", None).await
+        }
+        "notifications/settings/update" => {
+            let payload = json!({
+                "enabledEventTypes": params.get("enabledEventTypes").cloned().unwrap_or(Value::Null),
+                "slackWebhookUrl": params.get("slackWebhookUrl").cloned().unwrap_or(Value::Null),
+                "webhookUrl": params.get("webhookUrl").cloned().unwrap_or(Value::Null)
+            });
+            internal_json_request(state, Method::PATCH, "/api/notifications/settings", Some(payload)).await
+        }
         "runtime/status" => codex_runtime_status(state, false).await,
         "runtime/checkUpdate" => codex_runtime_status(state, true).await,
         "runtime/quota" => codex_quota_status(

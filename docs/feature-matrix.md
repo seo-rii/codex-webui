@@ -53,6 +53,7 @@ In the comparison columns:
 | `config.toml` editor | Implemented | Different shape | Different shape | Browser-native settings page that syncs session defaults back to Codex config. |
 | Runtime install and update checks | Implemented | Different shape | Not targeted | Added for browser-hosted deployments where the runtime might not be present yet. |
 | Quota display | Implemented | Comparable | Comparable | Exposed in the account surface with cached refresh support. |
+| Notification center and webhook delivery | Implemented | Different shape | Different shape | Browser-native notification inbox with persisted unread state and Slack/generic webhook delivery hooks. |
 | Password-protected remote access | Implemented | Different shape | Not targeted | Core web deployment feature rather than upstream app or extension parity. |
 | Base path and reverse-proxy support | Implemented | Different shape | Not targeted | Important for self-hosted setups. |
 | Configurable CORS | Implemented | Different shape | Not targeted | Needed for controlled remote browser access. |

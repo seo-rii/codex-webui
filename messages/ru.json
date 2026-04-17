@@ -297,5 +297,18 @@
   "error_pending_request_not_found": "Этот запрос на подтверждение больше недоступен.",
   "error_session_already_archived": "Этот сеанс уже архивирован.",
   "error_session_not_archived": "Этот сеанс больше не находится в архиве.",
-  "error_session_not_found": "Не удалось найти этот сеанс."
+  "error_session_not_found": "Не удалось найти этот сеанс.",
+  "notifications": "Notifications",
+  "notification_center": "Notification center",
+  "notification_events": "Notification events",
+  "slack_webhook_url": "Slack webhook URL",
+  "generic_webhook_url": "Generic webhook URL",
+  "save_notification_settings": "Save notification settings",
+  "notification_session_completed": "Task completed",
+  "notification_input_required": "Needs input",
+  "notification_queue_failed": "Queue dispatch failed",
+  "notification_shutdown_scheduled": "Shutdown scheduled",
+  "no_notifications": "No notifications yet",
+  "mark_all_read": "Mark all read",
+  "clear_all": "Clear all"
 }

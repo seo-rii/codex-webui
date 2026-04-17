@@ -1,15 +1,20 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import type {
+  AppNotification,
   AppConfigPayload,
   AttachmentRecord,
   CodexItem,
   CodexTurn,
   CollaborationModeOption,
   GlobalStreamEvent,
+  NotificationEventType,
+  NotificationListPayload,
+  NotificationSettings,
   PendingServerRequest,
   SessionDetailPayload,
   SessionDraftPayload,
@@ -54,6 +59,7 @@ const HYDRATION_CACHE_LIMIT = 2;
 const DEFERRED_ITEM_TYPES = new Set(["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"]);
 const DEFAULT_THREAD_NAME = "New thread";
 const LIVE_THREAD_STATUSES = new Set(["running", "active"]);
+const DEFAULT_NOTIFICATION_LIMIT = 80;
 
 function asRecord(value: unknown) {
   return (value ?? {}) as Record<string, unknown>;
@@ -427,6 +433,54 @@ function getDisplayThreadName(name: string | null | undefined, preview: string |
   return inferSessionDisplayTitle(preview ?? "");
 }
 
+function buildNotificationPayload(
+  type: NotificationEventType,
+  sessionId: string | null,
+  sessionName: string | null,
+  payload: Record<string, unknown> = {}
+) {
+  return {
+    id: randomUUID(),
+    type,
+    createdAt: Date.now(),
+    readAt: null,
+    sessionId,
+    sessionName,
+    payload
+  } satisfies AppNotification;
+}
+
+function describeNotification(notification: AppNotification) {
+  if (notification.type === "sessionCompleted") {
+    const sessionLabel = notification.sessionName?.trim() || "Codex session";
+    return {
+      title: "Codex task completed",
+      body: `${sessionLabel} finished and is ready for review.`
+    };
+  }
+
+  if (notification.type === "sessionAttention") {
+    const sessionLabel = notification.sessionName?.trim() || "Codex session";
+    return {
+      title: "Codex needs input",
+      body: `${sessionLabel} is waiting for a decision or input.`
+    };
+  }
+
+  if (notification.type === "queueDispatchFailed") {
+    const sessionLabel = notification.sessionName?.trim() || "Codex session";
+    return {
+      title: "Queued follow-up failed",
+      body: `${sessionLabel} could not send the next queued message automatically.`
+    };
+  }
+
+  return {
+    title: "Shutdown scheduled",
+    body: `The server will shut down in ${String(notification.payload.delaySeconds ?? 0)} seconds once work remains idle.`
+  };
+}
+
 export class CodexGateway {
   private readonly client = new AppServerClient();
   private readonly streamSubscribers = new Map<string, Set<(event: StreamEvent) => void>>();
@@ -484,7 +538,11 @@ export class CodexGateway {
       this.client.request("collaborationMode/list", {}),
       this.client.request("account/read", { refreshToken: false })
     ]);
-    const [pausedQueueEntries, globalState] = await Promise.all([uiStateStore.listResumePendingQueues(), uiStateStore.getGlobal()]);
+    const [pausedQueueEntries, globalState, notifications] = await Promise.all([
+      uiStateStore.listResumePendingQueues(),
+      uiStateStore.getGlobal(),
+      uiStateStore.getNotifications(DEFAULT_NOTIFICATION_LIMIT)
+    ]);
     const preferences: Record<string, SessionPreferences> = pausedQueueEntries.length > 0 ? await uiStateStore.getAll() : {};
     const indexedSessions =
       pausedQueueEntries.length > 0 ? await sessionIndexClient.list(getRuntimeConfig().codexHome).catch(() => []) : [];
@@ -567,12 +625,70 @@ export class CodexGateway {
             ? globalState.scheduledShutdown
             : null
       },
+      notifications: {
+        unreadCount: notifications.unreadCount,
+        settings: await uiStateStore.getNotificationSettings()
+      },
       account: {
         type: (account.type as "apiKey" | "chatgpt" | null) ?? null,
         email: (account.email as string | null) ?? null,
         planType: (account.planType as string | null) ?? null,
         requiresOpenaiAuth: Boolean(asRecord(accountResponse).requiresOpenaiAuth)
       }
+    };
+  }
+
+  async getNotifications(limit = DEFAULT_NOTIFICATION_LIMIT): Promise<NotificationListPayload> {
+    return uiStateStore.getNotifications(limit);
+  }
+
+  async markNotificationsRead(ids: string[] | null = null) {
+    const changed = await uiStateStore.markNotificationsRead(ids);
+    const payload = await uiStateStore.getNotifications(DEFAULT_NOTIFICATION_LIMIT);
+    if (changed) {
+      this.emitGlobal({
+        kind: "notification",
+        method: "codex-webui/notificationStateUpdated",
+        params: {
+          unreadCount: payload.unreadCount
+        }
+      });
+      void this.emitConfigUpdated();
+    }
+    return payload;
+  }
+
+  async clearNotifications() {
+    const changed = await uiStateStore.clearNotifications();
+    const payload = await uiStateStore.getNotifications(DEFAULT_NOTIFICATION_LIMIT);
+    if (changed) {
+      this.emitGlobal({
+        kind: "notification",
+        method: "codex-webui/notificationStateUpdated",
+        params: {
+          unreadCount: payload.unreadCount
+        }
+      });
+      void this.emitConfigUpdated();
+    }
+    return payload;
+  }
+
+  async updateNotificationSettings(settings: Partial<NotificationSettings>) {
+    const nextSettings = await uiStateStore.updateNotificationSettings(settings);
+    const unreadCount = (await uiStateStore.getNotifications(1)).unreadCount;
+    this.emitGlobal({
+      kind: "notification",
+      method: "codex-webui/notificationSettingsUpdated",
+      params: {
+        settings: nextSettings,
+        unreadCount
+      }
+    });
+    await this.emitConfigUpdated();
+    return {
+      settings: nextSettings,
+      unreadCount
     };
   }
 
@@ -2200,6 +2316,16 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       }
       void this.maybeDrainQueue(threadId);
       void this.maybeScheduleGlobalShutdown(String(turn.id ?? ""));
+      void this.enqueueAppNotification(
+        buildNotificationPayload(
+          "sessionCompleted",
+          threadId,
+          this.recentLiveSessions.get(threadId)?.name ?? null,
+          {
+            turnId: String(turn.id ?? "")
+          }
+        )
+      );
       this.emitGlobal({
         kind: "notification",
         method: "codex-webui/sessionAttention",
@@ -2362,6 +2488,13 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         reason: "approval"
       }
     });
+    void this.enqueueAppNotification(
+      buildNotificationPayload("sessionAttention", threadId, this.recentLiveSessions.get(threadId)?.name ?? null, {
+        reason: "approval",
+        requestId: pending.id,
+        requestMethod: pending.method
+      })
+    );
     void this.setSessionHighlight(threadId, {
       kind: "attention",
       at: Date.now()
@@ -2436,7 +2569,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
 
   private async emitConfigUpdated() {
     const runtimeConfig = getRuntimeConfig();
-    const globalState = await uiStateStore.getGlobal();
+    const [globalState, notifications] = await Promise.all([uiStateStore.getGlobal(), uiStateStore.getNotifications(1)]);
     this.emitGlobal({
       kind: "notification",
       method: "codex-webui/configUpdated",
@@ -2454,9 +2587,70 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
             globalState.scheduledShutdown.scheduledFor > Date.now()
               ? globalState.scheduledShutdown
               : null
+        },
+        notifications: {
+          unreadCount: notifications.unreadCount,
+          settings: await uiStateStore.getNotificationSettings()
         }
       }
     });
+  }
+
+  private async enqueueAppNotification(notification: AppNotification) {
+    const settings = await uiStateStore.getNotificationSettings();
+    if (!settings.enabledEventTypes.includes(notification.type)) {
+      return;
+    }
+
+    await uiStateStore.addNotification(notification);
+    const unreadCount = (await uiStateStore.getNotifications(1)).unreadCount;
+    this.emitGlobal({
+      kind: "notification",
+      method: "codex-webui/notificationAdded",
+      params: {
+        notification,
+        unreadCount
+      }
+    });
+    void this.emitConfigUpdated();
+    void this.deliverNotificationHooks(notification, settings);
+  }
+
+  private async deliverNotificationHooks(notification: AppNotification, settings: NotificationSettings) {
+    const { title, body } = describeNotification(notification);
+    const deliveries: Array<Promise<unknown>> = [];
+
+    if (settings.slackWebhookUrl) {
+      deliveries.push(
+        fetch(settings.slackWebhookUrl, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            text: `*${title}*\n${body}`
+          })
+        }).catch(() => null)
+      );
+    }
+
+    if (settings.webhookUrl) {
+      deliveries.push(
+        fetch(settings.webhookUrl, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            notification
+          })
+        }).catch(() => null)
+      );
+    }
+
+    if (deliveries.length > 0) {
+      await Promise.allSettled(deliveries);
+    }
   }
 
   private armScheduledShutdown(shutdown: StartupScheduledShutdownAlert) {
@@ -2601,6 +2795,13 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         sessionId: null
       }
     });
+    void this.enqueueAppNotification(
+      buildNotificationPayload("shutdownScheduled", null, null, {
+        delaySeconds: runtimeConfig.systemShutdownDelaySeconds,
+        scheduledFor: scheduledShutdown.scheduledFor,
+        turnId: completedTurnId
+      })
+    );
     await this.emitConfigUpdated();
   }
 
@@ -2650,6 +2851,13 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
             message: parsedError?.message ?? (error instanceof Error ? error.message : "Failed to dispatch queued message.")
           }
         });
+        void this.enqueueAppNotification(
+          buildNotificationPayload("queueDispatchFailed", threadId, this.recentLiveSessions.get(threadId)?.name ?? null, {
+            queueId: queuedItem.id,
+            code: parsedError?.code ?? null,
+            message: parsedError?.message ?? (error instanceof Error ? error.message : "Failed to dispatch queued message.")
+          })
+        );
       }
     });
   }

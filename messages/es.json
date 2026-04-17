@@ -297,5 +297,18 @@
   "error_pending_request_not_found": "Esta solicitud de aprobación ya no está disponible.",
   "error_session_already_archived": "Esta sesión ya está archivada.",
   "error_session_not_archived": "Esta sesión ya no está archivada.",
-  "error_session_not_found": "No se pudo encontrar esta sesión."
+  "error_session_not_found": "No se pudo encontrar esta sesión.",
+  "notifications": "Notifications",
+  "notification_center": "Notification center",
+  "notification_events": "Notification events",
+  "slack_webhook_url": "Slack webhook URL",
+  "generic_webhook_url": "Generic webhook URL",
+  "save_notification_settings": "Save notification settings",
+  "notification_session_completed": "Task completed",
+  "notification_input_required": "Needs input",
+  "notification_queue_failed": "Queue dispatch failed",
+  "notification_shutdown_scheduled": "Shutdown scheduled",
+  "no_notifications": "No notifications yet",
+  "mark_all_read": "Mark all read",
+  "clear_all": "Clear all"
 }

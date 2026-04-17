@@ -17,6 +17,8 @@ import type {
   GitRepository,
   GitStatusPayload,
   GitWorktreePayload,
+  NotificationListPayload,
+  NotificationSettings,
   SessionDetailPayload,
   SessionDraftPayload,
   SessionItemDetailPayload,
@@ -123,6 +125,22 @@ export const api = {
         armed
       }
     });
+  },
+
+  getNotifications(limit = 80) {
+    return ws.request<NotificationListPayload>("notifications/list", { limit });
+  },
+
+  markNotificationsRead(ids: string[] | null = null) {
+    return ws.request<NotificationListPayload>("notifications/markRead", { ids });
+  },
+
+  clearNotifications() {
+    return ws.request<NotificationListPayload>("notifications/clear");
+  },
+
+  updateNotificationSettings(settings: Partial<NotificationSettings>) {
+    return ws.request<{ settings: NotificationSettings; unreadCount: number }>("notifications/settings/update", settings);
   },
 
   getRuntimeStatus() {

@@ -297,5 +297,18 @@
   "error_pending_request_not_found": "이 승인 요청을 더 이상 찾을 수 없습니다.",
   "error_session_already_archived": "이 세션은 이미 아카이브되었습니다.",
   "error_session_not_archived": "이 세션은 더 이상 아카이브 상태가 아닙니다.",
-  "error_session_not_found": "이 세션을 찾을 수 없습니다."
+  "error_session_not_found": "이 세션을 찾을 수 없습니다.",
+  "notifications": "알림",
+  "notification_center": "알림 센터",
+  "notification_events": "알림 이벤트",
+  "slack_webhook_url": "Slack 웹훅 URL",
+  "generic_webhook_url": "일반 웹훅 URL",
+  "save_notification_settings": "알림 설정 저장",
+  "notification_session_completed": "작업 완료",
+  "notification_input_required": "입력 필요",
+  "notification_queue_failed": "큐 전송 실패",
+  "notification_shutdown_scheduled": "시스템 종료 예약됨",
+  "no_notifications": "아직 알림이 없습니다",
+  "mark_all_read": "모두 읽음 처리",
+  "clear_all": "모두 지우기"
 }

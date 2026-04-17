@@ -297,5 +297,18 @@
   "error_pending_request_not_found": "Cette demande d’approbation n’est plus disponible.",
   "error_session_already_archived": "Cette session est déjà archivée.",
   "error_session_not_archived": "Cette session n’est plus archivée.",
-  "error_session_not_found": "Cette session est introuvable."
+  "error_session_not_found": "Cette session est introuvable.",
+  "notifications": "Notifications",
+  "notification_center": "Notification center",
+  "notification_events": "Notification events",
+  "slack_webhook_url": "Slack webhook URL",
+  "generic_webhook_url": "Generic webhook URL",
+  "save_notification_settings": "Save notification settings",
+  "notification_session_completed": "Task completed",
+  "notification_input_required": "Needs input",
+  "notification_queue_failed": "Queue dispatch failed",
+  "notification_shutdown_scheduled": "Shutdown scheduled",
+  "no_notifications": "No notifications yet",
+  "mark_all_read": "Mark all read",
+  "clear_all": "Clear all"
 }

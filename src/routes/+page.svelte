@@ -60,6 +60,7 @@
     type ThemeMode
   } from "$lib/theme";
   import type {
+    AppNotification,
     AppConfigPayload,
     AttachmentRecord,
     CodexAccountLoginFlow,
@@ -70,6 +71,7 @@
     GitCommit,
     GitOpenRequest,
     GlobalStreamEvent,
+    NotificationSettings,
     PendingServerRequest,
     SessionListPayload,
     SessionPreferences,
@@ -121,6 +123,7 @@
   let quota = $state<CodexQuotaStatus | null>(null);
   let runtime = $state<CodexRuntimeStatus | null>(null);
   let sessions = $state<SessionSummary[]>([]);
+  let notifications = $state<AppNotification[]>([]);
   let sessionsCursor = $state<string | null>(null);
   let sessionsHasMore = $state(false);
   let sessionsLoadingMore = $state(false);
@@ -145,6 +148,7 @@
   let browserBusy = $state(false);
   let runtimeBusyAction = $state<"install" | "update" | "check" | null>(null);
   let quotaBusy = $state(false);
+  let notificationsBusy = $state(false);
   let directoryPayload = $state<DirectoryPayload | null>(null);
   let requestAnswers = $state<Record<string, Record<string, string>>>({});
   let rawRequestResponses = $state<Record<string, string>>({});
@@ -1899,7 +1903,9 @@
     resetWorkspaceState();
     authenticated = false;
     runtime = null;
+    notifications = [];
     loginBusy = false;
+    notificationsBusy = false;
     releaseGlobalStream?.();
     releaseGlobalStream = null;
     api.disconnect();
@@ -1942,6 +1948,7 @@
       const requestedSessionId = getRequestedSessionIdFromUrl();
       config = await api.getConfig();
       syncStartupAlertModal(config);
+      await refreshNotifications();
       await refreshSessions();
       await refreshTerminals();
       void refreshQuota(false);
@@ -1993,6 +2000,68 @@
       if (requestVersion === sessionListRequestVersion) {
         sessionsBusy = false;
       }
+    }
+  }
+
+  async function refreshNotifications() {
+    notificationsBusy = true;
+    try {
+      const payload = await api.getNotifications();
+      notifications = payload.notifications;
+      if (config) {
+        config = {
+          ...config,
+          notifications: {
+            ...config.notifications,
+            unreadCount: payload.unreadCount
+          }
+        };
+      }
+    } catch (error) {
+      errorText = describeError(error);
+    } finally {
+      notificationsBusy = false;
+    }
+  }
+
+  async function markNotificationsRead(ids: string[] | null = null) {
+    const payload = await api.markNotificationsRead(ids);
+    notifications = payload.notifications;
+    if (config) {
+      config = {
+        ...config,
+        notifications: {
+          ...config.notifications,
+          unreadCount: payload.unreadCount
+        }
+      };
+    }
+  }
+
+  async function clearNotifications() {
+    const payload = await api.clearNotifications();
+    notifications = payload.notifications;
+    if (config) {
+      config = {
+        ...config,
+        notifications: {
+          ...config.notifications,
+          unreadCount: payload.unreadCount
+        }
+      };
+    }
+  }
+
+  async function saveNotificationSettings(settings: Partial<NotificationSettings>) {
+    const payload = await api.updateNotificationSettings(settings);
+    if (config) {
+      config = {
+        ...config,
+        notifications: {
+          unreadCount: payload.unreadCount,
+          settings: payload.settings
+        }
+      };
     }
   }
 
@@ -2370,6 +2439,12 @@
           defaults: (event.params.defaults as SessionPreferences | undefined) ?? config.defaults,
           systemShutdown:
             (event.params.systemShutdown as AppConfigPayload["systemShutdown"] | undefined) ?? config.systemShutdown,
+          notifications: event.params.notifications
+            ? {
+                ...config.notifications,
+                ...(event.params.notifications as Partial<AppConfigPayload["notifications"]>)
+              }
+            : config.notifications,
           startup: event.params.startup
             ? {
                 ...config.startup,
@@ -2378,6 +2453,49 @@
             : config.startup
         };
         syncStartupAlertModal(config);
+      }
+      return;
+    }
+
+    if (event.method === "codex-webui/notificationAdded") {
+      const incoming = event.params.notification as AppNotification | undefined;
+      if (incoming) {
+        notifications = [incoming, ...notifications.filter((entry) => entry.id !== incoming.id)].slice(0, 80);
+      }
+      if (config) {
+        config = {
+          ...config,
+          notifications: {
+            ...config.notifications,
+            unreadCount: Number(event.params.unreadCount ?? config.notifications.unreadCount)
+          }
+        };
+      }
+      return;
+    }
+
+    if (event.method === "codex-webui/notificationStateUpdated") {
+      if (config) {
+        config = {
+          ...config,
+          notifications: {
+            ...config.notifications,
+            unreadCount: Number(event.params.unreadCount ?? 0)
+          }
+        };
+      }
+      return;
+    }
+
+    if (event.method === "codex-webui/notificationSettingsUpdated") {
+      if (config) {
+        config = {
+          ...config,
+          notifications: {
+            unreadCount: Number(event.params.unreadCount ?? config.notifications.unreadCount),
+            settings: (event.params.settings as NotificationSettings | undefined) ?? config.notifications.settings
+          }
+        };
       }
       return;
     }
@@ -5361,6 +5479,9 @@
     <SessionSidebar
       account={config?.account ?? null}
       {accountLoginFlow}
+      {notifications}
+      notificationsBusy={notificationsBusy}
+      notificationsUnreadCount={config?.notifications.unreadCount ?? 0}
       {quota}
       {quotaBusy}
       {runtime}
@@ -5399,6 +5520,15 @@
       }}
       onRefreshQuota={() => {
         void refreshQuota(true);
+      }}
+      onRefreshNotifications={() => {
+        void refreshNotifications();
+      }}
+      onMarkNotificationsRead={(ids) => {
+        void markNotificationsRead(ids);
+      }}
+      onClearNotifications={() => {
+        void clearNotifications();
       }}
       onRefreshRuntime={() => {
         void refreshRuntimeStatus(true);
@@ -6070,7 +6200,7 @@
                   </div>
                 {/if}
                 <form class="composer-panel bg-white/95 border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200 focus-within:-translate-y-0.5 focus-within:border-amber-400/70 focus-within:bg-white focus-within:shadow-[0_24px_60px_-34px_rgba(245,158,11,0.65)]" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
-                  <textarea bind:this={composerTextareaElement} bind:value={draft} class="composer-textarea w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 transition-colors duration-150 focus:ring-0 focus:placeholder:text-amber-500/70 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} rows="1"></textarea>
+                  <textarea bind:this={composerTextareaElement} bind:value={draft} class="composer-textarea w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 outline-none transition-colors duration-150 focus:outline-none focus:ring-0 focus:placeholder:text-amber-500/70 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} rows="1"></textarea>
                   
                   {#if draftAttachments.length > 0}
                     <div class="px-4 pb-2 flex flex-wrap gap-2">
@@ -6100,62 +6230,73 @@
                       <button class="surface-contrast-button ui-animated-button ui-animated-button--strong rounded-xl bg-gray-900 px-4 py-1.5 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:px-6 sm:py-2 sm:text-xs" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
                     </div>
                   </div>
-                  {#if conversation}
-                    <div class="composer-meta-row flex flex-wrap items-center gap-2 border-t border-gray-100/80 bg-white/72 px-3 pb-3 pt-2.5 sm:px-4">
-                      <button
-                        class={`ui-animated-button ui-animated-button--soft inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
-                          (conversation.preferences.mode ?? "default") === "plan"
-                            ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
-                            : "border-gray-200 bg-white text-gray-500 hover:border-gray-300 hover:text-gray-700"
-                        }`}
-                        onclick={() => {
-                          if (!conversation) {
-                            return;
-                          }
-                          setPreference("mode", (conversation.preferences.mode ?? "default") === "plan" ? "default" : "plan");
-                        }}
-                        type="button"
-                      >
-                        <ListTodo size={13} class="shrink-0" />
-                        <span>{ui.planMode}</span>
-                      </button>
-                      <div class="inline-flex min-w-0 flex-wrap items-center gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
-                        <span class="px-1.5 text-[9px] font-bold uppercase tracking-[0.14em] text-gray-400 sm:px-2">{ui.speed}</span>
-                        {#each speedOptions as option}
+                </form>
+
+                <!-- Settings Popovers -->
+                {#if composerSettingsOpen && conversation}
+                  <div class="composer-popover absolute bottom-24 left-0 w-80 bg-white border border-gray-200 rounded-2xl shadow-2xl p-4 space-y-4 z-50">
+                    <div class="flex items-center justify-between border-b border-gray-100 pb-3 mb-2"><h3 class="text-xs font-bold text-gray-400 uppercase tracking-widest">{ui.composerSettings}</h3><button class="text-gray-400 hover:text-gray-600" onclick={() => (composerSettingsOpen = false)}><X size={16} /></button></div>
+                    <div class="grid grid-cols-1 gap-4">
+                      <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-model-select">{ui.model}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all" id="composer-model-select" onchange={(event) => setPreference("model", (event.currentTarget as HTMLSelectElement).value || null)} value={conversation.preferences.model ?? ""}><option value="">{ui.autoDefault}</option>{#each config?.models ?? [] as model}<option value={model.id}>{model.displayName}</option>{/each}</select></div>
+                      <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-effort-select">{m.reasoning()}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all" id="composer-effort-select" onchange={(event) => setPreference("effort", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["effort"])} value={conversation.preferences.effort ?? (reasoningOptions[0] ?? "medium")}>{#each reasoningOptions as option}<option value={option}>{option}</option>{/each}</select></div>
+                      <div class="space-y-2 rounded-2xl border border-gray-200/80 bg-gray-50/80 p-3">
+                        <div class="flex items-center justify-between gap-3">
+                          <div class="space-y-0.5">
+                            <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.planMode}</p>
+                            <p class="text-[11px] text-gray-500">{(conversation.preferences.mode ?? "default") === "plan" ? m.plan_mode_enabled() : ui.planMode}</p>
+                          </div>
                           <button
-                            class={`ui-animated-button ui-animated-button--soft ${ (conversation.preferences.speed ?? "auto") === option ? "surface-contrast-button" : "" } rounded-lg px-2.5 py-1 text-[10px] font-bold transition-all sm:text-[11px] ${
-                              (conversation.preferences.speed ?? "auto") === option
-                                ? "bg-gray-900 text-white shadow-sm"
-                                : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"
+                            class={`ui-animated-button ui-animated-button--soft inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
+                              (conversation.preferences.mode ?? "default") === "plan"
+                                ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
+                                : "border-gray-200 bg-white text-gray-500 hover:border-gray-300 hover:text-gray-700"
                             }`}
                             onclick={() => {
                               if (!conversation) {
                                 return;
                               }
-                              setPreference("speed", option as SessionPreferences["speed"]);
+                              setPreference("mode", (conversation.preferences.mode ?? "default") === "plan" ? "default" : "plan");
                             }}
                             type="button"
                           >
-                            {getSpeedOptionLabel(option as SessionPreferences["speed"])}
+                            <ListTodo size={13} class="shrink-0" />
+                            <span>{ui.planMode}</span>
                           </button>
-                        {/each}
+                        </div>
                       </div>
-                    </div>
-                  {/if}
-                </form>
-
-                <!-- Settings Popovers -->
-                {#if composerSettingsOpen && conversation}
-                  <div class="absolute bottom-24 left-0 w-80 bg-white border border-gray-200 rounded-2xl shadow-2xl p-4 space-y-4 z-50 animate-in slide-in-from-bottom-4 duration-300">
-                    <div class="flex items-center justify-between border-b border-gray-100 pb-3 mb-2"><h3 class="text-xs font-bold text-gray-400 uppercase tracking-widest">{ui.composerSettings}</h3><button class="text-gray-400 hover:text-gray-600" onclick={() => (composerSettingsOpen = false)}><X size={16} /></button></div>
-                    <div class="grid grid-cols-1 gap-4">
-                      <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-model-select">{ui.model}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all" id="composer-model-select" onchange={(event) => setPreference("model", (event.currentTarget as HTMLSelectElement).value || null)} value={conversation.preferences.model ?? ""}><option value="">{ui.autoDefault}</option>{#each config?.models ?? [] as model}<option value={model.id}>{model.displayName}</option>{/each}</select></div>
-                      <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-effort-select">{m.reasoning()}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all" id="composer-effort-select" onchange={(event) => setPreference("effort", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["effort"])} value={conversation.preferences.effort ?? (reasoningOptions[0] ?? "medium")}>{#each reasoningOptions as option}<option value={option}>{option}</option>{/each}</select></div>
+                      <div class="space-y-2 rounded-2xl border border-gray-200/80 bg-gray-50/80 p-3">
+                        <div class="flex items-center justify-between gap-3">
+                          <div class="space-y-0.5">
+                            <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.speed}</p>
+                            <p class="text-[11px] text-gray-500">{getSpeedOptionLabel(conversation.preferences.speed ?? "auto")}</p>
+                          </div>
+                        </div>
+                        <div class="inline-flex min-w-0 flex-wrap items-center gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
+                          {#each speedOptions as option}
+                            <button
+                              class={`ui-animated-button ui-animated-button--soft ${ (conversation.preferences.speed ?? "auto") === option ? "surface-contrast-button" : "" } rounded-lg px-2.5 py-1 text-[10px] font-bold transition-all sm:text-[11px] ${
+                                (conversation.preferences.speed ?? "auto") === option
+                                  ? "bg-gray-900 text-white shadow-sm"
+                                  : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"
+                              }`}
+                              onclick={() => {
+                                if (!conversation) {
+                                  return;
+                                }
+                                setPreference("speed", option as SessionPreferences["speed"]);
+                              }}
+                              type="button"
+                            >
+                              {getSpeedOptionLabel(option as SessionPreferences["speed"])}
+                            </button>
+                          {/each}
+                        </div>
+                      </div>
                     </div>
                   </div>
                 {/if}
                 {#if composerSecurityOpen && conversation}
-                  <div class="absolute bottom-24 left-0 w-80 bg-white border border-gray-200 rounded-2xl shadow-2xl p-4 space-y-4 z-50 animate-in slide-in-from-bottom-4 duration-300">
+                  <div class="composer-popover absolute bottom-24 left-0 w-80 bg-white border border-gray-200 rounded-2xl shadow-2xl p-4 space-y-4 z-50">
                     <div class="flex items-center justify-between border-b border-gray-100 pb-3 mb-2"><h3 class="text-xs font-bold text-gray-400 uppercase tracking-widest">{ui.securitySession}</h3><button class="text-gray-400 hover:text-gray-600" onclick={() => (composerSecurityOpen = false)}><X size={16} /></button></div>
                     <div class="space-y-4">
                       <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-approval-select">{ui.approvalMode}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all" id="composer-approval-select" onchange={(event) => setPreference("autoApproveMode", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["autoApproveMode"])} value={conversation.preferences.autoApproveMode ?? "manual"}><option value="manual">{ui.manual}</option><option value="turn">{ui.autoOnce}</option><option value="session">{ui.autoSession}</option></select></div>
@@ -6193,9 +6334,13 @@
             <SettingsWorkspace
               codexHome={config?.paths.codexHome ?? ""}
               configFilePath={config?.paths.configFilePath ?? ""}
+              notificationSettings={config?.notifications.settings ?? null}
               onConfigSaved={async () => {
                 config = await api.getConfig();
                 syncStartupAlertModal(config);
+              }}
+              onNotificationSettingsSaved={async (settings) => {
+                await saveNotificationSettings(settings);
               }}
             />
           </div>
@@ -6461,8 +6606,28 @@
     backdrop-filter: blur(18px);
   }
 
-  .composer-meta-row {
-    backdrop-filter: blur(12px);
+  .composer-popover {
+    transform-origin: bottom left;
+    animation: composer-popover-enter 220ms cubic-bezier(0.22, 1, 0.36, 1);
+    will-change: transform, opacity;
+  }
+
+  @keyframes composer-popover-enter {
+    0% {
+      opacity: 0;
+      transform: translateY(10px) scale(0.985);
+    }
+
+    100% {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .composer-popover {
+      animation: none;
+    }
   }
 
   :global(:root[data-theme="dark"]) .transcript-dock {
@@ -6509,11 +6674,6 @@
   :global(:root[data-theme="dark"]) .composer-toolbar {
     border-color: rgba(71, 85, 105, 0.42) !important;
     background: linear-gradient(180deg, rgba(17, 24, 39, 0.9), rgba(11, 18, 32, 0.97)) !important;
-  }
-
-  :global(:root[data-theme="dark"]) .composer-meta-row {
-    border-color: rgba(71, 85, 105, 0.36) !important;
-    background: linear-gradient(180deg, rgba(15, 23, 42, 0.94), rgba(11, 18, 32, 0.985)) !important;
   }
 
   :global(:root[data-theme="dark"]) .composer-compact-trigger {

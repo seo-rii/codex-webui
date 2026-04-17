@@ -161,6 +161,24 @@ export type StartupScheduledShutdownAlert = {
   delaySeconds: number;
 };
 
+export type NotificationEventType = "sessionCompleted" | "sessionAttention" | "queueDispatchFailed" | "shutdownScheduled";
+
+export type NotificationSettings = {
+  enabledEventTypes: NotificationEventType[];
+  slackWebhookUrl: string | null;
+  webhookUrl: string | null;
+};
+
+export type AppNotification = {
+  id: string;
+  type: NotificationEventType;
+  createdAt: number;
+  readAt: number | null;
+  sessionId: string | null;
+  sessionName: string | null;
+  payload: Record<string, unknown>;
+};
+
 export type AppConfigPayload = {
   models: ModelOption[];
   collaborationModes: CollaborationModeOption[];
@@ -182,12 +200,21 @@ export type AppConfigPayload = {
     pausedQueues: StartupPausedQueueAlert[];
     scheduledShutdown: StartupScheduledShutdownAlert | null;
   };
+  notifications: {
+    unreadCount: number;
+    settings: NotificationSettings;
+  };
   account: {
     type: "apiKey" | "chatgpt" | null;
     email: string | null;
     planType: string | null;
     requiresOpenaiAuth: boolean;
   };
+};
+
+export type NotificationListPayload = {
+  notifications: AppNotification[];
+  unreadCount: number;
 };
 
 export type SessionSearchScope = "summary" | "full";

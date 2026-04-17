@@ -297,5 +297,18 @@
   "error_pending_request_not_found": "这个审批请求已不可用。",
   "error_session_already_archived": "这个会话已经归档。",
   "error_session_not_archived": "这个会话已经不在归档状态。",
-  "error_session_not_found": "找不到这个会话。"
+  "error_session_not_found": "找不到这个会话。",
+  "notifications": "Notifications",
+  "notification_center": "Notification center",
+  "notification_events": "Notification events",
+  "slack_webhook_url": "Slack webhook URL",
+  "generic_webhook_url": "Generic webhook URL",
+  "save_notification_settings": "Save notification settings",
+  "notification_session_completed": "Task completed",
+  "notification_input_required": "Needs input",
+  "notification_queue_failed": "Queue dispatch failed",
+  "notification_shutdown_scheduled": "Shutdown scheduled",
+  "no_notifications": "No notifications yet",
+  "mark_all_read": "Mark all read",
+  "clear_all": "Clear all"
 }

@@ -1,6 +1,14 @@
 import fsp from "node:fs/promises";
 
-import type { SessionPreferences, SessionQueueItem, SessionSummaryHighlight, StartupScheduledShutdownAlert } from "$lib/types";
+import type {
+  AppNotification,
+  NotificationEventType,
+  NotificationSettings,
+  SessionPreferences,
+  SessionQueueItem,
+  SessionSummaryHighlight,
+  StartupScheduledShutdownAlert
+} from "$lib/types";
 
 import { ensureDataDirectories, getStoreFilePath, pathExists } from "./fs";
 
@@ -8,6 +16,10 @@ type UiState = {
   global: {
     shutdownAfterQueueCompletes: boolean;
     scheduledShutdown: StartupScheduledShutdownAlert | null;
+  };
+  notifications: {
+    items: AppNotification[];
+    settings: NotificationSettings;
   };
   preferencesByThreadId: Record<string, SessionPreferences>;
   draftsByThreadId: Record<
@@ -29,6 +41,28 @@ type UiState = {
   highlightsByThreadId: Record<string, SessionSummaryHighlight>;
 };
 
+const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
+  enabledEventTypes: ["sessionCompleted", "sessionAttention", "queueDispatchFailed", "shutdownScheduled"],
+  slackWebhookUrl: null,
+  webhookUrl: null
+};
+
+function normalizeNotificationSettings(value: NotificationSettings | null | undefined): NotificationSettings {
+  return {
+    enabledEventTypes: Array.isArray(value?.enabledEventTypes)
+      ? value.enabledEventTypes.filter(
+          (entry): entry is NotificationEventType =>
+            entry === "sessionCompleted" ||
+            entry === "sessionAttention" ||
+            entry === "queueDispatchFailed" ||
+            entry === "shutdownScheduled"
+        )
+      : [...DEFAULT_NOTIFICATION_SETTINGS.enabledEventTypes],
+    slackWebhookUrl: typeof value?.slackWebhookUrl === "string" && value.slackWebhookUrl.trim() ? value.slackWebhookUrl.trim() : null,
+    webhookUrl: typeof value?.webhookUrl === "string" && value.webhookUrl.trim() ? value.webhookUrl.trim() : null
+  };
+}
+
 class UiStateStore {
   private state: UiState | null = null;
   private writeChain = Promise.resolve();
@@ -46,6 +80,10 @@ class UiStateStore {
           shutdownAfterQueueCompletes: false,
           scheduledShutdown: null
         },
+        notifications: {
+          items: [],
+          settings: { ...DEFAULT_NOTIFICATION_SETTINGS }
+        },
         preferencesByThreadId: {},
         draftsByThreadId: {},
         queuesByThreadId: {},
@@ -61,6 +99,10 @@ class UiStateStore {
         global: {
           shutdownAfterQueueCompletes: Boolean(parsed.global?.shutdownAfterQueueCompletes),
           scheduledShutdown: parsed.global?.scheduledShutdown ?? null
+        },
+        notifications: {
+          items: Array.isArray(parsed.notifications?.items) ? parsed.notifications.items : [],
+          settings: normalizeNotificationSettings(parsed.notifications?.settings)
         },
         preferencesByThreadId: parsed.preferencesByThreadId ?? {},
         draftsByThreadId: parsed.draftsByThreadId ?? {},
@@ -78,6 +120,10 @@ class UiStateStore {
         global: {
           shutdownAfterQueueCompletes: false,
           scheduledShutdown: null
+        },
+        notifications: {
+          items: [],
+          settings: { ...DEFAULT_NOTIFICATION_SETTINGS }
         },
         preferencesByThreadId: {},
         draftsByThreadId: {},
@@ -106,6 +152,92 @@ class UiStateStore {
       shutdownAfterQueueCompletes: Boolean(state.global.shutdownAfterQueueCompletes),
       scheduledShutdown: state.global.scheduledShutdown ?? null
     };
+  }
+
+  async getNotifications(limit = 80) {
+    const state = await this.load();
+    const items = [...state.notifications.items]
+      .sort((left, right) => right.createdAt - left.createdAt)
+      .slice(0, Math.max(1, limit))
+      .map((entry) => ({
+        ...entry,
+        payload: { ...entry.payload }
+      }));
+    return {
+      notifications: items,
+      unreadCount: state.notifications.items.filter((entry) => entry.readAt === null).length
+    };
+  }
+
+  async addNotification(notification: AppNotification) {
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      state.notifications.items = [notification, ...state.notifications.items.filter((entry) => entry.id !== notification.id)].slice(0, 200);
+      await this.flush();
+    });
+    return this.writeChain;
+  }
+
+  async markNotificationsRead(ids: string[] | null = null) {
+    let changed = false;
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      const targetIds = ids ? new Set(ids) : null;
+      const markedAt = Date.now();
+      state.notifications.items = state.notifications.items.map((entry) => {
+        if (entry.readAt !== null) {
+          return entry;
+        }
+        if (targetIds && !targetIds.has(entry.id)) {
+          return entry;
+        }
+        changed = true;
+        return {
+          ...entry,
+          readAt: markedAt
+        };
+      });
+      if (changed) {
+        await this.flush();
+      }
+    });
+    await this.writeChain;
+    return changed;
+  }
+
+  async clearNotifications() {
+    let changed = false;
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      if (state.notifications.items.length === 0) {
+        return;
+      }
+      changed = true;
+      state.notifications.items = [];
+      await this.flush();
+    });
+    await this.writeChain;
+    return changed;
+  }
+
+  async getNotificationSettings() {
+    const state = await this.load();
+    return normalizeNotificationSettings(state.notifications.settings);
+  }
+
+  async updateNotificationSettings(nextSettings: Partial<NotificationSettings>) {
+    let updatedSettings = { ...DEFAULT_NOTIFICATION_SETTINGS };
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      state.notifications.settings = normalizeNotificationSettings({
+        ...state.notifications.settings,
+        ...nextSettings
+      });
+      updatedSettings = { ...state.notifications.settings };
+      await this.flush();
+    });
+    await this.writeChain;
+    return updatedSettings;
   }
 
   async setGlobalShutdownAfterQueueCompletes(enabled: boolean) {

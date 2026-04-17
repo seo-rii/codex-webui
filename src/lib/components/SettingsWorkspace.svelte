@@ -6,15 +6,19 @@
   import MonacoTextEditor from "$lib/components/MonacoTextEditor.svelte";
   import { localeSignal } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
-  import type { CatalogPayload, EditableFilePayload } from "$lib/types";
+  import type { CatalogPayload, EditableFilePayload, NotificationEventType, NotificationSettings } from "$lib/types";
 
   let {
     codexHome,
     configFilePath,
+    notificationSettings = null,
+    onNotificationSettingsSaved = null,
     onConfigSaved = null
   }: {
     codexHome: string;
     configFilePath: string;
+    notificationSettings?: NotificationSettings | null;
+    onNotificationSettingsSaved?: ((settings: Partial<NotificationSettings>) => void | Promise<void>) | null;
     onConfigSaved?: (() => void | Promise<void>) | null;
   } = $props();
 
@@ -22,10 +26,27 @@
   let catalog = $state<CatalogPayload | null>(null);
   let editorValue = $state("");
   let errorText = $state("");
+  let notificationSlackWebhookUrl = $state("");
+  let notificationWebhookUrl = $state("");
+  let notificationEventTypes = $state<NotificationEventType[]>([]);
   let loading = $state(true);
   let saving = $state(false);
   let reloading = $state(false);
+  let savingNotifications = $state(false);
   const dirty = $derived(Boolean(configFile && editorValue !== configFile.content));
+  const notificationDirty = $derived.by(() => {
+    const current = notificationSettings;
+    if (!current) {
+      return false;
+    }
+    const left = [...notificationEventTypes].sort().join(",");
+    const right = [...current.enabledEventTypes].sort().join(",");
+    return (
+      left !== right ||
+      notificationSlackWebhookUrl.trim() !== (current.slackWebhookUrl ?? "") ||
+      notificationWebhookUrl.trim() !== (current.webhookUrl ?? "")
+    );
+  });
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
 
@@ -41,6 +62,16 @@
       configTitle: m.codex_config_toml(),
       unsaved: m.unsaved(),
       editableFile: m.editable_file(),
+      notifications: m.notifications(),
+      notificationCenter: m.notification_center(),
+      notificationEvents: m.notification_events(),
+      slackWebhookUrl: m.slack_webhook_url(),
+      genericWebhookUrl: m.generic_webhook_url(),
+      saveNotificationSettings: m.save_notification_settings(),
+      notificationSessionCompleted: m.notification_session_completed(),
+      notificationInputRequired: m.notification_input_required(),
+      notificationQueueFailed: m.notification_queue_failed(),
+      notificationShutdownScheduled: m.notification_shutdown_scheduled(),
       installedPlugins: m.installed_plugins(),
       noPlugins: m.no_installed_plugins(),
       noDescription: m.no_description(),
@@ -52,6 +83,62 @@
   onMount(() => {
     void bootstrap();
   });
+
+  $effect(() => {
+    const current = notificationSettings;
+    if (!current) {
+      notificationSlackWebhookUrl = "";
+      notificationWebhookUrl = "";
+      notificationEventTypes = [];
+      return;
+    }
+
+    notificationSlackWebhookUrl = current.slackWebhookUrl ?? "";
+    notificationWebhookUrl = current.webhookUrl ?? "";
+    notificationEventTypes = [...current.enabledEventTypes];
+  });
+
+  function toggleNotificationEvent(eventType: NotificationEventType, enabled: boolean) {
+    if (enabled) {
+      notificationEventTypes = [...new Set([...notificationEventTypes, eventType])];
+      return;
+    }
+    notificationEventTypes = notificationEventTypes.filter((entry) => entry !== eventType);
+  }
+
+  function notificationEventLabel(eventType: NotificationEventType) {
+    if (eventType === "sessionCompleted") {
+      return ui.notificationSessionCompleted;
+    }
+    if (eventType === "sessionAttention") {
+      return ui.notificationInputRequired;
+    }
+    if (eventType === "queueDispatchFailed") {
+      return ui.notificationQueueFailed;
+    }
+    return ui.notificationShutdownScheduled;
+  }
+
+  async function saveNotifications() {
+    if (!notificationDirty) {
+      return;
+    }
+
+    savingNotifications = true;
+    errorText = "";
+
+    try {
+      await onNotificationSettingsSaved?.({
+        enabledEventTypes: notificationEventTypes,
+        slackWebhookUrl: notificationSlackWebhookUrl.trim() || null,
+        webhookUrl: notificationWebhookUrl.trim() || null
+      });
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      savingNotifications = false;
+    }
+  }
 
   async function bootstrap() {
     loading = true;
@@ -145,6 +232,53 @@
       </section>
 
       <section class="settings-column">
+        <section class="panel">
+          <div class="panel__header">
+            <div class="panel-title">
+              <Settings2 size={16} />
+              <h3>{ui.notificationCenter}</h3>
+            </div>
+            {#if notificationDirty}
+              <span class="meta-pill subtle">{ui.unsaved}</span>
+            {/if}
+          </div>
+          <div class="catalog-list">
+            <div class="settings-meta">
+              <label class="field-block">
+                <span>{ui.slackWebhookUrl}</span>
+                <input bind:value={notificationSlackWebhookUrl} class="field-input" placeholder="https://hooks.slack.com/services/..." type="url" />
+              </label>
+              <label class="field-block">
+                <span>{ui.genericWebhookUrl}</span>
+                <input bind:value={notificationWebhookUrl} class="field-input" placeholder="https://example.com/codex-webhook" type="url" />
+              </label>
+            </div>
+            <div class="catalog-list">
+              <p class="field-note">{ui.notificationEvents}</p>
+              {#each ["sessionCompleted", "sessionAttention", "queueDispatchFailed", "shutdownScheduled"] as eventType (eventType)}
+                <label class="checkbox-card checkbox-card--compact">
+                  <input
+                    class="checkbox-input"
+                    checked={notificationEventTypes.includes(eventType as NotificationEventType)}
+                    onchange={(event) => toggleNotificationEvent(eventType as NotificationEventType, (event.currentTarget as HTMLInputElement).checked)}
+                    type="checkbox"
+                  />
+                  <span aria-hidden="true" class="checkbox-control"></span>
+                  <span class="checkbox-copy">
+                    <span class="checkbox-title">{notificationEventLabel(eventType as NotificationEventType)}</span>
+                  </span>
+                </label>
+              {/each}
+            </div>
+            <div class="settings-shell__actions">
+              <button class="solid-button" disabled={!notificationDirty || savingNotifications} onclick={() => void saveNotifications()} type="button">
+                <Save size={14} />
+                <span>{savingNotifications ? ui.saving : ui.saveNotificationSettings}</span>
+              </button>
+            </div>
+          </div>
+        </section>
+
         <section class="panel">
           <div class="panel__header">
             <div class="panel-title">
@@ -273,6 +407,39 @@
   .catalog-list {
     display: grid;
     gap: 1rem;
+  }
+
+  .field-block {
+    display: grid;
+    gap: 0.45rem;
+    min-width: 0;
+    flex: 1 1 100%;
+  }
+
+  .field-block span {
+    color: var(--muted);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .field-input {
+    width: 100%;
+    border: 1px solid rgba(148, 163, 184, 0.28);
+    border-radius: 0.95rem;
+    background: rgba(255, 255, 255, 0.92);
+    color: var(--ink-strong);
+    padding: 0.75rem 0.9rem;
+    font: inherit;
+    outline: none;
+    transition: border-color 160ms ease, box-shadow 160ms ease, background-color 160ms ease;
+  }
+
+  .field-input:focus {
+    border-color: rgba(245, 158, 11, 0.65);
+    box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.12);
+    background: rgba(255, 255, 255, 1);
   }
 
   .panel {

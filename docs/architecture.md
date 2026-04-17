@@ -44,6 +44,7 @@ The internal service contains most Codex-specific application logic:
 - `codex app-server` client management
 - session hydration and turn shaping
 - queue persistence and dispatch
+- notification center persistence and webhook delivery settings
 - attachment storage
 - Git repository discovery and file operations
 - `config.toml` synchronization
@@ -193,6 +194,7 @@ Current examples include:
 - queued-work resume prompts restored after restart
 - globally armed or scheduled shutdown-after-queue-completion state
 - persisted per-session completion and attention highlights used by the sidebar
+- notification center history, unread state, and webhook settings
 
 This state is persisted in `CODEX_WEBUI_DATA_DIR`, exposed through config payloads and global WebSocket notifications, and treated as authoritative by the backend so reconnecting clients do not need to rebuild it from local browser memory.
 

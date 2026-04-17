@@ -33,6 +33,7 @@ The goal is not to replace upstream surfaces. The goal is to make Codex usable f
 - Git repository discovery, status, diff, commit inspection, branch checkout, worktree management, and a mobile-friendly Git workspace layout
 - Terminal tabs that survive page reloads as long as the server process stays up
 - Runtime install/update checks, quota display, plugin/skill catalog visibility, and `config.toml` editing
+- Persistent notification center with unread sync, plus Slack and generic webhook delivery for completion, attention, queue-failure, and shutdown events
 - Structured backend error codes mapped to localized UI messages for common queue, steer, and archive timing failures
 - Global "shutdown after queue completes" control that is synchronized across clients and still executes with no browser attached
 - Base-path deployment, configurable CORS, dark/light themes, and Paraglide-based i18n
@@ -181,6 +182,7 @@ Meaning of the main fields:
 - "Shutdown after queue completes" is a server-global operational toggle, not a per-session preference.
 - When that toggle is armed, the gateway waits until every session queue is empty and no live Codex turn is still running before scheduling shutdown.
 - The scheduled shutdown timestamp is persisted in `codex-webui` state, synchronized to every connected client, and can still execute if no client is connected.
+- Notification center history and webhook settings are also persisted in `codex-webui` runtime state so multiple clients see the same unread counts and delivery configuration.
 
 ## Environment Overrides
 

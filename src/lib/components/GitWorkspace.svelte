@@ -7,6 +7,7 @@
   import { localeSignal } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
   import { getLocale } from "$lib/paraglide/runtime.js";
+  import { describeUiError } from "$lib/ui-errors";
   import type { GitCommit, GitFilePayload, GitFileStatus, GitOpenRequest, GitRepository, GitStatusPayload, GitWorktree } from "$lib/types";
 
   let {
@@ -47,6 +48,9 @@
   let errorText = $state("");
   let lastRepoPath: string | null = null;
   let lastOpenRequestId = $state<number | null>(null);
+  let isMobileLayout = $state(false);
+  let mobileSection = $state<"repository" | "worktrees" | "changes" | "commits" | "detail">("repository");
+  const hasDetailPanel = $derived(groupedFilePayloads.length > 0 || Boolean(filePayload));
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
 
@@ -94,6 +98,7 @@
       saveFile: m.save_file(),
       saving: m.saving(),
       recentCommits: m.recent_commits(),
+      openTab: m.open_tab(),
       gitErrorGeneric: m.git_error_generic()
     };
   });
@@ -104,6 +109,26 @@
 
   onMount(() => {
     void bootstrap();
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const mobileQuery = window.matchMedia("(max-width: 720px)");
+    const syncMobileLayout = () => {
+      isMobileLayout = mobileQuery.matches;
+      if (!mobileQuery.matches) {
+        mobileSection = "repository";
+      } else if (mobileSection === "detail" && !hasDetailPanel) {
+        mobileSection = "changes";
+      }
+    };
+
+    syncMobileLayout();
+    mobileQuery.addEventListener("change", syncMobileLayout);
+
+    return () => {
+      mobileQuery.removeEventListener("change", syncMobileLayout);
+    };
   });
 
   $effect(() => {
@@ -114,6 +139,7 @@
 
     lastRepoPath = repoPath;
     clearDetailPanels();
+    mobileSection = "repository";
 
     if (!repoPath) {
       status = null;
@@ -166,7 +192,7 @@
   }
 
   async function openFile(fileStatus: GitFileStatus) {
-    if (selectedRepoPath && onOpenDiffTab) {
+    if (!isMobileLayout && selectedRepoPath && onOpenDiffTab) {
       onOpenDiffTab(selectedRepoPath, fileStatus.path);
       return;
     }
@@ -216,6 +242,7 @@
     try {
       filePayload = await api.getGitFile(repoPath, filePath);
       editorValue = filePayload.modifiedContent;
+      mobileSection = "detail";
     } catch (error) {
       errorText = describeError(error);
     } finally {
@@ -245,6 +272,7 @@
     try {
       groupedFilePayloads = await Promise.all(uniqueFilePaths.map((filePath) => api.getGitFile(repoPath, filePath)));
       groupedFileTitle = title?.trim() || `${groupedFilePayloads.length} files changed`;
+      mobileSection = "detail";
     } catch (error) {
       errorText = describeError(error);
     } finally {
@@ -409,13 +437,14 @@
 
   function closeEditor() {
     clearDetailPanels();
+    if (isMobileLayout) {
+      mobileSection = "changes";
+    }
   }
 
   function describeError(value: unknown) {
-    if (value instanceof Error) {
-      return value.message;
-    }
-    return ui.gitErrorGeneric;
+    const message = describeUiError(value);
+    return message === m.unknown_error() ? ui.gitErrorGeneric : message;
   }
 
   $effect(() => {
@@ -473,125 +502,145 @@
       <button class="ghost-button" type="button" onclick={() => refreshStatus(selectedRepoPath)}>{ui.refresh}</button>
     </div>
 
-    <div class="toolbar-row toolbar-row--fields">
-      <label class="field field--inline field--grow">
-        <span>{ui.worktreePath}</span>
-        <input bind:value={newWorktreePath} placeholder="/path/to/worktree" type="text" />
-      </label>
-      <label class="field field--inline field--grow">
-        <span>{ui.worktreeBranch}</span>
-        <input bind:value={newWorktreeBranch} disabled={detachWorktree} placeholder={detachWorktree ? ui.detachedHeadShort : ui.branchOrNewBranch} type="text" />
-      </label>
-      <label class:checkbox-card--disabled={detachWorktree} class="checkbox-card checkbox-card--compact">
-        <input bind:checked={createWorktreeBranch} class="checkbox-input" disabled={detachWorktree} type="checkbox" />
-        <span aria-hidden="true" class="checkbox-control"></span>
-        <span class="checkbox-copy">
-          <span class="checkbox-title">{ui.createBranchOption}</span>
-        </span>
-      </label>
-      <label class="checkbox-card checkbox-card--compact">
-        <input bind:checked={detachWorktree} class="checkbox-input" type="checkbox" />
-        <span aria-hidden="true" class="checkbox-control"></span>
-        <span class="checkbox-copy">
-          <span class="checkbox-title">{ui.detachHeadOption}</span>
-        </span>
-      </label>
-      <button class="solid-button" disabled={!newWorktreePath.trim() || (!detachWorktree && !newWorktreeBranch.trim()) || worktreeBusy} type="button" onclick={createWorktree}>
-        {worktreeBusy ? ui.creating : ui.addWorktree}
-      </button>
-    </div>
-
-    <div class="git-actions toolbar-row">
-      <button class="ghost-button" disabled={gitBusy} type="button" onclick={() => stage(null)}>{ui.stageAll}</button>
-      <button class="ghost-button" disabled={gitBusy} type="button" onclick={() => unstage(null)}>{ui.unstageAll}</button>
-    </div>
-
-    <div class="toolbar-row toolbar-row--fields">
-      <label class="field field--inline field--grow">
-        <span>{ui.switchBranch}</span>
-        <select onchange={(event) => void switchBranch((event.currentTarget as HTMLSelectElement).value)} value={status.branch ?? ""}>
-          <option value="">{ui.switchBranch}</option>
-          {#each status.branches as branch (branch.name)}
-            <option value={branch.name}>{branch.name}{branch.current ? ` · ${ui.current}` : ""}</option>
-          {/each}
-        </select>
-      </label>
-
-      <div class="inline-field inline-field--compact">
-        <input bind:value={newBranchName} placeholder={ui.newBranchName} type="text" />
-        <button class="ghost-button" disabled={!newBranchName.trim() || gitBusy} type="button" onclick={createBranch}>{ui.create}</button>
+    {#if isMobileLayout}
+      <div class="git-mobile-nav" aria-label={ui.git}>
+        <button class:git-mobile-nav__button--active={mobileSection === "repository"} class="git-mobile-nav__button" type="button" onclick={() => (mobileSection = "repository")}>{ui.repository}</button>
+        <button class:git-mobile-nav__button--active={mobileSection === "worktrees"} class="git-mobile-nav__button" type="button" onclick={() => (mobileSection = "worktrees")}>{ui.worktrees}</button>
+        <button class:git-mobile-nav__button--active={mobileSection === "changes"} class="git-mobile-nav__button" type="button" onclick={() => (mobileSection = "changes")}>{ui.changes}</button>
+        <button class:git-mobile-nav__button--active={mobileSection === "commits"} class="git-mobile-nav__button" type="button" onclick={() => (mobileSection = "commits")}>{ui.recentCommits}</button>
+        <button class:git-mobile-nav__button--active={mobileSection === "detail"} class="git-mobile-nav__button" disabled={!hasDetailPanel} type="button" onclick={() => (mobileSection = "detail")}>{ui.edit}</button>
       </div>
-    </div>
+    {/if}
 
-    <div class="toolbar-row toolbar-row--fields">
-      <label class="field field--inline field--grow">
-        <span>{ui.commit}</span>
-        <input bind:value={commitMessage} placeholder={ui.commitMessage} type="text" />
-      </label>
-      <button class="solid-button" disabled={!commitMessage.trim() || gitBusy} type="button" onclick={commit}>{ui.commit}</button>
-    </div>
-
-    <section class="panel">
-      <div class="panel__header">
-        <h3>{ui.worktrees}</h3>
-        <span>{loadingWorktrees ? "..." : worktrees.length}</span>
+    {#if !isMobileLayout || mobileSection === "repository"}
+      <div class="toolbar-row toolbar-row--fields">
+        <label class="field field--inline field--grow">
+          <span>{ui.worktreePath}</span>
+          <input bind:value={newWorktreePath} placeholder="/path/to/worktree" type="text" />
+        </label>
+        <label class="field field--inline field--grow">
+          <span>{ui.worktreeBranch}</span>
+          <input bind:value={newWorktreeBranch} disabled={detachWorktree} placeholder={detachWorktree ? ui.detachedHeadShort : ui.branchOrNewBranch} type="text" />
+        </label>
+        <label class:checkbox-card--disabled={detachWorktree} class="checkbox-card checkbox-card--compact">
+          <input bind:checked={createWorktreeBranch} class="checkbox-input" disabled={detachWorktree} type="checkbox" />
+          <span aria-hidden="true" class="checkbox-control"></span>
+          <span class="checkbox-copy">
+            <span class="checkbox-title">{ui.createBranchOption}</span>
+          </span>
+        </label>
+        <label class="checkbox-card checkbox-card--compact">
+          <input bind:checked={detachWorktree} class="checkbox-input" type="checkbox" />
+          <span aria-hidden="true" class="checkbox-control"></span>
+          <span class="checkbox-copy">
+            <span class="checkbox-title">{ui.detachHeadOption}</span>
+          </span>
+        </label>
+        <button class="solid-button" disabled={!newWorktreePath.trim() || (!detachWorktree && !newWorktreeBranch.trim()) || worktreeBusy} type="button" onclick={createWorktree}>
+          {worktreeBusy ? ui.creating : ui.addWorktree}
+        </button>
       </div>
 
-      {#if loadingWorktrees}
-        <div class="placeholder-card">{ui.loadingWorktrees}</div>
-      {:else if worktrees.length === 0}
-        <p class="field-note">{ui.noLinkedWorktrees}</p>
-      {:else}
-        <div class="file-list">
-          {#each worktrees as worktree (worktree.path)}
-            <article class="file-row">
-              <button class="file-link" type="button" onclick={() => void selectRepository(worktree.path)}>
-                <strong>{worktree.path}</strong>
-                <small>{worktree.branch ?? ui.detached}{worktree.current ? ` · ${ui.current}` : ""}</small>
-              </button>
-              <div class="file-actions">
-                <button class="ghost-button small" type="button" onclick={() => void selectRepository(worktree.path)}>{ui.open}</button>
-                {#if !worktree.current}
-                  <button class="ghost-button small" disabled={worktreeBusy} type="button" onclick={() => void removeWorktree(worktree.path)}>{ui.remove}</button>
-                {/if}
-              </div>
-            </article>
-          {/each}
+      <div class="git-actions toolbar-row">
+        <button class="ghost-button" disabled={gitBusy} type="button" onclick={() => stage(null)}>{ui.stageAll}</button>
+        <button class="ghost-button" disabled={gitBusy} type="button" onclick={() => unstage(null)}>{ui.unstageAll}</button>
+      </div>
+
+      <div class="toolbar-row toolbar-row--fields">
+        <label class="field field--inline field--grow">
+          <span>{ui.switchBranch}</span>
+          <select onchange={(event) => void switchBranch((event.currentTarget as HTMLSelectElement).value)} value={status.branch ?? ""}>
+            <option value="">{ui.switchBranch}</option>
+            {#each status.branches as branch (branch.name)}
+              <option value={branch.name}>{branch.name}{branch.current ? ` · ${ui.current}` : ""}</option>
+            {/each}
+          </select>
+        </label>
+
+        <div class="inline-field inline-field--compact">
+          <input bind:value={newBranchName} placeholder={ui.newBranchName} type="text" />
+          <button class="ghost-button" disabled={!newBranchName.trim() || gitBusy} type="button" onclick={createBranch}>{ui.create}</button>
         </div>
-      {/if}
-    </section>
+      </div>
 
-    <div class="panel-grid">
+      <div class="toolbar-row toolbar-row--fields">
+        <label class="field field--inline field--grow">
+          <span>{ui.commit}</span>
+          <input bind:value={commitMessage} placeholder={ui.commitMessage} type="text" />
+        </label>
+        <button class="solid-button" disabled={!commitMessage.trim() || gitBusy} type="button" onclick={commit}>{ui.commit}</button>
+      </div>
+    {/if}
+
+    {#if !isMobileLayout || mobileSection === "worktrees"}
       <section class="panel">
         <div class="panel__header">
-          <h3>{ui.changes}</h3>
-          <span>{status.files.length}</span>
+          <h3>{ui.worktrees}</h3>
+          <span>{loadingWorktrees ? "..." : worktrees.length}</span>
         </div>
 
-        {#if status.files.length === 0}
-          <p class="field-note">{ui.workingTreeClean}</p>
+        {#if loadingWorktrees}
+          <div class="placeholder-card">{ui.loadingWorktrees}</div>
+        {:else if worktrees.length === 0}
+          <p class="field-note">{ui.noLinkedWorktrees}</p>
         {:else}
           <div class="file-list">
-            {#each status.files as file (file.path)}
+            {#each worktrees as worktree (worktree.path)}
               <article class="file-row">
-                <button class="file-link" type="button" onclick={() => openFile(file)}>
-                  <strong>{file.path}</strong>
-                  <small>{file.stagedLabel} / {file.unstagedLabel}</small>
+                <button class="file-link" type="button" onclick={() => void selectRepository(worktree.path)}>
+                  <strong>{worktree.path}</strong>
+                  <small>{worktree.branch ?? ui.detached}{worktree.current ? ` · ${ui.current}` : ""}</small>
                 </button>
                 <div class="file-actions">
-                  <button class="ghost-button small" type="button" onclick={() => stage(file.path)}>{ui.stage}</button>
-                  <button class="ghost-button small" type="button" onclick={() => unstage(file.path)}>{ui.unstage}</button>
+                  <button class="ghost-button small" type="button" onclick={() => void selectRepository(worktree.path)}>{ui.open}</button>
+                  {#if !worktree.current}
+                    <button class="ghost-button small" disabled={worktreeBusy} type="button" onclick={() => void removeWorktree(worktree.path)}>{ui.remove}</button>
+                  {/if}
                 </div>
               </article>
             {/each}
           </div>
         {/if}
       </section>
+    {/if}
 
-      <section class="panel panel--detail">
+    <div class="panel-grid">
+      {#if !isMobileLayout || mobileSection === "changes"}
+        <section class="panel">
+          <div class="panel__header">
+            <h3>{ui.changes}</h3>
+            <span>{status.files.length}</span>
+          </div>
+
+          {#if status.files.length === 0}
+            <p class="field-note">{ui.workingTreeClean}</p>
+          {:else}
+            <div class="file-list">
+              {#each status.files as file (file.path)}
+                <article class="file-row">
+                  <button class="file-link" type="button" onclick={() => openFile(file)}>
+                    <strong>{file.path}</strong>
+                    <small>{file.stagedLabel} / {file.unstagedLabel}</small>
+                  </button>
+                  <div class="file-actions">
+                    <button class="ghost-button small" type="button" onclick={() => stage(file.path)}>{ui.stage}</button>
+                    <button class="ghost-button small" type="button" onclick={() => unstage(file.path)}>{ui.unstage}</button>
+                    {#if isMobileLayout && onOpenDiffTab && selectedRepoPath}
+                      <button class="ghost-button small" type="button" onclick={() => onOpenDiffTab(selectedRepoPath, file.path)}>{ui.openTab}</button>
+                    {/if}
+                  </div>
+                </article>
+              {/each}
+            </div>
+          {/if}
+        </section>
+      {/if}
+
+      {#if !isMobileLayout || mobileSection === "commits" || mobileSection === "detail"}
+        <section class="panel panel--detail">
         {#if loadingFile}
           <div class="placeholder-card">{ui.loadingFile}</div>
-        {:else if groupedFilePayloads.length > 0}
+        {:else if groupedFilePayloads.length > 0 && (!isMobileLayout || mobileSection === "detail")}
           <div class="panel__header">
             <div>
               <h3>{groupedFileTitle || `${groupedFilePayloads.length} files changed`}</h3>
@@ -622,9 +671,9 @@
                 {#if groupedFile.isBinary}
                   <div class="placeholder-card">{ui.binaryDiffNotPreviewable}</div>
                 {:else}
-                  <MonacoDiffEditor
-                    height={320}
-                    modified={groupedFile.modifiedContent}
+                <MonacoDiffEditor
+                  height={320}
+                  modified={groupedFile.modifiedContent}
                     original={groupedFile.originalContent}
                     path={groupedFile.filePath}
                   />
@@ -632,7 +681,7 @@
               </section>
             {/each}
           </div>
-        {:else if filePayload}
+        {:else if filePayload && (!isMobileLayout || mobileSection === "detail")}
           <div class="panel__header">
             <div>
               <h3>{filePayload.filePath}</h3>
@@ -668,6 +717,8 @@
               </section>
             </div>
           {/if}
+        {:else if isMobileLayout && mobileSection === "detail"}
+          <div class="placeholder-card">{ui.loadingFile}</div>
         {:else}
           <div class="panel__header">
             <h3>{ui.recentCommits}</h3>
@@ -686,7 +737,8 @@
             {/each}
           </div>
         {/if}
-      </section>
+        </section>
+      {/if}
     </div>
   {/if}
 </section>
@@ -784,6 +836,10 @@
 
   .panel-grid {
     grid-template-columns: minmax(20rem, 0.92fr) minmax(0, 1.45fr);
+  }
+
+  .git-mobile-nav {
+    display: none;
   }
 
   .panel {
@@ -908,6 +964,41 @@
   }
 
   @media (max-width: 720px) {
+    .git-mobile-nav {
+      display: flex;
+      gap: 0.5rem;
+      overflow-x: auto;
+      padding-bottom: 0.2rem;
+      margin: -0.1rem 0 0.1rem;
+      scrollbar-width: none;
+    }
+
+    .git-mobile-nav::-webkit-scrollbar {
+      display: none;
+    }
+
+    .git-mobile-nav__button {
+      border: 1px solid rgba(83, 61, 42, 0.12);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.78);
+      color: var(--muted);
+      padding: 0.55rem 0.9rem;
+      font-size: 0.76rem;
+      font-weight: 700;
+      white-space: nowrap;
+      transition: color 140ms ease, background-color 140ms ease, border-color 140ms ease;
+    }
+
+    .git-mobile-nav__button--active {
+      background: rgba(255, 248, 237, 0.96);
+      border-color: rgba(214, 140, 69, 0.28);
+      color: var(--ink-strong);
+    }
+
+    .git-mobile-nav__button:disabled {
+      opacity: 0.45;
+    }
+
     .git-header,
     .git-meta,
     .git-actions,

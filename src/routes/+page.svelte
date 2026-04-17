@@ -32,6 +32,7 @@
     MessageSquare,
     RefreshCw,
     Search,
+    Pencil,
     Copy,
     SlidersHorizontal,
     Shield
@@ -47,6 +48,7 @@
   import SessionSidebar from "$lib/components/SessionSidebar.svelte";
   import SettingsWorkspace from "$lib/components/SettingsWorkspace.svelte";
   import TerminalWorkspace from "$lib/components/TerminalWorkspace.svelte";
+  import { describeUiError } from "$lib/ui-errors";
   import { activeLocale, localeOptions, localeSignal, updateLocale } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
   import {
@@ -309,8 +311,8 @@
       queuedFollowups: m.queued_followups(),
       paused: m.paused(),
       followUp: m.follow_up(),
+      queueSave: m.save(),
       edit: m.edit(),
-      save: m.save_file(),
       cancel: m.close(),
       steerNow: m.steer_now(),
       sendNow: m.send_now(),
@@ -603,17 +605,36 @@
   let lastLoadedConversationId = $state<string | null>(null);
   let lastActiveLiveTurnId = $state<string | null>(null);
 
-  function canQueueComposerMessage(currentConversation: ConversationState | null = conversation) {
+  function hasQueueableConversationActivity(currentConversation: ConversationState | null = conversation) {
     if (!currentConversation || !selectedSessionId) {
       return false;
     }
-    if (pendingQueueModeSessionId === selectedSessionId) {
+
+    const hasPendingLocalSend =
+      pendingQueueModeSessionId === selectedSessionId &&
+      (startingMessage ||
+        (optimisticMessage !== null && optimisticMessage.sessionId === selectedSessionId) ||
+        (visibleOptimisticMessage !== null && visibleOptimisticMessage.sessionId === selectedSessionId));
+
+    if (hasPendingLocalSend) {
       return true;
     }
+
     if (currentConversation.thread.status === "running" || currentConversation.thread.status === "active") {
       return true;
     }
-    return currentConversation.thread.turns.some((turn) => String(turn.status ?? "") === "inProgress");
+
+    if (!currentConversation.activeTurnId) {
+      return false;
+    }
+
+    return currentConversation.thread.turns.some(
+      (turn) => turn.id === currentConversation.activeTurnId && String(turn.status ?? "") === "inProgress"
+    );
+  }
+
+  function canQueueComposerMessage(currentConversation: ConversationState | null = conversation) {
+    return hasQueueableConversationActivity(currentConversation);
   }
 
   const running = $derived.by(() => {
@@ -629,6 +650,7 @@
     );
   });
   const queueModeActive = $derived.by(() => canQueueComposerMessage());
+  const lastComposerHistoryPrompt = $derived.by(() => composerHistory.at(-1) ?? "");
   const selectedSessionSummary = $derived(sessions.find((session) => session.id === selectedSessionId) ?? null);
   const queuedMessages = $derived(conversation?.queue.items ?? []);
   const activeTurn = $derived.by(() => {
@@ -1232,13 +1254,10 @@
     if (conversation?.thread.id !== pendingQueueModeSessionId) {
       return;
     }
-    if (conversation.activeTurnId || conversation.thread.status === "running" || conversation.thread.status === "active") {
-      pendingQueueModeSessionId = null;
+    if (hasQueueableConversationActivity(conversation)) {
       return;
     }
-    if (!sending && !visibleOptimisticMessage) {
-      pendingQueueModeSessionId = null;
-    }
+    pendingQueueModeSessionId = null;
   });
 
   $effect(() => {
@@ -2167,12 +2186,12 @@
     disconnectStream();
     releaseSessionStream = api.subscribeSession(sessionId, (payload: StreamEvent) => {
       if (payload.kind === "notification" && payload.method === "codex-webui/queueDispatchFailed") {
-        errorText = m.queue_dispatch_failed({ message: String(payload.params.message ?? m.unknown_error()) });
+        errorText = m.queue_dispatch_failed({ message: describeUiError(payload.params) });
       }
 
       if (payload.kind === "notification" && payload.method === "codex-webui/sessionHydrationFailed") {
         clearHydrationRefresh();
-        errorText = m.session_history_failed({ message: String(payload.params.message ?? m.unknown_error()) });
+        errorText = m.session_history_failed({ message: describeUiError(payload.params.message ?? payload.params) });
       }
 
       if (payload.kind === "serverRequest") {
@@ -2522,6 +2541,12 @@
         return;
       }
 
+      const hasLocalComposerState = draft.length > 0 || draftAttachments.length > 0;
+      if (hasLocalComposerState) {
+        pendingSteerResume = null;
+        return;
+      }
+
       const savedDraft = saved.draft.trim();
       if (!savedDraft) {
         pendingSteerResume = null;
@@ -2737,15 +2762,20 @@
     }
   }
 
-  async function sendMessage() {
+  async function sendMessage(options?: {
+    promptText?: string;
+    attachmentSnapshot?: AttachmentRecord[];
+    preserveComposer?: boolean;
+  }) {
     if (!conversation || sending || startingMessage || uploading || queueModeActive) {
       return;
     }
 
-    const prompt = draft.trim();
-    const draftText = draft;
-    const attachmentNames = draftAttachments.map((attachment) => attachment.originalName);
-    const attachmentSnapshot = [...draftAttachments];
+    const draftText = options?.promptText ?? draft;
+    const attachmentSnapshot = options?.attachmentSnapshot ?? [...draftAttachments];
+    const prompt = draftText.trim();
+    const attachmentNames = attachmentSnapshot.map((attachment) => attachment.originalName);
+    const preserveComposer = options?.preserveComposer ?? false;
     startingMessage = true;
     errorText = "";
     noticeText = "";
@@ -2758,7 +2788,7 @@
 
       const sessionId = materialized.sessionId;
       const activeConversation = materialized.state;
-      const attachmentIds = draftAttachments.map((attachment) => attachment.id);
+      const attachmentIds = attachmentSnapshot.map((attachment) => attachment.id);
       const preferences = activeConversation.preferences;
       optimisticMessage = {
         sessionId,
@@ -2772,11 +2802,13 @@
       forceTranscriptScroll = true;
       pendingQueueModeSessionId = sessionId;
       recordComposerHistory(prompt);
-      draft = "";
-      draftAttachments = [];
-      scheduleComposerTextareaResize();
-      composerSettingsOpen = false;
-      composerSecurityOpen = false;
+      if (!preserveComposer) {
+        draft = "";
+        draftAttachments = [];
+        scheduleComposerTextareaResize();
+        composerSettingsOpen = false;
+        composerSecurityOpen = false;
+      }
 
       void api
         .sendMessage(sessionId, {
@@ -2794,7 +2826,7 @@
           if (optimisticMessage?.sessionId === sessionId && optimisticMessage.prompt === prompt) {
             optimisticMessage = null;
           }
-          if (selectedSessionId === sessionId && !draft.trim() && draftAttachments.length === 0) {
+          if (!preserveComposer && selectedSessionId === sessionId && !draft.trim() && draftAttachments.length === 0) {
             draft = draftText;
             draftAttachments = attachmentSnapshot;
             scheduleComposerTextareaResize();
@@ -2810,12 +2842,24 @@
     }
   }
 
-  async function queueMessage() {
+  async function queueMessage(options?: {
+    promptText?: string;
+    attachmentSnapshot?: AttachmentRecord[];
+    preserveComposer?: boolean;
+  }) {
     if (!selectedSessionId || !conversation || sending || uploading || !canQueueComposerMessage(conversation) || (!draft.trim() && draftAttachments.length === 0)) {
-      return;
+      if (!options?.promptText?.trim() || !selectedSessionId || !conversation || sending || uploading || !canQueueComposerMessage(conversation)) {
+        return;
+      }
     }
 
-    const prompt = draft.trim();
+    const draftText = options?.promptText ?? draft;
+    const attachmentSnapshot = options?.attachmentSnapshot ?? [...draftAttachments];
+    const prompt = draftText.trim();
+    const preserveComposer = options?.preserveComposer ?? false;
+    if (!prompt && attachmentSnapshot.length === 0) {
+      return;
+    }
     sending = true;
     sendIntent = "queue";
     errorText = "";
@@ -2823,8 +2867,8 @@
 
     try {
       const queue = await api.enqueueSessionMessage(selectedSessionId, {
-        prompt: draft,
-        attachmentIds: draftAttachments.map((attachment) => attachment.id)
+        prompt: draftText,
+        attachmentIds: attachmentSnapshot.map((attachment) => attachment.id)
       });
       if (conversation?.thread.id === selectedSessionId) {
         conversation = {
@@ -2844,11 +2888,13 @@
       }
 
       recordComposerHistory(prompt);
-      draft = "";
-      draftAttachments = [];
-      scheduleComposerTextareaResize();
-      composerSettingsOpen = false;
-      composerSecurityOpen = false;
+      if (!preserveComposer) {
+        draft = "";
+        draftAttachments = [];
+        scheduleComposerTextareaResize();
+        composerSettingsOpen = false;
+        composerSecurityOpen = false;
+      }
       noticeText = m.queue_notice();
     } catch (error) {
       errorText = describeError(error);
@@ -3037,6 +3083,38 @@
       return;
     }
     await sendMessage();
+  }
+
+  function reuseLastComposerMessage() {
+    if (!lastComposerHistoryPrompt) {
+      return;
+    }
+
+    draft = lastComposerHistoryPrompt;
+    resetComposerHistoryNavigation();
+    scheduleComposerTextareaResize();
+    composerTextareaElement?.focus();
+  }
+
+  async function resendLastComposerMessage() {
+    if (!lastComposerHistoryPrompt || sending || startingMessage || uploading) {
+      return;
+    }
+
+    if (queueModeActive) {
+      await queueMessage({
+        promptText: lastComposerHistoryPrompt,
+        attachmentSnapshot: [],
+        preserveComposer: true
+      });
+      return;
+    }
+
+    await sendMessage({
+      promptText: lastComposerHistoryPrompt,
+      attachmentSnapshot: [],
+      preserveComposer: true
+    });
   }
 
   function promptAttachmentPicker() {
@@ -3937,21 +4015,7 @@
   }
 
   function describeError(value: unknown) {
-    if (value instanceof Error) {
-      const message = value.message.trim();
-      if (message.startsWith("{")) {
-        try {
-          const parsed = JSON.parse(message) as { message?: unknown };
-          if (typeof parsed.message === "string" && parsed.message.trim()) {
-            return parsed.message.trim();
-          }
-        } catch {
-          // Fall through to the raw message.
-        }
-      }
-      return message;
-    }
-    return m.unknown_error();
+    return describeUiError(value);
   }
 
   function formatValue(value: unknown, depth = 0): string {
@@ -5471,6 +5535,20 @@
 
           {#if workspaceMenuOpen}
             <div class="absolute top-10 right-0 w-56 bg-white border border-gray-200 rounded-xl shadow-2xl p-1 z-50">
+              {#if isMobileLayout}
+                <button
+                  class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group"
+                  onclick={() => {
+                    workspaceMenuOpen = false;
+                    void createSession();
+                  }}
+                  type="button"
+                >
+                  <MessageSquare size={16} class="text-gray-400 group-hover:text-amber-600" />
+                  <span>{ui.newThread}</span>
+                </button>
+                <div class="mx-2 my-1 h-px bg-gray-100"></div>
+              {/if}
               <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" disabled={subagentTasks.length === 0} onclick={() => { activateTab("tasks"); workspaceMenuOpen = false; }} type="button">
                 <History size={16} class="text-gray-400 group-hover:text-amber-600" />
                 <span>{ui.tasks}</span>
@@ -5823,10 +5901,19 @@
                           </div>
                           <div class="flex flex-wrap items-center gap-2 md:justify-end">
                             {#if editingQueueId === item.id}
-                              <button class="px-2.5 py-1.5 rounded-lg border border-emerald-200 bg-emerald-50 text-[11px] font-bold text-emerald-700 hover:bg-emerald-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.save}</button>
+                              <button class="px-2.5 py-1.5 rounded-lg border border-emerald-200 bg-emerald-50 text-[11px] font-bold text-emerald-700 hover:bg-emerald-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.queueSave}</button>
                               <button class="px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-[11px] font-bold text-gray-700 hover:bg-gray-100 transition-colors disabled:opacity-50" disabled={sending} onclick={cancelQueuedMessageEdit} type="button">{ui.cancel}</button>
                             {:else}
-                              <button class="px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-[11px] font-bold text-gray-700 hover:bg-gray-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => beginQueuedMessageEdit(item)} type="button">{ui.edit}</button>
+                              <button
+                                aria-label={ui.edit}
+                                class="p-2 rounded-lg border border-gray-200 bg-white text-gray-500 hover:bg-gray-100 hover:text-gray-700 transition-colors disabled:opacity-50"
+                                disabled={sending}
+                                onclick={() => beginQueuedMessageEdit(item)}
+                                title={ui.edit}
+                                type="button"
+                              >
+                                <Pencil size={14} />
+                              </button>
                               <button class="px-2.5 py-1.5 rounded-lg border border-amber-200 bg-amber-50 text-[11px] font-bold text-amber-700 hover:bg-amber-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => void dispatchQueuedMessage(item.id, "steer")} type="button">{ui.steerNow}</button>
                               <button class="px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-[11px] font-bold text-gray-700 hover:bg-gray-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => void dispatchQueuedMessage(item.id, "message")} type="button">{ui.sendNow}</button>
                             {/if}
@@ -5988,6 +6075,29 @@
               {/if}
 
               <div class="relative group">
+                {#if lastComposerHistoryPrompt}
+                  <div class="mb-2 flex items-center gap-2 px-1">
+                    <button
+                      class="ui-animated-button ui-animated-button--soft flex min-w-0 flex-1 items-center gap-2 rounded-2xl border border-gray-200/80 bg-white/80 px-3 py-1.5 text-left text-[11px] text-gray-500 shadow-sm backdrop-blur-sm transition-colors hover:border-amber-200 hover:bg-amber-50/70 hover:text-gray-700"
+                      onclick={reuseLastComposerMessage}
+                      title={ui.editInComposer}
+                      type="button"
+                    >
+                      <Clock size={12} class="shrink-0 text-gray-400" />
+                      <span class="truncate font-medium">{lastComposerHistoryPrompt}</span>
+                    </button>
+                    <button
+                      class="surface-contrast-button ui-animated-button ui-animated-button--soft flex shrink-0 items-center gap-1.5 rounded-xl px-3 py-1.5 text-[10px] font-bold shadow-sm"
+                      disabled={sending || startingMessage || uploading}
+                      onclick={() => void resendLastComposerMessage()}
+                      title={queueModeActive ? ui.queue : ui.send}
+                      type="button"
+                    >
+                      <span class="hidden sm:inline">{queueModeActive ? ui.queue : ui.send}</span>
+                      <Send size={13} />
+                    </button>
+                  </div>
+                {/if}
                 <form class="composer-panel bg-white/95 border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200 focus-within:-translate-y-0.5 focus-within:border-amber-400/70 focus-within:bg-white focus-within:shadow-[0_24px_60px_-34px_rgba(245,158,11,0.65)]" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
                   <textarea bind:this={composerTextareaElement} bind:value={draft} class="composer-textarea w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 transition-colors duration-150 focus:ring-0 focus:placeholder:text-amber-500/70 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} rows="1"></textarea>
                   

@@ -222,20 +222,27 @@ class UiStateStore {
   }
 
   async removeQueueItem(threadId: string, itemId: string) {
+    let removed = false;
     this.writeChain = this.writeChain.then(async () => {
       const state = await this.load();
       const existing = state.queuesByThreadId[threadId];
       if (!existing) {
         return;
       }
-      existing.items = existing.items.filter((item) => item.id !== itemId);
+      const nextItems = existing.items.filter((item) => item.id !== itemId);
+      if (nextItems.length === existing.items.length) {
+        return;
+      }
+      removed = true;
+      existing.items = nextItems;
       existing.updatedAt = Date.now();
       if (existing.items.length === 0) {
         delete state.queuesByThreadId[threadId];
       }
       await this.flush();
     });
-    return this.writeChain;
+    await this.writeChain;
+    return removed;
   }
 
   async updateQueueItem(

@@ -26,6 +26,7 @@ import type {
   ThreadTokenUsage
 } from "$lib/types";
 import { stripAttachmentPreamble } from "$lib/attachments";
+import { createAppError, parseAppError } from "$lib/errors";
 
 import { listAttachments } from "./attachments";
 import { AppServerClient } from "./app-server/client";
@@ -791,7 +792,23 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   async archiveSession(threadId: string) {
-    await this.client.request("thread/archive", { threadId });
+    if (await this.findSessionSummaryById(threadId, true)) {
+      throw createAppError("SESSION_ALREADY_ARCHIVED");
+    }
+    if (!(await this.findSessionSummaryById(threadId, false))) {
+      throw createAppError("SESSION_NOT_FOUND");
+    }
+    try {
+      await this.client.request("thread/archive", { threadId });
+    } catch (error) {
+      if (await this.findSessionSummaryById(threadId, true)) {
+        throw createAppError("SESSION_ALREADY_ARCHIVED");
+      }
+      if (!(await this.findSessionSummaryById(threadId, false))) {
+        throw createAppError("SESSION_NOT_FOUND");
+      }
+      throw error;
+    }
     sessionIndexClient.invalidate();
     this.recentLiveSessions.delete(threadId);
     this.rolloutPaths.delete(threadId);
@@ -802,7 +819,24 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   async unarchiveSession(threadId: string) {
-    const response = asRecord(await this.client.request("thread/unarchive", { threadId }));
+    if (await this.findSessionSummaryById(threadId, false)) {
+      throw createAppError("SESSION_NOT_ARCHIVED");
+    }
+    if (!(await this.findSessionSummaryById(threadId, true))) {
+      throw createAppError("SESSION_NOT_FOUND");
+    }
+    let response: Record<string, unknown>;
+    try {
+      response = asRecord(await this.client.request("thread/unarchive", { threadId }));
+    } catch (error) {
+      if (await this.findSessionSummaryById(threadId, false)) {
+        throw createAppError("SESSION_NOT_ARCHIVED");
+      }
+      if (!(await this.findSessionSummaryById(threadId, true))) {
+        throw createAppError("SESSION_NOT_FOUND");
+      }
+      throw error;
+    }
     sessionIndexClient.invalidate();
     this.rolloutPaths.delete(threadId);
     this.sessionHydrations.delete(threadId);
@@ -1093,7 +1127,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   async enqueueMessage(threadId: string, prompt: string, attachments: AttachmentRecord[]): Promise<SessionQueuePayload> {
     const trimmedPrompt = prompt.trim();
     if (!trimmedPrompt && attachments.length === 0) {
-      throw new Error("Provide a prompt or at least one attachment.");
+      throw createAppError("EMPTY_MESSAGE");
     }
 
     await this.cancelScheduledShutdownForActivity();
@@ -1121,7 +1155,10 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   async removeQueuedMessage(threadId: string, queueId: string): Promise<SessionQueuePayload> {
-    await uiStateStore.removeQueueItem(threadId, queueId);
+    const removed = await uiStateStore.removeQueueItem(threadId, queueId);
+    if (!removed) {
+      throw createAppError("QUEUE_ITEM_NOT_FOUND");
+    }
     const queue = await this.getQueue(threadId);
     this.emitQueueUpdated(threadId, queue);
     await this.maybeScheduleGlobalShutdown(null);
@@ -1132,12 +1169,12 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     const stored = await uiStateStore.getQueue(threadId);
     const queuedItem = stored?.items.find((item) => item.id === queueId);
     if (!queuedItem) {
-      throw new Error("Queued message not found.");
+      throw createAppError("QUEUE_ITEM_NOT_FOUND");
     }
 
     const trimmedPrompt = prompt.trim();
     if (!trimmedPrompt && attachments.length === 0) {
-      throw new Error("Provide a prompt or at least one attachment.");
+      throw createAppError("EMPTY_MESSAGE");
     }
 
     const updated = await uiStateStore.updateQueueItem(threadId, queueId, {
@@ -1146,7 +1183,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       attachmentNames: attachments.map((attachment) => attachment.originalName)
     });
     if (!updated) {
-      throw new Error("Queued message not found.");
+      throw createAppError("QUEUE_ITEM_NOT_FOUND");
     }
 
     const queue = await this.getQueue(threadId);
@@ -1159,7 +1196,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       const stored = await uiStateStore.getQueue(threadId);
       const queuedItem = stored?.items.find((item) => item.id === queueId);
       if (!queuedItem) {
-        throw new Error("Queued message not found.");
+        throw createAppError("QUEUE_ITEM_NOT_FOUND");
       }
 
       const attachments = (await listAttachments(threadId)).filter((attachment) => queuedItem.attachmentIds.includes(attachment.id));
@@ -1177,7 +1214,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     });
 
     if (!queue) {
-      throw new Error("Queue is already dispatching.");
+      throw createAppError("QUEUE_ALREADY_DISPATCHING");
     }
 
     return queue;
@@ -1276,7 +1313,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   async steer(threadId: string, prompt: string, attachments: AttachmentRecord[] = []) {
     const turnId = await this.resolveActiveTurnId(threadId);
     if (!turnId) {
-      throw new Error("No active turn is available to steer.");
+      throw createAppError("NO_ACTIVE_TURN");
     }
     const response = await this.client.request("turn/steer", {
       threadId,
@@ -1299,9 +1336,30 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   async resolveServerRequest(threadId: string, requestId: string, result: unknown) {
     const pending = this.pendingRequests.get(threadId)?.get(requestId);
     if (!pending) {
-      throw new Error("Pending request not found.");
+      throw createAppError("PENDING_REQUEST_NOT_FOUND");
     }
     await this.client.respond(pending.rawId, result);
+  }
+
+  private async findSessionSummaryById(threadId: string, archived: boolean) {
+    const [preferences, queueCounts] = await Promise.all([
+      uiStateStore.getAll(),
+      archived ? Promise.resolve({} as Record<string, number>) : uiStateStore.getQueueCounts()
+    ]);
+    let cursor: string | null = null;
+
+    do {
+      const response = asRecord(await this.client.request("thread/list", { limit: 200, archived, cursor }));
+      const threads = (response.data as Array<Record<string, unknown>> | undefined) ?? [];
+      const matched = threads.find((thread) => String(thread.id ?? "") === threadId && !isSubagentThread(thread));
+      if (matched) {
+        const stored = preferences[threadId];
+        return toSummary(matched, stored ? coercePreferences(stored) : null, archived, queueCounts[threadId] ?? 0);
+      }
+      cursor = typeof response.nextCursor === "string" && response.nextCursor.trim() ? String(response.nextCursor) : null;
+    } while (cursor);
+
+    return null;
   }
 
   async listDirectories(currentPath: string | null) {
@@ -2517,12 +2575,14 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         await uiStateStore.removeQueueItem(threadId, queuedItem.id);
         this.emitQueueUpdated(threadId);
       } catch (error) {
+        const parsedError = parseAppError(error);
         this.emit(threadId, {
           kind: "notification",
           method: "codex-webui/queueDispatchFailed",
           params: {
             queueId: queuedItem.id,
-            message: error instanceof Error ? error.message : "Failed to dispatch queued message."
+            code: parsedError?.code ?? null,
+            message: parsedError?.message ?? (error instanceof Error ? error.message : "Failed to dispatch queued message.")
           }
         });
       }

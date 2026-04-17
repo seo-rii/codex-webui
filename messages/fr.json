@@ -123,6 +123,7 @@
   "single_tab": "Single tab",
   "binary_diff_not_previewable": "Binary file diff is not previewable in Monaco.",
   "save_file": "Save file",
+  "save": "Save",
   "recent_commits": "Recent commits",
   "diff": "Diff",
   "edit": "Edit",
@@ -287,5 +288,14 @@
   "render_diff_failed": "Failed to render the diff.",
   "init_diff_editor_failed": "Failed to initialize the diff editor.",
   "session_archived_notice": "Thread archived.",
-  "session_restored_notice": "Thread restored."
+  "session_restored_notice": "Thread restored.",
+  "error_empty_message": "Saisissez un message ou joignez au moins un fichier.",
+  "error_invalid_queue_mode": "Cette action en file d’attente n’est plus valide.",
+  "error_queue_item_not_found": "Ce suivi en file d’attente n’est plus disponible. Il a peut-être déjà été envoyé ou supprimé.",
+  "error_queue_already_dispatching": "Un autre suivi en file d’attente est déjà en cours d’envoi. Réessaie dans un instant.",
+  "error_no_active_turn": "Il n’y a plus de réponse active à piloter.",
+  "error_pending_request_not_found": "Cette demande d’approbation n’est plus disponible.",
+  "error_session_already_archived": "Cette session est déjà archivée.",
+  "error_session_not_archived": "Cette session n’est plus archivée.",
+  "error_session_not_found": "Cette session est introuvable."
 }

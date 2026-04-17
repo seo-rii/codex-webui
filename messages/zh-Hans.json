@@ -123,6 +123,7 @@
   "single_tab": "Single tab",
   "binary_diff_not_previewable": "Binary file diff is not previewable in Monaco.",
   "save_file": "Save file",
+  "save": "Save",
   "recent_commits": "Recent commits",
   "diff": "Diff",
   "edit": "Edit",
@@ -287,5 +288,14 @@
   "render_diff_failed": "Failed to render the diff.",
   "init_diff_editor_failed": "Failed to initialize the diff editor.",
   "session_archived_notice": "Thread archived.",
-  "session_restored_notice": "Thread restored."
+  "session_restored_notice": "Thread restored.",
+  "error_empty_message": "请输入消息，或至少附加一个文件。",
+  "error_invalid_queue_mode": "这个队列操作已不再有效。",
+  "error_queue_item_not_found": "该排队中的后续消息已不可用，可能已经发送或被移除。",
+  "error_queue_already_dispatching": "另一个排队中的后续消息已经在发送中。请稍等后再试。",
+  "error_no_active_turn": "已经没有可继续引导的活动回复了。",
+  "error_pending_request_not_found": "这个审批请求已不可用。",
+  "error_session_already_archived": "这个会话已经归档。",
+  "error_session_not_archived": "这个会话已经不在归档状态。",
+  "error_session_not_found": "找不到这个会话。"
 }

@@ -123,6 +123,7 @@
   "single_tab": "Single tab",
   "binary_diff_not_previewable": "Binary file diff is not previewable in Monaco.",
   "save_file": "Save file",
+  "save": "Save",
   "recent_commits": "Recent commits",
   "diff": "Diff",
   "edit": "Edit",
@@ -287,5 +288,14 @@
   "render_diff_failed": "Failed to render the diff.",
   "init_diff_editor_failed": "Failed to initialize the diff editor.",
   "session_archived_notice": "Thread archived.",
-  "session_restored_notice": "Thread restored."
+  "session_restored_notice": "Thread restored.",
+  "error_empty_message": "Escribe un mensaje o adjunta al menos un archivo.",
+  "error_invalid_queue_mode": "Esta acción en cola ya no es válida.",
+  "error_queue_item_not_found": "Ese seguimiento en cola ya no está disponible. Puede que ya se haya enviado o eliminado.",
+  "error_queue_already_dispatching": "Ya se está enviando otro seguimiento en cola. Espera un momento y vuelve a intentarlo.",
+  "error_no_active_turn": "Ya no hay una respuesta activa que se pueda dirigir.",
+  "error_pending_request_not_found": "Esta solicitud de aprobación ya no está disponible.",
+  "error_session_already_archived": "Esta sesión ya está archivada.",
+  "error_session_not_archived": "Esta sesión ya no está archivada.",
+  "error_session_not_found": "No se pudo encontrar esta sesión."
 }

@@ -123,6 +123,7 @@
   "single_tab": "Single tab",
   "binary_diff_not_previewable": "Binary file diff is not previewable in Monaco.",
   "save_file": "Save file",
+  "save": "Save",
   "recent_commits": "Recent commits",
   "diff": "Diff",
   "edit": "Edit",
@@ -287,5 +288,14 @@
   "render_diff_failed": "Failed to render the diff.",
   "init_diff_editor_failed": "Failed to initialize the diff editor.",
   "session_archived_notice": "Thread archived.",
-  "session_restored_notice": "Thread restored."
+  "session_restored_notice": "Thread restored.",
+  "error_empty_message": "Введите сообщение или прикрепите хотя бы один файл.",
+  "error_invalid_queue_mode": "Это действие очереди больше недействительно.",
+  "error_queue_item_not_found": "Это отложенное сообщение больше недоступно. Возможно, оно уже было отправлено или удалено.",
+  "error_queue_already_dispatching": "Другое отложенное сообщение уже отправляется. Подождите немного и попробуйте снова.",
+  "error_no_active_turn": "Больше нет активного ответа, которым можно управлять.",
+  "error_pending_request_not_found": "Этот запрос на подтверждение больше недоступен.",
+  "error_session_already_archived": "Этот сеанс уже архивирован.",
+  "error_session_not_archived": "Этот сеанс больше не находится в архиве.",
+  "error_session_not_found": "Не удалось найти этот сеанс."
 }

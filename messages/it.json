@@ -123,6 +123,7 @@
   "single_tab": "Single tab",
   "binary_diff_not_previewable": "Binary file diff is not previewable in Monaco.",
   "save_file": "Save file",
+  "save": "Save",
   "recent_commits": "Recent commits",
   "diff": "Diff",
   "edit": "Edit",
@@ -287,5 +288,14 @@
   "render_diff_failed": "Failed to render the diff.",
   "init_diff_editor_failed": "Failed to initialize the diff editor.",
   "session_archived_notice": "Thread archived.",
-  "session_restored_notice": "Thread restored."
+  "session_restored_notice": "Thread restored.",
+  "error_empty_message": "Inserisci un messaggio o allega almeno un file.",
+  "error_invalid_queue_mode": "Questa azione in coda non è più valida.",
+  "error_queue_item_not_found": "Questo follow-up in coda non è più disponibile. Potrebbe essere già stato inviato o rimosso.",
+  "error_queue_already_dispatching": "Un altro follow-up in coda è già in fase di invio. Attendi un momento e riprova.",
+  "error_no_active_turn": "Non c’è più una risposta attiva da guidare.",
+  "error_pending_request_not_found": "Questa richiesta di approvazione non è più disponibile.",
+  "error_session_already_archived": "Questa sessione è già archiviata.",
+  "error_session_not_archived": "Questa sessione non è più archiviata.",
+  "error_session_not_found": "Impossibile trovare questa sessione."
 }

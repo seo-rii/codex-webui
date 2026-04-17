@@ -123,6 +123,7 @@
   "single_tab": "Single tab",
   "binary_diff_not_previewable": "Binary file diff is not previewable in Monaco.",
   "save_file": "Save file",
+  "save": "Save",
   "recent_commits": "Recent commits",
   "diff": "Diff",
   "edit": "Edit",
@@ -287,5 +288,14 @@
   "render_diff_failed": "Failed to render the diff.",
   "init_diff_editor_failed": "Failed to initialize the diff editor.",
   "session_archived_notice": "Thread archived.",
-  "session_restored_notice": "Thread restored."
+  "session_restored_notice": "Thread restored.",
+  "error_empty_message": "請輸入訊息，或至少附加一個檔案。",
+  "error_invalid_queue_mode": "這個佇列操作已不再有效。",
+  "error_queue_item_not_found": "這個排隊中的後續訊息已無法使用，可能已經送出或被移除。",
+  "error_queue_already_dispatching": "另一個排隊中的後續訊息已在傳送中。請稍候再試。",
+  "error_no_active_turn": "已經沒有可引導的進行中回應了。",
+  "error_pending_request_not_found": "這個核准請求已無法使用。",
+  "error_session_already_archived": "這個工作階段已經封存。",
+  "error_session_not_archived": "這個工作階段已不在封存狀態。",
+  "error_session_not_found": "找不到這個工作階段。"
 }

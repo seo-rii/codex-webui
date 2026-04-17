@@ -28,6 +28,7 @@ In the comparison columns:
 | Session list and chat history | Implemented | Comparable | Comparable | Progressive loading, search, archive, reconnect-safe refresh, and backend-persisted sidebar badges are browser-first additions. |
 | Multi-turn streaming chat | Implemented | Comparable | Comparable | Streaming survives tab reloads because execution remains server-side. |
 | Model selection | Implemented | Comparable | Comparable | Exposed from the chat composer shell and persisted in session preferences. |
+| Multi-account switching | Implemented | Different shape | Different shape | Uses profile-scoped `CODEX_HOME` directories, independent browser profile cookies, and separate `codex app-server` clients rather than a single shared desktop login state. |
 | Reasoning effort selection | Implemented | Comparable | Comparable | Matches the app-server preference model rather than copying a specific upstream layout. |
 | Plan mode selection | Implemented | Comparable | Comparable | Uses the same session preference model that Codex consumes. |
 | Speed mode selection | Implemented | Comparable | Comparable | Supports `auto`, `fast`, and `flex` where available from model metadata. |
@@ -48,7 +49,7 @@ In the comparison columns:
 | Aggregated diff view | Implemented | Different shape | Comparable | Exposes grouped file changes per turn and in dedicated tabs. |
 | Inline file editing | Implemented | Partial | Comparable | Focused on quick inspection and edits rather than full IDE parity. |
 | Git repository discovery | Implemented | Different shape | Comparable | Discovery is depth-limited and gated on explicit repository selection. |
-| Git status, fetch/pull, diff, commit inspection | Implemented | Partial | Comparable | Designed as a browser-side Git workspace, not a full desktop VCS client, and includes compact action rows, fetch/pull controls, and a mobile-friendly navigation mode. |
+| Git status, fetch/pull, diff, commit inspection | Implemented | Partial | Comparable | Designed as a browser-side Git workspace, not a full desktop VCS client, and now includes VS Code-inspired staged/unstaged Source Control sections, dense one-row actions, tree-or-list change browsing, fetch/pull controls, and a mobile-friendly navigation mode. |
 | Git worktree management | Implemented | Partial | Comparable | Explicitly exposed in the web UI because multiple browser workspaces benefit from it. |
 | Terminal tabs | Implemented | Different shape | Comparable | Terminals live in the Rust gateway and survive page reloads while the server stays up. |
 | Subagent activity view | Implemented | Comparable | Comparable | Subagent activity is rendered inline and can open related threads in tabs. |
@@ -90,6 +91,8 @@ Upstream Codex surfaces are not primarily optimized for a self-hosted browser de
 The project leans into browser-native Git inspection and workspace management:
 
 - repository discovery under configured roots
+- staged and unstaged Source Control sections similar to VS Code
+- dense tree or flat-list file browsing for change sets
 - grouped file-change views
 - Monaco diff panes
 - worktree operations

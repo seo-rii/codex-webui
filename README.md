@@ -32,7 +32,7 @@ The goal is not to replace upstream surfaces. The goal is to make Codex usable f
 - Composer history recall with keyboard navigation, a quick "reuse last message" chip, and one-click resend/queue for the most recent prompt
 - Session completion and input-required badges are persisted server-side, so they survive reconnects and show up consistently across multiple clients
 - Attachments, Monaco-backed diff/file editing, aggregated live diff, live plan, and subagent activity views
-- Git repository discovery, status, fetch/pull, diff, commit inspection, branch checkout, worktree management, and a compact mobile-friendly Git workspace layout
+- Git repository discovery, status, fetch/pull, staged/unstaged Source Control sections, dense tree-or-list change browsing, commit inspection, branch checkout, and worktree management in a VS Code-inspired Git workspace
 - Terminal tabs that survive page reloads as long as the server process stays up
 - Runtime install/update checks, quota display, plugin/skill catalog visibility, and `config.toml` editing
 - Persistent notification center with unread sync, plus Slack and generic webhook delivery for completion, attention, queue-failure, and shutdown events
@@ -55,6 +55,13 @@ Stable enough to use:
 - progressive session loading
 - queue persistence
 - Git and terminal workflows
+
+Recent UI work worth calling out:
+
+- a denser Git Source Control workspace with separate staged and unstaged sections
+- tree and flat-list change browsing for repository diffs
+- faster one-row file actions for open, stage, and unstage flows
+- mobile navigation that preserves the same Git workflow in a compressed layout
 
 Still evolving:
 

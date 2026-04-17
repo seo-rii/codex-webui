@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ExternalLink, GitPullRequest, RefreshCw } from "lucide-svelte";
+  import { ChevronDown, ChevronRight, ExternalLink, FileText, Folder, FolderOpen, GitPullRequest, RefreshCw } from "lucide-svelte";
 
   import { api } from "$lib/api";
   import MarkdownMessage from "$lib/components/MarkdownMessage.svelte";
@@ -22,6 +22,49 @@
     GitStatusPayload,
     GitWorktree
   } from "$lib/types";
+
+  type ChangeSectionId = "staged" | "changes";
+  type GitChangeEntry = {
+    key: string;
+    sectionId: ChangeSectionId;
+    file: GitFileStatus;
+    path: string;
+    fileName: string;
+    directoryPath: string;
+    originalPath: string | null;
+    statusCode: string;
+    statusLabel: string;
+  };
+  type GitChangeVisibleRow =
+    | {
+        type: "folder";
+        key: string;
+        depth: number;
+        name: string;
+        count: number;
+      }
+    | {
+        type: "file";
+        key: string;
+        depth: number;
+        entry: GitChangeEntry;
+      };
+  type GitChangeTreeNode =
+    | {
+        type: "folder";
+        key: string;
+        name: string;
+        path: string;
+        depth: number;
+        count: number;
+        children: GitChangeTreeNode[];
+      }
+    | {
+        type: "file";
+        key: string;
+        depth: number;
+        entry: GitChangeEntry;
+      };
 
   let {
     selectedRepoPath,
@@ -77,12 +120,19 @@
   let pullRequestState = $state<"open" | "closed" | "all">("open");
   let pullRequestDetail = $state<GitHubPullRequestDetailPayload | null>(null);
   let selectedPullRequestFilePath = $state<string | null>(null);
+  let changeViewMode = $state<"tree" | "list">("tree");
+  let collapsedChangeSections = $state<Record<ChangeSectionId, boolean>>({
+    staged: false,
+    changes: false
+  });
+  let collapsedChangeFolders = $state<Record<string, boolean>>({});
   const hasDetailPanel = $derived(groupedFilePayloads.length > 0 || Boolean(filePayload) || Boolean(pullRequestDetail));
   const selectedPullRequestFile = $derived.by(
     () => pullRequestDetail?.pullRequest.files.find((file) => file.path === selectedPullRequestFilePath) ?? null
   );
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
+    const locale = getLocale();
 
     return {
       git: m.git(),
@@ -145,9 +195,180 @@
       openOnGitHub: m.open_on_github(),
       pullRequestOverview: m.pull_request_overview(),
       pullRequestFiles: m.pull_request_files(),
-      pullRequestBodyEmpty: m.pull_request_body_empty()
+      pullRequestBodyEmpty: m.pull_request_body_empty(),
+      sourceControl: locale === "ko" ? "소스 제어" : "Source Control",
+      stagedChanges: locale === "ko" ? "스테이징된 변경 사항" : "Staged Changes",
+      workingChanges: locale === "ko" ? "변경 사항" : "Changes",
+      treeView: locale === "ko" ? "트리" : "Tree",
+      listView: locale === "ko" ? "목록" : "List",
+      viewAs: locale === "ko" ? "보기" : "View",
+      noStagedChanges: locale === "ko" ? "스테이징된 변경 사항이 없습니다." : "No staged changes.",
+      noWorkingChanges: locale === "ko" ? "작업 트리 변경 사항이 없습니다." : "No working tree changes.",
+      fileTree: locale === "ko" ? "파일 트리" : "File tree"
     };
   });
+
+  function buildChangeEntries(files: GitFileStatus[], sectionId: ChangeSectionId) {
+    const entries: GitChangeEntry[] = [];
+
+    for (const file of files) {
+      const include = sectionId === "staged" ? file.hasStagedChanges : file.hasUnstagedChanges || file.isUntracked;
+      if (!include) {
+        continue;
+      }
+
+      const segments = file.path.split("/").filter((segment) => segment.length > 0);
+      const fileName = segments.at(-1) ?? file.path;
+      const directoryPath = segments.length > 1 ? segments.slice(0, -1).join("/") : "";
+      const rawStatusCode = (sectionId === "staged" ? file.stagedCode : file.unstagedCode).trim();
+      const normalizedStatusCode = rawStatusCode.replace(/\?/g, "U");
+
+      entries.push({
+        key: `${sectionId}:${file.path}`,
+        sectionId,
+        file,
+        path: file.path,
+        fileName,
+        directoryPath,
+        originalPath: file.originalPath ?? null,
+        statusCode: normalizedStatusCode || "M",
+        statusLabel: sectionId === "staged" ? file.stagedLabel : file.unstagedLabel
+      });
+    }
+
+    return entries.sort((left, right) => left.path.localeCompare(right.path));
+  }
+
+  function buildChangeTreeNodes(
+    entries: GitChangeEntry[],
+    sectionId: ChangeSectionId,
+    parentPath = "",
+    depth = 0
+  ): GitChangeTreeNode[] {
+    const folders = new Map<string, GitChangeEntry[]>();
+    const fileNodes: GitChangeTreeNode[] = [];
+
+    for (const entry of entries) {
+      const relativePath = parentPath ? entry.path.slice(parentPath.length + 1) : entry.path;
+      const segments = relativePath.split("/").filter((segment) => segment.length > 0);
+      const firstSegment = segments[0] ?? "";
+      if (!firstSegment) {
+        continue;
+      }
+
+      if (segments.length === 1) {
+        fileNodes.push({
+          type: "file",
+          key: entry.key,
+          depth,
+          entry
+        });
+        continue;
+      }
+
+      const bucket = folders.get(firstSegment) ?? [];
+      bucket.push(entry);
+      folders.set(firstSegment, bucket);
+    }
+
+    const folderNodes: GitChangeTreeNode[] = [...folders.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, childEntries]) => {
+        const folderPath = parentPath ? `${parentPath}/${name}` : name;
+        return {
+          type: "folder",
+          key: `${sectionId}:folder:${folderPath}`,
+          name,
+          path: folderPath,
+          depth,
+          count: childEntries.length,
+          children: buildChangeTreeNodes(childEntries, sectionId, folderPath, depth + 1)
+        } satisfies GitChangeTreeNode;
+      });
+
+    fileNodes.sort((left, right) => {
+      if (left.type !== "file" || right.type !== "file") {
+        return 0;
+      }
+      return left.entry.path.localeCompare(right.entry.path);
+    });
+
+    return [...folderNodes, ...fileNodes];
+  }
+
+  const stagedChangeEntries = $derived.by(() => buildChangeEntries(status?.files ?? [], "staged"));
+  const workingChangeEntries = $derived.by(() => buildChangeEntries(status?.files ?? [], "changes"));
+  const changeSections = $derived.by(() => [
+    {
+      id: "staged" as const,
+      label: ui.stagedChanges,
+      entries: stagedChangeEntries,
+      tree: buildChangeTreeNodes(stagedChangeEntries, "staged"),
+      emptyLabel: ui.noStagedChanges
+    },
+    {
+      id: "changes" as const,
+      label: ui.workingChanges,
+      entries: workingChangeEntries,
+      tree: buildChangeTreeNodes(workingChangeEntries, "changes"),
+      emptyLabel: ui.noWorkingChanges
+    }
+  ]);
+
+  function flattenChangeTree(nodes: GitChangeTreeNode[]): GitChangeVisibleRow[] {
+    const rows: GitChangeVisibleRow[] = [];
+
+    const visit = (currentNodes: GitChangeTreeNode[]) => {
+      for (const node of currentNodes) {
+        if (node.type === "folder") {
+          rows.push({
+            type: "folder",
+            key: node.key,
+            depth: node.depth,
+            name: node.name,
+            count: node.count
+          });
+
+          if (isChangeFolderExpanded(node.key)) {
+            visit(node.children);
+          }
+          continue;
+        }
+
+        rows.push({
+          type: "file",
+          key: node.key,
+          depth: node.depth,
+          entry: node.entry
+        });
+      }
+    };
+
+    visit(nodes);
+    return rows;
+  }
+
+  function getChangeStatusTone(statusCode: string) {
+    const code = statusCode.trim().toUpperCase();
+    if (code.includes("D")) {
+      return "deleted";
+    }
+    if (code.includes("A") || code.includes("U") || code.includes("?")) {
+      return "added";
+    }
+    if (code.includes("R")) {
+      return "renamed";
+    }
+    return "modified";
+  }
+
+  function getChangeSecondaryLabel(entry: GitChangeEntry) {
+    if (entry.originalPath) {
+      return entry.originalPath;
+    }
+
+    return changeViewMode === "list" ? entry.directoryPath : "";
+  }
 
   function getDateLocale() {
     return getLocale() === "ko" ? "ko-KR" : "en-US";
@@ -276,13 +497,48 @@
     filePayload = null;
   }
 
-  async function openFile(fileStatus: GitFileStatus) {
-    if (!isMobileLayout && selectedRepoPath && onOpenDiffTab) {
-      onOpenDiffTab(selectedRepoPath, fileStatus.path);
+  function toggleChangeSection(sectionId: ChangeSectionId) {
+    collapsedChangeSections = {
+      ...collapsedChangeSections,
+      [sectionId]: !collapsedChangeSections[sectionId]
+    };
+  }
+
+  function isChangeSectionExpanded(sectionId: ChangeSectionId) {
+    return !collapsedChangeSections[sectionId];
+  }
+
+  function toggleChangeFolder(nodeKey: string) {
+    collapsedChangeFolders = {
+      ...collapsedChangeFolders,
+      [nodeKey]: !collapsedChangeFolders[nodeKey]
+    };
+  }
+
+  function isChangeFolderExpanded(nodeKey: string) {
+    return !collapsedChangeFolders[nodeKey];
+  }
+
+  function isActiveChangeEntry(entry: GitChangeEntry) {
+    return filePayload?.filePath === entry.path && groupedFilePayloads.length === 0;
+  }
+
+  async function applyChangeEntry(entry: GitChangeEntry) {
+    if (entry.sectionId === "staged") {
+      await unstage(entry.path);
       return;
     }
 
-    await openFileByPath(selectedRepoPath, fileStatus.path);
+    await stage(entry.path);
+  }
+
+  async function openChangeEntry(entry: GitChangeEntry, openInTab = false) {
+    if (openInTab && selectedRepoPath && onOpenDiffTab) {
+      onOpenDiffTab(selectedRepoPath, entry.path);
+      return;
+    }
+
+    await openFileByPath(selectedRepoPath, entry.path);
   }
 
   async function openCommit(commit: GitCommit) {
@@ -677,8 +933,6 @@
         <button class="ghost-button small" disabled={readOnly || gitBusy || loadingStatus} type="button" onclick={pullRepository}>
           {gitBusyAction === "pull" ? ui.pulling : ui.pull}
         </button>
-        <button class="ghost-button small" disabled={readOnly || gitBusy} type="button" onclick={() => stage(null)}>{ui.stageAll}</button>
-        <button class="ghost-button small" disabled={readOnly || gitBusy} type="button" onclick={() => unstage(null)}>{ui.unstageAll}</button>
         <button class="ghost-button small" type="button" onclick={() => refreshStatus(selectedRepoPath)}>{ui.refresh}</button>
       </div>
     </div>
@@ -739,14 +993,6 @@
           <button class="ghost-button" disabled={readOnly || !newBranchName.trim() || gitBusy} type="button" onclick={createBranch}>{ui.create}</button>
         </div>
       </div>
-
-      <div class="toolbar-row toolbar-row--fields">
-        <label class="field field--inline field--grow">
-          <span>{ui.commit}</span>
-          <input bind:value={commitMessage} disabled={readOnly} placeholder={ui.commitMessage} type="text" />
-        </label>
-        <button class="solid-button" disabled={readOnly || !commitMessage.trim() || gitBusy} type="button" onclick={commit}>{ui.commit}</button>
-      </div>
     {/if}
 
     {#if !isMobileLayout || mobileSection === "worktrees"}
@@ -783,33 +1029,153 @@
 
     <div class="panel-grid">
       {#if !isMobileLayout || mobileSection === "changes"}
-        <section class="panel">
+        <section class="panel panel--scm">
           <div class="panel__header">
-            <h3>{ui.changes}</h3>
-            <span>{status.files.length}</span>
+            <div class="panel__title">
+              <h3>{ui.sourceControl}</h3>
+              <span>{status.files.length} files</span>
+            </div>
+            <div class="scm-toolbar">
+              <div class="segmented-control" aria-label={ui.viewAs}>
+                <button
+                  class:segmented-control__button--active={changeViewMode === "tree"}
+                  class="segmented-control__button"
+                  type="button"
+                  onclick={() => (changeViewMode = "tree")}
+                >
+                  <Folder size={13} />
+                  <span>{ui.treeView}</span>
+                </button>
+                <button
+                  class:segmented-control__button--active={changeViewMode === "list"}
+                  class="segmented-control__button"
+                  type="button"
+                  onclick={() => (changeViewMode = "list")}
+                >
+                  <FileText size={13} />
+                  <span>{ui.listView}</span>
+                </button>
+              </div>
+            </div>
           </div>
 
-          {#if status.files.length === 0}
-            <p class="field-note">{ui.workingTreeClean}</p>
-          {:else}
-            <div class="file-list">
-              {#each status.files as file (file.path)}
-                <article class="file-row">
-                  <button class="file-link" type="button" onclick={() => openFile(file)}>
-                    <strong>{file.path}</strong>
-                    <small>{file.stagedLabel} / {file.unstagedLabel}</small>
-                  </button>
-                  <div class="file-actions">
-                    <button class="ghost-button small" disabled={readOnly || gitBusy} type="button" onclick={() => stage(file.path)}>{ui.stage}</button>
-                    <button class="ghost-button small" disabled={readOnly || gitBusy} type="button" onclick={() => unstage(file.path)}>{ui.unstage}</button>
-                    {#if isMobileLayout && onOpenDiffTab && selectedRepoPath}
-                      <button class="ghost-button small" type="button" onclick={() => onOpenDiffTab(selectedRepoPath, file.path)}>{ui.openTab}</button>
-                    {/if}
-                  </div>
-                </article>
-              {/each}
+          <div class="scm-commit-box">
+            <textarea
+              bind:value={commitMessage}
+              class="scm-commit-box__input"
+              disabled={readOnly}
+              placeholder={ui.commitMessage}
+              rows="3"
+            ></textarea>
+            <div class="scm-commit-box__actions">
+              <div class="git-actions git-actions--compact">
+                <button class="ghost-button small" disabled={readOnly || gitBusy} type="button" onclick={() => stage(null)}>{ui.stageAll}</button>
+                <button class="ghost-button small" disabled={readOnly || gitBusy} type="button" onclick={() => unstage(null)}>{ui.unstageAll}</button>
+              </div>
+              <button class="solid-button" disabled={readOnly || !commitMessage.trim() || gitBusy} type="button" onclick={commit}>{ui.commit}</button>
             </div>
-          {/if}
+          </div>
+
+          <div class="change-sections">
+            {#each changeSections as section (section.id)}
+              <section class="change-section">
+                <button class="change-section__header" type="button" onclick={() => toggleChangeSection(section.id)}>
+                  {#if isChangeSectionExpanded(section.id)}
+                    <ChevronDown size={14} />
+                  {:else}
+                    <ChevronRight size={14} />
+                  {/if}
+                  <span>{section.label}</span>
+                  <span class="change-section__count">{section.entries.length}</span>
+                </button>
+
+                {#if isChangeSectionExpanded(section.id)}
+                  {#if section.entries.length === 0}
+                    <p class="field-note field-note--dense">{section.emptyLabel}</p>
+                  {:else}
+                    <div class="scm-list">
+                      {#each (changeViewMode === "tree" ? flattenChangeTree(section.tree) : section.entries) as row (row.key)}
+                        {#if "type" in row && row.type === "folder"}
+                          <button
+                            class="scm-row scm-row--folder"
+                            style={`--scm-depth:${row.depth}`}
+                            type="button"
+                            onclick={() => toggleChangeFolder(row.key)}
+                          >
+                            <span class="scm-row__primary">
+                              <span class="scm-row__icon">
+                                {#if isChangeFolderExpanded(row.key)}
+                                  <ChevronDown size={13} />
+                                  <FolderOpen size={14} />
+                                {:else}
+                                  <ChevronRight size={13} />
+                                  <Folder size={14} />
+                                {/if}
+                              </span>
+                              <span class="scm-row__copy">
+                                <strong>{row.name}</strong>
+                              </span>
+                            </span>
+                            <span class="scm-row__meta">{row.count}</span>
+                          </button>
+                        {:else}
+                          {@const entry = "entry" in row ? row.entry : row}
+                          {@const depth = "depth" in row ? row.depth : 0}
+                          <article
+                            class:scm-row--active={isActiveChangeEntry(entry)}
+                            class="scm-row scm-row--file"
+                            style={`--scm-depth:${depth}`}
+                          >
+                            <button class="scm-row__primary" type="button" onclick={() => void openChangeEntry(entry)}>
+                              <span class="scm-row__icon">
+                                <FileText size={13} />
+                              </span>
+                              <span class="scm-row__copy">
+                                <strong>{entry.fileName}</strong>
+                                {#if getChangeSecondaryLabel(entry)}
+                                  <small>{getChangeSecondaryLabel(entry)}</small>
+                                {/if}
+                              </span>
+                            </button>
+                            <div class="scm-row__actions">
+                              <span class={`scm-status scm-status--${getChangeStatusTone(entry.statusCode)}`} title={entry.statusLabel}>
+                                {entry.statusCode}
+                              </span>
+                              <button
+                                class="icon-button"
+                                disabled={readOnly || gitBusy}
+                                title={entry.sectionId === "staged" ? ui.unstage : ui.stage}
+                                type="button"
+                                onclick={(event) => {
+                                  event.stopPropagation();
+                                  void applyChangeEntry(entry);
+                                }}
+                              >
+                                {entry.sectionId === "staged" ? "−" : "+"}
+                              </button>
+                              {#if selectedRepoPath && onOpenDiffTab}
+                                <button
+                                  class="icon-button"
+                                  title={ui.openTab}
+                                  type="button"
+                                  onclick={(event) => {
+                                    event.stopPropagation();
+                                    void openChangeEntry(entry, true);
+                                  }}
+                                >
+                                  <ExternalLink size={13} />
+                                </button>
+                              {/if}
+                            </div>
+                          </article>
+                        {/if}
+                      {/each}
+                    </div>
+                  {/if}
+                {/if}
+              </section>
+            {/each}
+          </div>
         </section>
       {/if}
 
@@ -1166,7 +1532,7 @@
   }
 
   .panel-grid {
-    grid-template-columns: minmax(17rem, 0.82fr) minmax(17rem, 0.86fr) minmax(0, 1.42fr);
+    grid-template-columns: minmax(18rem, 0.92fr) minmax(17rem, 0.88fr) minmax(0, 1.48fr);
   }
 
   .git-mobile-nav {
@@ -1210,6 +1576,14 @@
     align-items: center;
   }
 
+  .panel--scm {
+    align-content: start;
+  }
+
+  .panel--scm .panel__header {
+    align-items: flex-start;
+  }
+
   .panel__title span {
     color: var(--muted);
     font-size: 0.75rem;
@@ -1221,7 +1595,7 @@
   .file-list,
   .commit-list {
     display: grid;
-    gap: 0.55rem;
+    gap: 0.4rem;
     max-height: 20rem;
     overflow: auto;
   }
@@ -1229,11 +1603,11 @@
   .file-row,
   .commit-row {
     display: flex;
-    gap: 0.55rem;
+    gap: 0.48rem;
     align-items: center;
     border-radius: 1rem;
     background: rgba(249, 245, 239, 0.75);
-    padding: 0.62rem 0.72rem;
+    padding: 0.54rem 0.62rem;
   }
 
   .file-row--stacked {
@@ -1306,6 +1680,257 @@
     justify-content: flex-end;
   }
 
+  .scm-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    flex: 0 0 auto;
+  }
+
+  .segmented-control {
+    display: inline-flex;
+    gap: 0.2rem;
+    padding: 0.2rem;
+    border-radius: 999px;
+    background: rgba(249, 245, 239, 0.86);
+  }
+
+  .segmented-control__button {
+    display: inline-flex;
+    gap: 0.36rem;
+    align-items: center;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    padding: 0.42rem 0.72rem;
+    font-size: 0.76rem;
+    font-weight: 700;
+    transition: background-color 140ms ease, color 140ms ease;
+  }
+
+  .segmented-control__button--active {
+    background: rgba(255, 255, 255, 0.98);
+    color: var(--ink-strong);
+  }
+
+  .scm-commit-box {
+    display: grid;
+    gap: 0.55rem;
+    padding: 0.72rem;
+    border-radius: 1rem;
+    background: rgba(249, 245, 239, 0.76);
+  }
+
+  .scm-commit-box__input {
+    width: 100%;
+    min-height: 4.85rem;
+    border: 1px solid rgba(83, 61, 42, 0.12);
+    border-radius: 0.92rem;
+    background: rgba(255, 255, 255, 0.92);
+    color: var(--ink);
+    padding: 0.72rem 0.82rem;
+    resize: vertical;
+  }
+
+  .scm-commit-box__actions {
+    display: flex;
+    gap: 0.55rem;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+  }
+
+  .change-sections {
+    display: grid;
+    gap: 0.6rem;
+    min-height: 0;
+  }
+
+  .change-section {
+    display: grid;
+    gap: 0.35rem;
+    min-height: 0;
+  }
+
+  .change-section__header {
+    display: flex;
+    gap: 0.42rem;
+    align-items: center;
+    justify-content: flex-start;
+    border: 0;
+    background: transparent;
+    color: var(--ink-strong);
+    padding: 0.12rem 0.12rem 0.12rem 0;
+    font-size: 0.82rem;
+    font-weight: 700;
+    text-align: left;
+  }
+
+  .change-section__count {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 0.74rem;
+    font-weight: 600;
+  }
+
+  .scm-list {
+    display: grid;
+    gap: 0.22rem;
+    max-height: min(28rem, 52dvh);
+    overflow: auto;
+  }
+
+  .scm-row {
+    display: flex;
+    gap: 0.45rem;
+    align-items: center;
+    min-width: 0;
+    border-radius: 0.85rem;
+    background: rgba(249, 245, 239, 0.68);
+    padding: 0.38rem 0.46rem;
+    padding-inline-start: calc(0.46rem + (var(--scm-depth, 0) * 0.78rem));
+    transition: background-color 140ms ease, box-shadow 140ms ease;
+  }
+
+  .scm-row--file:hover,
+  .scm-row--folder:hover {
+    background: rgba(245, 238, 229, 0.94);
+  }
+
+  .scm-row--file {
+    overflow: hidden;
+  }
+
+  .scm-row--folder {
+    width: 100%;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .scm-row--active {
+    box-shadow: inset 0 0 0 1px rgba(214, 140, 69, 0.28);
+    background: rgba(255, 248, 237, 0.98);
+  }
+
+  .scm-row__primary {
+    display: flex;
+    gap: 0.45rem;
+    align-items: center;
+    min-width: 0;
+    flex: 1 1 auto;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    padding: 0;
+    text-align: left;
+  }
+
+  .scm-row__icon {
+    display: inline-flex;
+    gap: 0.14rem;
+    align-items: center;
+    color: var(--muted);
+    flex: 0 0 auto;
+  }
+
+  .scm-row__copy {
+    display: grid;
+    gap: 0.04rem;
+    min-width: 0;
+  }
+
+  .scm-row__copy strong,
+  .scm-row__copy small,
+  .scm-row__meta {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .scm-row__copy strong {
+    color: var(--ink-strong);
+    font-size: 0.79rem;
+    font-weight: 700;
+  }
+
+  .scm-row__copy small,
+  .scm-row__meta {
+    color: var(--muted);
+    font-size: 0.7rem;
+  }
+
+  .scm-row__actions {
+    display: inline-flex;
+    gap: 0.28rem;
+    align-items: center;
+    justify-content: flex-end;
+    flex: 0 0 auto;
+  }
+
+  .icon-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.72rem;
+    height: 1.72rem;
+    border: 1px solid rgba(83, 61, 42, 0.12);
+    border-radius: 0.65rem;
+    background: rgba(255, 255, 255, 0.88);
+    color: var(--ink);
+    padding: 0;
+    transition: border-color 140ms ease, background-color 140ms ease, color 140ms ease;
+  }
+
+  .icon-button:hover:not(:disabled) {
+    border-color: rgba(214, 140, 69, 0.24);
+    background: rgba(255, 248, 237, 0.98);
+    color: var(--ink-strong);
+  }
+
+  .icon-button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .scm-status {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.72rem;
+    height: 1.72rem;
+    border-radius: 0.65rem;
+    background: rgba(255, 255, 255, 0.92);
+    font-size: 0.7rem;
+    font-weight: 800;
+    letter-spacing: 0.02em;
+  }
+
+  .scm-status--added {
+    color: #1f7a41;
+  }
+
+  .scm-status--modified {
+    color: #b66a11;
+  }
+
+  .scm-status--deleted {
+    color: #b13a3a;
+  }
+
+  .scm-status--renamed {
+    color: #2869b6;
+  }
+
+  .field-note--dense {
+    margin: 0;
+    padding: 0.18rem 0 0.08rem 1.5rem;
+    font-size: 0.76rem;
+  }
+
   .git-markdown-body {
     border-radius: 1rem;
     background: rgba(249, 245, 239, 0.72);
@@ -1335,7 +1960,7 @@
 
   @media (max-width: 1480px) {
     .panel-grid {
-      grid-template-columns: minmax(18rem, 0.92fr) minmax(0, 1.2fr);
+      grid-template-columns: minmax(19rem, 0.98fr) minmax(0, 1.3fr);
     }
   }
 
@@ -1383,18 +2008,45 @@
 
     .git-header,
     .git-meta,
+    .panel__header,
+    .scm-commit-box__actions,
     .inline-field,
     .toolbar-row,
     .file-row,
-    .commit-row,
-    .file-link,
-    .commit-link {
+    .commit-row {
       flex-direction: column;
       align-items: stretch;
     }
 
     .field--inline {
       grid-template-columns: 1fr;
+    }
+
+    .segmented-control {
+      width: 100%;
+      justify-content: stretch;
+    }
+
+    .segmented-control__button {
+      flex: 1 1 0;
+      justify-content: center;
+    }
+
+    .scm-toolbar {
+      width: 100%;
+    }
+
+    .scm-list {
+      max-height: none;
+    }
+
+    .scm-row {
+      align-items: flex-start;
+    }
+
+    .scm-row__actions {
+      width: 100%;
+      justify-content: flex-end;
     }
 
     .file-link small,

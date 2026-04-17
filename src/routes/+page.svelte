@@ -55,6 +55,7 @@
   import { activeLocale, localeOptions, localeSignal, updateLocale } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
   import {
+    applyThemeSettings,
     applyThemeMode,
     getResolvedTheme,
     readThemeMode,
@@ -62,6 +63,7 @@
     type ResolvedTheme,
     type ThemeMode
   } from "$lib/theme";
+  import type { ThemeSettings } from "$lib/theme-customization";
   import type {
     AutomationDefinition,
     AppNotification,
@@ -134,6 +136,7 @@
     description: string;
     value: string;
   };
+  type ThemedConfigPayload = AppConfigPayload & { theme?: ThemeSettings };
 
   let config = $state<AppConfigPayload | null>(null);
   let quota = $state<CodexQuotaStatus | null>(null);
@@ -2080,6 +2083,16 @@
     });
   }
 
+  function syncConfiguredTheme(nextConfig: AppConfigPayload | null | undefined) {
+    const themeSettings = (nextConfig as ThemedConfigPayload | null | undefined)?.theme;
+    if (!themeSettings) {
+      return;
+    }
+    const detail = applyThemeSettings(themeSettings, themeMode);
+    themeMode = detail.mode;
+    resolvedTheme = detail.resolved;
+  }
+
   async function bootstrap() {
     loading = true;
     errorText = "";
@@ -2106,6 +2119,7 @@
 
       const requestedSessionId = getRequestedSessionIdFromUrl();
       config = await api.getConfig();
+      syncConfiguredTheme(config);
       syncStartupAlertModal(config);
       await refreshNotifications();
       await refreshSessions();
@@ -2531,6 +2545,7 @@
       }
 
       config = await api.getConfig();
+      syncConfiguredTheme(config);
       syncStartupAlertModal(config);
       await refreshSessions(shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null);
       await refreshTerminals();
@@ -2619,13 +2634,15 @@
                 ...(event.params.automations as Partial<AppConfigPayload["automations"]>)
               }
             : config.automations,
+          theme: event.params.theme ? (event.params.theme as ThemeSettings) : (config as ThemedConfigPayload).theme,
           startup: event.params.startup
             ? {
                 ...config.startup,
                 ...(event.params.startup as Partial<AppConfigPayload["startup"]>)
               }
             : config.startup
-        };
+        } as ThemedConfigPayload;
+        syncConfiguredTheme(config);
         syncStartupAlertModal(config);
       }
       return;
@@ -2956,6 +2973,7 @@
           };
         }
         config = nextConfig;
+        syncConfiguredTheme(nextConfig);
         await refreshSessions(shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null);
       } catch (error) {
         errorText = describeError(error);
@@ -2971,7 +2989,23 @@
     try {
       const nextConfig = await api.saveSystemShutdownAfterQueueCompletes(armed);
       config = nextConfig;
+      syncConfiguredTheme(nextConfig);
       syncStartupAlertModal(nextConfig, Boolean(nextConfig.startup.scheduledShutdown));
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function saveThemeSettings(theme: ThemeSettings) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    try {
+      const nextConfig = await api.saveThemeSettings(theme);
+      config = nextConfig;
+      syncConfiguredTheme(nextConfig);
+      noticeText = m.theme_saved();
     } catch (error) {
       errorText = describeError(error);
     }
@@ -6812,7 +6846,7 @@
                   {#if liveTurnCardExpanded}
                     <div class="turn-card-expand grid gap-2.5 border-t border-amber-100 bg-amber-50/20 p-2.5 {activeLiveTurnPlan && activeLiveTurnDiff && activeLiveTurnSubagents.length > 0 ? 'lg:grid-cols-2 xl:grid-cols-3' : 'lg:grid-cols-2'}" transition:slide|local={{ duration: 220 }}>
                       {#if activeLiveTurnDiff}
-                        <div class="turn-card-shell rounded-xl border border-gray-200 bg-white/85 overflow-hidden lg:col-span-2 xl:col-span-3">
+                        <div class="turn-card-shell rounded-xl border border-gray-200 bg-white/85 overflow-hidden lg:col-span-full">
                           <div class="turn-card-header turn-card-header--neutral flex items-center justify-between gap-2 border-b border-gray-200 px-2.5 py-2" data-sticky-level="1">
                             <div class="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.18em] text-gray-500">
                               <FileDiff size={12} />
@@ -7109,11 +7143,18 @@
               promptPresets={config?.promptPresets ?? []}
               automations={config?.automations.items ?? []}
               automationRuns={config?.automations.recentRuns ?? []}
+              themeSettings={(config as ThemedConfigPayload | null)?.theme ?? null}
+              themeMode={themeMode}
+              resolvedTheme={resolvedTheme}
               webRole={webRole}
               readOnly={readOnlyRole}
               onConfigSaved={async () => {
                 config = await api.getConfig();
+                syncConfiguredTheme(config);
                 syncStartupAlertModal(config);
+              }}
+              onSaveThemeSettings={async (theme) => {
+                await saveThemeSettings(theme);
               }}
               onNotificationSettingsSaved={async (settings) => {
                 await saveNotificationSettings(settings);

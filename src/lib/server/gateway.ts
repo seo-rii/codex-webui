@@ -5,6 +5,7 @@ import { readdir } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import type { ArenaContestant, ArenaListPayload, ArenaRun } from "$lib/arena-types";
+import type { ThemeSettings } from "$lib/theme-customization";
 import type {
   AutomationDefinition,
   AutomationRun,
@@ -53,6 +54,7 @@ import { createGitWorktree, resolveGitRepository } from "./git";
 import { runWithProfile } from "./profile-context";
 import { sessionIndexClient, type IndexedSessionSummary } from "./session-index";
 import { uiStateStore } from "./store";
+import { getStoredThemeSettings, updateStoredThemeSettings } from "./theme-store";
 
 type InternalPendingRequest = PendingServerRequest & {
   rawId: string | number;
@@ -693,13 +695,13 @@ export class CodexGateway {
     };
   }
 
-  async getConfig(): Promise<AppConfigPayload> {
+  async getConfig(): Promise<AppConfigPayload & { theme: ThemeSettings }> {
     const [modelsResponse, collaborationResponse, accountState] = await Promise.all([
       this.client.request("model/list", { includeHidden: false }),
       this.client.request("collaborationMode/list", {}),
       this.readAccountState()
     ]);
-    const [pausedQueueEntries, globalState, notifications, savedFilters, knownTags, promptPresets, automations, automationRuns] = await Promise.all([
+    const [pausedQueueEntries, globalState, notifications, savedFilters, knownTags, promptPresets, automations, automationRuns, theme] = await Promise.all([
       uiStateStore.listResumePendingQueues(),
       uiStateStore.getGlobal(),
       uiStateStore.getNotifications(DEFAULT_NOTIFICATION_LIMIT),
@@ -707,7 +709,8 @@ export class CodexGateway {
       uiStateStore.getKnownSessionTags(),
       uiStateStore.getPromptPresets(),
       uiStateStore.getAutomations(),
-      uiStateStore.getAutomationRuns(DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT)
+      uiStateStore.getAutomationRuns(DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT),
+      getStoredThemeSettings(this.profile)
     ]);
     const preferences: Record<string, SessionPreferences> = pausedQueueEntries.length > 0 ? await uiStateStore.getAll() : {};
     const indexedSessions = pausedQueueEntries.length > 0 ? await sessionIndexClient.list(this.profile.codexHome).catch(() => []) : [];
@@ -809,6 +812,7 @@ export class CodexGateway {
         planType: (account.planType as string | null) ?? null,
         requiresOpenaiAuth: accountState.requiresOpenaiAuth
       },
+      theme,
       profiles: this.runtimeConfig.profiles.map((profile) => ({
         id: profile.id,
         label: profile.label,
@@ -2054,6 +2058,12 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       await this.maybeScheduleGlobalShutdown(null);
     }
 
+    return this.getConfig();
+  }
+
+  async saveThemeSettings(settings: ThemeSettings) {
+    await updateStoredThemeSettings(settings, this.profile);
+    await this.emitConfigUpdated();
     return this.getConfig();
   }
 
@@ -3431,14 +3441,15 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
 
   private async emitConfigUpdated() {
     const runtimeConfig = this.runtimeConfig;
-    const [globalState, notifications, savedFilters, knownTags, promptPresets, automations, automationRuns] = await Promise.all([
+    const [globalState, notifications, savedFilters, knownTags, promptPresets, automations, automationRuns, theme] = await Promise.all([
       uiStateStore.getGlobal(),
       uiStateStore.getNotifications(1),
       uiStateStore.getSavedSessionFilters(),
       uiStateStore.getKnownSessionTags(),
       uiStateStore.getPromptPresets(),
       uiStateStore.getAutomations(),
-      uiStateStore.getAutomationRuns(DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT)
+      uiStateStore.getAutomationRuns(DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT),
+      getStoredThemeSettings(this.profile)
     ]);
     this.emitGlobal({
       kind: "notification",
@@ -3470,7 +3481,8 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         automations: {
           items: automations,
           recentRuns: automationRuns
-        }
+        },
+        theme
       }
     });
   }

@@ -1151,7 +1151,8 @@ async fn execute_ws_method(
         "config/get" => internal_json_request(state, Method::GET, "/api/config", None).await,
         "config/update" => {
             let payload = json!({
-                "systemShutdown": params.get("systemShutdown").cloned().unwrap_or_else(|| json!({}))
+                "systemShutdown": params.get("systemShutdown").cloned().unwrap_or_else(|| json!({})),
+                "theme": params.get("theme").cloned().unwrap_or(Value::Null)
             });
             internal_json_request(state, Method::PATCH, "/api/config", Some(payload)).await
         }

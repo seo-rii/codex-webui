@@ -1,4 +1,10 @@
 import { browser } from "$app/environment";
+import {
+  cloneThemeSettings,
+  DEFAULT_THEME_SETTINGS,
+  deriveThemeRuntimeVariables,
+  type ThemeSettings
+} from "$lib/theme-customization";
 
 export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
@@ -6,10 +12,7 @@ export type ResolvedTheme = "light" | "dark";
 export const THEME_MODE_STORAGE_KEY = "codex-webui.theme-mode";
 const THEME_CHANGE_EVENT = "codex-webui:themechange";
 
-const themeColorByMode: Record<ResolvedTheme, string> = {
-  light: "#f8fafc",
-  dark: "#0b1220"
-};
+let activeThemeSettings: ThemeSettings = cloneThemeSettings(DEFAULT_THEME_SETTINGS);
 
 function normalizeThemeMode(value: string | null | undefined): ThemeMode {
   if (value === "light" || value === "dark") {
@@ -49,7 +52,18 @@ function updateThemeColorMeta(theme: ResolvedTheme) {
   if (!meta) {
     return;
   }
-  meta.setAttribute("content", themeColorByMode[theme]);
+  meta.setAttribute("content", activeThemeSettings[theme].bg);
+}
+
+function applyResolvedThemeSettings(resolved: ResolvedTheme) {
+  if (!browser) {
+    return;
+  }
+
+  const variables = deriveThemeRuntimeVariables(activeThemeSettings, resolved);
+  for (const [name, value] of Object.entries(variables)) {
+    document.documentElement.style.setProperty(name, value);
+  }
 }
 
 function emitThemeChange(mode: ThemeMode, resolved: ResolvedTheme) {
@@ -57,10 +71,38 @@ function emitThemeChange(mode: ThemeMode, resolved: ResolvedTheme) {
     new CustomEvent(THEME_CHANGE_EVENT, {
       detail: {
         mode,
-        resolved
+        resolved,
+        settings: cloneThemeSettings(activeThemeSettings)
       }
     })
   );
+}
+
+export function getThemeSettings() {
+  return cloneThemeSettings(activeThemeSettings);
+}
+
+export function applyThemeSettings(settings: ThemeSettings | null | undefined, mode: ThemeMode = readThemeMode()) {
+  activeThemeSettings = cloneThemeSettings(settings ?? DEFAULT_THEME_SETTINGS);
+  const resolved = resolveTheme(mode);
+
+  if (!browser) {
+    return {
+      mode,
+      resolved,
+      settings: cloneThemeSettings(activeThemeSettings)
+    };
+  }
+
+  applyResolvedThemeSettings(resolved);
+  updateThemeColorMeta(resolved);
+  emitThemeChange(mode, resolved);
+
+  return {
+    mode,
+    resolved,
+    settings: cloneThemeSettings(activeThemeSettings)
+  };
 }
 
 export function applyThemeMode(mode: ThemeMode, persist = true) {
@@ -70,7 +112,8 @@ export function applyThemeMode(mode: ThemeMode, persist = true) {
   if (!browser) {
     return {
       mode: normalizedMode,
-      resolved
+      resolved,
+      settings: cloneThemeSettings(activeThemeSettings)
     };
   }
 
@@ -81,22 +124,24 @@ export function applyThemeMode(mode: ThemeMode, persist = true) {
   document.documentElement.dataset.themeMode = normalizedMode;
   document.documentElement.dataset.theme = resolved;
   document.documentElement.style.colorScheme = resolved;
+  applyResolvedThemeSettings(resolved);
   updateThemeColorMeta(resolved);
   emitThemeChange(normalizedMode, resolved);
 
   return {
     mode: normalizedMode,
-    resolved
+    resolved,
+    settings: cloneThemeSettings(activeThemeSettings)
   };
 }
 
-export function subscribeThemeChange(listener: (detail: { mode: ThemeMode; resolved: ResolvedTheme }) => void) {
+export function subscribeThemeChange(listener: (detail: { mode: ThemeMode; resolved: ResolvedTheme; settings: ThemeSettings }) => void) {
   if (!browser) {
     return () => {};
   }
 
   const handleEvent = (event: Event) => {
-    const detail = (event as CustomEvent<{ mode: ThemeMode; resolved: ResolvedTheme }>).detail;
+    const detail = (event as CustomEvent<{ mode: ThemeMode; resolved: ResolvedTheme; settings: ThemeSettings }>).detail;
     if (!detail) {
       return;
     }
@@ -118,6 +163,7 @@ export function initThemeRuntime() {
   let mode = readThemeMode();
   const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
+  applyThemeSettings(activeThemeSettings, mode);
   applyThemeMode(mode, false);
 
   const handleMediaChange = () => {
@@ -136,7 +182,7 @@ export function initThemeRuntime() {
   };
 
   const handleThemeChange = (event: Event) => {
-    const detail = (event as CustomEvent<{ mode: ThemeMode; resolved: ResolvedTheme }>).detail;
+    const detail = (event as CustomEvent<{ mode: ThemeMode; resolved: ResolvedTheme; settings: ThemeSettings }>).detail;
     if (!detail) {
       return;
     }

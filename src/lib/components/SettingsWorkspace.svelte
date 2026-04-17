@@ -1,12 +1,23 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { Clock3, History, Pencil, Play, Plug, RefreshCw, Save, Settings2, Sparkles, Trash2, Wand2 } from "lucide-svelte";
+  import { Clock3, History, Palette, Pencil, Play, Plug, RefreshCw, RotateCcw, Save, Settings2, Sparkles, Trash2, Wand2 } from "lucide-svelte";
 
   import { api } from "$lib/api";
   import MonacoTextEditor from "$lib/components/MonacoTextEditor.svelte";
   import { localeSignal } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
   import { getLocale } from "$lib/paraglide/runtime.js";
+  import type { ResolvedTheme, ThemeMode } from "$lib/theme";
+  import {
+    cloneThemeSettings,
+    DEFAULT_THEME_SETTINGS,
+    deriveThemeRuntimeVariables,
+    THEME_SURFACES,
+    THEME_TOKEN_KEYS,
+    type ThemeSettings,
+    type ThemeSurface,
+    type ThemeTokenKey
+  } from "$lib/theme-customization";
   import type {
     AutomationDefinition,
     AutomationRun,
@@ -26,8 +37,12 @@
     promptPresets = [],
     automations = [],
     automationRuns = [],
+    themeSettings = null,
+    themeMode = "system",
+    resolvedTheme = "light",
     webRole = "admin",
     readOnly = false,
+    onSaveThemeSettings = null,
     onNotificationSettingsSaved = null,
     onSavePromptPreset = null,
     onDeletePromptPreset = null,
@@ -42,8 +57,12 @@
     promptPresets?: PromptPreset[];
     automations?: AutomationDefinition[];
     automationRuns?: AutomationRun[];
+    themeSettings?: ThemeSettings | null;
+    themeMode?: ThemeMode;
+    resolvedTheme?: ResolvedTheme;
     webRole?: UserRole | null;
     readOnly?: boolean;
+    onSaveThemeSettings?: ((settings: ThemeSettings) => void | Promise<void>) | null;
     onNotificationSettingsSaved?: ((settings: Partial<NotificationSettings>) => void | Promise<void>) | null;
     onSavePromptPreset?: ((preset: PromptPreset) => void | Promise<void>) | null;
     onDeletePromptPreset?: ((presetId: string) => void | Promise<void>) | null;
@@ -77,12 +96,16 @@
   let automationSpeed = $state("");
   let automationMode = $state("");
   let auditEntries = $state<AuditLogEntry[]>([]);
+  let themeDraft = $state<ThemeSettings>(cloneThemeSettings(DEFAULT_THEME_SETTINGS));
+  let themeBaseFingerprint = $state(JSON.stringify(cloneThemeSettings(DEFAULT_THEME_SETTINGS)));
   let loading = $state(true);
   let saving = $state(false);
   let reloading = $state(false);
   let savingNotifications = $state(false);
   let savingPreset = $state(false);
+  let savingTheme = $state(false);
   const dirty = $derived(Boolean(configFile && editorValue !== configFile.content));
+  const themeDirty = $derived(themeBaseFingerprint !== JSON.stringify(themeDraft));
   const notificationDirty = $derived.by(() => {
     const current = notificationSettings;
     if (!current) {
@@ -197,12 +220,42 @@
       noDescription: m.no_description(),
       installedSkills: m.installed_skills(),
       noSkills: m.no_local_skills(),
+      themeEditor: m.theme_editor(),
+      themeEditorDescription: m.theme_editor_description(),
+      saveTheme: m.save_theme(),
+      resetTheme: m.reset_theme(),
+      themeSaved: m.theme_saved(),
+      lightPalette: m.light_palette(),
+      darkPalette: m.dark_palette(),
+      currentThemeMode: m.current_theme_mode(),
+      currentResolvedTheme: m.current_resolved_theme(),
+      themePreview: m.theme_preview(),
+      themeTokenBackground: m.theme_token_background(),
+      themeTokenSidebar: m.theme_token_sidebar(),
+      themeTokenAccentSurface: m.theme_token_accent_surface(),
+      themeTokenStrongPanel: m.theme_token_strong_panel(),
+      themeTokenSoftPanel: m.theme_token_soft_panel(),
+      themeTokenPrimaryText: m.theme_token_primary_text(),
+      themeTokenSecondaryText: m.theme_token_secondary_text(),
+      themeTokenMutedText: m.theme_token_muted_text(),
+      themeTokenAccent: m.theme_token_accent(),
+      themeTokenBorder: m.theme_token_border(),
       remove: m.remove()
     };
   });
 
   onMount(() => {
     void bootstrap();
+  });
+
+  $effect(() => {
+    const nextTheme = cloneThemeSettings(themeSettings ?? DEFAULT_THEME_SETTINGS);
+    const nextFingerprint = JSON.stringify(nextTheme);
+    if (nextFingerprint === themeBaseFingerprint) {
+      return;
+    }
+    themeBaseFingerprint = nextFingerprint;
+    themeDraft = nextTheme;
   });
 
   $effect(() => {
@@ -304,6 +357,89 @@
       errorText = error instanceof Error ? error.message : ui.failedSave;
     } finally {
       saving = false;
+    }
+  }
+
+  function getThemeSurfaceLabel(surface: ThemeSurface) {
+    return surface === "dark" ? ui.darkPalette : ui.lightPalette;
+  }
+
+  function getThemeModeLabel(mode: ThemeMode | ResolvedTheme) {
+    if (mode === "dark") {
+      return m.dark();
+    }
+    if (mode === "light") {
+      return m.light();
+    }
+    return m.system();
+  }
+
+  function getThemeTokenLabel(token: ThemeTokenKey) {
+    if (token === "bg") {
+      return ui.themeTokenBackground;
+    }
+    if (token === "bgSidebar") {
+      return ui.themeTokenSidebar;
+    }
+    if (token === "bgAccent") {
+      return ui.themeTokenAccentSurface;
+    }
+    if (token === "panelStrong") {
+      return ui.themeTokenStrongPanel;
+    }
+    if (token === "panelSoft") {
+      return ui.themeTokenSoftPanel;
+    }
+    if (token === "inkStrong") {
+      return ui.themeTokenPrimaryText;
+    }
+    if (token === "ink") {
+      return ui.themeTokenSecondaryText;
+    }
+    if (token === "muted") {
+      return ui.themeTokenMutedText;
+    }
+    if (token === "accent") {
+      return ui.themeTokenAccent;
+    }
+    return ui.themeTokenBorder;
+  }
+
+  function setThemeColor(surface: ThemeSurface, token: ThemeTokenKey, value: string) {
+    themeDraft = {
+      ...themeDraft,
+      [surface]: {
+        ...themeDraft[surface],
+        [token]: value
+      }
+    };
+  }
+
+  function getThemePreviewStyle(surface: ThemeSurface) {
+    return Object.entries(deriveThemeRuntimeVariables(themeDraft, surface))
+      .map(([name, value]) => `${name}:${value}`)
+      .join(";");
+  }
+
+  function resetThemeDraft() {
+    themeDraft = cloneThemeSettings(DEFAULT_THEME_SETTINGS);
+  }
+
+  async function saveTheme() {
+    if (readOnly || !themeDirty) {
+      return;
+    }
+
+    savingTheme = true;
+    errorText = "";
+
+    try {
+      const nextTheme = cloneThemeSettings(themeDraft);
+      await onSaveThemeSettings?.(nextTheme);
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      savingTheme = false;
     }
   }
 
@@ -523,6 +659,91 @@
       </section>
 
       <section class="settings-column">
+        <section class="panel">
+          <div class="panel__header">
+            <div class="panel-title">
+              <Palette size={16} />
+              <h3>{ui.themeEditor}</h3>
+            </div>
+            {#if themeDirty}
+              <span class="meta-pill subtle">{ui.unsaved}</span>
+            {/if}
+          </div>
+          <p class="field-note">{ui.themeEditorDescription}</p>
+          <div class="settings-meta">
+            <div class="meta-card">
+              <span>{ui.currentThemeMode}</span>
+              <strong>{getThemeModeLabel(themeMode)}</strong>
+            </div>
+            <div class="meta-card">
+              <span>{ui.currentResolvedTheme}</span>
+              <strong>{getThemeModeLabel(resolvedTheme)}</strong>
+            </div>
+          </div>
+          <div class="theme-preview-grid">
+            {#each THEME_SURFACES as surface (surface)}
+              <article class="theme-preview-card" style={getThemePreviewStyle(surface)}>
+                <div class="theme-preview-card__header">
+                  <div>
+                    <h4>{getThemeSurfaceLabel(surface)}</h4>
+                    <p>{ui.themePreview}</p>
+                  </div>
+                  <span class="theme-preview-card__accent"></span>
+                </div>
+                <div class="theme-preview-shell">
+                  <aside class="theme-preview-sidebar">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                  </aside>
+                  <div class="theme-preview-main">
+                    <div class="theme-preview-panel theme-preview-panel--strong">
+                      <div class="theme-preview-line theme-preview-line--strong"></div>
+                      <div class="theme-preview-line"></div>
+                    </div>
+                    <div class="theme-preview-panel theme-preview-panel--soft">
+                      <div class="theme-preview-badge"></div>
+                      <div class="theme-preview-line theme-preview-line--strong"></div>
+                      <div class="theme-preview-line"></div>
+                    </div>
+                  </div>
+                </div>
+              </article>
+            {/each}
+          </div>
+          <div class="theme-editor-grid">
+            {#each THEME_SURFACES as surface (surface)}
+              <section class="theme-surface-card">
+                <div class="panel__header">
+                  <h4>{getThemeSurfaceLabel(surface)}</h4>
+                  <span>{themeDraft[surface].accent}</span>
+                </div>
+                <div class="theme-token-grid">
+                  {#each THEME_TOKEN_KEYS as token (token)}
+                    <label class="theme-token-field">
+                      <span>{getThemeTokenLabel(token)}</span>
+                      <div class="theme-token-control">
+                        <input type="color" value={themeDraft[surface][token]} onchange={(event) => setThemeColor(surface, token, (event.currentTarget as HTMLInputElement).value)} />
+                        <code>{themeDraft[surface][token]}</code>
+                      </div>
+                    </label>
+                  {/each}
+                </div>
+              </section>
+            {/each}
+          </div>
+          <div class="settings-shell__actions">
+            <button class="ghost-button" disabled={readOnly || savingTheme} onclick={resetThemeDraft} type="button">
+              <RotateCcw size={14} />
+              <span>{ui.resetTheme}</span>
+            </button>
+            <button class="solid-button" disabled={readOnly || !themeDirty || savingTheme} onclick={() => void saveTheme()} type="button">
+              <Save size={14} />
+              <span>{savingTheme ? ui.saving : ui.saveTheme}</span>
+            </button>
+          </div>
+        </section>
+
         <section class="panel">
           <div class="panel__header">
             <div class="panel-title">
@@ -1182,6 +1403,175 @@
     color: var(--muted);
   }
 
+  .theme-preview-grid,
+  .theme-editor-grid,
+  .theme-token-grid {
+    display: grid;
+    gap: 0.9rem;
+  }
+
+  .theme-preview-grid,
+  .theme-editor-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .theme-preview-card,
+  .theme-surface-card {
+    display: grid;
+    gap: 0.9rem;
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 1.1rem;
+    background: rgba(248, 250, 252, 0.78);
+    padding: 0.95rem;
+  }
+
+  .theme-preview-card__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+
+  .theme-preview-card__header h4,
+  .theme-surface-card h4 {
+    margin: 0;
+    color: var(--ink-strong);
+    font-size: 0.9rem;
+  }
+
+  .theme-preview-card__header p {
+    margin: 0.15rem 0 0;
+    color: var(--muted);
+    font-size: 0.72rem;
+  }
+
+  .theme-preview-card__accent {
+    width: 0.95rem;
+    height: 0.95rem;
+    border-radius: 999px;
+    background: var(--accent);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+
+  .theme-preview-shell {
+    display: grid;
+    grid-template-columns: 4.4rem minmax(0, 1fr);
+    gap: 0.75rem;
+    min-height: 11.5rem;
+    border-radius: 1rem;
+    border: 1px solid color-mix(in srgb, var(--line) 92%, transparent);
+    background: var(--bg);
+    padding: 0.8rem;
+  }
+
+  .theme-preview-sidebar {
+    display: grid;
+    align-content: start;
+    gap: 0.55rem;
+    border-radius: 0.9rem;
+    background: var(--bg-sidebar);
+    padding: 0.8rem 0.65rem;
+  }
+
+  .theme-preview-sidebar span,
+  .theme-preview-line {
+    display: block;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--ink) 16%, transparent);
+  }
+
+  .theme-preview-sidebar span {
+    height: 0.5rem;
+  }
+
+  .theme-preview-main {
+    display: grid;
+    align-content: start;
+    gap: 0.75rem;
+  }
+
+  .theme-preview-panel {
+    display: grid;
+    gap: 0.55rem;
+    border-radius: 0.95rem;
+    border: 1px solid color-mix(in srgb, var(--line) 92%, transparent);
+    padding: 0.85rem;
+  }
+
+  .theme-preview-panel--strong {
+    background: var(--panel-strong);
+  }
+
+  .theme-preview-panel--soft {
+    background: var(--panel-soft);
+  }
+
+  .theme-preview-line {
+    height: 0.58rem;
+  }
+
+  .theme-preview-line--strong {
+    width: 68%;
+    background: color-mix(in srgb, var(--ink-strong) 24%, transparent);
+  }
+
+  .theme-preview-badge {
+    width: 2.4rem;
+    height: 0.78rem;
+    border-radius: 999px;
+    background: var(--accent);
+  }
+
+  .theme-surface-card .panel__header {
+    margin-bottom: -0.1rem;
+  }
+
+  .theme-token-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .theme-token-field {
+    display: grid;
+    gap: 0.45rem;
+  }
+
+  .theme-token-field span {
+    color: var(--muted);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .theme-token-control {
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+    min-width: 0;
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    border-radius: 0.9rem;
+    background: rgba(255, 255, 255, 0.9);
+    padding: 0.45rem 0.6rem;
+  }
+
+  .theme-token-control input[type="color"] {
+    width: 2.2rem;
+    height: 2rem;
+    border: none;
+    padding: 0;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .theme-token-control code {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--ink-strong);
+    font-size: 0.8rem;
+  }
+
   @media (max-width: 1120px) {
     .settings-grid {
       grid-template-columns: 1fr;
@@ -1190,6 +1580,11 @@
     .settings-column {
       grid-template-columns: repeat(2, minmax(0, 1fr));
       align-items: start;
+    }
+
+    .theme-preview-grid,
+    .theme-editor-grid {
+      grid-template-columns: 1fr;
     }
   }
 
@@ -1205,6 +1600,10 @@
     }
 
     .settings-column {
+      grid-template-columns: 1fr;
+    }
+
+    .theme-token-grid {
       grid-template-columns: 1fr;
     }
   }

@@ -1,5 +1,6 @@
 import { base } from "$app/paths";
 import type { ArenaListPayload, ArenaRun } from "$lib/arena-types";
+import type { ThemeSettings } from "$lib/theme-customization";
 
 import type {
   AutomationDefinition,
@@ -154,6 +155,12 @@ export const api = {
       systemShutdown: {
         armed
       }
+    });
+  },
+
+  saveThemeSettings(theme: ThemeSettings) {
+    return ws.request<AppConfigPayload & { theme: ThemeSettings }>("config/update", {
+      theme
     });
   },
 

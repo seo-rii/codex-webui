@@ -33,6 +33,7 @@ In the comparison columns:
 | Speed mode selection | Implemented | Comparable | Comparable | Supports `auto`, `fast`, and `flex` where available from model metadata. |
 | Working directory selection | Implemented | Comparable | Comparable | Chosen per session and constrained to allowed roots. |
 | File attachments | Implemented | Comparable | Comparable | Files and images are persisted server-side and attached to turns or queued work. |
+| Prompt presets and slash commands | Implemented | Different shape | Different shape | Browser-first composer workflow with server-persisted presets and slash commands for presets, queueing, steering, and quick session preference changes. |
 | Composer history recall and last-message resend | Implemented | Different shape | Different shape | Browser-first affordance for quickly reusing or re-sending the most recent prompt without losing current draft text. |
 | Steer during an active turn | Implemented | Comparable | Comparable | Supports explicit steer while work is active. |
 | Queued follow-up messages | Implemented | Different shape | Comparable | Queue is a first-class server-side feature in `codex-webui`; it survives browser churn. |

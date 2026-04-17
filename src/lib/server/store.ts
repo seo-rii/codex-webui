@@ -4,6 +4,7 @@ import type {
   AppNotification,
   NotificationEventType,
   NotificationSettings,
+  PromptPreset,
   SavedSessionFilter,
   SessionPreferences,
   SessionQueueItem,
@@ -30,6 +31,7 @@ type UiState = {
     }
   >;
   savedSessionFilters: SavedSessionFilter[];
+  promptPresets: PromptPreset[];
   preferencesByThreadId: Record<string, SessionPreferences>;
   draftsByThreadId: Record<
     string,
@@ -95,6 +97,7 @@ class UiStateStore {
         },
         sessionMetaByThreadId: {},
         savedSessionFilters: [],
+        promptPresets: [],
         preferencesByThreadId: {},
         draftsByThreadId: {},
         queuesByThreadId: {},
@@ -117,6 +120,7 @@ class UiStateStore {
         },
         sessionMetaByThreadId: parsed.sessionMetaByThreadId ?? {},
         savedSessionFilters: Array.isArray(parsed.savedSessionFilters) ? parsed.savedSessionFilters : [],
+        promptPresets: Array.isArray(parsed.promptPresets) ? parsed.promptPresets : [],
         preferencesByThreadId: parsed.preferencesByThreadId ?? {},
         draftsByThreadId: parsed.draftsByThreadId ?? {},
         queuesByThreadId: parsed.queuesByThreadId ?? {},
@@ -140,6 +144,7 @@ class UiStateStore {
         },
         sessionMetaByThreadId: {},
         savedSessionFilters: [],
+        promptPresets: [],
         preferencesByThreadId: {},
         draftsByThreadId: {},
         queuesByThreadId: {},
@@ -352,6 +357,44 @@ class UiStateStore {
     });
     await this.writeChain;
     return savedFilters;
+  }
+
+  async getPromptPresets() {
+    const state = await this.load();
+    return [...state.promptPresets].sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+  }
+
+  async savePromptPreset(preset: PromptPreset) {
+    let promptPresets: PromptPreset[] = [];
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      const now = Date.now();
+      const current = state.promptPresets.find((entry) => entry.id === preset.id) ?? null;
+      const nextPreset: PromptPreset = {
+        id: preset.id,
+        name: preset.name.trim(),
+        prompt: preset.prompt,
+        createdAt: current?.createdAt ?? preset.createdAt ?? now,
+        updatedAt: now
+      };
+      state.promptPresets = [nextPreset, ...state.promptPresets.filter((entry) => entry.id !== nextPreset.id)].slice(0, 80);
+      promptPresets = [...state.promptPresets];
+      await this.flush();
+    });
+    await this.writeChain;
+    return promptPresets.sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+  }
+
+  async deletePromptPreset(presetId: string) {
+    let promptPresets: PromptPreset[] = [];
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      state.promptPresets = state.promptPresets.filter((entry) => entry.id !== presetId);
+      promptPresets = [...state.promptPresets];
+      await this.flush();
+    });
+    await this.writeChain;
+    return promptPresets.sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
   }
 
   async set(threadId: string, preferences: SessionPreferences) {

@@ -55,6 +55,14 @@ export type SavedSessionFilter = SessionSummaryFilter & {
   name: string;
 };
 
+export type PromptPreset = {
+  id: string;
+  name: string;
+  prompt: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type SessionSummaryHighlight = {
   kind: "completed" | "attention";
   at: number;
@@ -223,6 +231,7 @@ export type AppConfigPayload = {
     savedFilters: SavedSessionFilter[];
     knownTags: string[];
   };
+  promptPresets: PromptPreset[];
   account: {
     type: "apiKey" | "chatgpt" | null;
     email: string | null;

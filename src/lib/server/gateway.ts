@@ -16,6 +16,7 @@ import type {
   NotificationListPayload,
   NotificationSettings,
   PendingServerRequest,
+  PromptPreset,
   SavedSessionFilter,
   SessionDetailPayload,
   SessionDraftPayload,
@@ -607,12 +608,13 @@ export class CodexGateway {
       this.client.request("collaborationMode/list", {}),
       this.client.request("account/read", { refreshToken: false })
     ]);
-    const [pausedQueueEntries, globalState, notifications, savedFilters, knownTags] = await Promise.all([
+    const [pausedQueueEntries, globalState, notifications, savedFilters, knownTags, promptPresets] = await Promise.all([
       uiStateStore.listResumePendingQueues(),
       uiStateStore.getGlobal(),
       uiStateStore.getNotifications(DEFAULT_NOTIFICATION_LIMIT),
       uiStateStore.getSavedSessionFilters(),
-      uiStateStore.getKnownSessionTags()
+      uiStateStore.getKnownSessionTags(),
+      uiStateStore.getPromptPresets()
     ]);
     const preferences: Record<string, SessionPreferences> = pausedQueueEntries.length > 0 ? await uiStateStore.getAll() : {};
     const indexedSessions =
@@ -704,6 +706,7 @@ export class CodexGateway {
         savedFilters,
         knownTags
       },
+      promptPresets,
       account: {
         type: (account.type as "apiKey" | "chatgpt" | null) ?? null,
         email: (account.email as string | null) ?? null,
@@ -798,6 +801,32 @@ export class CodexGateway {
     return {
       savedFilters,
       knownTags: await uiStateStore.getKnownSessionTags()
+    };
+  }
+
+  async savePromptPreset(preset: PromptPreset) {
+    if (!preset.name.trim()) {
+      throw new Error("Preset name is required.");
+    }
+    if (!preset.prompt.trim()) {
+      throw new Error("Preset prompt is required.");
+    }
+
+    const promptPresets = await uiStateStore.savePromptPreset({
+      ...preset,
+      name: preset.name.trim()
+    });
+    await this.emitConfigUpdated();
+    return {
+      promptPresets
+    };
+  }
+
+  async deletePromptPreset(presetId: string) {
+    const promptPresets = await uiStateStore.deletePromptPreset(presetId);
+    await this.emitConfigUpdated();
+    return {
+      promptPresets
     };
   }
 
@@ -2710,11 +2739,12 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
 
   private async emitConfigUpdated() {
     const runtimeConfig = getRuntimeConfig();
-    const [globalState, notifications, savedFilters, knownTags] = await Promise.all([
+    const [globalState, notifications, savedFilters, knownTags, promptPresets] = await Promise.all([
       uiStateStore.getGlobal(),
       uiStateStore.getNotifications(1),
       uiStateStore.getSavedSessionFilters(),
-      uiStateStore.getKnownSessionTags()
+      uiStateStore.getKnownSessionTags(),
+      uiStateStore.getPromptPresets()
     ]);
     this.emitGlobal({
       kind: "notification",
@@ -2741,7 +2771,8 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         sessionOrganization: {
           savedFilters,
           knownTags
-        }
+        },
+        promptPresets
       }
     });
   }

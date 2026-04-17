@@ -864,6 +864,23 @@ async fn execute_ws_method(
             )
             .await
         }
+        "promptPresets/save" => {
+            let payload = json!({
+                "preset": params.get("preset").cloned().unwrap_or(Value::Null)
+            });
+            internal_json_request(state, Method::POST, "/api/prompt-presets", Some(payload)).await
+        }
+        "promptPresets/delete" => {
+            let preset_id = require_string(&params, "presetId")?;
+            let preset_id = urlencoding::encode(&preset_id);
+            internal_json_request(
+                state,
+                Method::DELETE,
+                &format!("/api/prompt-presets?presetId={preset_id}"),
+                None,
+            )
+            .await
+        }
         "session/get" => {
             let session_id = require_string(&params, "sessionId")?;
             let limit = params

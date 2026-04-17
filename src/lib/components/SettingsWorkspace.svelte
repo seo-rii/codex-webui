@@ -1,24 +1,30 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { Plug, RefreshCw, Save, Settings2, Sparkles } from "lucide-svelte";
+  import { Pencil, Plug, RefreshCw, Save, Settings2, Sparkles, Trash2 } from "lucide-svelte";
 
   import { api } from "$lib/api";
   import MonacoTextEditor from "$lib/components/MonacoTextEditor.svelte";
   import { localeSignal } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
-  import type { CatalogPayload, EditableFilePayload, NotificationEventType, NotificationSettings } from "$lib/types";
+  import type { CatalogPayload, EditableFilePayload, NotificationEventType, NotificationSettings, PromptPreset } from "$lib/types";
 
   let {
     codexHome,
     configFilePath,
     notificationSettings = null,
+    promptPresets = [],
     onNotificationSettingsSaved = null,
+    onSavePromptPreset = null,
+    onDeletePromptPreset = null,
     onConfigSaved = null
   }: {
     codexHome: string;
     configFilePath: string;
     notificationSettings?: NotificationSettings | null;
+    promptPresets?: PromptPreset[];
     onNotificationSettingsSaved?: ((settings: Partial<NotificationSettings>) => void | Promise<void>) | null;
+    onSavePromptPreset?: ((preset: PromptPreset) => void | Promise<void>) | null;
+    onDeletePromptPreset?: ((presetId: string) => void | Promise<void>) | null;
     onConfigSaved?: (() => void | Promise<void>) | null;
   } = $props();
 
@@ -29,10 +35,14 @@
   let notificationSlackWebhookUrl = $state("");
   let notificationWebhookUrl = $state("");
   let notificationEventTypes = $state<NotificationEventType[]>([]);
+  let presetId = $state<string | null>(null);
+  let presetName = $state("");
+  let presetPrompt = $state("");
   let loading = $state(true);
   let saving = $state(false);
   let reloading = $state(false);
   let savingNotifications = $state(false);
+  let savingPreset = $state(false);
   const dirty = $derived(Boolean(configFile && editorValue !== configFile.content));
   const notificationDirty = $derived.by(() => {
     const current = notificationSettings;
@@ -46,6 +56,16 @@
       notificationSlackWebhookUrl.trim() !== (current.slackWebhookUrl ?? "") ||
       notificationWebhookUrl.trim() !== (current.webhookUrl ?? "")
     );
+  });
+  const selectedPromptPreset = $derived.by(() => promptPresets.find((preset) => preset.id === presetId) ?? null);
+  const promptPresetDirty = $derived.by(() => {
+    if (!presetName.trim() && !presetPrompt.trim()) {
+      return false;
+    }
+    if (!selectedPromptPreset) {
+      return true;
+    }
+    return presetName.trim() !== selectedPromptPreset.name || presetPrompt !== selectedPromptPreset.prompt;
   });
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
@@ -72,6 +92,12 @@
       notificationInputRequired: m.notification_input_required(),
       notificationQueueFailed: m.notification_queue_failed(),
       notificationShutdownScheduled: m.notification_shutdown_scheduled(),
+      promptPresets: m.prompt_presets(),
+      presetName: m.preset_name(),
+      presetPrompt: m.preset_prompt(),
+      newPreset: m.new_preset(),
+      savePreset: m.save_preset(),
+      noPromptPresets: m.no_prompt_presets(),
       installedPlugins: m.installed_plugins(),
       noPlugins: m.no_installed_plugins(),
       noDescription: m.no_description(),
@@ -180,6 +206,58 @@
       saving = false;
     }
   }
+
+  function startNewPreset() {
+    presetId = null;
+    presetName = "";
+    presetPrompt = "";
+  }
+
+  function editPromptPreset(preset: PromptPreset) {
+    presetId = preset.id;
+    presetName = preset.name;
+    presetPrompt = preset.prompt;
+  }
+
+  async function savePromptPreset() {
+    if (!presetName.trim() || !presetPrompt.trim()) {
+      return;
+    }
+
+    savingPreset = true;
+    errorText = "";
+    try {
+      await onSavePromptPreset?.({
+        id: presetId ?? crypto.randomUUID(),
+        name: presetName.trim(),
+        prompt: presetPrompt,
+        createdAt: selectedPromptPreset?.createdAt ?? Date.now(),
+        updatedAt: selectedPromptPreset?.updatedAt ?? Date.now()
+      });
+      startNewPreset();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      savingPreset = false;
+    }
+  }
+
+  async function removePromptPreset() {
+    if (!presetId) {
+      return;
+    }
+
+    savingPreset = true;
+    errorText = "";
+    try {
+      await onDeletePromptPreset?.(presetId);
+      startNewPreset();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      savingPreset = false;
+    }
+  }
 </script>
 
 <section class="settings-shell surface">
@@ -275,6 +353,62 @@
                 <Save size={14} />
                 <span>{savingNotifications ? ui.saving : ui.saveNotificationSettings}</span>
               </button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel__header">
+            <div class="panel-title">
+              <Pencil size={16} />
+              <h3>{ui.promptPresets}</h3>
+            </div>
+            <button class="ghost-button" onclick={startNewPreset} type="button">
+              <Pencil size={14} />
+              <span>{ui.newPreset}</span>
+            </button>
+          </div>
+          <div class="settings-grid settings-grid--nested">
+            <div class="catalog-list">
+              {#if promptPresets.length === 0}
+                <p class="field-note">{ui.noPromptPresets}</p>
+              {:else}
+                {#each promptPresets as preset (preset.id)}
+                  <button
+                    class={`catalog-card catalog-card--button ${presetId === preset.id ? "catalog-card--active" : ""}`}
+                    onclick={() => editPromptPreset(preset)}
+                    type="button"
+                  >
+                    <div class="catalog-card__title">
+                      <Pencil size={14} />
+                      <strong>{preset.name}</strong>
+                    </div>
+                    <p>{preset.prompt.split(/\r?\n/u, 1)[0]?.trim() || preset.prompt.trim()}</p>
+                  </button>
+                {/each}
+              {/if}
+            </div>
+            <div class="settings-meta settings-meta--stack">
+              <label class="field-block">
+                <span>{ui.presetName}</span>
+                <input bind:value={presetName} class="field-input" placeholder={ui.presetName} type="text" />
+              </label>
+              <label class="field-block">
+                <span>{ui.presetPrompt}</span>
+                <textarea bind:value={presetPrompt} class="field-input field-textarea" placeholder={ui.presetPrompt} rows="8"></textarea>
+              </label>
+              <div class="settings-shell__actions">
+                <button class="solid-button" disabled={!promptPresetDirty || savingPreset || !presetName.trim() || !presetPrompt.trim()} onclick={() => void savePromptPreset()} type="button">
+                  <Save size={14} />
+                  <span>{savingPreset ? ui.saving : ui.savePreset}</span>
+                </button>
+                {#if presetId}
+                  <button class="ghost-button" disabled={savingPreset} onclick={() => void removePromptPreset()} type="button">
+                    <Trash2 size={14} />
+                    <span>{m.remove()}</span>
+                  </button>
+                {/if}
+              </div>
             </div>
           </div>
         </section>
@@ -403,6 +537,10 @@
     align-items: start;
   }
 
+  .settings-grid--nested {
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  }
+
   .settings-column,
   .catalog-list {
     display: grid;
@@ -442,6 +580,11 @@
     background: rgba(255, 255, 255, 1);
   }
 
+  .field-textarea {
+    min-height: 10rem;
+    resize: vertical;
+  }
+
   .panel {
     display: grid;
     gap: 0.9rem;
@@ -472,6 +615,11 @@
     flex-wrap: wrap;
   }
 
+  .settings-meta--stack {
+    display: grid;
+    align-content: start;
+  }
+
   .meta-card {
     display: grid;
     gap: 0.35rem;
@@ -499,6 +647,24 @@
     border-radius: 1rem;
     background: rgba(249, 245, 239, 0.75);
     padding: 0.9rem 1rem;
+  }
+
+  .catalog-card--button {
+    width: 100%;
+    border: 1px solid transparent;
+    text-align: left;
+    transition: border-color 160ms ease, background-color 160ms ease, transform 160ms ease;
+  }
+
+  .catalog-card--button:hover {
+    border-color: rgba(245, 158, 11, 0.2);
+    background: rgba(255, 255, 255, 0.95);
+    transform: translateY(-1px);
+  }
+
+  .catalog-card--active {
+    border-color: rgba(245, 158, 11, 0.35);
+    background: rgba(255, 251, 235, 0.9);
   }
 
   .catalog-card__title {

@@ -19,6 +19,7 @@ import type {
   GitWorktreePayload,
   NotificationListPayload,
   NotificationSettings,
+  PromptPreset,
   SavedSessionFilter,
   SessionDetailPayload,
   SessionDraftPayload,
@@ -282,6 +283,14 @@ export const api = {
 
   deleteSessionFilter(filterId: string) {
     return ws.request<{ savedFilters: SavedSessionFilter[]; knownTags: string[] }>("sessionFilters/delete", { filterId });
+  },
+
+  savePromptPreset(preset: PromptPreset) {
+    return ws.request<{ promptPresets: PromptPreset[] }>("promptPresets/save", { preset });
+  },
+
+  deletePromptPreset(presetId: string) {
+    return ws.request<{ promptPresets: PromptPreset[] }>("promptPresets/delete", { presetId });
   },
 
   archiveSession(sessionId: string) {

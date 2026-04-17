@@ -35,6 +35,7 @@ The goal is not to replace upstream surfaces. The goal is to make Codex usable f
 - Runtime install/update checks, quota display, plugin/skill catalog visibility, and `config.toml` editing
 - Persistent notification center with unread sync, plus Slack and generic webhook delivery for completion, attention, queue-failure, and shutdown events
 - Session pinning, per-session tags, and saved sidebar filters that persist on the server and stay synchronized across clients
+- Prompt presets stored server-side, plus composer slash commands for presets, queueing, steering, model changes, and plan-mode toggles
 - Structured backend error codes mapped to localized UI messages for common queue, steer, and archive timing failures
 - Global "shutdown after queue completes" control that is synchronized across clients and still executes with no browser attached
 - Base-path deployment, configurable CORS, dark/light themes, and Paraglide-based i18n
@@ -185,6 +186,7 @@ Meaning of the main fields:
 - The scheduled shutdown timestamp is persisted in `codex-webui` state, synchronized to every connected client, and can still execute if no client is connected.
 - Notification center history and webhook settings are also persisted in `codex-webui` runtime state so multiple clients see the same unread counts and delivery configuration.
 - Session organization metadata such as pins, tags, and saved sidebar filters also lives in `codex-webui` runtime state rather than ephemeral browser storage.
+- Prompt presets also live in `codex-webui` runtime state so slash-command behavior stays consistent across browsers.
 
 ## Environment Overrides
 

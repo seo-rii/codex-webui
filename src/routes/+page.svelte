@@ -74,6 +74,7 @@
     GlobalStreamEvent,
     NotificationSettings,
     PendingServerRequest,
+    PromptPreset,
     SavedSessionFilter,
     SessionListPayload,
     SessionPreferences,
@@ -120,6 +121,13 @@
     createdAt: number;
     baselineTurnId: string | null;
     baselineTurnCount: number;
+  };
+  type SlashSuggestion = {
+    key: string;
+    command: string;
+    title: string;
+    description: string;
+    value: string;
   };
 
   let config = $state<AppConfigPayload | null>(null);
@@ -776,6 +784,68 @@
   const speedOptions = $derived.by(() => {
     const available = ["auto", ...(selectedModel?.additionalSpeedTiers ?? [])];
     return [...new Set(available.filter((value) => value === "auto" || value === "fast" || value === "flex"))];
+  });
+  const slashSuggestions = $derived.by(() => {
+    const value = draft.trimStart();
+    if (!value.startsWith("/")) {
+      return [] as SlashSuggestion[];
+    }
+
+    const body = value.slice(1);
+    const lower = body.toLowerCase();
+    if (lower.startsWith("preset ")) {
+      const presetNeedle = body.slice("preset ".length).trim().toLowerCase();
+      return (config?.promptPresets ?? [])
+        .filter((preset) => !presetNeedle || preset.name.toLowerCase().includes(presetNeedle))
+        .slice(0, 6)
+        .map((preset) => ({
+          key: `preset:${preset.id}`,
+          command: "preset",
+          title: `/preset ${preset.name}`,
+          description: preset.prompt.split(/\r?\n/u, 1)[0]?.trim() || preset.prompt.trim(),
+          value: `/preset ${preset.name}`
+        }));
+    }
+
+    const builtinSuggestions: SlashSuggestion[] = [
+      {
+        key: "queue",
+        command: "queue",
+        title: "/queue",
+        description: m.slash_queue_description(),
+        value: "/queue "
+      },
+      {
+        key: "steer",
+        command: "steer",
+        title: "/steer",
+        description: m.slash_steer_description(),
+        value: "/steer "
+      },
+      {
+        key: "preset",
+        command: "preset",
+        title: "/preset",
+        description: m.slash_preset_description(),
+        value: "/preset "
+      },
+      {
+        key: "model",
+        command: "model",
+        title: "/model",
+        description: m.slash_model_description(),
+        value: "/model "
+      },
+      {
+        key: "plan",
+        command: "plan",
+        title: "/plan",
+        description: m.slash_plan_description(),
+        value: "/plan "
+      }
+    ];
+
+    return builtinSuggestions.filter((entry) => !lower || entry.command.includes(lower) || entry.title.includes(lower)).slice(0, 6);
   });
   const sessionHydrationState = $derived(conversation?.hydration.state ?? "idle");
   const sessionHydrationLoadedTurns = $derived(conversation?.hydration.loadedTurns ?? 0);
@@ -2523,6 +2593,9 @@
                 ...(event.params.sessionOrganization as Partial<AppConfigPayload["sessionOrganization"]>)
               }
             : config.sessionOrganization,
+          promptPresets: Array.isArray(event.params.promptPresets)
+            ? (event.params.promptPresets as PromptPreset[])
+            : config.promptPresets,
           startup: event.params.startup
             ? {
                 ...config.startup,
@@ -2931,6 +3004,113 @@
     }
   }
 
+  function findPromptPresetByName(value: string) {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) {
+      return null;
+    }
+
+    return (
+      [...(config?.promptPresets ?? [])]
+        .sort((left, right) => right.name.length - left.name.length)
+        .find((preset) => preset.name.trim().toLowerCase() === normalized) ?? null
+    );
+  }
+
+  async function handleSlashCommand(rawValue: string) {
+    const trimmed = rawValue.trim();
+    if (!trimmed.startsWith("/")) {
+      return false;
+    }
+
+    const match = trimmed.match(/^\/([^\s]+)\s*(.*)$/u);
+    if (!match) {
+      return false;
+    }
+
+    const command = match[1]?.toLowerCase() ?? "";
+    const args = match[2]?.trim() ?? "";
+
+    if (command === "queue") {
+      if (!args) {
+        errorText = m.slash_argument_required({ command: "/queue" });
+        return true;
+      }
+      await queueMessage({ promptText: args, attachmentSnapshot: [], preserveComposer: false });
+      return true;
+    }
+
+    if (command === "steer") {
+      if (!args) {
+        errorText = m.slash_argument_required({ command: "/steer" });
+        return true;
+      }
+      await sendSteerPrompt(args, false);
+      return true;
+    }
+
+    if (command === "preset") {
+      if (!args) {
+        errorText = m.slash_argument_required({ command: "/preset" });
+        return true;
+      }
+      const preset = findPromptPresetByName(args);
+      if (!preset) {
+        errorText = m.slash_preset_not_found();
+        return true;
+      }
+      draft = preset.prompt;
+      draftAttachments = [];
+      scheduleComposerTextareaResize();
+      composerTextareaElement?.focus();
+      noticeText = m.prompt_preset_applied({ name: preset.name });
+      return true;
+    }
+
+    if (command === "model") {
+      if (!args) {
+        errorText = m.slash_argument_required({ command: "/model" });
+        return true;
+      }
+      if (!config?.models.some((model) => model.id === args)) {
+        errorText = m.slash_model_not_found();
+        return true;
+      }
+      setPreference("model", args);
+      draft = "";
+      scheduleComposerTextareaResize();
+      noticeText = m.slash_model_updated({ model: args });
+      return true;
+    }
+
+    if (command === "plan") {
+      if (!args) {
+        errorText = m.slash_argument_required({ command: "/plan" });
+        return true;
+      }
+      const normalized = args.toLowerCase();
+      if (normalized === "plan" || normalized === "on") {
+        setPreference("mode", "plan");
+        draft = "";
+        scheduleComposerTextareaResize();
+        noticeText = m.slash_plan_enabled();
+        return true;
+      }
+      if (normalized === "default" || normalized === "off") {
+        setPreference("mode", "default");
+        draft = "";
+        scheduleComposerTextareaResize();
+        noticeText = m.slash_plan_disabled();
+        return true;
+      }
+      errorText = m.slash_plan_invalid();
+      return true;
+    }
+
+    errorText = m.slash_unknown_command();
+    return true;
+  }
+
   async function sendMessage(options?: {
     promptText?: string;
     attachmentSnapshot?: AttachmentRecord[];
@@ -2945,6 +3125,9 @@
     const prompt = draftText.trim();
     const attachmentNames = attachmentSnapshot.map((attachment) => attachment.originalName);
     const preserveComposer = options?.preserveComposer ?? false;
+    if (!options?.promptText && (await handleSlashCommand(draftText))) {
+      return;
+    }
     startingMessage = true;
     errorText = "";
     noticeText = "";
@@ -3247,6 +3430,9 @@
   }
 
   async function submitComposer() {
+    if (await handleSlashCommand(draft)) {
+      return;
+    }
     if (queueModeActive) {
       await queueMessage();
       return;
@@ -3905,6 +4091,42 @@
     } catch (error) {
       errorText = describeError(error);
     }
+  }
+
+  async function savePromptPreset(preset: PromptPreset) {
+    try {
+      const response = await api.savePromptPreset(preset);
+      if (config) {
+        config = {
+          ...config,
+          promptPresets: response.promptPresets
+        };
+      }
+      noticeText = m.prompt_preset_saved();
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function deletePromptPreset(presetId: string) {
+    try {
+      const response = await api.deletePromptPreset(presetId);
+      if (config) {
+        config = {
+          ...config,
+          promptPresets: response.promptPresets
+        };
+      }
+      noticeText = m.prompt_preset_deleted();
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  function applySlashSuggestion(suggestion: SlashSuggestion) {
+    draft = suggestion.value;
+    scheduleComposerTextareaResize();
+    composerTextareaElement?.focus();
   }
 
   function updateArchivedSessions(nextValue: boolean) {
@@ -6460,6 +6682,25 @@
                     </button>
                   </div>
                 {/if}
+                {#if slashSuggestions.length > 0}
+                  <div class="mb-2 grid gap-1 rounded-2xl border border-amber-100 bg-white/90 p-2 shadow-sm">
+                    {#each slashSuggestions as suggestion (suggestion.key)}
+                      <button
+                        class="ui-animated-button ui-animated-button--soft flex items-start justify-between gap-3 rounded-xl px-3 py-2 text-left transition-colors hover:bg-amber-50/70"
+                        onclick={() => applySlashSuggestion(suggestion)}
+                        type="button"
+                      >
+                        <div class="min-w-0">
+                          <p class="text-[11px] font-bold text-gray-800">{suggestion.title}</p>
+                          <p class="mt-0.5 truncate text-[10px] text-gray-500">{suggestion.description}</p>
+                        </div>
+                        <span class="rounded-full bg-gray-100 px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.18em] text-gray-500">
+                          {suggestion.command}
+                        </span>
+                      </button>
+                    {/each}
+                  </div>
+                {/if}
                 <form class="composer-panel bg-white/95 border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200 focus-within:-translate-y-0.5 focus-within:border-amber-400/70 focus-within:bg-white focus-within:shadow-[0_24px_60px_-34px_rgba(245,158,11,0.65)]" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
                   <textarea bind:this={composerTextareaElement} bind:value={draft} class="composer-textarea w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 outline-none transition-colors duration-150 focus:outline-none focus:ring-0 focus:placeholder:text-amber-500/70 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} rows="1"></textarea>
                   
@@ -6596,12 +6837,19 @@
               codexHome={config?.paths.codexHome ?? ""}
               configFilePath={config?.paths.configFilePath ?? ""}
               notificationSettings={config?.notifications.settings ?? null}
+              promptPresets={config?.promptPresets ?? []}
               onConfigSaved={async () => {
                 config = await api.getConfig();
                 syncStartupAlertModal(config);
               }}
               onNotificationSettingsSaved={async (settings) => {
                 await saveNotificationSettings(settings);
+              }}
+              onSavePromptPreset={async (preset) => {
+                await savePromptPreset(preset);
+              }}
+              onDeletePromptPreset={async (presetId) => {
+                await deletePromptPreset(presetId);
               }}
             />
           </div>

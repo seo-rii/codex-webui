@@ -36,11 +36,12 @@
     Pencil,
     Copy,
     ArrowRightLeft,
-    SlidersHorizontal,
-    Shield
+    Shield,
+    GripVertical,
+    Keyboard
   } from "lucide-svelte";
   import { onMount, tick } from "svelte";
-  import { fly } from "svelte/transition";
+  import { fly, slide } from "svelte/transition";
   import { extractAttachmentPaths, stripAttachmentPreamble } from "$lib/attachments";
   import { api } from "$lib/api";
   import { applyStreamEvent, createConversationState, type ConversationState } from "$lib/chat-state";
@@ -82,11 +83,14 @@
     PromptPreset,
     SavedSessionFilter,
     SessionListPayload,
+    SessionDetailPayload,
     SessionPreferences,
     SessionQueueItem,
     SessionSearchScope,
     SessionSummaryFilter,
     SessionSummary,
+    SessionTurnSearchMatch,
+    SessionTurnsPagePayload,
     StreamEvent,
     TerminalContextPayload,
     TerminalSummary,
@@ -222,6 +226,29 @@
   let editingQueueId = $state<string | null>(null);
   let editingQueuePrompt = $state("");
   let queuedFollowupsExpanded = $state(true);
+  let queueReorderBusy = $state(false);
+  let queueDragState = $state<{
+    pointerId: number;
+    queueId: string;
+    targetQueueId: string | null;
+    targetPosition: "before" | "after" | null;
+  } | null>(null);
+  let sessionTurnSearchOpen = $state(false);
+  let sessionTurnSearchQuery = $state("");
+  let sessionTurnSearchResults = $state<SessionTurnSearchMatch[]>([]);
+  let sessionTurnSearchCursor = $state<string | null>(null);
+  let sessionTurnSearchTotalMatches = $state(0);
+  let sessionTurnSearchBusy = $state(false);
+  let sessionTurnSearchLoadingMore = $state(false);
+  let sessionTurnSearchError = $state("");
+  let sessionTurnSearchFocusedTurnId = $state<string | null>(null);
+  let sessionTurnSearchJumpingTurnId = $state<string | null>(null);
+  let staleSessionCatchup = $state<{
+    sessionId: string;
+    hiddenDurationMs: number;
+    eventCount: number;
+    refreshing: boolean;
+  } | null>(null);
   let startupAlertModalOpen = $state(false);
   let startupAlertDismissed = $state(false);
   let startupAlertNow = $state(Date.now());
@@ -230,6 +257,16 @@
   $effect(() => {
     selectedSessionId;
     viewerGitRepoPath = null;
+  });
+
+  $effect(() => {
+    if (!staleSessionCatchup) {
+      return;
+    }
+    if (selectedSessionId && staleSessionCatchup.sessionId === selectedSessionId) {
+      return;
+    }
+    clearStaleSessionCatchup();
   });
 
   type FileChangeView = {
@@ -271,11 +308,15 @@
   const olderTurnPageSize = 20;
   const olderTurnAutoLoadWindowMs = 1500;
   const olderTurnAutoLoadBurstLimit = 3;
+  const staleSessionCatchupHiddenThresholdMs = 45_000;
+  const staleSessionCatchupEventThreshold = 40;
+  const staleSessionCatchupWindowMs = 7_500;
   const sessionQueryParamKey = "session";
   const notificationPromptStorageKey = "codex-webui.notifications.permission-prompted";
 
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
+    const locale = $activeLocale;
 
     return {
       appTitle: m.app_title(),
@@ -349,7 +390,7 @@
       ignore: m.ignore(),
       queuedFollowups: m.queued_followups(),
       paused: m.paused(),
-      followUp: m.follow_up(),
+      reorderQueue: locale === "ko" ? "대기 메시지 순서 변경" : "Reorder queued message",
       queueSave: m.save(),
       edit: m.edit(),
       cancel: m.close(),
@@ -357,6 +398,116 @@
       sendNow: m.send_now(),
       liveTurn: m.live_turn(),
       composerSettings: m.composer_settings(),
+      sendShortcut:
+        locale === "ko"
+          ? "전송 키"
+          : locale === "ja"
+            ? "送信キー"
+            : locale === "zh-Hans"
+              ? "发送按键"
+              : locale === "zh-Hant"
+                ? "傳送按鍵"
+                : locale === "fr"
+                  ? "Touche d'envoi"
+                  : locale === "es"
+                    ? "Tecla de envío"
+                    : locale === "de"
+                      ? "Senden-Taste"
+                      : locale === "it"
+                        ? "Tasto di invio"
+                        : locale === "pt-BR"
+                          ? "Tecla de envio"
+                          : locale === "ru"
+                            ? "Клавиша отправки"
+                            : "Send key",
+      sendShortcutDescription:
+        locale === "ko"
+          ? "Shift+Enter는 줄바꿈으로 유지됩니다."
+          : locale === "ja"
+            ? "Shift+Enter で改行します。"
+            : locale === "zh-Hans"
+              ? "Shift+Enter 仍然插入换行。"
+              : locale === "zh-Hant"
+                ? "Shift+Enter 仍會插入換行。"
+                : locale === "fr"
+                  ? "Shift+Enter insère toujours un retour à la ligne."
+                  : locale === "es"
+                    ? "Shift+Enter sigue insertando un salto de línea."
+                    : locale === "de"
+                      ? "Shift+Enter fügt weiterhin einen Zeilenumbruch ein."
+                      : locale === "it"
+                        ? "Shift+Invio continua a inserire una nuova riga."
+                        : locale === "pt-BR"
+                          ? "Shift+Enter continua inserindo uma nova linha."
+                          : locale === "ru"
+                            ? "Shift+Enter по-прежнему вставляет новую строку."
+                            : "Shift+Enter still inserts a new line.",
+      sendShortcutCtrlEnter:
+        locale === "ko"
+          ? "Ctrl+Enter"
+          : locale === "ja"
+            ? "Ctrl+Enter"
+            : locale === "zh-Hans"
+              ? "Ctrl+Enter"
+              : locale === "zh-Hant"
+                ? "Ctrl+Enter"
+                : locale === "fr"
+                  ? "Ctrl+Enter"
+                  : locale === "es"
+                    ? "Ctrl+Enter"
+                    : locale === "de"
+                      ? "Strg+Enter"
+                      : locale === "it"
+                        ? "Ctrl+Invio"
+                        : locale === "pt-BR"
+                          ? "Ctrl+Enter"
+                          : locale === "ru"
+                            ? "Ctrl+Enter"
+                            : "Ctrl+Enter",
+      sendShortcutEnter:
+        locale === "ko"
+          ? "Enter"
+          : locale === "ja"
+            ? "Enter"
+            : locale === "zh-Hans"
+              ? "Enter"
+              : locale === "zh-Hant"
+                ? "Enter"
+                : locale === "fr"
+                  ? "Entrée"
+                  : locale === "es"
+                    ? "Enter"
+                    : locale === "de"
+                      ? "Enter"
+                      : locale === "it"
+                        ? "Invio"
+                        : locale === "pt-BR"
+                          ? "Enter"
+                          : locale === "ru"
+                            ? "Enter"
+                            : "Enter",
+      sessionResyncing:
+        locale === "ko"
+          ? "세션 상태를 다시 동기화하는 중입니다."
+          : locale === "ja"
+            ? "セッション状態を再同期しています。"
+            : locale === "zh-Hans"
+              ? "正在重新同步会话状态。"
+              : locale === "zh-Hant"
+                ? "正在重新同步對話狀態。"
+                : locale === "fr"
+                  ? "Resynchronisation de l'état de la session."
+                  : locale === "es"
+                    ? "Resincronizando el estado de la sesión."
+                    : locale === "de"
+                      ? "Sitzungsstatus wird erneut synchronisiert."
+                      : locale === "it"
+                        ? "Sincronizzazione dello stato della sessione in corso."
+                        : locale === "pt-BR"
+                          ? "Ressincronizando o estado da sessão."
+                          : locale === "ru"
+                            ? "Повторная синхронизация состояния сессии."
+                            : "Resynchronizing session state.",
       securitySession: m.security_session(),
       addAttachments: m.add_attachments(),
       selectFolder: m.select_folder(),
@@ -403,6 +554,31 @@
       contextCompressionInProgress: m.context_compression_in_progress(),
       contextCompressionCompleted: m.context_compression_completed(),
       stopped: m.stopped()
+    };
+  });
+
+  const sessionSearchCopy = $derived.by(() => {
+    const locale = $activeLocale;
+    if (locale === "ko") {
+      return {
+        placeholder: "이 대화에서 검색",
+        hint: "메시지, 추론, 명령, 도구 호출까지 검색합니다.",
+        noResults: "일치하는 내용이 없습니다.",
+        loadMore: "결과 더 보기",
+        turn: "턴",
+        results: "결과",
+        openSearch: "세션 검색"
+      };
+    }
+
+    return {
+      placeholder: "Search this thread",
+      hint: "Search messages, reasoning, commands, and tool calls.",
+      noResults: "No matches found.",
+      loadMore: "Load more results",
+      turn: "Turn",
+      results: "results",
+      openSearch: "Search thread"
     };
   });
 
@@ -499,6 +675,8 @@
   ) {
     clearHydrationRefresh();
     disconnectStream();
+    dismissLastComposerPromptChip();
+    resetSessionTurnSearch();
     selectedSessionId = null;
     conversation = createDraftConversation(preferences, options.title ?? null);
     draftPersistencePaused = false;
@@ -529,6 +707,157 @@
     queueMicrotask(() => {
       scheduleComposerTextareaResize();
     });
+  }
+
+  function resetSessionTurnSearch(close = true) {
+    if (sessionTurnSearchTimer) {
+      clearTimeout(sessionTurnSearchTimer);
+      sessionTurnSearchTimer = null;
+    }
+    if (sessionTurnSearchHighlightTimer) {
+      clearTimeout(sessionTurnSearchHighlightTimer);
+      sessionTurnSearchHighlightTimer = null;
+    }
+
+    sessionTurnSearchRequestVersion += 1;
+    sessionTurnSearchQuery = "";
+    sessionTurnSearchResults = [];
+    sessionTurnSearchCursor = null;
+    sessionTurnSearchTotalMatches = 0;
+    sessionTurnSearchBusy = false;
+    sessionTurnSearchLoadingMore = false;
+    sessionTurnSearchError = "";
+    sessionTurnSearchFocusedTurnId = null;
+    sessionTurnSearchJumpingTurnId = null;
+    if (close) {
+      sessionTurnSearchOpen = false;
+    }
+  }
+
+  function clearStaleSessionCatchup() {
+    if (staleSessionCatchupTimer) {
+      clearTimeout(staleSessionCatchupTimer);
+      staleSessionCatchupTimer = null;
+    }
+    staleSessionCatchup = null;
+  }
+
+  function beginStaleSessionCatchup(sessionId: string, hiddenDurationMs: number) {
+    clearStaleSessionCatchup();
+    staleSessionCatchup = {
+      sessionId,
+      hiddenDurationMs,
+      eventCount: 0,
+      refreshing: false
+    };
+    staleSessionCatchupTimer = setTimeout(() => {
+      staleSessionCatchupTimer = null;
+      staleSessionCatchup = null;
+    }, staleSessionCatchupWindowMs);
+  }
+
+  function queuePendingSessionEvent(sessionId: string, payload: StreamEvent) {
+    pendingSessionEvents = {
+      ...pendingSessionEvents,
+      [sessionId]: [...(pendingSessionEvents[sessionId] ?? []), payload]
+    };
+  }
+
+  function toggleSessionTurnSearch() {
+    if (sessionTurnSearchOpen) {
+      resetSessionTurnSearch(true);
+      return;
+    }
+
+    sessionTurnSearchOpen = true;
+    queueMicrotask(() => {
+      sessionTurnSearchInputElement?.focus();
+      sessionTurnSearchInputElement?.select();
+    });
+  }
+
+  function scheduleSessionTurnSearch(reset = true) {
+    if (sessionTurnSearchTimer) {
+      clearTimeout(sessionTurnSearchTimer);
+      sessionTurnSearchTimer = null;
+    }
+
+    sessionTurnSearchError = "";
+
+    if (!selectedSessionId || !sessionTurnSearchOpen) {
+      return;
+    }
+
+    if (!sessionTurnSearchQuery.trim()) {
+      sessionTurnSearchResults = [];
+      sessionTurnSearchCursor = null;
+      sessionTurnSearchTotalMatches = 0;
+      sessionTurnSearchBusy = false;
+      sessionTurnSearchLoadingMore = false;
+      return;
+    }
+
+    sessionTurnSearchTimer = setTimeout(() => {
+      sessionTurnSearchTimer = null;
+      void runSessionTurnSearch(reset);
+    }, 180);
+  }
+
+  async function runSessionTurnSearch(reset = true) {
+    const sessionId = selectedSessionId;
+    const query = sessionTurnSearchQuery.trim();
+    if (!sessionId || !sessionTurnSearchOpen || !query) {
+      return;
+    }
+
+    const requestVersion = ++sessionTurnSearchRequestVersion;
+    if (reset) {
+      sessionTurnSearchBusy = true;
+      sessionTurnSearchCursor = null;
+    } else {
+      sessionTurnSearchLoadingMore = true;
+    }
+    sessionTurnSearchError = "";
+
+    try {
+      const response = await api.searchSessionTurns(sessionId, query, reset ? null : sessionTurnSearchCursor, 20);
+      if (
+        requestVersion !== sessionTurnSearchRequestVersion ||
+        selectedSessionId !== sessionId ||
+        sessionTurnSearchQuery.trim() !== query
+      ) {
+        return;
+      }
+
+      sessionTurnSearchResults = reset
+        ? response.matches
+        : [...sessionTurnSearchResults, ...response.matches].filter(
+            (match, index, collection) =>
+              collection.findIndex(
+                (candidate) =>
+                  candidate.turnId === match.turnId && candidate.itemId === match.itemId && candidate.preview === match.preview
+              ) === index
+          );
+      sessionTurnSearchCursor = response.nextCursor;
+      sessionTurnSearchTotalMatches = response.totalMatches;
+    } catch (error) {
+      if (requestVersion !== sessionTurnSearchRequestVersion) {
+        return;
+      }
+      sessionTurnSearchError = describeError(error);
+    } finally {
+      if (requestVersion === sessionTurnSearchRequestVersion) {
+        sessionTurnSearchBusy = false;
+        sessionTurnSearchLoadingMore = false;
+      }
+    }
+  }
+
+  async function loadMoreSessionTurnSearchResults() {
+    if (!sessionTurnSearchCursor || sessionTurnSearchBusy || sessionTurnSearchLoadingMore) {
+      return;
+    }
+    await runSessionTurnSearch(false);
   }
 
   async function ensureSessionForComposer() {
@@ -626,19 +955,32 @@
   let composerSettingsPopoverElement = $state<HTMLDivElement | undefined>(undefined);
   let composerSettingsPopoverStyle = $state("");
   let composerSecurityTriggerElement = $state<HTMLButtonElement | undefined>(undefined);
+  let sessionTurnSearchTriggerElement = $state<HTMLButtonElement | undefined>(undefined);
+  let sessionTurnSearchPopoverElement = $state<HTMLDivElement | undefined>(undefined);
+  let sessionTurnSearchInputElement = $state<HTMLInputElement | undefined>(undefined);
+  let sessionTurnSearchTimer: ReturnType<typeof setTimeout> | null = null;
+  let sessionTurnSearchHighlightTimer: ReturnType<typeof setTimeout> | null = null;
+  let staleSessionCatchupTimer: ReturnType<typeof setTimeout> | null = null;
+  let sessionTurnSearchRequestVersion = 0;
+  let sessionTurnSearchPopoverStyle = $state("");
   let composerSecurityPopoverElement = $state<HTMLDivElement | undefined>(undefined);
   let composerSecurityPopoverStyle = $state("");
   let titleInputElement = $state<HTMLInputElement | undefined>(undefined);
   let composerTextareaElement = $state<HTMLTextAreaElement | undefined>(undefined);
+  let composerPanelElement = $state<HTMLFormElement | undefined>(undefined);
+  let composerToolbarElement = $state<HTMLDivElement | undefined>(undefined);
   let filePickerElement = $state<HTMLInputElement | undefined>(undefined);
   let fakeTopLoadPercent = $state(0);
   let transcriptScrollFrame: number | null = null;
   let composerTextareaResizeFrame: number | null = null;
   let transcriptResizeObserver: ResizeObserver | null = null;
+  let composerToolbarResizeObserver: ResizeObserver | null = null;
+  let composerToolbarCompact = $state(true);
   let transcriptScrollGeneration = 0;
   let composerHistory = $state<string[]>([]);
   let composerHistoryIndex = $state(-1);
   let composerHistoryDraft = $state("");
+  let lastComposerPromptChip = $state<{ sessionId: string; prompt: string } | null>(null);
   let notificationPermissionRequested = false;
   const handledResumeDraftKeys = new Set<string>();
   let lastLoadedConversationId = $state<string | null>(null);
@@ -689,7 +1031,7 @@
     );
   });
   const queueModeActive = $derived.by(() => canQueueComposerMessage());
-  const lastComposerHistoryPrompt = $derived.by(() => composerHistory.at(-1) ?? "");
+  const lastComposerHistoryPrompt = $derived.by(() => lastComposerPromptChip?.prompt ?? "");
   const selectedSessionSummary = $derived(sessions.find((session) => session.id === selectedSessionId) ?? null);
   const sessionHighlights = $derived.by(() =>
     Object.fromEntries(
@@ -747,26 +1089,6 @@
   const activeLiveTurnPlan = $derived.by(() => (activeLiveTurnId ? conversation?.livePlans[activeLiveTurnId] ?? null : null));
   const activeLiveTurnDiff = $derived.by(() => (activeLiveTurnId ? conversation?.liveDiffs[activeLiveTurnId] ?? null : null));
   const activeLiveTurnDiffViews = $derived.by(() => (activeLiveTurnDiff ? parseAggregatedDiffViews(activeLiveTurnDiff) : []));
-  const activeLiveTurnSummary = $derived.by(() => {
-    const explanation = activeLiveTurnPlan?.explanation?.trim();
-    if (explanation) {
-      return explanation;
-    }
-
-    if (activeLiveTurnSubagents.length > 0) {
-      const prompt = activeLiveTurnSubagents[0]?.prompt?.trim();
-      if (prompt) {
-        return prompt;
-      }
-
-      const tool = activeLiveTurnSubagents[0]?.tool?.trim();
-      if (tool) {
-        return tool;
-      }
-    }
-
-    return null;
-  });
   const visibleOptimisticMessage = $derived.by(() => {
     if (!optimisticMessage || optimisticMessage.sessionId !== selectedSessionId) {
       return null;
@@ -958,16 +1280,25 @@
     if (authenticated !== true) {
       return null;
     }
+    if (staleSessionCatchup?.refreshing) {
+      return {
+        tone: "warning" as const,
+        text: ui.sessionResyncing,
+        dismissible: false
+      };
+    }
     if (errorText) {
       return {
         tone: "error" as const,
-        text: errorText
+        text: errorText,
+        dismissible: true
       };
     }
     if (noticeText) {
       return {
         tone: "success" as const,
-        text: noticeText
+        text: noticeText,
+        dismissible: true
       };
     }
     return null;
@@ -1034,13 +1365,11 @@
     const tabs: Array<{ id: WorkspaceTabId; label: string; kind: "chat" | "tasks" | "git" | "settings" | "git-diff" | "code-diff" | "terminal" }> = [
       { id: "chat", label: ui.chat, kind: "chat" }
     ];
-    if (subagentTasks.length > 0) {
-      tabs.push({
-        id: "tasks",
-        label: `${ui.tasks} ${subagentTasks.length}`,
-        kind: "tasks"
-      });
-    }
+    tabs.push({
+      id: "tasks",
+      label: subagentTasks.length > 0 ? `${ui.tasks} ${subagentTasks.length}` : ui.tasks,
+      kind: "tasks"
+    });
     if (gitTabOpen) {
       tabs.push({
         id: "git",
@@ -1154,6 +1483,39 @@
       if (composerSecurityOpen) {
         void updateComposerSecurityPopoverPosition();
       }
+      if (sessionTurnSearchOpen) {
+        void updateSessionTurnSearchPopoverPosition();
+      }
+    };
+    const handleGlobalKeydown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f" && selectedSessionId && activeWorkspaceTabId === "chat") {
+        event.preventDefault();
+        sessionTurnSearchOpen = true;
+        queueMicrotask(() => {
+          sessionTurnSearchInputElement?.focus();
+          sessionTurnSearchInputElement?.select();
+        });
+      }
+    };
+    let hiddenStartedAt: number | null = document.hidden ? Date.now() : null;
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        hiddenStartedAt = Date.now();
+        return;
+      }
+
+      const lastHiddenAt = hiddenStartedAt;
+      hiddenStartedAt = null;
+      if (!selectedSessionId || connectionState !== "connected" || lastHiddenAt === null) {
+        return;
+      }
+
+      const hiddenDurationMs = Date.now() - lastHiddenAt;
+      if (hiddenDurationMs < staleSessionCatchupHiddenThresholdMs) {
+        return;
+      }
+
+      beginStaleSessionCatchup(selectedSessionId, hiddenDurationMs);
     };
     let notificationPromptRecorded = false;
     try {
@@ -1194,8 +1556,10 @@
     mobileQuery.addEventListener("change", syncMobileLayout);
     window.addEventListener("resize", handleViewportChange);
     window.addEventListener("scroll", handleViewportChange, true);
+    window.addEventListener("keydown", handleGlobalKeydown, true);
     window.addEventListener("pointerdown", requestNotificationPermissionFromGesture, true);
     window.addEventListener("keydown", requestNotificationPermissionFromGesture, true);
+    document.addEventListener("visibilitychange", handleVisibilityChange, true);
     void bootstrap();
 
     return () => {
@@ -1209,6 +1573,15 @@
       }
       if (draftSaveTimer) {
         clearTimeout(draftSaveTimer);
+      }
+      if (sessionTurnSearchTimer) {
+        clearTimeout(sessionTurnSearchTimer);
+      }
+      if (sessionTurnSearchHighlightTimer) {
+        clearTimeout(sessionTurnSearchHighlightTimer);
+      }
+      if (staleSessionCatchupTimer) {
+        clearTimeout(staleSessionCatchupTimer);
       }
       if (transcriptScrollFrame !== null) {
         cancelAnimationFrame(transcriptScrollFrame);
@@ -1233,8 +1606,10 @@
       mobileQuery.removeEventListener("change", syncMobileLayout);
       window.removeEventListener("resize", handleViewportChange);
       window.removeEventListener("scroll", handleViewportChange, true);
+      window.removeEventListener("keydown", handleGlobalKeydown, true);
       window.removeEventListener("pointerdown", requestNotificationPermissionFromGesture, true);
       window.removeEventListener("keydown", requestNotificationPermissionFromGesture, true);
+      document.removeEventListener("visibilitychange", handleVisibilityChange, true);
       api.disconnect();
     };
   });
@@ -1268,6 +1643,17 @@
     if (titleDraft !== nextDisplayTitle) {
       titleDraft = nextDisplayTitle;
     }
+  });
+
+  $effect(() => {
+    if (!sessionTurnSearchOpen || !sessionTurnSearchInputElement) {
+      return;
+    }
+
+    queueMicrotask(() => {
+      sessionTurnSearchInputElement?.focus();
+      sessionTurnSearchInputElement?.select();
+    });
   });
 
   $effect(() => {
@@ -1313,6 +1699,71 @@
   });
 
   $effect(() => {
+    if (typeof window === "undefined" || activeWorkspaceTabId !== "chat") {
+      composerToolbarResizeObserver?.disconnect();
+      composerToolbarResizeObserver = null;
+      return;
+    }
+
+    const toolbarSignature = [
+      composerSettingsSummary.model,
+      composerSettingsSummary.speed,
+      running ? "running" : "idle",
+      queueModeActive ? "queue" : "send",
+      draftAttachments.length
+    ].join(":");
+    toolbarSignature;
+
+    const syncComposerToolbarCompact = () => {
+      const toolbar = composerToolbarElement;
+      if (!toolbar) {
+        return;
+      }
+
+      if (isMobileLayout) {
+        composerToolbarCompact = true;
+        return;
+      }
+
+      const modelWidthBias = Math.max(0, Math.min(84, (composerSettingsSummary.model.length - 9) * 4));
+      const threshold =
+        (conversation ? (running ? 560 : 470) : 340) +
+        modelWidthBias +
+        (composerSettingsSummary.speed === "flex" ? 18 : 0) +
+        (draftAttachments.length > 0 ? 12 : 0);
+
+      composerToolbarCompact = toolbar.clientWidth < threshold;
+    };
+
+    const toolbar = composerToolbarElement;
+    if (!toolbar) {
+      return;
+    }
+
+    syncComposerToolbarCompact();
+    composerToolbarResizeObserver?.disconnect();
+    composerToolbarResizeObserver = new ResizeObserver(() => {
+      syncComposerToolbarCompact();
+    });
+    composerToolbarResizeObserver.observe(toolbar);
+
+    return () => {
+      composerToolbarResizeObserver?.disconnect();
+      composerToolbarResizeObserver = null;
+    };
+  });
+
+  $effect(() => {
+    if (activeWorkspaceTabId !== "chat" || !composerTextareaElement) {
+      return;
+    }
+
+    queueMicrotask(() => {
+      scheduleComposerTextareaResize();
+    });
+  });
+
+  $effect(() => {
     if (!composerSettingsOpen) {
       composerSettingsPopoverStyle = "";
       return;
@@ -1326,6 +1777,14 @@
       return;
     }
     void updateComposerSecurityPopoverPosition();
+  });
+
+  $effect(() => {
+    if (!sessionTurnSearchOpen) {
+      sessionTurnSearchPopoverStyle = "";
+      return;
+    }
+    void updateSessionTurnSearchPopoverPosition();
   });
 
   $effect(() => {
@@ -1395,6 +1854,16 @@
   });
 
   $effect(() => {
+    const dragState = queueDragState;
+    if (!dragState) {
+      return;
+    }
+    if (!queuedMessages.some((item) => item.id === dragState.queueId)) {
+      queueDragState = null;
+    }
+  });
+
+  $effect(() => {
     const currentConversationId = conversation?.thread.id ?? null;
     if (!currentConversationId) {
       lastLoadedConversationId = null;
@@ -1407,12 +1876,6 @@
       mobileSidebarOpen = false;
       editingQueueId = null;
       editingQueuePrompt = "";
-    }
-  });
-
-  $effect(() => {
-    if (activeWorkspaceTabId === "tasks" && subagentTasks.length === 0) {
-      activeWorkspaceTabId = "chat";
     }
   });
 
@@ -2022,6 +2485,7 @@
     expandedTurnLogs = {};
     loadingTurns = {};
     turnLoadErrors = {};
+    resetSessionTurnSearch();
     sessionSearchQuery = "";
     sessionSearchScope = "summary";
     sessionFilter = normalizeSessionFilterState(null);
@@ -2051,6 +2515,7 @@
     pendingQueueModeSessionId = null;
     liveTurnCardExpanded = false;
     sendIntent = null;
+    dismissLastComposerPromptChip();
     editingQueueId = null;
     editingQueuePrompt = "";
     startupAlertModalOpen = false;
@@ -2306,6 +2771,8 @@
     }
 
     clearHydrationRefresh();
+    dismissLastComposerPromptChip();
+    resetSessionTurnSearch();
     loadingDetail = true;
     selectedSessionId = sessionId;
     conversation = null;
@@ -2335,6 +2802,7 @@
     pendingSteerResume = null;
     optimisticMessage = null;
     sendIntent = null;
+    clearStaleSessionCatchup();
     mobileSidebarOpen = false;
     composerSettingsOpen = false;
     composerSecurityOpen = false;
@@ -2343,26 +2811,10 @@
     connectStream(sessionId);
 
     try {
-      const detail = await api.getSession(sessionId, olderTurnPageSize);
-      if (selectedSessionId !== sessionId) {
+      const nextConversation = await refreshSelectedSessionState(sessionId, olderTurnPageSize, true);
+      if (selectedSessionId !== sessionId || !nextConversation) {
         return false;
       }
-      let nextConversation = createConversationState(detail);
-      nextConversation = flushPendingSessionEvents(sessionId, nextConversation);
-      conversation = nextConversation;
-      if (
-        pendingQueueModeSessionId === sessionId &&
-        (nextConversation.activeTurnId || nextConversation.thread.status === "running" || nextConversation.thread.status === "active")
-      ) {
-        pendingQueueModeSessionId = null;
-      }
-      titleDraft = getDisplayThreadTitle(detail.thread.name, detail.thread.preview) ?? "";
-      const existingSummary = sessions.find((session) => session.id === detail.thread.id) ?? null;
-      upsertSessionSummary({
-        ...buildSessionSummaryFromConversation(nextConversation),
-        updatedAt: Math.max(nextConversation.thread.updatedAt, existingSummary?.updatedAt ?? 0)
-      });
-      await loadSavedDraft(detail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
       const hasOnlyLiveTurnShell =
         nextConversation.thread.turns.length <= 1 &&
         nextConversation.thread.turns.every((turn) => String(turn.status ?? "") === "inProgress");
@@ -2376,20 +2828,12 @@
           if (selectedSessionId !== sessionId) {
             return;
           }
-          void api.getSession(sessionId, olderTurnPageSize).then((retryDetail) => {
-            if (selectedSessionId !== sessionId) {
-              return;
-            }
-            let recoveredConversation = createConversationState(retryDetail);
-            recoveredConversation = flushPendingSessionEvents(sessionId, recoveredConversation);
-            conversation = recoveredConversation;
-            titleDraft = getDisplayThreadTitle(retryDetail.thread.name, retryDetail.thread.preview) ?? "";
-          }).catch(() => {});
+          void refreshSelectedSessionState(sessionId, olderTurnPageSize).catch(() => {});
         }, 250);
       } else {
         clearHydrationRefresh();
       }
-      syncSelectedSessionInUrl(detail.thread.id);
+      syncSelectedSessionInUrl(sessionId);
       return true;
     } catch (error) {
       disconnectStream();
@@ -2421,6 +2865,40 @@
       }
 
       if (conversation?.thread.id === sessionId) {
+        const catchup = staleSessionCatchup;
+        if (catchup?.sessionId === sessionId) {
+          if (catchup.refreshing) {
+            queuePendingSessionEvent(sessionId, payload);
+            return;
+          }
+
+          const nextEventCount = catchup.eventCount + 1;
+          if (nextEventCount >= staleSessionCatchupEventThreshold) {
+            staleSessionCatchup = {
+              ...catchup,
+              eventCount: nextEventCount,
+              refreshing: true
+            };
+            pendingSessionEvents = {
+              ...pendingSessionEvents,
+              [sessionId]: []
+            };
+            void refreshSelectedSessionState(
+              sessionId,
+              Math.max(conversation.thread.turns.length, olderTurnPageSize)
+            ).catch((error) => {
+              clearStaleSessionCatchup();
+              errorText = describeError(error);
+            });
+            return;
+          }
+
+          staleSessionCatchup = {
+            ...catchup,
+            eventCount: nextEventCount
+          };
+        }
+
         conversation = applyStreamEvent(conversation, payload);
         if (
           pendingQueueModeSessionId === sessionId &&
@@ -2491,10 +2969,7 @@
 
         clearHydrationRefresh();
       } else if (selectedSessionId === sessionId) {
-        pendingSessionEvents = {
-          ...pendingSessionEvents,
-          [sessionId]: [...(pendingSessionEvents[sessionId] ?? []), payload]
-        };
+        queuePendingSessionEvent(sessionId, payload);
       }
     });
   }
@@ -2523,6 +2998,42 @@
     pendingSessionEvents = remaining;
 
     return queued.reduce((current, event) => applyStreamEvent(current, event), nextConversation);
+  }
+
+  function applyLoadedSessionDetail(sessionId: string, detail: SessionDetailPayload) {
+    let nextConversation = createConversationState(detail);
+    nextConversation = flushPendingSessionEvents(sessionId, nextConversation);
+    conversation = nextConversation;
+    if (
+      pendingQueueModeSessionId === sessionId &&
+      (nextConversation.activeTurnId || nextConversation.thread.status === "running" || nextConversation.thread.status === "active")
+    ) {
+      pendingQueueModeSessionId = null;
+    }
+    titleDraft = getDisplayThreadTitle(detail.thread.name, detail.thread.preview) ?? "";
+    const existingSummary = sessions.find((session) => session.id === detail.thread.id) ?? null;
+    upsertSessionSummary({
+      ...buildSessionSummaryFromConversation(nextConversation),
+      updatedAt: Math.max(nextConversation.thread.updatedAt, existingSummary?.updatedAt ?? 0)
+    });
+    clearHydrationRefresh();
+    clearStaleSessionCatchup();
+    return nextConversation;
+  }
+
+  async function refreshSelectedSessionState(sessionId: string, turnLimit: number, loadDraft = false) {
+    const detail = await api.getSession(sessionId, turnLimit);
+    if (selectedSessionId !== detail.thread.id) {
+      return null;
+    }
+
+    const nextConversation = applyLoadedSessionDetail(detail.thread.id, detail);
+    if (loadDraft) {
+      await loadSavedDraft(detail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
+    }
+    stickTranscriptToBottom = true;
+    forceTranscriptScroll = true;
+    return nextConversation;
   }
 
   async function recoverFromReconnect() {
@@ -2556,17 +3067,11 @@
         return;
       }
 
-      const detail = await api.getSession(selectedSessionId, Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize));
-      if (selectedSessionId === detail.thread.id) {
-        let nextConversation = createConversationState(detail);
-        nextConversation = flushPendingSessionEvents(detail.thread.id, nextConversation);
-        conversation = nextConversation;
-        titleDraft = getDisplayThreadTitle(detail.thread.name, detail.thread.preview) ?? "";
-        await loadSavedDraft(detail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
-        stickTranscriptToBottom = true;
-        forceTranscriptScroll = true;
-        clearHydrationRefresh();
-      }
+      await refreshSelectedSessionState(
+        selectedSessionId,
+        Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize),
+        true
+      );
     } catch (error) {
       errorText = describeError(error);
     }
@@ -3239,6 +3744,7 @@
       forceTranscriptScroll = true;
       pendingQueueModeSessionId = sessionId;
       recordComposerHistory(prompt);
+      rememberLastComposerPromptChip(sessionId, prompt);
       if (!preserveComposer) {
         draft = "";
         draftAttachments = [];
@@ -3329,6 +3835,7 @@
       }
 
       recordComposerHistory(prompt);
+      rememberLastComposerPromptChip(selectedSessionId, prompt);
       if (!preserveComposer) {
         draft = "";
         draftAttachments = [];
@@ -3364,6 +3871,7 @@
         clearComposer || draft.trim() === normalizedPrompt ? draftAttachments.map((attachment) => attachment.id) : []
       );
       recordComposerHistory(normalizedPrompt);
+      rememberLastComposerPromptChip(selectedSessionId, normalizedPrompt);
       if (clearComposer || draft.trim() === normalizedPrompt) {
         draft = "";
         draftAttachments = [];
@@ -3414,6 +3922,129 @@
       sending = false;
       sendIntent = null;
     }
+  }
+
+  function updateQueueDragTarget(clientX: number, clientY: number) {
+    if (!queueDragState || typeof document === "undefined") {
+      return;
+    }
+
+    const nextTarget = document.elementFromPoint(clientX, clientY)?.closest("[data-queue-item-id]");
+    if (!(nextTarget instanceof HTMLElement)) {
+      queueDragState = {
+        ...queueDragState,
+        targetQueueId: null,
+        targetPosition: null
+      };
+      return;
+    }
+
+    const targetQueueId = nextTarget.dataset.queueItemId ?? null;
+    if (!targetQueueId) {
+      queueDragState = {
+        ...queueDragState,
+        targetQueueId: null,
+        targetPosition: null
+      };
+      return;
+    }
+
+    const rect = nextTarget.getBoundingClientRect();
+    queueDragState = {
+      ...queueDragState,
+      targetQueueId,
+      targetPosition: clientY < rect.top + rect.height / 2 ? "before" : "after"
+    };
+  }
+
+  function startQueueDrag(event: PointerEvent, queueId: string) {
+    if (sending || queueReorderBusy || queuedMessages.length < 2) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(event.pointerId);
+    queueDragState = {
+      pointerId: event.pointerId,
+      queueId,
+      targetQueueId: null,
+      targetPosition: null
+    };
+    updateQueueDragTarget(event.clientX, event.clientY);
+  }
+
+  function moveQueueDrag(event: PointerEvent) {
+    if (!queueDragState || queueDragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    event.preventDefault();
+    updateQueueDragTarget(event.clientX, event.clientY);
+  }
+
+  async function endQueueDrag(event: PointerEvent) {
+    if (!queueDragState || queueDragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    event.preventDefault();
+    const dragState = queueDragState;
+    queueDragState = null;
+    (event.currentTarget as HTMLElement | null)?.releasePointerCapture?.(event.pointerId);
+
+    if (!selectedSessionId || dragState.targetQueueId === null || dragState.targetPosition === null) {
+      return;
+    }
+
+    const nextQueueIds = queuedMessages
+      .filter((item) => item.id !== dragState.queueId)
+      .map((item) => item.id);
+    const targetIndex = nextQueueIds.indexOf(dragState.targetQueueId);
+    if (targetIndex < 0) {
+      return;
+    }
+
+    nextQueueIds.splice(dragState.targetPosition === "before" ? targetIndex : targetIndex + 1, 0, dragState.queueId);
+    const currentQueueIds = queuedMessages.map((item) => item.id);
+    if (
+      nextQueueIds.length !== currentQueueIds.length ||
+      nextQueueIds.every((id, index) => id === currentQueueIds[index])
+    ) {
+      return;
+    }
+
+    queueReorderBusy = true;
+    errorText = "";
+    noticeText = "";
+    try {
+      const queue = await api.reorderQueuedMessages(selectedSessionId, nextQueueIds);
+      if (conversation?.thread.id === selectedSessionId) {
+        conversation = {
+          ...conversation,
+          queue
+        };
+      }
+    } catch (error) {
+      errorText = describeError(error);
+    } finally {
+      queueReorderBusy = false;
+    }
+  }
+
+  function cancelQueueDrag(event?: PointerEvent) {
+    if (event && queueDragState && queueDragState.pointerId === event.pointerId) {
+      (event.currentTarget as HTMLElement | null)?.releasePointerCapture?.(event.pointerId);
+    }
+    queueDragState = null;
+  }
+
+  function showQueueDropIndicator(itemId: string, position: "before" | "after") {
+    return (
+      queueDragState?.queueId !== itemId &&
+      queueDragState?.targetQueueId === itemId &&
+      queueDragState?.targetPosition === position
+    );
   }
 
   async function removeQueuedMessage(queueId: string) {
@@ -3882,6 +4513,27 @@
       accountLoginFlow = null;
       await refreshAccountState(true);
       await refreshQuota(true);
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function selectAccountProfile(profileId: string) {
+    if (!profileId.trim()) {
+      return;
+    }
+
+    const currentProfileId = config?.profiles.find((profile) => profile.active)?.id ?? null;
+    if (currentProfileId === profileId) {
+      return;
+    }
+
+    try {
+      await api.selectAuthProfile(profileId);
+      api.disconnect();
+      resetWorkspaceState();
+      authenticated = true;
+      await bootstrap();
     } catch (error) {
       errorText = describeError(error);
     }
@@ -4614,40 +5266,6 @@
     return new Intl.NumberFormat("en-US").format(value);
   }
 
-  function formatThreadStatusLabel(status: string | null | undefined) {
-    const normalized = String(status ?? "").trim().toLowerCase();
-    if (!normalized || normalized === "idle") {
-      return "idle";
-    }
-    if (normalized === "running" || normalized === "active") {
-      return ui.active;
-    }
-    if (["completed", "done", "success"].includes(normalized)) {
-      return ui.done;
-    }
-    if (normalized === "stopped") {
-      return ui.stopped;
-    }
-    return normalized;
-  }
-
-  function getThreadStatusTextClass(status: string | null | undefined) {
-    const normalized = String(status ?? "").trim().toLowerCase();
-    if (normalized === "running" || normalized === "active") {
-      return "text-amber-600";
-    }
-    if (["completed", "done", "success"].includes(normalized)) {
-      return "text-emerald-600";
-    }
-    if (normalized === "stopped" || normalized === "idle") {
-      return "text-gray-500";
-    }
-    if (["failed", "error", "systemerror"].includes(normalized)) {
-      return "text-red-600";
-    }
-    return "text-gray-500";
-  }
-
   function formatContextUsage() {
     const tokenUsage = conversation?.tokenUsage;
     if (!tokenUsage?.modelContextWindow || tokenUsage.modelContextWindow <= 0) {
@@ -4674,12 +5292,28 @@
     if (item.attachmentNames.length > 0) {
       return item.attachmentNames.join(", ");
     }
-    return "Queued follow-up";
+    return "...";
   }
 
   function resetComposerHistoryNavigation() {
     composerHistoryIndex = -1;
     composerHistoryDraft = "";
+  }
+
+  function rememberLastComposerPromptChip(sessionId: string, prompt: string) {
+    const normalizedPrompt = prompt.trim();
+    if (!sessionId || !normalizedPrompt) {
+      return;
+    }
+
+    lastComposerPromptChip = {
+      sessionId,
+      prompt: normalizedPrompt
+    };
+  }
+
+  function dismissLastComposerPromptChip() {
+    lastComposerPromptChip = null;
   }
 
   function recordComposerHistory(prompt: string) {
@@ -4759,6 +5393,23 @@
 
   function handleComposerKeydown(event: KeyboardEvent) {
     if (event.isComposing) {
+      return;
+    }
+
+    if (
+      conversation?.preferences.sendOnEnter &&
+      event.key === "Enter" &&
+      !event.altKey &&
+      !event.shiftKey &&
+      !event.ctrlKey &&
+      !event.metaKey
+    ) {
+      event.preventDefault();
+      if (canQueueComposerMessage()) {
+        void queueMessage();
+        return;
+      }
+      void submitComposer();
       return;
     }
 
@@ -5454,6 +6105,47 @@
     }
   }
 
+  async function applyOlderTurnPage(response: SessionTurnsPagePayload, previousHeight: number, previousTop: number) {
+    if (!conversation) {
+      return false;
+    }
+
+    const mergedTurns = [...response.turns, ...conversation.thread.turns].filter(
+      (turn, index, collection) => collection.findIndex((candidate) => candidate.id === turn.id) === index
+    );
+
+    conversation = {
+      ...conversation,
+      thread: {
+        ...conversation.thread,
+        turns: mergedTurns
+      },
+      hydration: {
+        ...conversation.hydration,
+        loadedTurns: mergedTurns.length,
+        totalTurns: response.totalTurns,
+        remainingTurns: response.remainingTurns
+      }
+    };
+
+    await tick();
+    if (transcriptElement) {
+      const previousBehavior = transcriptElement.style.scrollBehavior;
+      transcriptElement.style.scrollBehavior = "auto";
+      transcriptElement.scrollTo({
+        top: transcriptElement.scrollHeight - previousHeight + previousTop,
+        behavior: "auto"
+      });
+      if (previousBehavior) {
+        transcriptElement.style.scrollBehavior = previousBehavior;
+      } else {
+        transcriptElement.style.removeProperty("scroll-behavior");
+      }
+    }
+
+    return true;
+  }
+
   async function loadOlderTurns(mode: "auto" | "manual" = "manual") {
     if (!selectedSessionId || !conversation || loadingOlderTurns || conversation.hydration.remainingTurns <= 0) {
       return;
@@ -5479,38 +6171,7 @@
         return;
       }
 
-      const mergedTurns = [...response.turns, ...conversation.thread.turns].filter(
-        (turn, index, collection) => collection.findIndex((candidate) => candidate.id === turn.id) === index
-      );
-
-      conversation = {
-        ...conversation,
-        thread: {
-          ...conversation.thread,
-          turns: mergedTurns
-        },
-        hydration: {
-          ...conversation.hydration,
-          loadedTurns: mergedTurns.length,
-          totalTurns: response.totalTurns,
-          remainingTurns: response.remainingTurns
-        }
-      };
-
-      await tick();
-      if (transcriptElement) {
-        const previousBehavior = transcriptElement.style.scrollBehavior;
-        transcriptElement.style.scrollBehavior = "auto";
-        transcriptElement.scrollTo({
-          top: transcriptElement.scrollHeight - previousHeight + previousTop,
-          behavior: "auto"
-        });
-        if (previousBehavior) {
-          transcriptElement.style.scrollBehavior = previousBehavior;
-        } else {
-          transcriptElement.style.removeProperty("scroll-behavior");
-        }
-      }
+      await applyOlderTurnPage(response, previousHeight, previousTop);
     } catch (error) {
       errorText = describeError(error);
       olderTurnsAutoLoadPaused = true;
@@ -5540,6 +6201,105 @@
     olderTurnsAutoTriggerTimestamps = [];
     if (transcriptElement && transcriptElement.scrollTop <= transcriptTopLoadThreshold) {
       void maybeAutoLoadOlderTurns();
+    }
+  }
+
+  async function jumpToSessionSearchResult(match: SessionTurnSearchMatch) {
+    if (!selectedSessionId || !conversation || sessionTurnSearchJumpingTurnId || loadingOlderTurns) {
+      return;
+    }
+
+    sessionTurnSearchJumpingTurnId = match.turnId;
+    sessionTurnSearchError = "";
+
+    try {
+      while (conversation && conversation.thread.id === selectedSessionId && !conversation.thread.turns.some((turn) => turn.id === match.turnId)) {
+        if (conversation.hydration.remainingTurns <= 0) {
+          break;
+        }
+
+        const totalTurns = conversation.hydration.totalTurns ?? conversation.thread.turns.length;
+        const loadedStartIndex = Math.max(0, totalTurns - conversation.thread.turns.length);
+        if (match.turnIndex >= loadedStartIndex) {
+          break;
+        }
+
+        const beforeTurnId = conversation.thread.turns[0]?.id;
+        if (!beforeTurnId) {
+          break;
+        }
+
+        const previousHeight = transcriptElement?.scrollHeight ?? 0;
+        const previousTop = transcriptElement?.scrollTop ?? 0;
+        loadingOlderTurns = true;
+        const response = await api.getSessionOlderTurns(selectedSessionId, beforeTurnId, Math.min(100, Math.max(olderTurnPageSize, loadedStartIndex - match.turnIndex)));
+        if (!conversation || conversation.thread.id !== selectedSessionId) {
+          return;
+        }
+        await applyOlderTurnPage(response, previousHeight, previousTop);
+        loadingOlderTurns = false;
+      }
+
+      if (!conversation || !conversation.thread.turns.some((turn) => turn.id === match.turnId)) {
+        sessionTurnSearchError = describeUiError({
+          code: "SESSION_SEARCH_RESULT_UNAVAILABLE",
+          message: "Search result could not be located."
+        });
+        return;
+      }
+
+      if (match.requiresFullTurn) {
+        await loadTurnDetails(match.turnId);
+        expandedTurnLogs = {
+          ...expandedTurnLogs,
+          [match.turnId]: true
+        };
+      }
+
+      if (match.itemId && match.requiresItemDetail) {
+        expandedItems = {
+          ...expandedItems,
+          [getItemKey(match.turnId, match.itemId)]: true
+        };
+        await loadItemDetail(match.turnId, match.itemId);
+      }
+
+      await tick();
+      const escapedTurnId =
+        typeof CSS !== "undefined" && typeof CSS.escape === "function"
+          ? CSS.escape(match.turnId)
+          : match.turnId.replace(/"/g, '\\"');
+      const target = transcriptContentElement?.querySelector<HTMLElement>(`[data-turn-id="${escapedTurnId}"]`);
+      if (!target) {
+        sessionTurnSearchError = describeUiError({
+          code: "SESSION_SEARCH_RESULT_UNAVAILABLE",
+          message: "Search result could not be located."
+        });
+        return;
+      }
+
+      stickTranscriptToBottom = false;
+      forceTranscriptScroll = false;
+      target.scrollIntoView({
+        block: "start",
+        behavior: "smooth"
+      });
+      sessionTurnSearchFocusedTurnId = match.turnId;
+      if (sessionTurnSearchHighlightTimer) {
+        clearTimeout(sessionTurnSearchHighlightTimer);
+      }
+      sessionTurnSearchHighlightTimer = setTimeout(() => {
+        if (sessionTurnSearchFocusedTurnId === match.turnId) {
+          sessionTurnSearchFocusedTurnId = null;
+        }
+      }, 2200);
+    } catch (error) {
+      sessionTurnSearchError = describeError(error);
+    } finally {
+      loadingOlderTurns = false;
+      if (sessionTurnSearchJumpingTurnId === match.turnId) {
+        sessionTurnSearchJumpingTurnId = null;
+      }
     }
   }
 
@@ -5719,6 +6479,18 @@
     return Boolean(expandedTurnLogs[turnId]);
   }
 
+  function isLiveDiffExpanded(turnId: string) {
+    return isItemExpanded(turnId, "live-diff-panel");
+  }
+
+  function toggleLiveDiff(turnId: string) {
+    const itemKey = getItemKey(turnId, "live-diff-panel");
+    expandedItems = {
+      ...expandedItems,
+      [itemKey]: !expandedItems[itemKey]
+    };
+  }
+
   async function toggleTurnLogs(turnId: string) {
     expandedTurnLogs = {
       ...expandedTurnLogs,
@@ -5887,10 +6659,44 @@
     composerSecurityPopoverStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.max(240, window.innerHeight - margin * 2)}px;opacity:1;pointer-events:auto;`;
   }
 
+  async function updateSessionTurnSearchPopoverPosition() {
+    if (!sessionTurnSearchOpen || !sessionTurnSearchTriggerElement || !sessionTurnSearchPopoverElement || typeof window === "undefined") {
+      return;
+    }
+
+    await tick();
+    const margin = 12;
+    const triggerRect = sessionTurnSearchTriggerElement.getBoundingClientRect();
+    const popoverRect = sessionTurnSearchPopoverElement.getBoundingClientRect();
+    const width =
+      window.innerWidth <= 760
+        ? Math.min(window.innerWidth - margin * 2, 440)
+        : Math.min(Math.max(popoverRect.width || 420, 360), window.innerWidth - margin * 2);
+
+    let left = triggerRect.right - width;
+    if (left < margin) {
+      left = margin;
+    }
+    if (left + width > window.innerWidth - margin) {
+      left = window.innerWidth - width - margin;
+    }
+
+    let top = triggerRect.bottom + 10;
+    if (top + popoverRect.height > window.innerHeight - margin) {
+      top = triggerRect.top - popoverRect.height - 10;
+    }
+    if (top < margin) {
+      top = Math.max(margin, window.innerHeight - popoverRect.height - margin);
+    }
+
+    sessionTurnSearchPopoverStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.max(220, window.innerHeight - margin * 2)}px;opacity:1;pointer-events:auto;`;
+  }
+
   function getComposerSettingsSummary() {
     if (!conversation) {
       return {
         model: ui.settings,
+        speed: "auto" as SessionPreferences["speed"],
         indicators: [] as Array<{ key: string; icon: string; label: string; text: string | null }>
       };
     }
@@ -5924,6 +6730,7 @@
 
     return {
       model: selectedModel?.displayName ?? m.auto_model(),
+      speed: conversation.preferences.speed ?? "auto",
       indicators
     };
   }
@@ -5941,6 +6748,10 @@
       return ui.speedFlex;
     }
     return ui.speedAuto;
+  }
+
+  function isFastSpeedMode(speed: SessionPreferences["speed"] | null | undefined) {
+    return (speed ?? "auto") === "fast";
   }
 
   function getSecuritySettingsSummary() {
@@ -6154,24 +6965,30 @@
               transition:fly={{ y: -14, duration: 220 }}
               class="snackbar-card pointer-events-auto flex w-full items-start gap-3 rounded-2xl border px-4 py-3 shadow-xl backdrop-blur-xl transition-all duration-300 {feedbackSnackbar.tone === 'error'
                 ? 'border-red-200 bg-red-50/95 text-red-800 shadow-red-100/80'
+                : feedbackSnackbar.tone === 'warning'
+                  ? 'border-amber-200 bg-amber-50/95 text-amber-800 shadow-amber-100/80'
                 : 'border-emerald-200 bg-emerald-50/95 text-emerald-800 shadow-emerald-100/80'}"
               role={feedbackSnackbar.tone === "error" ? "alert" : "status"}
             >
               {#if feedbackSnackbar.tone === "error"}
                 <AlertCircle size={16} class="mt-0.5 shrink-0" />
+              {:else if feedbackSnackbar.tone === "warning"}
+                <RefreshCw size={16} class="mt-0.5 shrink-0 animate-spin" />
               {:else}
                 <CheckCircle2 size={16} class="mt-0.5 shrink-0" />
               {/if}
               <span class="min-w-0 flex-1 text-sm font-medium leading-5">{feedbackSnackbar.text}</span>
-              <button
-                aria-label={ui.close}
-                class="ui-animated-button ui-animated-button--icon rounded-lg p-1 text-current/70 transition-colors hover:bg-black/5 hover:text-current"
-                onclick={dismissFeedbackSnackbar}
-                title={ui.close}
-                type="button"
-              >
-                <X size={14} />
-              </button>
+              {#if feedbackSnackbar.dismissible !== false}
+                <button
+                  aria-label={ui.close}
+                  class="ui-animated-button ui-animated-button--icon rounded-lg p-1 text-current/70 transition-colors hover:bg-black/5 hover:text-current"
+                  onclick={dismissFeedbackSnackbar}
+                  title={ui.close}
+                  type="button"
+                >
+                  <X size={14} />
+                </button>
+              {/if}
             </div>
           {/key}
         {/if}
@@ -6201,6 +7018,7 @@
       {quotaBusy}
       {runtime}
       {runtimeBusyAction}
+      profiles={config?.profiles ?? []}
       systemShutdownArmed={config?.systemShutdown.armed ?? false}
       systemShutdownAvailable={config?.systemShutdown.available ?? false}
       systemShutdownDelaySeconds={config?.systemShutdown.delaySeconds ?? 0}
@@ -6284,6 +7102,9 @@
       onStartAccountLogin={(type) => {
         void startAccountLogin(type);
       }}
+      onSelectProfile={(profileId) => {
+        void selectAccountProfile(profileId);
+      }}
       selectedId={selectedSessionId}
     />
   </aside>
@@ -6313,13 +7134,16 @@
             placeholder={ui.threadTitle}
             readonly={readOnlyRole}
           />
-          {#if selectedModel}
+          {#if selectedModel && (isFastSpeedMode(conversation?.preferences.speed) || conversation?.thread.status === "running" || conversation?.thread.status === "active")}
             <div class="flex items-center gap-1.5 mt-0.5">
-              <span class="text-[10px] font-bold text-gray-400 uppercase tracking-widest leading-none">{selectedModel.displayName}</span>
-              <span class="w-1 h-1 rounded-full bg-gray-300"></span>
-              <span class={`text-[10px] font-medium uppercase tracking-widest leading-none ${getThreadStatusTextClass(conversation?.thread.status)}`}>
-                {formatThreadStatusLabel(conversation?.thread.status)}
-              </span>
+              {#if isFastSpeedMode(conversation?.preferences.speed)}
+                <span class="inline-flex h-4 w-4 items-center justify-center rounded-full bg-amber-100 text-amber-700">
+                  <Zap size={10} />
+                </span>
+              {/if}
+              {#if conversation?.thread.status === "running" || conversation?.thread.status === "active"}
+                <span class="inline-flex h-2 w-2 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.45)] animate-pulse"></span>
+              {/if}
             </div>
           {/if}
           {#if selectedSessionSummary}
@@ -6349,23 +7173,34 @@
         </div>
       </div>
 
-      <div class="app-header-actions flex items-center gap-2">
+      <div class="app-header-actions flex min-w-0 shrink-0 items-center gap-1 sm:gap-1.5">
         {#if conversation?.tokenUsage}
-          <div class="hidden md:flex items-center gap-2 mr-2">
-            <span class="px-2 py-0.5 bg-gray-50 text-[10px] font-bold text-gray-500 rounded border border-gray-100 uppercase tracking-tight">
+          <div class="hidden xl:flex items-center gap-1.5 mr-1.5">
+            <span class="rounded-md border border-gray-100 bg-gray-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-tight text-gray-500">
               {formatTokenCount(conversation.tokenUsage.total.totalTokens)} tok
             </span>
             {#if formatContextUsage()}
-              <span class="px-2 py-0.5 bg-amber-50 text-[10px] font-bold text-amber-700 rounded border border-amber-100 uppercase tracking-tight">
+              <span class="rounded-md border border-amber-100 bg-amber-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-tight text-amber-700">
                 {formatContextUsage()}
               </span>
             {/if}
           </div>
         {/if}
 
-        {#if selectedSessionId}
+        {#if selectedSessionId && activeWorkspaceTabId === "chat"}
           <button
-            class="ui-animated-button ui-animated-button--icon p-2 rounded-lg text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 disabled:cursor-not-allowed disabled:opacity-50"
+            bind:this={sessionTurnSearchTriggerElement}
+            class={`ui-animated-button ui-animated-button--icon inline-flex h-8 w-8 items-center justify-center rounded-lg p-0 transition-all sm:h-9 sm:w-9 ${
+              sessionTurnSearchOpen ? "bg-amber-50 text-amber-600 hover:bg-amber-100" : "text-gray-400 hover:text-amber-600 hover:bg-amber-50"
+            }`}
+            onclick={toggleSessionTurnSearch}
+            title={sessionSearchCopy.openSearch}
+            type="button"
+          >
+            <Search size={18} />
+          </button>
+          <button
+            class="ui-animated-button ui-animated-button--icon inline-flex h-8 w-8 items-center justify-center rounded-lg p-0 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9"
             disabled={readOnlyRole}
             onclick={() => void forkCurrentThread("handoff")}
             title={ui.handoffToNewThread}
@@ -6374,7 +7209,7 @@
             <ArrowRightLeft size={18} />
           </button>
           <button
-            class={`ui-animated-button ui-animated-button--icon p-2 rounded-lg transition-all ${
+            class={`ui-animated-button ui-animated-button--icon inline-flex h-8 w-8 items-center justify-center rounded-lg p-0 transition-all sm:h-9 sm:w-9 ${
               selectedSessionSummary?.pinned
                 ? "bg-amber-50 text-amber-600 hover:bg-amber-100"
                 : "text-gray-400 hover:text-amber-600 hover:bg-amber-50"
@@ -6391,7 +7226,7 @@
             <Pin size={18} />
           </button>
           <button
-            class="ui-animated-button ui-animated-button--icon p-2 text-gray-400 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-all disabled:cursor-not-allowed disabled:opacity-50"
+            class="ui-animated-button ui-animated-button--icon inline-flex h-8 w-8 items-center justify-center rounded-lg p-0 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9"
             disabled={readOnlyRole}
             onclick={() => {
               if (showArchivedSessions) void unarchiveCurrentSession();
@@ -6404,15 +7239,16 @@
           </button>
         {/if}
 
-        <div class="w-px h-4 bg-gray-200 mx-1"></div>
+        <div class="mx-0.5 h-4 w-px bg-gray-200"></div>
 
         <div class="relative">
           <button 
-            class="surface-contrast-button ui-animated-button ui-animated-button--strong flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-xs font-bold hover:bg-gray-800 transition-all shadow-sm active:scale-95"
+            class="surface-contrast-button ui-animated-button ui-animated-button--strong flex h-8 shrink-0 items-center gap-1 rounded-lg bg-gray-900 px-2.5 text-[11px] font-bold text-white whitespace-nowrap transition-all hover:bg-gray-800 shadow-sm active:scale-95 sm:h-9 sm:px-3 sm:text-xs"
             onclick={() => (workspaceMenuOpen = !workspaceMenuOpen)}
+            title={ui.open}
           >
             <Plus size={14} />
-            <span>{ui.open}</span>
+            <span class="hidden xl:inline">{ui.open}</span>
             <ChevronDown size={12} class={workspaceMenuOpen ? 'rotate-180' : ''} />
           </button>
 
@@ -6433,7 +7269,7 @@
                 </button>
                 <div class="mx-2 my-1 h-px bg-gray-100"></div>
               {/if}
-              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" disabled={subagentTasks.length === 0} onclick={() => { activateTab("tasks"); workspaceMenuOpen = false; }} type="button">
+              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" onclick={() => { activateTab("tasks"); workspaceMenuOpen = false; }} type="button">
                 <History size={16} class="text-gray-400 group-hover:text-amber-600" />
                 <span>{ui.tasks}</span>
               </button>
@@ -6536,12 +7372,19 @@
                 {/if}
 
                 {#each conversation.thread.turns as turn (turn.id)}
-                  <div class="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                  <div
+                    class={`space-y-8 rounded-[1.75rem] px-3 py-3 transition-[background-color,box-shadow,border-color] duration-300 animate-in fade-in slide-in-from-bottom-4 ${
+                      sessionTurnSearchFocusedTurnId === turn.id
+                        ? "border border-amber-200 bg-amber-50/50 shadow-[0_18px_40px_-32px_rgba(245,158,11,0.8)]"
+                        : "border border-transparent"
+                    }`}
+                    data-turn-id={turn.id}
+                  >
                     {#each turn.items.filter((item) => item.type === "userMessage") as item (item.id)}
                       <div class="flex flex-col items-end gap-2 max-w-[85%] ml-auto group/user-message">
                         <div class="flex items-center gap-1 opacity-0 group-hover/user-message:opacity-100 transition-opacity">
                           <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors" onclick={() => void copyMessageText(getUserText(item))} title={ui.copyMessage} type="button"><Copy size={13} /></button>
-                          <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors" onclick={() => editMessageText(getUserText(item))} title={ui.editInComposer} type="button"><MessageSquare size={13} /></button>
+                          <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors" onclick={() => editMessageText(getUserText(item))} title={ui.editInComposer} type="button"><Pencil size={13} /></button>
                           <button class="p-1.5 rounded-lg text-gray-400 hover:text-amber-700 hover:bg-amber-50 transition-colors" onclick={() => void forkCurrentThread("fork", { turnId: turn.id, messageText: getUserText(item) })} title={ui.branchIntoNewThread} type="button"><GitBranch size={13} /></button>
                           <button class="p-1.5 rounded-lg text-gray-400 hover:text-amber-700 hover:bg-amber-50 transition-colors" onclick={() => void forkCurrentThread("handoff", { turnId: turn.id, messageText: getUserText(item) })} title={ui.handoffToNewThread} type="button"><ArrowRightLeft size={13} /></button>
                         </div>
@@ -6561,8 +7404,12 @@
                       <div class="flex-1 min-w-0 space-y-6">
                         {#if shouldCollapseTurnLogs(turn)}
                           {#if getCollapsedTurnProgressCount(turn) > 0}
-                            <div class="border border-gray-100 rounded-xl bg-gray-50/50 overflow-hidden">
-                              <button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-4 py-3 hover:bg-gray-100/50 transition-colors" onclick={() => void toggleTurnLogs(turn.id)}>
+                            <div class="turn-card-shell border border-gray-100 rounded-xl bg-gray-50/50 overflow-hidden">
+                              <button
+                                class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-4 py-3 hover:bg-gray-100/50 transition-colors"
+                                data-sticky-level="0"
+                                onclick={() => void toggleTurnLogs(turn.id)}
+                              >
                                 <div class="flex items-center gap-3">
                                   <div class="p-1.5 bg-white border border-gray-200 rounded-lg text-gray-400"><History size={14} /></div>
                                   <span class="text-xs font-bold text-gray-600 tracking-tight uppercase">{m.work_steps_count({ count: String(getCollapsedTurnProgressCount(turn)) })}</span>
@@ -6570,21 +7417,21 @@
                                 <ChevronDown size={14} class="text-gray-400 {isTurnLogExpanded(turn.id) ? 'rotate-180' : ''} transition-transform" />
                               </button>
                               {#if isTurnLogExpanded(turn.id)}
-                                <div class="p-4 pt-0 space-y-4 bg-white/50 border-t border-gray-100">
+                                <div class="turn-card-expand p-4 pt-0 space-y-4 bg-white/50 border-t border-gray-100" transition:slide|local={{ duration: 220 }}>
                                   {#if isTurnLoading(turn.id)}<div class="py-4 flex items-center justify-center gap-2 text-xs text-gray-400"><RefreshCw size={12} class="animate-spin" />{m.loading()}</div>
                                   {:else if getTurnLoadError(turn.id)}<div class="p-3 bg-red-50 text-red-600 rounded-xl text-xs">{getTurnLoadError(turn.id)}</div>
-                                  {:else}{#each getCollapsedTurnEntries(turn) as entry (entry.key)}{@render renderTurnEntry(turn.id, entry)}{/each}{/if}
+                                  {:else}{#each getCollapsedTurnEntries(turn) as entry (entry.key)}{@render renderTurnEntry(turn.id, entry, 1)}{/each}{/if}
                                 </div>
                               {/if}
                             </div>
                           {/if}
-                          {#each getVisibleSummaryEntries(turn) as entry (entry.key)}{@render renderTurnEntry(turn.id, entry)}{/each}
-                          {#if getFinalAgentItem(turn)}{@render renderTurnItem(turn.id, getFinalAgentItem(turn)!)}{/if}
-                        {:else}{#each getTurnEntries(turn) as entry (entry.key)}{@render renderTurnEntry(turn.id, entry)}{/each}{/if}
+                          {#each getVisibleSummaryEntries(turn) as entry (entry.key)}{@render renderTurnEntry(turn.id, entry, 0)}{/each}
+                          {#if getFinalAgentItem(turn)}{@render renderTurnItem(turn.id, getFinalAgentItem(turn)!, 0)}{/if}
+                        {:else}{#each getTurnEntries(turn) as entry (entry.key)}{@render renderTurnEntry(turn.id, entry, 0)}{/each}{/if}
                         
                         {#if conversation.livePlans[turn.id] && turn.id !== conversation.activeTurnId}
-                          <div class="border border-amber-100 rounded-xl bg-amber-50/30 overflow-hidden">
-                            <div class="turn-card-header turn-card-header--amber px-4 py-2 border-b border-amber-100 flex items-center gap-2 text-[10px] font-bold text-amber-700 uppercase tracking-widest"><ListTodo size={12} /><span>{ui.livePlan}</span></div>
+                          <div class="turn-card-shell border border-amber-100 rounded-xl bg-amber-50/30 overflow-hidden">
+                            <div class="turn-card-header turn-card-header--amber px-4 py-2 border-b border-amber-100 flex items-center gap-2 text-[10px] font-bold text-amber-700 uppercase tracking-widest" data-sticky-level="0"><ListTodo size={12} /><span>{ui.livePlan}</span></div>
                             <div class="p-4 text-sm text-gray-700 space-y-3">
                               {#if conversation.livePlans[turn.id].explanation}<p class="leading-relaxed">{conversation.livePlans[turn.id].explanation}</p>{/if}
                               <ul class="space-y-1.5 pl-2">
@@ -6599,45 +7446,55 @@
                           </div>
                         {/if}
                         {#if conversation.liveDiffs[turn.id] && turn.id !== conversation.activeTurnId}
-                          <details class="group bg-gray-50 border border-gray-200 rounded-xl overflow-hidden">
-                            <summary class="turn-card-header turn-card-header--neutral flex items-center justify-between px-4 py-2 text-[10px] font-bold text-gray-500 uppercase tracking-widest cursor-pointer hover:bg-gray-100 transition-colors">
+                          {@const turnDiffStats = diffLineStats(conversation.liveDiffs[turn.id])}
+                          <div class="turn-card-shell group bg-gray-50 border border-gray-200 rounded-xl overflow-hidden">
+                            <button
+                              class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between px-4 py-2 text-[10px] font-bold text-gray-500 uppercase tracking-widest hover:bg-gray-100 transition-colors"
+                              data-sticky-level="0"
+                              onclick={() => toggleLiveDiff(turn.id)}
+                              type="button"
+                            >
                               <div class="flex items-center gap-2"><FileDiff size={12} /> {ui.aggregatedDiff}</div>
-                              <ChevronDown size={12} class="group-open:rotate-180 transition-transform" />
-                            </summary>
-                            <div class="flex items-center justify-between gap-3 px-4 py-2 border-t border-gray-200 bg-white">
-                              <div class="flex items-center gap-2 text-[10px] font-bold">
-                                <span class="rounded-full bg-emerald-50 px-2 py-1 text-emerald-700">+{diffLineStats(conversation.liveDiffs[turn.id]).added}</span>
-                                <span class="rounded-full bg-red-50 px-2 py-1 text-red-700">-{diffLineStats(conversation.liveDiffs[turn.id]).removed}</span>
+                              <div class="flex items-center gap-1.5">
+                                <span class="rounded-full bg-emerald-50 px-2 py-1 text-emerald-700">+{turnDiffStats.added}</span>
+                                <span class="rounded-full bg-red-50 px-2 py-1 text-red-700">-{turnDiffStats.removed}</span>
+                                <ChevronDown size={12} class="{isLiveDiffExpanded(turn.id) ? 'rotate-180' : ''} transition-transform" />
                               </div>
-                              <button class="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-[10px] font-bold text-gray-700 hover:bg-gray-50 transition-colors" onclick={() => openLiveDiffTab(turn.id, conversation!.liveDiffs[turn.id]!)} type="button">{ui.openTab}</button>
-                            </div>
-                            {#if parseAggregatedDiffViews(conversation.liveDiffs[turn.id]).length > 0}
-                              <div class="border-t border-gray-200 bg-white">
-                                {#each parseAggregatedDiffViews(conversation.liveDiffs[turn.id]) as change}
-                                  <div class="border-b border-gray-100 last:border-b-0">
-                                    <button class="flex w-full items-center justify-between gap-3 px-4 py-2 text-left hover:bg-gray-50 transition-colors" onclick={() => toggleFileChangeEntry(turn.id, `live-diff:${turn.id}`, change)} type="button">
-                                      <div class="min-w-0">
-                                        <p class="truncate text-[11px] font-bold text-gray-700">{change.path}</p>
-                                        <p class="mt-0.5 text-[10px] uppercase tracking-widest text-gray-400">{change.kind}</p>
-                                      </div>
-                                      <ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turn.id, `live-diff:${turn.id}`, change) ? 'rotate-180' : ''} transition-transform" />
-                                    </button>
-                                    {#if isFileChangeEntryExpanded(turn.id, `live-diff:${turn.id}`, change)}
-                                      <div class="border-t border-gray-100 bg-gray-50">
-                                        {#if change.renderable}
-                                          <MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />
-                                        {:else}
-                                          <pre class="p-4 text-xs font-mono overflow-x-auto text-gray-600">{change.diff}</pre>
+                            </button>
+                            {#if isLiveDiffExpanded(turn.id)}
+                              <div class="turn-card-expand border-t border-gray-200 bg-white" transition:slide|local={{ duration: 220 }}>
+                                <div class="flex items-center justify-end gap-3 px-4 py-2 bg-white">
+                                  <button class="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-[10px] font-bold text-gray-700 hover:bg-gray-50 transition-colors" onclick={() => openLiveDiffTab(turn.id, conversation!.liveDiffs[turn.id]!)} type="button">{ui.openTab}</button>
+                                </div>
+                                {#if parseAggregatedDiffViews(conversation.liveDiffs[turn.id]).length > 0}
+                                  <div class="border-t border-gray-200 bg-white">
+                                    {#each parseAggregatedDiffViews(conversation.liveDiffs[turn.id]) as change}
+                                      <div class="border-b border-gray-100 last:border-b-0">
+                                        <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-3 px-4 py-2 text-left hover:bg-gray-50 transition-colors" data-sticky-level="1" onclick={() => toggleFileChangeEntry(turn.id, `live-diff:${turn.id}`, change)} type="button">
+                                          <div class="min-w-0">
+                                            <p class="truncate text-[11px] font-bold text-gray-700">{change.path}</p>
+                                            <p class="mt-0.5 text-[10px] uppercase tracking-widest text-gray-400">{change.kind}</p>
+                                          </div>
+                                          <ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turn.id, `live-diff:${turn.id}`, change) ? 'rotate-180' : ''} transition-transform" />
+                                        </button>
+                                        {#if isFileChangeEntryExpanded(turn.id, `live-diff:${turn.id}`, change)}
+                                          <div class="turn-card-expand border-t border-gray-100 bg-gray-50" transition:slide|local={{ duration: 180 }}>
+                                            {#if change.renderable}
+                                              <MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />
+                                            {:else}
+                                              <pre class="p-4 text-xs font-mono overflow-x-auto text-gray-600">{change.diff}</pre>
+                                            {/if}
+                                          </div>
                                         {/if}
                                       </div>
-                                    {/if}
+                                    {/each}
                                   </div>
-                                {/each}
+                                {:else}
+                                  <pre class="border-t border-gray-200 bg-gray-50/30 p-4 text-xs font-mono overflow-x-auto text-gray-600">{conversation.liveDiffs[turn.id]}</pre>
+                                {/if}
                               </div>
-                            {:else}
-                              <pre class="p-4 text-xs font-mono overflow-x-auto text-gray-600 bg-gray-50/30 border-t border-gray-200">{conversation.liveDiffs[turn.id]}</pre>
                             {/if}
-                          </details>
+                          </div>
                         {/if}
                       </div>
                     </div>
@@ -6731,9 +7588,11 @@
                     onclick={() => (queuedFollowupsExpanded = !queuedFollowupsExpanded)}
                     type="button"
                   >
-                    <div>
-                      <p class="text-[11px] font-bold text-gray-900 uppercase tracking-widest">{ui.queuedFollowups}</p>
-                      <p class="mt-0.5 text-[10px] text-gray-500">{m.pending_count({ count: String(queuedMessages.length) })}</p>
+                    <div class="flex min-w-0 items-center gap-2">
+                      <p class="truncate text-[11px] font-bold uppercase tracking-widest text-gray-900">{ui.queuedFollowups}</p>
+                      <span class="inline-flex min-w-[1.35rem] items-center justify-center rounded-full bg-gray-900/6 px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-gray-600">
+                        {queuedMessages.length}
+                      </span>
                     </div>
                     <div class="flex items-center gap-2.5">
                       {#if conversation?.queue.resumeRequired}
@@ -6745,64 +7604,95 @@
                   {#if queuedFollowupsExpanded}
                     <div class="max-h-52 overflow-y-auto divide-y divide-gray-200 overscroll-contain">
                       {#each queuedMessages as item (item.id)}
-                        <div class="px-3.5 py-2.5 flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
-                          <div class="min-w-0 flex-1 space-y-1">
-                            <div class="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-gray-400">
-                              <span>{ui.followUp}</span>
-                              {#if item.attachmentNames.length > 0}
-                                <span class="text-gray-300">•</span>
-                                <span>{m.attached_files_count({ count: String(item.attachmentNames.length) })}</span>
-                              {/if}
-                            </div>
-                            {#if editingQueueId === item.id}
-                              <div class="space-y-2">
-                                <textarea
-                                  bind:value={editingQueuePrompt}
-                                  class="w-full min-h-[4.25rem] rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 shadow-sm focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-100"
-                                  onkeydown={(event) => {
-                                    if (event.key === "Escape") {
-                                      event.preventDefault();
-                                      cancelQueuedMessageEdit();
-                                    }
-                                    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-                                      event.preventDefault();
-                                      void saveQueuedMessage(item.id);
-                                    }
-                                  }}
-                                  placeholder={m.edit_queued_followup()}
-                                ></textarea>
-                                {#if item.attachmentNames.length > 0}
-                                  <div class="flex flex-wrap gap-1.5">
-                                    {#each item.attachmentNames as attachmentName}
-                                      <span class="rounded-full border border-gray-200 bg-white px-2 py-1 text-[11px] text-gray-500">{attachmentName}</span>
-                                    {/each}
-                                  </div>
-                                {/if}
-                                <p class="text-[11px] text-gray-400">{m.attached_files_stay()}</p>
+                        <div
+                          class={`relative px-3.5 py-2.5 transition-colors ${queueDragState?.queueId === item.id ? "bg-amber-50/60" : ""}`}
+                          data-queue-item-id={item.id}
+                        >
+                          {#if showQueueDropIndicator(item.id, "before")}
+                            <div class="pointer-events-none absolute inset-x-3 top-0 h-0.5 rounded-full bg-amber-400 shadow-[0_0_0_1px_rgba(251,191,36,0.18)]"></div>
+                          {/if}
+                          {#if showQueueDropIndicator(item.id, "after")}
+                            <div class="pointer-events-none absolute inset-x-3 bottom-0 h-0.5 rounded-full bg-amber-400 shadow-[0_0_0_1px_rgba(251,191,36,0.18)]"></div>
+                          {/if}
+                          <div class="flex items-start gap-2.5">
+                            <button
+                              aria-label={ui.reorderQueue ?? "Reorder queued message"}
+                              class={`mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-400 transition-colors ${sending || queueReorderBusy || queuedMessages.length < 2 ? "cursor-not-allowed opacity-45" : queueDragState?.queueId === item.id ? "cursor-grabbing border-amber-300 bg-amber-50 text-amber-700 shadow-sm" : "cursor-grab hover:bg-gray-100 hover:text-gray-700"}`}
+                              disabled={sending || queueReorderBusy || queuedMessages.length < 2}
+                              onlostpointercapture={cancelQueueDrag}
+                              onpointercancel={cancelQueueDrag}
+                              onpointerdown={(event) => startQueueDrag(event, item.id)}
+                              onpointermove={moveQueueDrag}
+                              onpointerup={endQueueDrag}
+                              style="touch-action: none;"
+                              title={ui.reorderQueue ?? "Reorder queued message"}
+                              type="button"
+                            >
+                              <GripVertical size={14} />
+                            </button>
+                            <div class="min-w-0 flex-1">
+                              <div class="flex flex-col gap-2.5 md:flex-row md:items-start md:justify-between">
+                                <div class="min-w-0 flex-1 space-y-1.5">
+                                  {#if editingQueueId === item.id}
+                                    <div class="space-y-2">
+                                      <textarea
+                                        bind:value={editingQueuePrompt}
+                                        class="w-full min-h-[4.25rem] rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 shadow-sm focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-100"
+                                        onkeydown={(event) => {
+                                          if (event.key === "Escape") {
+                                            event.preventDefault();
+                                            cancelQueuedMessageEdit();
+                                          }
+                                          if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                                            event.preventDefault();
+                                            void saveQueuedMessage(item.id);
+                                          }
+                                        }}
+                                        placeholder={m.edit_queued_followup()}
+                                      ></textarea>
+                                      {#if item.attachmentNames.length > 0}
+                                        <div class="flex flex-wrap gap-1.5">
+                                          {#each item.attachmentNames as attachmentName}
+                                            <span class="rounded-full border border-gray-200 bg-white px-2 py-1 text-[11px] text-gray-500">{attachmentName}</span>
+                                          {/each}
+                                        </div>
+                                      {/if}
+                                      <p class="text-[11px] text-gray-400">{m.attached_files_stay()}</p>
+                                    </div>
+                                  {:else}
+                                    <p class="text-[13px] leading-5 text-gray-700 break-words">{summarizeQueueItem(item)}</p>
+                                    {#if item.attachmentNames.length > 0}
+                                      <div class="flex flex-wrap gap-1.5">
+                                        <span class="inline-flex items-center gap-1 rounded-full border border-gray-200 bg-white px-2 py-1 text-[10px] font-semibold text-gray-500">
+                                          <Paperclip size={10} />
+                                          <span>{m.attached_files_count({ count: String(item.attachmentNames.length) })}</span>
+                                        </span>
+                                      </div>
+                                    {/if}
+                                  {/if}
+                                </div>
+                                <div class="flex flex-wrap items-center gap-2 md:justify-end">
+                                  {#if editingQueueId === item.id}
+                                    <button class="inline-flex h-8 items-center justify-center rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 text-[11px] font-bold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.queueSave}</button>
+                                    <button class="inline-flex h-8 items-center justify-center rounded-lg border border-gray-200 bg-white px-2.5 text-[11px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={cancelQueuedMessageEdit} type="button">{ui.cancel}</button>
+                                  {:else}
+                                    <button class="inline-flex h-8 items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-2.5 text-[11px] font-bold text-amber-700 transition-colors hover:bg-amber-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={() => void dispatchQueuedMessage(item.id, "steer")} type="button">{ui.steerNow}</button>
+                                    <button class="inline-flex h-8 items-center justify-center rounded-lg border border-gray-200 bg-white px-2.5 text-[11px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={() => void dispatchQueuedMessage(item.id, "message")} type="button">{ui.sendNow}</button>
+                                    <button
+                                      aria-label={ui.edit}
+                                      class="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-gray-200 bg-white p-0 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:opacity-50"
+                                      disabled={sending || queueReorderBusy}
+                                      onclick={() => beginQueuedMessageEdit(item)}
+                                      title={ui.edit}
+                                      type="button"
+                                    >
+                                      <Pencil size={14} />
+                                    </button>
+                                  {/if}
+                                  <button class="inline-flex h-8 w-8 items-center justify-center rounded-lg p-0 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:opacity-50" aria-label={m.remove_queued_message()} disabled={sending || queueReorderBusy} onclick={() => void removeQueuedMessage(item.id)} type="button"><Trash2 size={14} /></button>
+                                </div>
                               </div>
-                            {:else}
-                              <p class="text-[13px] leading-5 text-gray-700 break-words">{summarizeQueueItem(item)}</p>
-                            {/if}
-                          </div>
-                          <div class="flex flex-wrap items-center gap-2 md:justify-end">
-                            {#if editingQueueId === item.id}
-                              <button class="px-2.5 py-1.5 rounded-lg border border-emerald-200 bg-emerald-50 text-[11px] font-bold text-emerald-700 hover:bg-emerald-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.queueSave}</button>
-                              <button class="px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-[11px] font-bold text-gray-700 hover:bg-gray-100 transition-colors disabled:opacity-50" disabled={sending} onclick={cancelQueuedMessageEdit} type="button">{ui.cancel}</button>
-                            {:else}
-                              <button
-                                aria-label={ui.edit}
-                                class="p-2 rounded-lg border border-gray-200 bg-white text-gray-500 hover:bg-gray-100 hover:text-gray-700 transition-colors disabled:opacity-50"
-                                disabled={sending}
-                                onclick={() => beginQueuedMessageEdit(item)}
-                                title={ui.edit}
-                                type="button"
-                              >
-                                <Pencil size={14} />
-                              </button>
-                              <button class="px-2.5 py-1.5 rounded-lg border border-amber-200 bg-amber-50 text-[11px] font-bold text-amber-700 hover:bg-amber-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => void dispatchQueuedMessage(item.id, "steer")} type="button">{ui.steerNow}</button>
-                              <button class="px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-[11px] font-bold text-gray-700 hover:bg-gray-100 transition-colors disabled:opacity-50" disabled={sending} onclick={() => void dispatchQueuedMessage(item.id, "message")} type="button">{ui.sendNow}</button>
-                            {/if}
-                            <button class="p-2 rounded-lg text-gray-400 hover:text-red-600 hover:bg-red-50 transition-colors disabled:opacity-50" aria-label={m.remove_queued_message()} disabled={sending} onclick={() => void removeQueuedMessage(item.id)} type="button"><Trash2 size={14} /></button>
+                            </div>
                           </div>
                         </div>
                       {/each}
@@ -6858,7 +7748,7 @@
                             <div class="max-h-72 overflow-auto">
                               {#each activeLiveTurnDiffViews as change (`${change.path}:${change.kind}`)}
                                 <div class="border-t border-gray-100 first:border-t-0">
-                                  <button class="flex w-full items-center justify-between gap-3 px-2.5 py-2 text-left hover:bg-gray-50 transition-colors" onclick={() => toggleFileChangeEntry(activeLiveTurnId, "live-diff:active", change)} type="button">
+                                  <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-3 px-2.5 py-2 text-left hover:bg-gray-50 transition-colors" data-sticky-level="2" onclick={() => toggleFileChangeEntry(activeLiveTurnId, "live-diff:active", change)} type="button">
                                     <div class="min-w-0">
                                       <p class="truncate text-[11px] font-bold text-gray-700">{change.path}</p>
                                       <p class="mt-0.5 text-[10px] uppercase tracking-[0.18em] text-gray-400">{change.kind}</p>
@@ -6866,7 +7756,7 @@
                                     <ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(activeLiveTurnId, 'live-diff:active', change) ? 'rotate-180' : ''} transition-transform" />
                                   </button>
                                   {#if isFileChangeEntryExpanded(activeLiveTurnId, "live-diff:active", change)}
-                                    <div class="border-t border-gray-100 bg-gray-50">
+                                    <div class="turn-card-expand border-t border-gray-100 bg-gray-50" transition:slide|local={{ duration: 180 }}>
                                       {#if change.renderable}
                                         <MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />
                                       {:else}
@@ -6882,9 +7772,28 @@
                           {/if}
                         </div>
                       {/if}
+                      {#if activeLiveTurnPlan}
+                        <div class="turn-card-shell rounded-xl border border-amber-100 bg-white/85 p-2.5">
+                          <div class="turn-card-header turn-card-header--amber mb-1.5 flex items-center gap-2 rounded-xl px-2 py-2 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-700" data-sticky-level="1">
+                            <ListTodo size={12} />
+                            <span>{ui.livePlan}</span>
+                          </div>
+                          {#if activeLiveTurnPlan.explanation}
+                            <p class="text-[11px] leading-relaxed text-gray-600">{activeLiveTurnPlan.explanation}</p>
+                          {/if}
+                          <ul class="mt-2 max-h-72 space-y-1.5 overflow-auto pr-1">
+                            {#each activeLiveTurnPlan.plan as step (`${step.step}:${step.status}`)}
+                              <li class="flex items-start gap-2 text-[11px] leading-4">
+                                <span class="mt-1 h-1.5 w-1.5 flex-shrink-0 rounded-full {step.status === 'completed' ? 'bg-emerald-500' : 'bg-amber-400 animate-pulse'}"></span>
+                                <span class="{step.status === 'completed' ? 'text-gray-400 line-through' : 'text-gray-700'}">{step.step}</span>
+                              </li>
+                            {/each}
+                          </ul>
+                        </div>
+                      {/if}
                       {#if activeLiveTurnSubagents.length > 0}
-                        <div class="rounded-xl border border-sky-100 bg-white/85 overflow-hidden">
-                          <div class="flex items-center justify-between gap-2 border-b border-sky-100 px-2.5 py-2">
+                        <div class="turn-card-shell rounded-xl border border-sky-100 bg-white/85 overflow-hidden">
+                          <div class="turn-card-header turn-card-header--neutral flex items-center justify-between gap-2 border-b border-sky-100 px-2.5 py-2" data-sticky-level="1">
                             <div class="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.18em] text-sky-700">
                               <Bot size={12} />
                               <span>{ui.subagentActivities}</span>
@@ -6950,7 +7859,16 @@
                       <span class="truncate font-medium">{lastComposerHistoryPrompt}</span>
                     </button>
                     <button
-                      class="surface-contrast-button ui-animated-button ui-animated-button--soft flex shrink-0 items-center gap-1.5 rounded-xl px-3 py-1.5 text-[10px] font-bold shadow-sm"
+                      aria-label={ui.close}
+                      class="ui-animated-button ui-animated-button--icon flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-gray-200/80 bg-white/80 text-gray-400 shadow-sm transition-colors hover:border-gray-300 hover:bg-gray-50 hover:text-gray-600"
+                      onclick={dismissLastComposerPromptChip}
+                      title={ui.close}
+                      type="button"
+                    >
+                      <X size={14} />
+                    </button>
+                    <button
+                      class="surface-contrast-button ui-animated-button ui-animated-button--soft flex h-8 shrink-0 items-center gap-1.5 rounded-xl px-3 text-[10px] font-bold shadow-sm"
                       disabled={readOnlyRole || sending || startingMessage || uploading}
                       onclick={() => void resendLastComposerMessage()}
                       title={queueModeActive ? ui.queue : ui.send}
@@ -6980,7 +7898,7 @@
                     {/each}
                   </div>
                 {/if}
-                <form class="composer-panel bg-white/95 border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200 focus-within:-translate-y-0.5 focus-within:border-amber-400/70 focus-within:bg-white focus-within:shadow-[0_24px_60px_-34px_rgba(245,158,11,0.65)]" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
+                <form bind:this={composerPanelElement} class="composer-panel bg-white/95 border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200 focus-within:-translate-y-0.5 focus-within:border-amber-400/70 focus-within:bg-white focus-within:shadow-[0_24px_60px_-34px_rgba(245,158,11,0.65)]" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
                   <textarea bind:this={composerTextareaElement} bind:value={draft} class="composer-textarea w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 outline-none transition-colors duration-150 focus:outline-none focus:ring-0 focus:placeholder:text-amber-500/70 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} readonly={readOnlyRole} rows="1"></textarea>
                   
                   {#if draftAttachments.length > 0}
@@ -6989,37 +7907,89 @@
                     </div>
                   {/if}
 
-                  <div class="composer-toolbar flex flex-wrap items-center gap-2 border-t border-gray-100 bg-gray-50/80 px-3 py-2.5 transition-colors duration-200 group-focus-within:border-amber-100 group-focus-within:bg-[linear-gradient(180deg,rgba(255,251,235,0.9),rgba(255,255,255,0.98))] sm:px-4 sm:py-3">
-                    <div class="flex min-w-0 flex-1 items-center gap-1.5 sm:gap-2">
+                  <div bind:this={composerToolbarElement} class={`composer-toolbar flex items-center gap-2 border-t border-gray-100 bg-gray-50/80 px-3 py-2.5 transition-colors duration-200 group-focus-within:border-amber-100 group-focus-within:bg-[linear-gradient(180deg,rgba(255,251,235,0.9),rgba(255,255,255,0.98))] sm:px-4 sm:py-3 ${composerToolbarCompact ? "flex-wrap" : "flex-nowrap"}`}>
+                    <div class={`flex min-w-0 items-center gap-1.5 sm:gap-2 ${composerToolbarCompact ? "basis-full flex-1" : "flex-1"}`}>
                       <input bind:this={filePickerElement} disabled={readOnlyRole || uploading} hidden multiple onchange={(event) => void uploadFiles((event.currentTarget as HTMLInputElement).files)} type="file" />
-                      <button class="ui-animated-button ui-animated-button--icon rounded-xl p-1.5 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 group-focus-within:bg-white/90 group-focus-within:text-amber-700 sm:p-2 disabled:cursor-not-allowed disabled:opacity-50" disabled={readOnlyRole || uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={18} class="animate-spin" />{:else}<Paperclip size={18} />{/if}</button>
+                      <button class="ui-animated-button ui-animated-button--icon inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl p-0 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 group-focus-within:bg-white/90 group-focus-within:text-amber-700 disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9" disabled={readOnlyRole || uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={16} class="animate-spin" />{:else}<Paperclip size={16} />{/if}</button>
                       {#if conversation}
                         <div class="mx-0.5 hidden h-4 w-px bg-gray-200 sm:block"></div>
-                        <button class="composer-compact-trigger ui-animated-button ui-animated-button--soft flex min-w-0 max-w-[8.5rem] items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:max-w-[11rem] sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button">
-                          <SlidersHorizontal size={13} class="shrink-0 text-gray-400" />
+                        <button bind:this={composerSettingsTriggerElement} class="composer-compact-trigger ui-animated-button ui-animated-button--soft flex h-8 min-w-0 max-w-[10.5rem] items-center gap-1.5 rounded-xl border border-transparent px-2.5 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:h-9 sm:max-w-[13.5rem] sm:gap-2 sm:px-3 sm:text-[11px]" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button">
+                          {#if isFastSpeedMode(composerSettingsSummary.speed)}
+                            <span class="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-700">
+                              <Zap size={12} />
+                            </span>
+                          {:else}
+                            <Cpu size={13} class="shrink-0 text-gray-400" />
+                          {/if}
                           <span class="truncate">{composerSettingsSummary.model}</span>
+                          {#if composerSettingsSummary.speed === "flex"}
+                            <span class="hidden rounded-full bg-sky-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-sky-700 sm:inline-flex">
+                              {ui.speedFlex}
+                            </span>
+                          {/if}
                           <ChevronDown size={14} class={`shrink-0 transition-transform ${composerSettingsOpen ? "rotate-180" : ""}`} />
                         </button>
-                        <button class="composer-compact-trigger ui-animated-button ui-animated-button--soft flex shrink-0 items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSecurityOpen = !composerSecurityOpen; composerSettingsOpen = false; }} title={ui.securitySession} type="button"><Shield size={14} class="text-gray-400" /><span class="hidden sm:inline">{ui.securitySession}</span></button>
+                        <button bind:this={composerSecurityTriggerElement} class="composer-compact-trigger ui-animated-button ui-animated-button--soft flex h-8 shrink-0 items-center gap-1.5 rounded-xl border border-transparent px-2.5 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:h-9 sm:gap-2 sm:px-3 sm:text-[11px]" onclick={() => { composerSecurityOpen = !composerSecurityOpen; composerSettingsOpen = false; }} title={ui.securitySession} type="button"><Shield size={14} class="text-gray-400" /><span class="hidden lg:inline">{ui.securitySession}</span></button>
                       {/if}
                     </div>
-                    <div class="flex w-full items-center justify-end gap-1.5 sm:w-auto sm:gap-2">
+                    <div class={`flex items-center justify-end gap-1.5 sm:gap-2 ${composerToolbarCompact ? "basis-full" : "shrink-0"}`}>
                       {#if running}
-                        <button class="ui-animated-button ui-animated-button--soft rounded-xl px-3 py-1.5 text-[11px] font-bold text-red-600 transition-all hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 sm:px-4 sm:py-2 sm:text-xs" disabled={readOnlyRole} onclick={interruptTurn} type="button">{ui.stop}</button>
-                        <button class="ui-animated-button ui-animated-button--soft rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] font-bold text-amber-700 transition-all hover:bg-amber-100 disabled:opacity-50 sm:px-4 sm:py-2 sm:text-xs" disabled={readOnlyRole || sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
+                        <button class="ui-animated-button ui-animated-button--soft inline-flex h-8 items-center justify-center rounded-xl px-3 text-[11px] font-bold text-red-600 transition-all hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:px-4 sm:text-xs" disabled={readOnlyRole} onclick={interruptTurn} type="button">{ui.stop}</button>
+                        <button class="ui-animated-button ui-animated-button--soft inline-flex h-8 items-center justify-center rounded-xl border border-amber-200 bg-amber-50 px-3 text-[11px] font-bold text-amber-700 transition-all hover:bg-amber-100 disabled:opacity-50 sm:h-9 sm:px-4 sm:text-xs" disabled={readOnlyRole || sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
                       {/if}
-                      <button class="surface-contrast-button ui-animated-button ui-animated-button--strong rounded-xl bg-gray-900 px-4 py-1.5 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:px-6 sm:py-2 sm:text-xs" disabled={readOnlyRole || sending || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
+                      <button class="surface-contrast-button ui-animated-button ui-animated-button--strong inline-flex h-8 items-center justify-center rounded-xl bg-gray-900 px-4 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:h-9 sm:px-6 sm:text-xs" disabled={readOnlyRole || sending || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
                     </div>
                   </div>
                 </form>
 
                 <!-- Settings Popovers -->
                 {#if composerSettingsOpen && conversation}
-                  <div class="composer-popover absolute bottom-24 left-0 w-80 bg-white border border-gray-200 rounded-2xl shadow-2xl p-4 space-y-4 z-50">
+                  <div bind:this={composerSettingsPopoverElement} class="composer-popover absolute bottom-24 left-0 w-80 bg-white border border-gray-200 rounded-2xl shadow-2xl p-4 space-y-4 z-50" style={composerSettingsPopoverStyle}>
                     <div class="flex items-center justify-between border-b border-gray-100 pb-3 mb-2"><h3 class="text-xs font-bold text-gray-400 uppercase tracking-widest">{ui.composerSettings}</h3><button class="text-gray-400 hover:text-gray-600" onclick={() => (composerSettingsOpen = false)}><X size={16} /></button></div>
                     <div class="grid grid-cols-1 gap-4">
                       <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-model-select">{ui.model}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} id="composer-model-select" onchange={(event) => setPreference("model", (event.currentTarget as HTMLSelectElement).value || null)} value={conversation.preferences.model ?? ""}><option value="">{ui.autoDefault}</option>{#each config?.models ?? [] as model}<option value={model.id}>{model.displayName}</option>{/each}</select></div>
                       <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-effort-select">{m.reasoning()}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} id="composer-effort-select" onchange={(event) => setPreference("effort", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["effort"])} value={conversation.preferences.effort ?? (reasoningOptions[0] ?? "medium")}>{#each reasoningOptions as option}<option value={option}>{option}</option>{/each}</select></div>
+                      <div class="space-y-2 rounded-2xl border border-gray-200/80 bg-gray-50/80 p-3">
+                        <div class="flex items-center gap-2">
+                          <span class={`inline-flex h-7 w-7 items-center justify-center rounded-xl border ${
+                            conversation.preferences.sendOnEnter
+                              ? "border-amber-200 bg-amber-100 text-amber-700"
+                              : "border-gray-200 bg-white text-gray-500"
+                          }`}>
+                            <Keyboard size={13} />
+                          </span>
+                          <div class="min-w-0">
+                            <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.sendShortcut}</p>
+                            <p class="text-[11px] text-gray-500">{ui.sendShortcutDescription}</p>
+                          </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-1.5 rounded-2xl border border-gray-200 bg-white p-1 shadow-sm">
+                          <button
+                            class={`ui-animated-button ui-animated-button--soft flex min-h-[2.85rem] items-center justify-center rounded-xl border px-2 py-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                              !conversation.preferences.sendOnEnter
+                                ? "border-gray-900 bg-gray-900 text-white shadow-sm"
+                                : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
+                            }`}
+                            disabled={readOnlyRole}
+                            onclick={() => setPreference("sendOnEnter", false)}
+                            type="button"
+                          >
+                            <span>{ui.sendShortcutCtrlEnter}</span>
+                          </button>
+                          <button
+                            class={`ui-animated-button ui-animated-button--soft flex min-h-[2.85rem] items-center justify-center rounded-xl border px-2 py-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                              conversation.preferences.sendOnEnter
+                                ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
+                                : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
+                            }`}
+                            disabled={readOnlyRole}
+                            onclick={() => setPreference("sendOnEnter", true)}
+                            type="button"
+                          >
+                            <span>{ui.sendShortcutEnter}</span>
+                          </button>
+                        </div>
+                      </div>
                       <div class="space-y-2 rounded-2xl border border-gray-200/80 bg-gray-50/80 p-3">
                         <div class="flex items-center justify-between gap-3">
                           <div class="space-y-0.5">
@@ -7047,19 +8017,34 @@
                         </div>
                       </div>
                       <div class="space-y-2 rounded-2xl border border-gray-200/80 bg-gray-50/80 p-3">
-                        <div class="flex items-center justify-between gap-3">
-                          <div class="space-y-0.5">
+                        <div class="flex items-center gap-2">
+                          <span class={`inline-flex h-7 w-7 items-center justify-center rounded-xl border ${
+                            isFastSpeedMode(conversation.preferences.speed)
+                              ? "border-amber-200 bg-amber-100 text-amber-700"
+                              : "border-gray-200 bg-white text-gray-500"
+                          }`}>
+                            {#if isFastSpeedMode(conversation.preferences.speed)}
+                              <Zap size={13} />
+                            {:else}
+                              <Cpu size={13} />
+                            {/if}
+                          </span>
+                          <div class="min-w-0">
                             <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.speed}</p>
                             <p class="text-[11px] text-gray-500">{getSpeedOptionLabel(conversation.preferences.speed ?? "auto")}</p>
                           </div>
                         </div>
-                        <div class="inline-flex min-w-0 flex-wrap items-center gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
+                        <div class="grid grid-cols-3 gap-1.5 rounded-2xl border border-gray-200 bg-white p-1 shadow-sm">
                           {#each speedOptions as option}
                             <button
-                              class={`ui-animated-button ui-animated-button--soft ${ (conversation.preferences.speed ?? "auto") === option ? "surface-contrast-button" : "" } rounded-lg px-2.5 py-1 text-[10px] font-bold transition-all sm:text-[11px] ${
+                              class={`ui-animated-button ui-animated-button--soft flex min-h-[3.1rem] flex-col items-center justify-center gap-1 rounded-xl border px-2 py-2 text-[10px] font-bold transition-all sm:text-[11px] ${
                                 (conversation.preferences.speed ?? "auto") === option
-                                  ? "bg-gray-900 text-white shadow-sm"
-                                  : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"
+                                  ? option === "fast"
+                                    ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
+                                    : option === "flex"
+                                      ? "border-sky-200 bg-sky-50 text-sky-700 shadow-sm"
+                                      : "border-gray-900 bg-gray-900 text-white shadow-sm"
+                                  : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
                               }`}
                               disabled={readOnlyRole}
                               onclick={() => {
@@ -7070,7 +8055,12 @@
                               }}
                               type="button"
                             >
-                              {getSpeedOptionLabel(option as SessionPreferences["speed"])}
+                              {#if option === "fast"}
+                                <Zap size={13} class="shrink-0" />
+                              {:else}
+                                <Cpu size={13} class="shrink-0 opacity-80" />
+                              {/if}
+                              <span>{getSpeedOptionLabel(option as SessionPreferences["speed"])}</span>
                             </button>
                           {/each}
                         </div>
@@ -7079,7 +8069,7 @@
                   </div>
                 {/if}
                 {#if composerSecurityOpen && conversation}
-                  <div class="composer-popover absolute bottom-24 left-0 w-80 bg-white border border-gray-200 rounded-2xl shadow-2xl p-4 space-y-4 z-50">
+                  <div bind:this={composerSecurityPopoverElement} class="composer-popover absolute bottom-24 left-0 w-80 bg-white border border-gray-200 rounded-2xl shadow-2xl p-4 space-y-4 z-50" style={composerSecurityPopoverStyle}>
                     <div class="flex items-center justify-between border-b border-gray-100 pb-3 mb-2"><h3 class="text-xs font-bold text-gray-400 uppercase tracking-widest">{ui.securitySession}</h3><button class="text-gray-400 hover:text-gray-600" onclick={() => (composerSecurityOpen = false)}><X size={16} /></button></div>
                     <div class="space-y-4">
                       <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-approval-select">{ui.approvalMode}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} id="composer-approval-select" onchange={(event) => setPreference("autoApproveMode", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["autoApproveMode"])} value={conversation.preferences.autoApproveMode ?? "manual"}><option value="manual">{ui.manual}</option><option value="turn">{ui.autoOnce}</option><option value="session">{ui.autoSession}</option></select></div>
@@ -7209,6 +8199,123 @@
     </div>
   </main>
 </div>
+
+{#if selectedSessionId && activeWorkspaceTabId === "chat" && sessionTurnSearchOpen}
+  <div
+    bind:this={sessionTurnSearchPopoverElement}
+    class="composer-popover fixed z-[72] overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl"
+    style={sessionTurnSearchPopoverStyle || "opacity:0;pointer-events:none;"}
+  >
+    <div class="flex items-center gap-2 border-b border-gray-100 px-3 py-2.5">
+      <Search size={14} class="shrink-0 text-gray-400" />
+      <input
+        bind:this={sessionTurnSearchInputElement}
+        bind:value={sessionTurnSearchQuery}
+        class="w-full border-none bg-transparent p-0 text-sm text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-0"
+        oninput={() => scheduleSessionTurnSearch(true)}
+        onkeydown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            resetSessionTurnSearch();
+          }
+          if (event.key === "Enter" && sessionTurnSearchResults.length > 0) {
+            event.preventDefault();
+            void jumpToSessionSearchResult(sessionTurnSearchResults[0]);
+          }
+        }}
+        placeholder={sessionSearchCopy.placeholder}
+        type="search"
+      />
+      {#if sessionTurnSearchBusy}
+        <RefreshCw size={14} class="shrink-0 animate-spin text-gray-400" />
+      {:else if sessionTurnSearchQuery.trim()}
+        <span class="shrink-0 text-[10px] font-bold uppercase tracking-widest text-gray-400">
+          {sessionTurnSearchTotalMatches} {sessionSearchCopy.results}
+        </span>
+      {/if}
+      <button
+        class="ui-animated-button ui-animated-button--icon rounded-lg p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700"
+        onclick={() => resetSessionTurnSearch()}
+        title={ui.close}
+        type="button"
+      >
+        <X size={14} />
+      </button>
+    </div>
+    <div class="max-h-72 overflow-y-auto overscroll-contain">
+      {#if sessionTurnSearchError}
+        <div class="px-3 py-3 text-xs text-red-600">{sessionTurnSearchError}</div>
+      {:else if !sessionTurnSearchQuery.trim()}
+        <div class="px-3 py-3 text-xs leading-relaxed text-gray-500">{sessionSearchCopy.hint}</div>
+      {:else if !sessionTurnSearchBusy && sessionTurnSearchResults.length === 0}
+        <div class="px-3 py-3 text-xs text-gray-500">{sessionSearchCopy.noResults}</div>
+      {:else}
+        <div class="divide-y divide-gray-100">
+          {#each sessionTurnSearchResults as result (`${result.turnId}:${result.itemId ?? 'turn'}:${result.preview}`)}
+            <button
+              class="ui-animated-button ui-animated-button--soft flex w-full items-start justify-between gap-3 px-3 py-3 text-left transition-colors hover:bg-amber-50/60"
+              disabled={sessionTurnSearchJumpingTurnId === result.turnId}
+              onclick={() => void jumpToSessionSearchResult(result)}
+              type="button"
+            >
+              <div class="min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <span class="rounded-full bg-gray-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-gray-500">
+                    {sessionSearchCopy.turn} {result.turnIndex + 1}
+                  </span>
+                  <span class="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-amber-700">
+                    {result.itemType === "userMessage"
+                      ? "User"
+                      : result.itemType === "agentMessage"
+                        ? "Assistant"
+                        : result.itemType === "reasoning"
+                          ? m.reasoning()
+                          : result.itemType === "plan"
+                            ? ui.planMode
+                            : result.itemType === "commandExecution"
+                              ? m.run_command()
+                              : result.itemType === "fileChange"
+                                ? m.files_changed_fallback()
+                                : result.itemType === "webSearch"
+                                  ? m.web_search()
+                                  : result.itemType === "mcpToolCall"
+                                    ? m.mcp_call()
+                                    : result.itemType === "dynamicToolCall"
+                                      ? m.tool_call()
+                                      : result.itemType === "contextCompaction"
+                                        ? ui.contextCompression
+                                        : result.itemType ?? "Item"}
+                  </span>
+                </div>
+                <p class="mt-2 line-clamp-2 text-sm leading-5 text-gray-700">{result.preview}</p>
+              </div>
+              {#if sessionTurnSearchJumpingTurnId === result.turnId}
+                <RefreshCw size={14} class="mt-1 shrink-0 animate-spin text-gray-400" />
+              {:else}
+                <ChevronDown size={14} class="-rotate-90 shrink-0 text-gray-300" />
+              {/if}
+            </button>
+          {/each}
+        </div>
+        {#if sessionTurnSearchCursor}
+          <div class="border-t border-gray-100 px-3 py-2.5">
+            <button
+              class="ui-animated-button ui-animated-button--soft flex w-full items-center justify-center gap-2 rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs font-bold text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={sessionTurnSearchLoadingMore}
+              onclick={() => void loadMoreSessionTurnSearchResults()}
+              type="button"
+            >
+              {#if sessionTurnSearchLoadingMore}
+                <RefreshCw size={13} class="animate-spin" />
+              {/if}
+              <span>{sessionSearchCopy.loadMore}</span>
+            </button>
+          </div>
+        {/if}
+      {/if}
+    </div>
+  </div>
+{/if}
 
 {#if startupAlertModalOpen && config && (startupPausedQueues.length > 0 || startupScheduledShutdown)}
   <div
@@ -7540,19 +8647,55 @@
     color: #f8fafc !important;
   }
 
+  .turn-card-shell {
+    position: relative;
+    isolation: isolate;
+  }
+
+  .turn-card-expand {
+    overflow: hidden;
+    transform-origin: top center;
+  }
+
   .turn-card-header {
     position: sticky;
-    top: 0.35rem;
-    z-index: 4;
-    backdrop-filter: blur(12px);
+    top: 0.65rem;
+    z-index: 16;
+    backdrop-filter: blur(14px);
+    box-shadow: 0 14px 28px -26px rgba(15, 23, 42, 0.38);
+  }
+
+  .turn-card-header[data-sticky-level="1"] {
+    top: 3.95rem;
+    z-index: 15;
+  }
+
+  .turn-card-header[data-sticky-level="2"] {
+    top: 7.2rem;
+    z-index: 14;
+  }
+
+  .turn-card-header[data-sticky-level="3"] {
+    top: 10.45rem;
+    z-index: 13;
   }
 
   .turn-card-header--neutral {
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(249, 250, 251, 0.94));
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.985), rgba(249, 250, 251, 0.95));
   }
 
   .turn-card-header--amber {
-    background: linear-gradient(180deg, rgba(255, 251, 235, 0.98), rgba(255, 247, 237, 0.94));
+    background: linear-gradient(180deg, rgba(255, 251, 235, 0.985), rgba(255, 247, 237, 0.95));
+  }
+
+  :global(:root[data-theme="dark"]) .turn-card-header--neutral {
+    background: linear-gradient(180deg, rgba(17, 24, 39, 0.985), rgba(15, 23, 42, 0.95));
+    box-shadow: 0 16px 32px -26px rgba(2, 6, 23, 0.74);
+  }
+
+  :global(:root[data-theme="dark"]) .turn-card-header--amber {
+    background: linear-gradient(180deg, rgba(69, 39, 10, 0.98), rgba(45, 28, 10, 0.94));
+    box-shadow: 0 16px 32px -26px rgba(2, 6, 23, 0.74);
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -7565,11 +8708,15 @@
     .snackbar-card {
       transition-duration: 0.01ms;
     }
+
+    .turn-card-header {
+      backdrop-filter: none;
+    }
   }
 
 </style>
 
-{#snippet renderTurnItem(turnId: string, item: CodexItem)}
+{#snippet renderTurnItem(turnId: string, item: CodexItem, stickyLevel = 0)}
   {#if item.type === "agentMessage"}
     <div class="space-y-2 group/agent-message">
       <div class="flex justify-end opacity-0 group-hover/agent-message:opacity-100 transition-opacity">
@@ -7578,8 +8725,8 @@
       <div class="prose prose-sm max-w-none text-gray-800 leading-relaxed animate-in fade-in slide-in-from-left-2 duration-700"><MarkdownMessage on:openLocalPath={(event: CustomEvent<{ href: string }>) => void openGitFileFromMessage(event.detail.href)} text={String(item.text ?? "")} /></div>
     </div>
   {:else if item.type === "reasoning"}
-    <div class="overflow-hidden rounded-2xl border border-amber-100 bg-amber-50/40 shadow-sm">
-      <div class="turn-card-header turn-card-header--amber flex items-start gap-3 border-b border-amber-100 px-4 py-3">
+    <div class="turn-card-shell overflow-hidden rounded-2xl border border-amber-100 bg-amber-50/40 shadow-sm">
+      <div class="turn-card-header turn-card-header--amber flex items-start gap-3 border-b border-amber-100 px-4 py-3" data-sticky-level={stickyLevel}>
         <div class="mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg border border-amber-100 bg-white text-amber-600">
           <Zap size={16} />
         </div>
@@ -7610,11 +8757,11 @@
       </div>
     </div>
   {:else if item.type === "plan"}
-    <div class="border border-amber-100 rounded-2xl bg-amber-50/20 overflow-hidden shadow-sm"><div class="turn-card-header turn-card-header--amber px-4 py-2.5 border-b border-amber-100 flex items-center gap-3"><ListTodo size={14} class="text-amber-700" /><span class="text-[10px] font-bold text-amber-700 uppercase tracking-widest">{ui.plannedStrategy}</span></div><pre class="p-5 text-xs font-mono text-gray-700 leading-relaxed whitespace-pre-wrap">{String(item.text ?? "")}</pre></div>
+    <div class="turn-card-shell border border-amber-100 rounded-2xl bg-amber-50/20 overflow-hidden shadow-sm"><div class="turn-card-header turn-card-header--amber px-4 py-2.5 border-b border-amber-100 flex items-center gap-3" data-sticky-level={stickyLevel}><ListTodo size={14} class="text-amber-700" /><span class="text-[10px] font-bold text-amber-700 uppercase tracking-widest">{ui.plannedStrategy}</span></div><pre class="p-5 text-xs font-mono text-gray-700 leading-relaxed whitespace-pre-wrap">{String(item.text ?? "")}</pre></div>
   {:else if item.type === "contextCompaction"}
     {@const contextCompressionRunning = isContextCompactionRunning(turnId, item)}
-    <div class="overflow-hidden rounded-2xl border border-amber-200 bg-gradient-to-br from-amber-50/80 via-white to-white shadow-sm">
-      <div class="turn-card-header turn-card-header--amber flex items-center justify-between gap-3 border-b border-amber-100 px-4 py-3">
+    <div class="turn-card-shell overflow-hidden rounded-2xl border border-amber-200 bg-gradient-to-br from-amber-50/80 via-white to-white shadow-sm">
+      <div class="turn-card-header turn-card-header--amber flex items-center justify-between gap-3 border-b border-amber-100 px-4 py-3" data-sticky-level={stickyLevel}>
         <div class="flex min-w-0 items-center gap-3">
           <div class={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl border ${contextCompressionRunning ? "border-amber-200 bg-amber-100 text-amber-700" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}>
             {#if contextCompressionRunning}
@@ -7636,8 +8783,8 @@
       </div>
     </div>
   {:else if ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"].includes(item.type)}
-    <div class="border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm hover:shadow-md transition-shadow">
-      <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-3 px-4 py-3 hover:bg-gray-50 transition-colors" onclick={() => void toggleToolItem(turnId, item.id)}>
+    <div class="turn-card-shell border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm hover:shadow-md transition-shadow">
+      <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-3 px-4 py-3 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel} onclick={() => void toggleToolItem(turnId, item.id)}>
         <div class="flex min-w-0 flex-1 items-center gap-3">
           <div class="shrink-0 rounded-xl bg-gray-100 p-2 text-gray-500">
             {#if item.type === 'commandExecution'}
@@ -7663,19 +8810,19 @@
         </div>
       </button>
       {#if isItemExpanded(turnId, item.id)}
-        <div class="p-0 border-t border-gray-100 animate-in slide-in-from-top-2 duration-300">
+        <div class="turn-card-expand p-0 border-t border-gray-100" transition:slide|local={{ duration: 220 }}>
           {#if isItemDetailLoading(turnId, item.id)}<div class="p-8 flex items-center justify-center gap-2 text-gray-400 text-xs italic"><RefreshCw size={16} class="animate-spin" />{ui.fetching}</div>
           {:else if getItemDetailError(turnId, item.id)}<div class="p-4 bg-red-50 text-red-600 text-xs border-t border-red-100">{getItemDetailError(turnId, item.id)}</div>
           {:else if item.type === "fileChange" && getFileChangeViews(item).length > 0}
-            <div class="p-0 space-y-0">{#each getFileChangeViews(item) as change}<div class="border-b border-gray-100 last:border-0"><button class="w-full flex items-center justify-between px-5 py-2 hover:bg-gray-50 transition-colors" onclick={() => toggleFileChangeEntry(turnId, item.id, change)}><div class="flex items-center gap-2"><span class="text-[10px] font-mono font-bold text-gray-600">{change.path}</span><span class="px-1.5 py-0.5 bg-gray-100 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{change.kind}</span></div><ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turnId, item.id, change) ? 'rotate-180' : ''} transition-transform" /></button>{#if isFileChangeEntryExpanded(turnId, item.id, change)}<div class="bg-gray-50 p-0 border-t border-gray-100">{#if change.renderable}<MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-4 text-[10px] font-mono text-gray-600 overflow-x-auto">{change.diff}</pre>{/if}</div>{/if}</div>{/each}</div>
+            <div class="p-0 space-y-0">{#each getFileChangeViews(item) as change}<div class="border-b border-gray-100 last:border-0"><button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-5 py-2 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel + 1} onclick={() => toggleFileChangeEntry(turnId, item.id, change)}><div class="flex items-center gap-2"><span class="text-[10px] font-mono font-bold text-gray-600">{change.path}</span><span class="px-1.5 py-0.5 bg-gray-100 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{change.kind}</span></div><ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turnId, item.id, change) ? 'rotate-180' : ''} transition-transform" /></button>{#if isFileChangeEntryExpanded(turnId, item.id, change)}<div class="turn-card-expand bg-gray-50 p-0 border-t border-gray-100" transition:slide|local={{ duration: 180 }}>{#if change.renderable}<MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-4 text-[10px] font-mono text-gray-600 overflow-x-auto">{change.diff}</pre>{/if}</div>{/if}</div>{/each}</div>
           {:else if getDeferredToolBody(item)}<pre class="p-4 bg-gray-50 text-[11px] font-mono text-gray-700 overflow-x-auto leading-relaxed">{getDeferredToolBody(item)}</pre>
           {:else}<div class="p-4 text-gray-400 text-xs italic text-center">{ui.noAdditionalOutput}</div>{/if}
         </div>
       {/if}
     </div>
   {:else if item.type === "collabAgentToolCall"}
-    <div class="border border-amber-200 rounded-2xl bg-white overflow-hidden shadow-sm group">
-      <div class="turn-card-header turn-card-header--amber px-4 py-3 flex items-center justify-between gap-4">
+    <div class="turn-card-shell border border-amber-200 rounded-2xl bg-white overflow-hidden shadow-sm group">
+      <div class="turn-card-header turn-card-header--amber px-4 py-3 flex items-center justify-between gap-4" data-sticky-level={stickyLevel}>
         <div class="flex items-center gap-3"><div class="p-2 bg-white border border-amber-200 text-amber-600 rounded-xl group-hover:bg-amber-600 group-hover:text-white transition-all shadow-sm"><Bot size={16} /></div><div><h4 class="text-xs font-bold text-gray-900 leading-tight">{ui.subagentInvocation}</h4><div class="flex items-center gap-2 mt-0.5"><span class="text-[10px] font-bold text-amber-600 uppercase tracking-widest">{item.tool}</span><span class="w-1 h-1 rounded-full bg-amber-200"></span><span class="text-[10px] text-gray-500 font-medium uppercase tracking-tighter">{item.status}</span></div></div></div>
         {#if getPrimarySubagentThreadId(item)}<button class="px-3 py-1.5 bg-white border border-amber-200 rounded-lg text-[10px] font-bold text-amber-700 hover:bg-amber-600 hover:text-white transition-all shadow-sm" onclick={() => void openSubagentThread(getPrimarySubagentThreadId(item) ?? "")}>{ui.viewThread}</button>{/if}
       </div>
@@ -7684,19 +8831,19 @@
   {/if}
 {/snippet}
 
-{#snippet renderTurnEntry(turnId: string, entry: RenderableTurnEntry)}
-  {#if entry.kind === "item"}{@render renderTurnItem(turnId, entry.item)}
+{#snippet renderTurnEntry(turnId: string, entry: RenderableTurnEntry, stickyLevel = 0)}
+  {#if entry.kind === "item"}{@render renderTurnItem(turnId, entry.item, stickyLevel)}
   {:else if entry.kind === "readGroup"}
-    <div class="border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm">
-      <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-3 px-4 py-3 hover:bg-gray-50 transition-colors" onclick={() => void toggleReadOnlyCommandGroup(turnId, entry.key, entry.items)}><div class="flex min-w-0 flex-1 items-center gap-3"><div class="shrink-0 rounded-xl bg-gray-100 p-2 text-gray-400">{#if getReadOnlyCommandGroupKind(entry.items) === "git"}<GitBranch size={14} />{:else}<Search size={14} />{/if}</div><div class="min-w-0 flex-1 text-left"><h4 class="truncate text-xs font-bold leading-tight text-gray-900">{getReadOnlyCommandGroupLabel(entry.items)}</h4><p class="mt-0.5 truncate text-[10px] font-medium text-gray-500">{summarizeReadOnlyCommandGroup(entry.items)}</p></div></div><div class="flex shrink-0 items-center gap-3"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{ui.opsCount(entry.items.length)}</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
+    <div class="turn-card-shell border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm">
+      <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-3 px-4 py-3 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel} onclick={() => void toggleReadOnlyCommandGroup(turnId, entry.key, entry.items)}><div class="flex min-w-0 flex-1 items-center gap-3"><div class="shrink-0 rounded-xl bg-gray-100 p-2 text-gray-400">{#if getReadOnlyCommandGroupKind(entry.items) === "git"}<GitBranch size={14} />{:else}<Search size={14} />{/if}</div><div class="min-w-0 flex-1 text-left"><h4 class="truncate text-xs font-bold leading-tight text-gray-900">{getReadOnlyCommandGroupLabel(entry.items)}</h4><p class="mt-0.5 truncate text-[10px] font-medium text-gray-500">{summarizeReadOnlyCommandGroup(entry.items)}</p></div></div><div class="flex shrink-0 items-center gap-3"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{ui.opsCount(entry.items.length)}</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
       {#if isItemExpanded(turnId, entry.key)}
-        <div class="border-t border-gray-100 bg-gray-50/30">{#if isItemDetailLoading(turnId, entry.key)}<div class="p-6 flex justify-center text-gray-400 italic text-xs animate-pulse">{ui.readingFileData}</div>
+        <div class="turn-card-expand border-t border-gray-100 bg-gray-50/30" transition:slide|local={{ duration: 220 }}>{#if isItemDetailLoading(turnId, entry.key)}<div class="p-6 flex justify-center text-gray-400 italic text-xs animate-pulse">{ui.readingFileData}</div>
           {:else}<div class="p-0">{#each entry.items as commandItem}<div class="p-4 border-b border-gray-100 last:border-0"><div class="flex items-center justify-between mb-2"><span class="text-[10px] font-bold text-gray-500 uppercase tracking-widest">{summarizeCommand(commandItem)}</span>{#if commandItem.exitCode !== null}<span class="text-[9px] font-mono text-gray-400">Exit {commandItem.exitCode}</span>{/if}</div><pre class="p-3 bg-white border border-gray-200 rounded-lg text-[10px] font-mono text-gray-600 overflow-x-auto max-h-60 leading-relaxed">{String(commandItem.aggregatedOutput ?? "")}</pre></div>{/each}</div>{/if}</div>
       {/if}
     </div>
   {:else}
-    <div class="border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm">
-      <div class="turn-card-header turn-card-header--neutral flex items-center gap-2 pr-3">
+    <div class="turn-card-shell border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm">
+      <div class="turn-card-header turn-card-header--neutral flex items-center gap-2 pr-3" data-sticky-level={stickyLevel}>
         <button class="min-w-0 flex-1 flex items-center justify-between px-4 py-3 hover:bg-gray-50 transition-colors" onclick={() => void toggleFileChangeGroup(turnId, entry.key, entry.items)} type="button"><div class="flex items-center gap-3 min-w-0"><div class="p-2 bg-gray-100 text-gray-400 rounded-xl shrink-0"><FileDiff size={14} /></div><div class="text-left min-w-0"><h4 class="text-xs font-bold text-gray-900 leading-tight">{getFileChangeGroupLabel(entry.items)}</h4><p class="text-[10px] text-gray-500 mt-0.5 font-medium truncate">{summarizeFileChangeGroup(entry.items)}</p></div></div><div class="flex items-center gap-3 shrink-0"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{getFileChangeGroupSummaryEntries(entry.items).length} Files</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
         {#if getFileChangeGroupViews(entry.items).length > 0}
           <button
@@ -7712,8 +8859,8 @@
         {/if}
       </div>
       {#if isItemExpanded(turnId, entry.key)}
-        <div class="border-t border-gray-100">{#if isItemDetailLoading(turnId, entry.key)}<div class="p-6 flex justify-center text-gray-400 italic text-xs">{ui.computingDiffs}</div>
-          {:else}<div class="p-0">{#each getFileChangeGroupViews(entry.items) as change}<div class="border-b border-gray-100 last:border-0"><button class="w-full flex items-center justify-between px-5 py-2 hover:bg-gray-50 transition-colors" onclick={() => toggleFileChangeEntry(turnId, entry.key, change)}><span class="text-[10px] font-mono font-bold text-gray-600">{change.path}</span><ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turnId, entry.key, change) ? 'rotate-180' : ''} transition-transform" /></button>{#if isFileChangeEntryExpanded(turnId, entry.key, change)}<div class="bg-gray-50 border-t border-gray-100">{#if change.renderable}<MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-4 text-[10px] font-mono text-gray-600 overflow-x-auto">{change.diff}</pre>{/if}</div>{/if}</div>{/each}</div>{/if}</div>
+        <div class="turn-card-expand border-t border-gray-100" transition:slide|local={{ duration: 220 }}>{#if isItemDetailLoading(turnId, entry.key)}<div class="p-6 flex justify-center text-gray-400 italic text-xs">{ui.computingDiffs}</div>
+          {:else}<div class="p-0">{#each getFileChangeGroupViews(entry.items) as change}<div class="border-b border-gray-100 last:border-0"><button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-5 py-2 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel + 1} onclick={() => toggleFileChangeEntry(turnId, entry.key, change)}><span class="text-[10px] font-mono font-bold text-gray-600">{change.path}</span><ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turnId, entry.key, change) ? 'rotate-180' : ''} transition-transform" /></button>{#if isFileChangeEntryExpanded(turnId, entry.key, change)}<div class="turn-card-expand bg-gray-50 border-t border-gray-100" transition:slide|local={{ duration: 180 }}>{#if change.renderable}<MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-4 text-[10px] font-mono text-gray-600 overflow-x-auto">{change.diff}</pre>{/if}</div>{/if}</div>{/each}</div>{/if}</div>
       {/if}
     </div>
   {/if}

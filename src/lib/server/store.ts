@@ -14,7 +14,8 @@ import type {
   StartupScheduledShutdownAlert
 } from "$lib/types";
 
-import { ensureDataDirectories, getStoreFilePath, pathExists } from "./fs";
+import { getCurrentRuntimeProfile, type RuntimeProfileConfig } from "./env";
+import { ensureDataDirectories, getProfileStoreFilePath, pathExists } from "./fs";
 
 type UiState = {
   global: {
@@ -79,6 +80,8 @@ function normalizeNotificationSettings(value: NotificationSettings | null | unde
 }
 
 class UiStateStore {
+  constructor(private readonly profile: RuntimeProfileConfig) {}
+
   private state: UiState | null = null;
   private writeChain = Promise.resolve();
 
@@ -87,8 +90,8 @@ class UiStateStore {
       return this.state;
     }
 
-    await ensureDataDirectories();
-    const storePath = getStoreFilePath();
+    await ensureDataDirectories(this.profile);
+    const storePath = getProfileStoreFilePath(this.profile);
     if (!(await pathExists(storePath))) {
       this.state = {
         global: {
@@ -167,8 +170,8 @@ class UiStateStore {
   }
 
   private async flush() {
-    await ensureDataDirectories();
-    await fsp.writeFile(getStoreFilePath(), JSON.stringify(this.state, null, 2), "utf8");
+    await ensureDataDirectories(this.profile);
+    await fsp.writeFile(getProfileStoreFilePath(this.profile), JSON.stringify(this.state, null, 2), "utf8");
   }
 
   async get(threadId: string) {
@@ -691,6 +694,35 @@ class UiStateStore {
     return updated;
   }
 
+  async reorderQueueItems(threadId: string, orderedIds: string[]) {
+    let reordered = false;
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      const existing = state.queuesByThreadId[threadId];
+      if (!existing) {
+        return;
+      }
+      if (orderedIds.length !== existing.items.length) {
+        return;
+      }
+
+      const itemsById = new Map(existing.items.map((item) => [item.id, item]));
+      const nextItems = orderedIds
+        .map((id) => itemsById.get(id))
+        .filter((item): item is SessionQueueItem => Boolean(item));
+      if (nextItems.length !== existing.items.length || new Set(orderedIds).size !== orderedIds.length) {
+        return;
+      }
+
+      existing.items = nextItems;
+      existing.updatedAt = Date.now();
+      reordered = true;
+      await this.flush();
+    });
+    await this.writeChain;
+    return reordered;
+  }
+
   async setQueueResumePending(threadId: string, resumePending: boolean) {
     this.writeChain = this.writeChain.then(async () => {
       const state = await this.load();
@@ -706,4 +738,35 @@ class UiStateStore {
   }
 }
 
-export const uiStateStore = new UiStateStore();
+const uiStateStores = new Map<string, UiStateStore>();
+
+function getProfileStore(profile?: RuntimeProfileConfig) {
+  const activeProfile = profile ?? getCurrentRuntimeProfile();
+  let store = uiStateStores.get(activeProfile.id);
+  if (!store) {
+    store = new UiStateStore(activeProfile);
+    uiStateStores.set(activeProfile.id, store);
+  }
+  return store;
+}
+
+type UiStateStoreMethodName = {
+  [Key in keyof UiStateStore]: UiStateStore[Key] extends (...args: never[]) => unknown ? Key : never;
+}[keyof UiStateStore];
+
+type UiStateStoreFacade = {
+  [Key in UiStateStoreMethodName]: UiStateStore[Key];
+};
+
+export { UiStateStore, getProfileStore };
+
+export const uiStateStore = new Proxy(
+  {} as UiStateStoreFacade,
+  {
+    get(_target, property) {
+      const store = getProfileStore();
+      const value = Reflect.get(store, property);
+      return typeof value === "function" ? value.bind(store) : value;
+    }
+  }
+);

@@ -23,7 +23,8 @@
     Monitor,
     Pin,
     Moon,
-    Sun
+    Sun,
+    Power
   } from "lucide-svelte";
 
   import { activeLocale, localeOptions, localeSignal, updateLocale } from "$lib/i18n";
@@ -72,6 +73,7 @@
     onArchivedChange,
     onTogglePin,
     onToggleArchive,
+    profiles = [],
     account,
     webRole = "admin",
     readOnly = false,
@@ -95,6 +97,7 @@
     onUpdateRuntime,
     onThemeModeChange,
     onStartAccountLogin,
+    onSelectProfile,
     onCancelAccountLogin,
     onLogoutAccount,
     onLogoutWeb,
@@ -130,6 +133,12 @@
     onArchivedChange: (nextValue: boolean) => void;
     onTogglePin: (session: SessionSummary) => void;
     onToggleArchive: (session: SessionSummary) => void;
+    profiles?: Array<{
+      id: string;
+      label: string;
+      codexHome: string;
+      active: boolean;
+    }>;
     account:
       | {
           type: "apiKey" | "chatgpt" | null;
@@ -160,6 +169,7 @@
     onUpdateRuntime: () => void;
     onThemeModeChange: (mode: ThemeMode) => void;
     onStartAccountLogin: (type: "chatgpt" | "chatgptDeviceCode") => void;
+    onSelectProfile: (profileId: string) => void;
     onCancelAccountLogin: (loginId: string) => void;
     onLogoutAccount: () => void;
     onLogoutWeb: () => void;
@@ -176,6 +186,7 @@
   let searchInputElement = $state<HTMLInputElement | undefined>(undefined);
   let notificationButtonElement = $state<HTMLButtonElement | undefined>(undefined);
   let notificationPanelElement = $state<HTMLDivElement | undefined>(undefined);
+  let notificationPanelStyle = $state("");
   let accountButtonElement = $state<HTMLButtonElement | undefined>(undefined);
   let accountPopoverElement = $state<HTMLDivElement | undefined>(undefined);
   let accountPopoverStyle = $state("");
@@ -348,13 +359,15 @@
   }
 
   function accountSubLabel() {
+    const activeProfile = profiles.find((profile) => profile.active) ?? null;
     if (account?.planType) {
-      return account.planType;
+      return activeProfile ? `${account.planType} · ${activeProfile.label}` : account.planType;
     }
     if (account?.requiresOpenaiAuth) {
-      return account?.email || account?.type ? ui.connected : ui.signInRequired;
+      const base = account?.email || account?.type ? ui.connected : ui.signInRequired;
+      return activeProfile ? `${base} · ${activeProfile.label}` : base;
     }
-    return ui.localRuntime;
+    return activeProfile ? `${ui.localRuntime} · ${activeProfile.label}` : ui.localRuntime;
   }
 
   function toggleNotifications() {
@@ -366,6 +379,7 @@
 
   function closeNotifications() {
     notificationsOpen = false;
+    notificationPanelStyle = "";
   }
 
   function notificationTitle(notification: AppNotification) {
@@ -555,6 +569,39 @@
     accountPopoverStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.max(240, window.innerHeight - margin * 2)}px;opacity:1;pointer-events:auto;`;
   }
 
+  async function updateNotificationPanelPosition() {
+    if (!notificationsOpen || !notificationButtonElement || !notificationPanelElement || typeof window === "undefined") {
+      return;
+    }
+
+    await tick();
+    const margin = 12;
+    const compactViewport = window.innerWidth < 640;
+    const triggerRect = notificationButtonElement.getBoundingClientRect();
+    const panelRect = notificationPanelElement.getBoundingClientRect();
+    const width = compactViewport
+      ? Math.min(352, Math.max(240, window.innerWidth - margin * 2))
+      : Math.min(Math.max(panelRect.width || 352, 320), window.innerWidth - margin * 2);
+    let left = compactViewport ? margin : triggerRect.right - width;
+    if (left + width > window.innerWidth - margin) {
+      left = window.innerWidth - width - margin;
+    }
+    if (left < margin) {
+      left = margin;
+    }
+
+    let top = compactViewport ? margin : triggerRect.bottom + 10;
+    if (!compactViewport && top + panelRect.height > window.innerHeight - margin) {
+      top = triggerRect.top - panelRect.height - 10;
+    }
+    if (top < margin) {
+      top = margin;
+    }
+
+    const maxHeight = Math.max(240, window.innerHeight - top - margin);
+    notificationPanelStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.round(maxHeight)}px;opacity:1;pointer-events:auto;`;
+  }
+
   $effect(() => {
     if (!accountMenuOpen) {
       accountPopoverStyle = "";
@@ -563,8 +610,19 @@
     void updateAccountPopoverPosition();
   });
 
+  $effect(() => {
+    if (!notificationsOpen) {
+      notificationPanelStyle = "";
+      return;
+    }
+    void updateNotificationPanelPosition();
+  });
+
   onMount(() => {
     const update = () => {
+      if (notificationsOpen) {
+        void updateNotificationPanelPosition();
+      }
       if (accountMenuOpen) {
         void updateAccountPopoverPosition();
       }
@@ -658,7 +716,8 @@
       {#if notificationsOpen}
         <div
           bind:this={notificationPanelElement}
-          class="absolute right-0 top-[calc(100%+0.6rem)] z-30 grid w-[22rem] gap-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-[0_24px_54px_-28px_rgba(15,23,42,0.35)]"
+          class="fixed z-50 grid grid-rows-[auto_auto_minmax(0,1fr)] gap-3 rounded-2xl border border-gray-200 bg-white p-3 opacity-0 pointer-events-none shadow-[0_24px_54px_-28px_rgba(15,23,42,0.35)]"
+          style={notificationPanelStyle}
         >
           <div class="flex items-center justify-between gap-3">
             <div>
@@ -679,7 +738,7 @@
             </button>
           </div>
 
-          <div class="max-h-80 overflow-y-auto pr-1 scrollbar-thin">
+          <div class="min-h-0 overflow-y-auto pr-1 scrollbar-thin">
             {#if notificationsBusy}
               <div class="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-xs text-gray-500">{ui.loadingMoreThreads}</div>
             {:else if notifications.length === 0}
@@ -1052,8 +1111,9 @@
                 </div>
                 <div class="flex shrink-0 flex-nowrap items-center gap-1.5 whitespace-nowrap">
                   {#if session.queueCount > 0}
-                    <span class="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-slate-600">
-                      Q {session.queueCount}
+                    <span class="inline-flex items-center gap-1 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-slate-600">
+                      <History size={10} />
+                      <span>{session.queueCount}</span>
                     </span>
                   {/if}
                   {#if sessionHighlights[session.id]?.kind === "attention"}
@@ -1205,9 +1265,9 @@
     </button>
 
     {#if accountMenuOpen}
-      <div 
-        bind:this={accountPopoverElement} 
-        class="fixed z-50 bg-white border border-gray-200 rounded-2xl shadow-2xl overflow-hidden opacity-0 pointer-events-none p-2 w-80" 
+      <div
+        bind:this={accountPopoverElement}
+        class="fixed z-50 grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] bg-white border border-gray-200 rounded-2xl shadow-2xl overflow-hidden opacity-0 pointer-events-none p-2 w-80"
         style={accountPopoverStyle}
       >
         <div class="p-4 border-b border-gray-100 flex items-center justify-between">
@@ -1230,7 +1290,39 @@
           </button>
         </div>
 
-        <div class="p-4 space-y-6">
+        <div class="min-h-0 overflow-y-auto px-4 py-4 space-y-6 pr-3 scrollbar-thin">
+          {#if profiles.length > 1}
+            <div class="space-y-3">
+              <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
+                <User size={10} /> {ui.switchAccount}
+              </h4>
+
+              <div class="space-y-2">
+                {#each profiles as profile (profile.id)}
+                  <button
+                    class={`flex w-full items-start justify-between gap-3 rounded-xl border px-3 py-2.5 text-left transition-all ${
+                      profile.active
+                        ? "border-amber-300 bg-amber-50 text-amber-800 shadow-sm"
+                        : "border-gray-200 bg-gray-50 text-gray-600 hover:border-gray-300 hover:bg-white hover:text-gray-800"
+                    }`}
+                    onclick={() => onSelectProfile(profile.id)}
+                    type="button"
+                  >
+                    <div class="min-w-0">
+                      <p class="truncate text-sm font-semibold">{profile.label}</p>
+                      <p class="mt-1 truncate text-[10px] text-gray-400">{profile.codexHome}</p>
+                    </div>
+                    {#if profile.active}
+                      <span class="rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-700">
+                        {ui.connected}
+                      </span>
+                    {/if}
+                  </button>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
           <div class="space-y-4">
             <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
               <Monitor size={10} /> {ui.appearance}
@@ -1322,22 +1414,6 @@
                 <span class="text-gray-500">{ui.binary}</span>
                 <code class="px-1.5 py-0.5 bg-white border border-gray-200 rounded text-[10px]">{runtime?.configuredBin ?? "codex"}</code>
               </div>
-              <label class:checkbox-card--disabled={!systemShutdownAvailable || readOnly} class="checkbox-card checkbox-card--compact" for="global-shutdown-after-queue">
-                <input
-                  class="checkbox-input"
-                  checked={systemShutdownArmed}
-                  disabled={!systemShutdownAvailable || readOnly}
-                  id="global-shutdown-after-queue"
-                  onchange={(event) => onSystemShutdownArmedChange((event.currentTarget as HTMLInputElement).checked)}
-                  type="checkbox"
-                />
-                <span aria-hidden="true" class="checkbox-control"></span>
-                <span class="checkbox-copy">
-                  <span class="checkbox-title">{ui.shutdownAfterQueueCompletes}</span>
-                  <span class="checkbox-description">{ui.shutdownWaitDescription(systemShutdownDelaySeconds)}</span>
-                </span>
-              </label>
-
               <div class="flex gap-2 pt-1">
                 {#if !runtime?.installed}
                   <button
@@ -1370,6 +1446,35 @@
               </div>
             </div>
           </div>
+
+          {#if systemShutdownAvailable}
+            <div class="space-y-4">
+              <div class="rounded-2xl border border-gray-200 bg-gray-50/80 p-3 shadow-sm">
+                <div class="flex items-start gap-3">
+                  <div class="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-gray-200 bg-white text-gray-500">
+                    <Power size={14} />
+                  </div>
+                  <div class="min-w-0 flex-1">
+                    <label class:checkbox-card--disabled={readOnly} class="checkbox-card checkbox-card--compact" for="global-shutdown-after-queue">
+                      <input
+                        class="checkbox-input"
+                        checked={systemShutdownArmed}
+                        disabled={readOnly}
+                        id="global-shutdown-after-queue"
+                        onchange={(event) => onSystemShutdownArmedChange((event.currentTarget as HTMLInputElement).checked)}
+                        type="checkbox"
+                      />
+                      <span aria-hidden="true" class="checkbox-control"></span>
+                      <span class="checkbox-copy">
+                        <span class="checkbox-title">{ui.shutdownAfterQueueCompletes}</span>
+                        <span class="checkbox-description">{ui.shutdownWaitDescription(systemShutdownDelaySeconds)}</span>
+                      </span>
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </div>
+          {/if}
         </div>
 
         <div class="p-2 border-t border-gray-100 bg-gray-50/50 space-y-1">

@@ -5,7 +5,7 @@ import { error } from "@sveltejs/kit";
 
 import type { EditableFilePayload } from "$lib/types";
 
-import { getRuntimeConfig } from "./env";
+import { getCurrentRuntimeProfile, getRuntimeConfig } from "./env";
 import { realPathSafe } from "./fs";
 
 function inferLanguage(filePath: string) {
@@ -52,8 +52,9 @@ async function resolveWritablePath(filePath: string) {
     throw error(400, "filePath is required.");
   }
   const config = getRuntimeConfig();
+  const profile = getCurrentRuntimeProfile();
   const candidatePath = path.resolve(filePath);
-  const roots = [...config.allowedRoots.map((root) => path.resolve(root)), path.resolve(config.codexHome)];
+  const roots = [...config.allowedRoots.map((root) => path.resolve(root)), path.resolve(profile.codexHome)];
   const existingPath = await realPathSafe(candidatePath).catch(() => null);
   const pathToCheck = existingPath ?? candidatePath;
 

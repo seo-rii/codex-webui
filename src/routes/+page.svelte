@@ -7120,32 +7120,29 @@
         {/if}
         
         <div class="flex flex-col min-w-0">
-          <input
-            bind:this={titleInputElement}
-            bind:value={titleDraft}
-            class="text-sm font-semibold bg-transparent border-none p-0 focus:ring-0 placeholder-gray-400 truncate w-full max-w-md"
-            onblur={saveTitle}
-            onkeydown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                void saveTitle();
-              }
-            }}
-            placeholder={ui.threadTitle}
-            readonly={readOnlyRole}
-          />
-          {#if selectedModel && (isFastSpeedMode(conversation?.preferences.speed) || conversation?.thread.status === "running" || conversation?.thread.status === "active")}
-            <div class="flex items-center gap-1.5 mt-0.5">
-              {#if isFastSpeedMode(conversation?.preferences.speed)}
-                <span class="inline-flex h-4 w-4 items-center justify-center rounded-full bg-amber-100 text-amber-700">
-                  <Zap size={10} />
-                </span>
-              {/if}
-              {#if conversation?.thread.status === "running" || conversation?.thread.status === "active"}
-                <span class="inline-flex h-2 w-2 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.45)] animate-pulse"></span>
-              {/if}
-            </div>
-          {/if}
+          <div class="flex min-w-0 items-center gap-2">
+            <input
+              bind:this={titleInputElement}
+              bind:value={titleDraft}
+              class="text-sm font-semibold bg-transparent border-none p-0 focus:ring-0 placeholder-gray-400 truncate w-full max-w-md"
+              onblur={saveTitle}
+              onkeydown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void saveTitle();
+                }
+              }}
+              placeholder={ui.threadTitle}
+              readonly={readOnlyRole}
+            />
+            {#if conversation?.thread.status === "running" || conversation?.thread.status === "active"}
+              <span
+                aria-label={ui.generatingResponse}
+                class="inline-flex h-2.5 w-2.5 shrink-0 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.45)] animate-pulse"
+                title={ui.generatingResponse}
+              ></span>
+            {/if}
+          </div>
           {#if selectedSessionSummary}
             <div class="mt-1.5 flex flex-wrap items-center gap-1.5">
               {#if selectedSessionSummary.pinned}
@@ -7602,7 +7599,10 @@
                     </div>
                   </button>
                   {#if queuedFollowupsExpanded}
-                    <div class="max-h-52 overflow-y-auto divide-y divide-gray-200 overscroll-contain">
+                    <div
+                      class="max-h-52 overflow-y-auto divide-y divide-gray-200 overscroll-contain"
+                      transition:slide|local={{ duration: 220 }}
+                    >
                       {#each queuedMessages as item (item.id)}
                         <div
                           class={`relative px-3.5 py-2.5 transition-colors ${queueDragState?.queueId === item.id ? "bg-amber-50/60" : ""}`}
@@ -8649,35 +8649,52 @@
 
   .turn-card-shell {
     position: relative;
-    isolation: isolate;
+    isolation: auto;
+    overflow: visible !important;
+  }
+
+  @supports (overflow: clip) {
+    .turn-card-shell {
+      overflow: clip !important;
+    }
   }
 
   .turn-card-expand {
-    overflow: hidden;
+    overflow: visible;
     transform-origin: top center;
   }
 
   .turn-card-header {
     position: sticky;
-    top: 0.65rem;
-    z-index: 16;
+    top: 0.85rem;
+    z-index: 26;
     backdrop-filter: blur(14px);
     box-shadow: 0 14px 28px -26px rgba(15, 23, 42, 0.38);
   }
 
   .turn-card-header[data-sticky-level="1"] {
-    top: 3.95rem;
-    z-index: 15;
+    top: 4.15rem;
+    z-index: 25;
   }
 
   .turn-card-header[data-sticky-level="2"] {
-    top: 7.2rem;
-    z-index: 14;
+    top: 7.45rem;
+    z-index: 24;
   }
 
   .turn-card-header[data-sticky-level="3"] {
-    top: 10.45rem;
-    z-index: 13;
+    top: 10.7rem;
+    z-index: 23;
+  }
+
+  .turn-card-shell > :first-child {
+    border-top-left-radius: inherit;
+    border-top-right-radius: inherit;
+  }
+
+  .turn-card-shell > :last-child {
+    border-bottom-left-radius: inherit;
+    border-bottom-right-radius: inherit;
   }
 
   .turn-card-header--neutral {

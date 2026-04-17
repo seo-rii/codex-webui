@@ -41,6 +41,7 @@ import type {
   TerminalContextPayload,
   TerminalListPayload,
   TerminalSnapshotPayload,
+  SessionTurnSearchPayload,
   SessionTurnPayload,
   SessionTurnsPagePayload,
   StreamEvent,
@@ -82,7 +83,7 @@ const ws = new WebSocketRpcClient();
 
 export const api = {
   getAuthSession() {
-    return request<{ authenticated: boolean; role: "admin" | "viewer" | null }>(apiPath("/auth/session"), {
+    return request<{ authenticated: boolean; role: "admin" | "viewer" | null; activeProfileId: string | null }>(apiPath("/auth/session"), {
       method: "GET"
     });
   },
@@ -101,6 +102,13 @@ export const api = {
     });
     ws.disconnect("Logged out.");
     return response;
+  },
+
+  selectAuthProfile(profileId: string) {
+    return request<{ ok: true; activeProfileId: string }>(apiPath("/auth/profile"), {
+      method: "POST",
+      body: JSON.stringify({ profileId })
+    });
   },
 
   disconnect() {
@@ -266,7 +274,14 @@ export const api = {
       messageText?: string | null;
     }
   ) {
-    return ws.request<SessionForkPayload>("session/fork", { sessionId, ...payload });
+    return ws.request<SessionForkPayload>("session/fork", {
+      sessionId,
+      ...payload
+    });
+  },
+
+  searchSessionTurns(sessionId: string, query: string, cursor: string | null = null, limit = 20) {
+    return ws.request<SessionTurnSearchPayload>("session/search", { sessionId, query, cursor, limit });
   },
 
   getSessionDraft(sessionId: string) {
@@ -303,6 +318,13 @@ export const api = {
       queueId,
       prompt: payload.prompt,
       attachmentIds: payload.attachmentIds
+    });
+  },
+
+  reorderQueuedMessages(sessionId: string, queueIds: string[]) {
+    return ws.request<SessionDetailPayload["queue"]>("session/queue/reorder", {
+      sessionId,
+      queueIds
     });
   },
 

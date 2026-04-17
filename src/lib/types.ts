@@ -19,6 +19,7 @@ export type SessionPreferences = {
   effort: ReasoningEffort | null;
   speed: ServiceSpeed;
   mode: CollaborationMode;
+  sendOnEnter: boolean;
   sandboxMode: SandboxMode;
   approvalPolicy: ApprovalPolicy;
   networkAccess: boolean;
@@ -255,6 +256,12 @@ export type AuditLogEntry = {
 export type AppConfigPayload = {
   models: ModelOption[];
   collaborationModes: CollaborationModeOption[];
+  profiles: Array<{
+    id: string;
+    label: string;
+    codexHome: string;
+    active: boolean;
+  }>;
   allowedRoots: DirectoryEntry[];
   defaults: SessionPreferences;
   paths: {
@@ -373,6 +380,23 @@ export type SessionForkPayload = {
   session: SessionSummary;
   draft: string;
   mode: SessionForkMode;
+};
+
+export type SessionTurnSearchMatch = {
+  turnId: string;
+  turnIndex: number;
+  itemId: string | null;
+  itemType: string | null;
+  preview: string;
+  startedAt: number | null;
+  requiresFullTurn: boolean;
+  requiresItemDetail: boolean;
+};
+
+export type SessionTurnSearchPayload = {
+  matches: SessionTurnSearchMatch[];
+  nextCursor: string | null;
+  totalMatches: number;
 };
 
 export type SessionItemDetailPayload = {

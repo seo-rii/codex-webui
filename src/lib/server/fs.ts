@@ -7,7 +7,7 @@ import { error } from "@sveltejs/kit";
 
 import type { DirectoryEntry, SessionPreferences } from "$lib/types";
 
-import { getRuntimeConfig } from "./env";
+import { getCurrentRuntimeProfile, getRuntimeConfig, type RuntimeProfileConfig } from "./env";
 
 function normalizePath(target: string) {
   return path.resolve(target);
@@ -26,10 +26,14 @@ export function sanitizeFileName(name: string) {
   return name.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "attachment";
 }
 
-export async function ensureDataDirectories() {
-  const { dataDir } = getRuntimeConfig();
-  await fsp.mkdir(dataDir, { recursive: true });
-  await fsp.mkdir(path.join(dataDir, "uploads"), { recursive: true });
+function resolveProfile(profile?: RuntimeProfileConfig) {
+  return profile ?? getCurrentRuntimeProfile();
+}
+
+export async function ensureDataDirectories(profile?: RuntimeProfileConfig) {
+  const activeProfile = resolveProfile(profile);
+  await fsp.mkdir(activeProfile.dataDir, { recursive: true });
+  await fsp.mkdir(path.join(activeProfile.dataDir, "uploads"), { recursive: true });
 }
 
 export async function resolveAllowedDirectory(candidate: string) {
@@ -89,15 +93,19 @@ export async function listDirectoryPayload(currentPath: string | null) {
 }
 
 export function getStoreFilePath() {
-  return path.join(getRuntimeConfig().dataDir, "ui-state.json");
+  return path.join(resolveProfile().dataDir, "ui-state.json");
 }
 
-export function getUploadsRoot() {
-  return path.join(getRuntimeConfig().dataDir, "uploads");
+export function getProfileStoreFilePath(profile: RuntimeProfileConfig) {
+  return path.join(profile.dataDir, "ui-state.json");
 }
 
-export function getThreadUploadsDir(threadId: string) {
-  return path.join(getUploadsRoot(), threadId);
+export function getUploadsRoot(profile?: RuntimeProfileConfig) {
+  return path.join(resolveProfile(profile).dataDir, "uploads");
+}
+
+export function getThreadUploadsDir(threadId: string, profile?: RuntimeProfileConfig) {
+  return path.join(getUploadsRoot(profile), threadId);
 }
 
 export function buildSandboxPolicy(preferences: SessionPreferences, additionalReadableRoots: string[]) {

@@ -152,7 +152,7 @@
 
 <style>
   .markdown-body {
-    color: rgb(31 41 55);
+    color: var(--markdown-body-fg, rgb(31 41 55));
     font-size: 15px;
     line-height: 1.7;
   }
@@ -170,7 +170,7 @@
   .markdown-body :global(h3),
   .markdown-body :global(h4) {
     margin: 1.5rem 0 0.75rem;
-    color: rgb(17 24 39);
+    color: var(--markdown-heading-fg, rgb(17 24 39));
     font-weight: 700;
   }
 
@@ -216,17 +216,17 @@
 
   .markdown-body :global(blockquote) {
     margin: 0 0 1rem;
-    border-left: 4px solid rgb(253 230 138);
+    border-left: 4px solid var(--markdown-blockquote-border, rgb(253 230 138));
     padding-left: 1rem;
-    color: rgb(75 85 99);
+    color: var(--markdown-blockquote-fg, rgb(75 85 99));
     font-style: italic;
   }
 
   .markdown-body :global(code:not(.hljs)) {
-    border: 1px solid rgb(229 231 235 / 0.5);
+    border: 1px solid var(--markdown-inline-code-border, rgb(229 231 235 / 0.5));
     border-radius: 0.375rem;
-    background: rgb(243 244 246);
-    color: rgb(17 24 39);
+    background: var(--markdown-inline-code-bg, rgb(243 244 246));
+    color: var(--markdown-inline-code-fg, rgb(17 24 39));
     padding: 0.125rem 0.375rem;
     font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
     font-size: 0.9em;
@@ -235,7 +235,7 @@
   .markdown-body :global(table) {
     width: 100%;
     margin: 0 0 1rem;
-    border: 1px solid rgb(229 231 235);
+    border: 1px solid var(--markdown-table-border, rgb(229 231 235));
     border-collapse: collapse;
     overflow: hidden;
     border-radius: 0.75rem;
@@ -243,18 +243,37 @@
 
   .markdown-body :global(th),
   .markdown-body :global(td) {
-    border: 1px solid rgb(229 231 235);
+    border: 1px solid var(--markdown-table-border, rgb(229 231 235));
     padding: 0.75rem;
     text-align: left;
   }
 
   .markdown-body :global(th) {
-    background: rgb(249 250 251);
-    color: rgb(55 65 81);
+    background: var(--markdown-table-head-bg, rgb(249 250 251));
+    color: var(--markdown-table-head-fg, rgb(55 65 81));
     font-size: 0.75rem;
     font-weight: 700;
     letter-spacing: 0.08em;
     text-transform: uppercase;
+  }
+
+  .markdown-body :global(td) {
+    color: var(--markdown-body-fg, rgb(31 41 55));
+  }
+
+  .markdown-body :global(.code-block) {
+    border-color: var(--markdown-code-block-border, rgb(229 231 235)) !important;
+    background: var(--markdown-code-block-bg, rgb(249 250 251 / 0.5)) !important;
+  }
+
+  .markdown-body :global(.code-block > div:first-child) {
+    border-bottom-color: var(--markdown-code-block-border, rgb(229 231 235)) !important;
+    background: var(--markdown-code-block-header-bg, rgb(243 244 246 / 0.6)) !important;
+    color: var(--markdown-code-block-header-fg, rgb(107 114 128)) !important;
+  }
+
+  .markdown-body :global(.code-block pre) {
+    color: var(--markdown-code-block-fg, rgb(31 41 55));
   }
 
   .markdown-body :global(.hljs-comment) {
@@ -303,5 +322,54 @@
 
   .markdown-body :global(.hljs-function) {
     color: rgb(37 99 235);
+  }
+
+  :global(:root[data-theme="dark"]) .markdown-body {
+    --markdown-body-fg: rgb(226 232 240);
+    --markdown-heading-fg: rgb(248 250 252);
+    --markdown-blockquote-border: rgb(217 119 6 / 0.65);
+    --markdown-blockquote-fg: rgb(148 163 184);
+    --markdown-inline-code-border: rgb(71 85 105 / 0.65);
+    --markdown-inline-code-bg: rgb(15 23 42 / 0.92);
+    --markdown-inline-code-fg: rgb(248 250 252);
+    --markdown-table-border: rgb(71 85 105 / 0.65);
+    --markdown-table-head-bg: rgb(30 41 59 / 0.95);
+    --markdown-table-head-fg: rgb(203 213 225);
+    --markdown-code-block-border: rgb(71 85 105 / 0.65);
+    --markdown-code-block-bg: rgb(15 23 42 / 0.78);
+    --markdown-code-block-header-bg: rgb(30 41 59 / 0.92);
+    --markdown-code-block-header-fg: rgb(148 163 184);
+    --markdown-code-block-fg: rgb(226 232 240);
+  }
+
+  :global(:root[data-theme="dark"]) .markdown-body :global(a) {
+    color: rgb(251 191 36) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .markdown-body :global(a:hover) {
+    color: rgb(252 211 77) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .markdown-body :global(.hljs-comment) {
+    color: rgb(100 116 139);
+  }
+
+  :global(:root[data-theme="dark"]) .markdown-body :global(.hljs-keyword),
+  :global(:root[data-theme="dark"]) .markdown-body :global(.hljs-selector-tag) {
+    color: rgb(251 191 36);
+  }
+
+  :global(:root[data-theme="dark"]) .markdown-body :global(.hljs-string),
+  :global(:root[data-theme="dark"]) .markdown-body :global(.hljs-title) {
+    color: rgb(52 211 153);
+  }
+
+  :global(:root[data-theme="dark"]) .markdown-body :global(.hljs-number),
+  :global(:root[data-theme="dark"]) .markdown-body :global(.hljs-attr) {
+    color: rgb(251 146 60);
+  }
+
+  :global(:root[data-theme="dark"]) .markdown-body :global(.hljs-function) {
+    color: rgb(96 165 250);
   }
 </style>

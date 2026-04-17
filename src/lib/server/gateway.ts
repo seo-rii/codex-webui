@@ -1,9 +1,11 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import { createReadStream } from "node:fs";
-import { readdir } from "node:fs/promises";
+import { access, readdir } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
+import { promisify } from "node:util";
 import type { ArenaContestant, ArenaListPayload, ArenaRun } from "$lib/arena-types";
 import type { ThemeSettings } from "$lib/theme-customization";
 import type {
@@ -60,6 +62,20 @@ type InternalPendingRequest = PendingServerRequest & {
   rawId: string | number;
 };
 
+type SystemShutdownPlan = {
+  command: string;
+  args: string[];
+  availabilityCheck: {
+    command: string;
+    args: string[];
+  } | null;
+};
+
+type SystemShutdownCapability = {
+  available: boolean;
+  plan: SystemShutdownPlan | null;
+};
+
 type SessionHydrationState = SessionDetailPayload["hydration"] & {
   turns: SessionDetailPayload["thread"]["turns"];
 };
@@ -76,6 +92,7 @@ const DEFAULT_THREAD_NAME = "New thread";
 const LIVE_THREAD_STATUSES = new Set(["running", "active"]);
 const DEFAULT_NOTIFICATION_LIMIT = 80;
 const DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT = 40;
+const execFileAsync = promisify(execFile);
 
 type GatewayAccountState = {
   account: Record<string, unknown>;
@@ -174,6 +191,7 @@ function normalizeTokenUsage(value: unknown): ThreadTokenUsage | null {
   const record = asRecord(value);
   const normalizeBreakdown = (input: unknown) => {
     const breakdown = asRecord(input);
+
     return {
       totalTokens: asNumber(breakdown.totalTokens),
       inputTokens: asNumber(breakdown.inputTokens),
@@ -661,6 +679,8 @@ export class CodexGateway {
   private accountStateCache: { value: GatewayAccountState; expiresAt: number } | null = null;
   private shutdownTimer: ReturnType<typeof setTimeout> | null = null;
   private shutdownScheduledFor: number | null = null;
+  private systemShutdownCapability: SystemShutdownCapability | null = null;
+  private systemShutdownCapabilityPromise: Promise<SystemShutdownCapability> | null = null;
 
   constructor(private readonly profile: RuntimeProfileConfig) {
     this.client = new AppServerClient(profile);
@@ -740,6 +760,7 @@ export class CodexGateway {
         };
       })
     );
+    const systemShutdown = await this.getSystemShutdownState(globalState);
 
     const models = asRecord(modelsResponse).data as Array<Record<string, unknown>> | undefined;
     const collabModes = asRecord(collaborationResponse).data as Array<Record<string, unknown>> | undefined;
@@ -779,15 +800,11 @@ export class CodexGateway {
       git: {
         discoveryDepth: this.runtimeConfig.gitDiscoveryDepth
       },
-      systemShutdown: {
-        available: this.runtimeConfig.systemShutdownEnabled,
-        delaySeconds: this.runtimeConfig.systemShutdownDelaySeconds,
-        armed: this.runtimeConfig.systemShutdownEnabled && globalState.shutdownAfterQueueCompletes
-      },
+      systemShutdown,
       startup: {
         pausedQueues,
         scheduledShutdown:
-          this.runtimeConfig.systemShutdownEnabled &&
+          systemShutdown.available &&
           globalState.scheduledShutdown &&
           globalState.scheduledShutdown.scheduledFor > Date.now()
             ? globalState.scheduledShutdown
@@ -2048,6 +2065,12 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     const runtimeConfig = this.runtimeConfig;
     if (!runtimeConfig.systemShutdownEnabled && enabled) {
       throw new Error("System shutdown support is disabled.");
+    }
+    if (enabled) {
+      const capability = await this.getSystemShutdownCapability();
+      if (!capability.available) {
+        throw new Error("System shutdown is unavailable for this server user. Configure passwordless sudo for the shutdown command first.");
+      }
     }
 
     await uiStateStore.setGlobalShutdownAfterQueueCompletes(Boolean(enabled));
@@ -3440,7 +3463,6 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   private async emitConfigUpdated() {
-    const runtimeConfig = this.runtimeConfig;
     const [globalState, notifications, savedFilters, knownTags, promptPresets, automations, automationRuns, theme] = await Promise.all([
       uiStateStore.getGlobal(),
       uiStateStore.getNotifications(1),
@@ -3451,19 +3473,16 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       uiStateStore.getAutomationRuns(DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT),
       getStoredThemeSettings(this.profile)
     ]);
+    const systemShutdown = await this.getSystemShutdownState(globalState);
     this.emitGlobal({
       kind: "notification",
       method: "codex-webui/configUpdated",
       params: {
         defaults: this.profile.defaults,
-        systemShutdown: {
-          available: runtimeConfig.systemShutdownEnabled,
-          delaySeconds: runtimeConfig.systemShutdownDelaySeconds,
-          armed: runtimeConfig.systemShutdownEnabled && globalState.shutdownAfterQueueCompletes
-        },
+        systemShutdown,
         startup: {
           scheduledShutdown:
-            runtimeConfig.systemShutdownEnabled &&
+            systemShutdown.available &&
             globalState.scheduledShutdown &&
             globalState.scheduledShutdown.scheduledFor > Date.now()
               ? globalState.scheduledShutdown
@@ -3675,29 +3694,24 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   private async executeScheduledShutdown() {
-    const runtimeConfig = this.runtimeConfig;
+    const capability = await this.getSystemShutdownCapability();
     this.shutdownTimer = null;
     this.shutdownScheduledFor = null;
     await uiStateStore.setScheduledShutdown(null);
     await this.emitConfigUpdated();
 
-    const command =
-      runtimeConfig.systemShutdownCommandOverride ??
-      (process.platform === "darwin"
-        ? "osascript"
-        : process.platform === "win32"
-          ? "shutdown"
-          : "shutdown");
-    const args =
-      runtimeConfig.systemShutdownCommandOverride
-        ? []
-        : process.platform === "darwin"
-          ? ["-e", 'tell app "System Events" to shut down']
-          : process.platform === "win32"
-            ? ["/s", "/t", "0"]
-            : ["-h", "now"];
+    if (!capability.available || !capability.plan) {
+      this.emitGlobal({
+        kind: "notification",
+        method: "codex-webui/shutdownFailed",
+        params: {
+          message: "System shutdown is unavailable for this server user."
+        }
+      });
+      return;
+    }
 
-    execFile(command, args, (error) => {
+    execFile(capability.plan.command, capability.plan.args, (error) => {
       if (!error) {
         return;
       }
@@ -3715,8 +3729,9 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   private async restorePersistedShutdownState() {
     const runtimeConfig = this.runtimeConfig;
     const globalState = await uiStateStore.getGlobal();
+    const capability = await this.getSystemShutdownCapability();
 
-    if (!runtimeConfig.systemShutdownEnabled) {
+    if (!runtimeConfig.systemShutdownEnabled || !capability.available) {
       if (globalState.scheduledShutdown || globalState.shutdownAfterQueueCompletes) {
         await uiStateStore.setGlobalShutdownAfterQueueCompletes(false);
         await uiStateStore.setScheduledShutdown(null);
@@ -3756,7 +3771,8 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
 
   private async maybeScheduleGlobalShutdown(completedTurnId: string | null) {
     const runtimeConfig = this.runtimeConfig;
-    if (!runtimeConfig.systemShutdownEnabled || this.shutdownTimer) {
+    const capability = await this.getSystemShutdownCapability();
+    if (!runtimeConfig.systemShutdownEnabled || !capability.available || this.shutdownTimer) {
       return;
     }
 
@@ -3799,6 +3815,139 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       })
     );
     await this.emitConfigUpdated();
+  }
+
+  private async getSystemShutdownState(globalState: Awaited<ReturnType<typeof uiStateStore.getGlobal>>) {
+    const capability = await this.getSystemShutdownCapability();
+    return {
+      available: capability.available,
+      delaySeconds: this.runtimeConfig.systemShutdownDelaySeconds,
+      armed: capability.available && this.runtimeConfig.systemShutdownEnabled && globalState.shutdownAfterQueueCompletes
+    };
+  }
+
+  private async getSystemShutdownCapability(): Promise<SystemShutdownCapability> {
+    if (!this.runtimeConfig.systemShutdownEnabled) {
+      return { available: false, plan: null };
+    }
+
+    if (this.systemShutdownCapability) {
+      return this.systemShutdownCapability;
+    }
+
+    if (!this.systemShutdownCapabilityPromise) {
+      this.systemShutdownCapabilityPromise = this.resolveSystemShutdownCapability().then((capability) => {
+        this.systemShutdownCapability = capability;
+        this.systemShutdownCapabilityPromise = null;
+        return capability;
+      });
+    }
+
+    return this.systemShutdownCapabilityPromise;
+  }
+
+  private async resolveSystemShutdownCapability(): Promise<SystemShutdownCapability> {
+    const plan = await this.resolveSystemShutdownPlan();
+    if (!plan) {
+      return { available: false, plan: null };
+    }
+
+    if (!plan.availabilityCheck) {
+      return { available: true, plan };
+    }
+
+    try {
+      await execFileAsync(plan.availabilityCheck.command, plan.availabilityCheck.args, {
+        timeout: 1_500,
+        windowsHide: true
+      });
+      return { available: true, plan };
+    } catch {
+      return { available: false, plan: null };
+    }
+  }
+
+  private async resolveSystemShutdownPlan(): Promise<SystemShutdownPlan | null> {
+    const runtimeConfig = this.runtimeConfig;
+    const isWindows = process.platform === "win32";
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    const pathEntries = (process.env.PATH ?? "")
+      .split(path.delimiter)
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+
+    const resolveExecutable = async (command: string) => {
+      const trimmed = command.trim();
+      if (!trimmed) {
+        return null;
+      }
+
+      const candidates =
+        path.isAbsolute(trimmed) || /[\\/]/u.test(trimmed)
+          ? [trimmed]
+          : pathEntries.map((entry) => path.join(entry, trimmed));
+
+      for (const candidate of candidates) {
+        try {
+          await access(candidate, fsConstants.X_OK);
+          return candidate;
+        } catch {
+          // Try the next candidate.
+        }
+      }
+
+      return null;
+    };
+
+    if (isWindows) {
+      const command = runtimeConfig.systemShutdownCommandOverride?.trim() || "shutdown";
+      return {
+        command,
+        args: runtimeConfig.systemShutdownCommandOverride ? [] : ["/s", "/t", "0"],
+        availabilityCheck: null
+      };
+    }
+
+    const override = runtimeConfig.systemShutdownCommandOverride?.trim() ?? "";
+    const directCommand =
+      (override ? await resolveExecutable(override) : null) ||
+      (await resolveExecutable("shutdown")) ||
+      (await resolveExecutable("/usr/sbin/shutdown")) ||
+      (await resolveExecutable("/sbin/shutdown")) ||
+      (await resolveExecutable("systemctl"));
+
+    if (!directCommand) {
+      return null;
+    }
+
+    const directArgs =
+      override
+        ? []
+        : path.basename(directCommand) === "systemctl"
+          ? ["poweroff"]
+          : ["-h", "now"];
+
+    if (uid === 0) {
+      return {
+        command: directCommand,
+        args: directArgs,
+        availabilityCheck: null
+      };
+    }
+
+    const sudoCommand = await resolveExecutable("sudo");
+    if (!sudoCommand) {
+      return null;
+    }
+
+    return {
+      command: sudoCommand,
+      args: ["-n", directCommand, ...directArgs],
+      availabilityCheck: {
+        command: sudoCommand,
+        args: ["-n", "-l", directCommand, ...directArgs]
+      }
+    };
   }
 
   private async cancelScheduledShutdownForActivity() {

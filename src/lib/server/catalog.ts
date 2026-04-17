@@ -3,14 +3,15 @@ import path from "node:path";
 
 import type { CatalogPayload, PluginCatalogEntry, SkillCatalogEntry } from "$lib/types";
 
-import { getRuntimeConfig } from "./env";
+import { getCurrentRuntimeProfile } from "./env";
 
-let catalogCache:
-  | {
-      expiresAt: number;
-      payload: CatalogPayload;
-    }
-  | null = null;
+const catalogCache = new Map<
+  string,
+  {
+    expiresAt: number;
+    payload: CatalogPayload;
+  }
+>();
 
 function parseFrontMatter(raw: string) {
   const match = raw.match(/^---\n([\s\S]*?)\n---/u);
@@ -127,16 +128,20 @@ async function listPluginEntries(codexHome: string): Promise<PluginCatalogEntry[
   return entries.sort((left, right) => left.displayName.localeCompare(right.displayName));
 }
 
-export async function getCatalog(): Promise<CatalogPayload> {
-  if (catalogCache && catalogCache.expiresAt > Date.now()) {
-    return catalogCache.payload;
+export async function getCatalogForCodexHome(codexHome: string): Promise<CatalogPayload> {
+  const cached = catalogCache.get(codexHome);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.payload;
   }
-  const { codexHome } = getRuntimeConfig();
   const [plugins, skills] = await Promise.all([listPluginEntries(codexHome), listSkillEntries(codexHome)]);
   const payload = { plugins, skills };
-  catalogCache = {
+  catalogCache.set(codexHome, {
     expiresAt: Date.now() + 10_000,
     payload
-  };
+  });
   return payload;
+}
+
+export async function getCatalog(): Promise<CatalogPayload> {
+  return getCatalogForCodexHome(getCurrentRuntimeProfile().codexHome);
 }

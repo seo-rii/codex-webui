@@ -42,7 +42,7 @@ The package already exposes:
 - reading and writing `~/.codex/codex-webui.yml`
 - starting, restarting, and stopping the background server
 - printing the launch URL, PID, config path, and log path
-- exposing `config`, `restart`, `stop`, and `tunnel`
+- exposing `config`, `restart`, `stop`, and richer `tunnel` management commands
 
 On first run, it prompts for:
 
@@ -50,8 +50,10 @@ On first run, it prompts for:
 - port
 - base path
 - Codex binary path
-- Codex home
 - data directory
+- profile count
+- per-profile id, label, Codex home, and optional profile-local data dir
+- default profile id
 - allowed roots
 - CORS origins
 - optional explicit backend binary path
@@ -70,6 +72,9 @@ That runtime state currently includes:
 
 - PID file
 - server log
+- tunnel PID file
+- tunnel log
+- tunnel metadata JSON
 
 ## Binary Resolution Order
 
@@ -91,10 +96,14 @@ The CLI starts the Rust gateway as a detached background process and injects the
 - `CODEX_WEBUI_CODEX_BIN`
 - `CODEX_WEBUI_CODEX_HOME`
 - `CODEX_WEBUI_DATA_DIR`
+- `CODEX_WEBUI_DEFAULT_PROFILE_ID`
+- `CODEX_WEBUI_PROFILES_JSON`
 - `CODEX_WEBUI_ALLOWED_ROOTS`
 - `CODEX_WEBUI_PASSWORD_HASH`
 - `CODEX_WEBUI_SESSION_SECRET`
 - `CODEX_WEBUI_CORS_ALLOWED_ORIGINS`
+
+`CODEX_WEBUI_CODEX_HOME` remains the default-profile convenience value for compatibility, while `CODEX_WEBUI_PROFILES_JSON` is the authoritative multi-profile runtime description.
 
 The CLI currently prints a URL ending in `/login`; that route redirects to the workspace root, so either URL is acceptable for end users.
 
@@ -106,12 +115,29 @@ When system shutdown support is enabled, the actual armed and scheduled state is
 
 ## Tunnel Behavior
 
-`codex-webui tunnel` ensures the server is running and then:
+The tunnel command family is:
 
-1. tries `cloudflared tunnel --url <base-url>`
-2. falls back to `ngrok http <host>:<port>`
+```bash
+codex-webui tunnel start [--provider auto|cloudflared|ngrok] [--foreground] [--hostname host] [--name tunnel] [--overwrite-dns] [--log-level level] [--arg value]
+codex-webui tunnel status [--json]
+codex-webui tunnel stop
+codex-webui tunnel logs [--lines 80] [--json]
+```
 
-This command assumes the selected tunneling tool is already installed and authenticated where necessary.
+Behavior:
+
+1. `start` ensures the server is running first
+2. the provider defaults to the configured tunnel provider, or `auto`
+3. `auto` prefers `cloudflared` and falls back to `ngrok`
+4. background launches persist tunnel PID and metadata under `~/.codex/codex-webui/`
+5. `status` reports the provider, PID, origin URL, public URL when discovered, and log path
+6. `logs` prints the most recent tunnel log lines without requiring the user to hunt down the log file manually
+
+Provider notes:
+
+- `cloudflared` supports `--hostname`, `--name`, and `--overwrite-dns`
+- `ngrok` currently uses the generic `http <origin>` launch path plus any extra args supplied through config or repeated `--arg` flags
+- both providers assume the user has already installed and authenticated the relevant CLI where necessary
 
 ## Cross Build
 

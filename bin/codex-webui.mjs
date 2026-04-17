@@ -15,6 +15,9 @@ const stateDir = path.join(os.homedir(), ".codex", "codex-webui");
 const configPath = path.join(os.homedir(), ".codex", "codex-webui.yml");
 const pidPath = path.join(stateDir, "server.pid");
 const logPath = path.join(stateDir, "server.log");
+const tunnelPidPath = path.join(stateDir, "tunnel.pid");
+const tunnelLogPath = path.join(stateDir, "tunnel.log");
+const tunnelMetaPath = path.join(stateDir, "tunnel.json");
 
 function expandHome(input) {
   if (!input) {
@@ -66,20 +69,165 @@ function currentRustTargets() {
   return candidates;
 }
 
+function defaultTunnelConfigValues() {
+  return {
+    provider: "auto",
+    background: true,
+    hostname: "",
+    name: "",
+    overwriteDns: false,
+    logLevel: "info",
+    extraArgs: []
+  };
+}
+
 function defaultConfigValues() {
   const port = 4173;
+  const dataDir = path.join(os.homedir(), ".codex", "codex-webui", "data");
+  const codexHome = path.join(os.homedir(), ".codex");
   return {
     host: "127.0.0.1",
     port,
     basePath: defaultBasePath(port),
     codexBin: "codex",
-    codexHome: path.join(os.homedir(), ".codex"),
-    dataDir: path.join(os.homedir(), ".codex", "codex-webui", "data"),
+    codexHome,
+    dataDir,
+    defaultProfileId: "default",
+    profiles: [
+      {
+        id: "default",
+        label: "Default",
+        codexHome,
+        dataDir: path.join(dataDir, "profiles", "default")
+      }
+    ],
     allowedRoots: [process.cwd()],
     passwordHash: "",
     sessionSecret: createSessionSecret(),
     corsAllowedOrigins: [],
-    backendBinaryPath: ""
+    backendBinaryPath: "",
+    tunnel: defaultTunnelConfigValues()
+  };
+}
+
+function sanitizeProfileId(input) {
+  const normalized = String(input ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/gu, "-")
+    .replace(/^-+|-+$/gu, "");
+  return normalized || "default";
+}
+
+function defaultProfileDataDir(rootDataDir, profileId) {
+  return path.join(rootDataDir, "profiles", profileId);
+}
+
+function normalizeTunnelProvider(input) {
+  return ["auto", "cloudflared", "ngrok"].includes(String(input ?? "").trim()) ? String(input).trim() : "auto";
+}
+
+function parseBooleanInput(input, fallback) {
+  const normalized = String(input ?? "").trim().toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+  if (["y", "yes", "true", "1", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["n", "no", "false", "0", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+function formatOptionalPrompt(value, emptyLabel = "none") {
+  return value ? String(value) : emptyLabel;
+}
+
+function normalizeTunnelConfig(rawTunnel = {}) {
+  const defaults = defaultTunnelConfigValues();
+  return {
+    ...defaults,
+    ...rawTunnel,
+    provider: normalizeTunnelProvider(rawTunnel.provider ?? defaults.provider),
+    background: rawTunnel.background === undefined ? defaults.background : rawTunnel.background !== false,
+    hostname: String(rawTunnel.hostname ?? defaults.hostname).trim(),
+    name: String(rawTunnel.name ?? defaults.name).trim(),
+    overwriteDns: rawTunnel.overwriteDns === true,
+    logLevel: String(rawTunnel.logLevel ?? defaults.logLevel).trim() || defaults.logLevel,
+    extraArgs:
+      Array.isArray(rawTunnel.extraArgs)
+        ? rawTunnel.extraArgs.map((entry) => String(entry).trim()).filter(Boolean)
+        : defaults.extraArgs
+  };
+}
+
+function normalizeProfiles(rawConfig, rootDataDir, defaultCodexHome) {
+  const rawProfiles = Array.isArray(rawConfig?.profiles) ? rawConfig.profiles : [];
+  const fallbackDefaultProfileId = sanitizeProfileId(rawConfig?.defaultProfileId);
+  const profiles = [];
+  const seenIds = new Set();
+
+  if (rawProfiles.length > 0) {
+    for (const [index, entry] of rawProfiles.entries()) {
+      const id = sanitizeProfileId(entry?.id ?? (index === 0 ? fallbackDefaultProfileId : `profile-${index + 1}`));
+      if (seenIds.has(id)) {
+        continue;
+      }
+      seenIds.add(id);
+      const codexHome = entry?.codexHome ?? entry?.codex_home ?? defaultCodexHome;
+      const dataDir = entry?.dataDir ?? entry?.data_dir ?? defaultProfileDataDir(rootDataDir, id);
+      profiles.push({
+        id,
+        label: String(entry?.label ?? "").trim() || (id === fallbackDefaultProfileId ? "Default" : id),
+        codexHome: expandHome(String(codexHome)),
+        dataDir: expandHome(String(dataDir))
+      });
+    }
+  }
+
+  if (profiles.length === 0) {
+    const id = fallbackDefaultProfileId;
+    profiles.push({
+      id,
+      label: "Default",
+      codexHome: expandHome(String(rawConfig?.codexHome ?? defaultCodexHome)),
+      dataDir: expandHome(defaultProfileDataDir(rootDataDir, id))
+    });
+  }
+
+  const defaultProfileId = profiles.some((profile) => profile.id === fallbackDefaultProfileId)
+    ? fallbackDefaultProfileId
+    : profiles[0].id;
+
+  return { defaultProfileId, profiles };
+}
+
+function normalizeConfig(rawConfig = {}) {
+  const defaults = defaultConfigValues();
+  const dataDir = expandHome(String(rawConfig.dataDir ?? defaults.dataDir));
+  const codexHome = expandHome(String(rawConfig.codexHome ?? defaults.codexHome));
+  const { defaultProfileId, profiles } = normalizeProfiles(rawConfig, dataDir, codexHome);
+  const defaultProfile = profiles.find((profile) => profile.id === defaultProfileId) ?? profiles[0];
+
+  return {
+    ...defaults,
+    ...rawConfig,
+    basePath: String(rawConfig.basePath ?? defaults.basePath).startsWith("/")
+      ? String(rawConfig.basePath ?? defaults.basePath)
+      : `/${String(rawConfig.basePath ?? defaults.basePath)}`,
+    codexHome: defaultProfile.codexHome,
+    dataDir,
+    defaultProfileId,
+    profiles,
+    allowedRoots:
+      Array.isArray(rawConfig.allowedRoots) && rawConfig.allowedRoots.length > 0
+        ? rawConfig.allowedRoots.map((entry) => expandHome(String(entry)))
+        : defaults.allowedRoots,
+    corsAllowedOrigins: Array.isArray(rawConfig.corsAllowedOrigins) ? rawConfig.corsAllowedOrigins : defaults.corsAllowedOrigins,
+    backendBinaryPath: expandHome(String(rawConfig.backendBinaryPath ?? defaults.backendBinaryPath)),
+    tunnel: normalizeTunnelConfig(rawConfig.tunnel)
   };
 }
 
@@ -90,14 +238,7 @@ async function ensureStateDir() {
 async function readConfig() {
   try {
     const raw = await fs.readFile(configPath, "utf8");
-    const parsed = YAML.parse(raw) ?? {};
-    const defaults = defaultConfigValues();
-    return {
-      ...defaults,
-      ...parsed,
-      allowedRoots: Array.isArray(parsed.allowedRoots) && parsed.allowedRoots.length > 0 ? parsed.allowedRoots.map(expandHome) : defaults.allowedRoots,
-      corsAllowedOrigins: Array.isArray(parsed.corsAllowedOrigins) ? parsed.corsAllowedOrigins : defaults.corsAllowedOrigins
-    };
+    return normalizeConfig(YAML.parse(raw) ?? {});
   } catch {
     return null;
   }
@@ -113,10 +254,7 @@ async function promptConfig(existing = null) {
     input: process.stdin,
     output: process.stdout
   });
-  const defaults = {
-    ...defaultConfigValues(),
-    ...(existing ?? {})
-  };
+  const defaults = normalizeConfig(existing ?? {});
 
   try {
     const host = (await rl.question(`Host [${defaults.host}]: `)).trim() || defaults.host;
@@ -124,11 +262,46 @@ async function promptConfig(existing = null) {
     const port = Number.parseInt(portInput || String(defaults.port), 10);
     const basePath = (await rl.question(`Base path [${defaults.basePath || defaultBasePath(port)}]: `)).trim() || defaults.basePath || defaultBasePath(port);
     const codexBin = (await rl.question(`Codex binary [${defaults.codexBin}]: `)).trim() || defaults.codexBin;
-    const codexHome = expandHome((await rl.question(`Codex home [${defaults.codexHome}]: `)).trim() || defaults.codexHome);
     const dataDir = expandHome((await rl.question(`Data dir [${defaults.dataDir}]: `)).trim() || defaults.dataDir);
+    const profileCountInput = (await rl.question(`Profile count [${defaults.profiles.length}]: `)).trim();
+    const profileCount = Math.max(1, Number.parseInt(profileCountInput || String(defaults.profiles.length), 10) || defaults.profiles.length);
+    const profiles = [];
+
+    for (let index = 0; index < profileCount; index += 1) {
+      const existingProfile =
+        defaults.profiles[index] ??
+        {
+          id: index === 0 ? defaults.defaultProfileId : `profile-${index + 1}`,
+          label: index === 0 ? "Default" : `Profile ${index + 1}`,
+          codexHome: defaults.profiles[0]?.codexHome ?? defaults.codexHome,
+          dataDir: defaultProfileDataDir(dataDir, index === 0 ? defaults.defaultProfileId : `profile-${index + 1}`)
+        };
+      const idInput = (await rl.question(`Profile ${index + 1} id [${existingProfile.id}]: `)).trim();
+      const id = sanitizeProfileId(idInput || existingProfile.id);
+      const label = (await rl.question(`Profile ${index + 1} label [${existingProfile.label}]: `)).trim() || existingProfile.label;
+      const codexHome = expandHome((await rl.question(`Profile ${index + 1} Codex home [${existingProfile.codexHome}]: `)).trim() || existingProfile.codexHome);
+      const defaultProfileDir = existingProfile.dataDir || defaultProfileDataDir(dataDir, id);
+      const profileDataDir = expandHome((await rl.question(`Profile ${index + 1} data dir [${defaultProfileDir}]: `)).trim() || defaultProfileDir);
+      profiles.push({
+        id,
+        label,
+        codexHome,
+        dataDir: profileDataDir
+      });
+    }
+
+    const defaultProfileIds = [...new Set(profiles.map((profile) => profile.id))];
+    const defaultProfilePrompt = `Default profile id [${defaults.defaultProfileId}] (${defaultProfileIds.join(", ")}): `;
+    const defaultProfileInput = (await rl.question(defaultProfilePrompt)).trim();
+    const requestedDefaultProfileId = sanitizeProfileId(defaultProfileInput || defaults.defaultProfileId);
+    const defaultProfileId = defaultProfileIds.includes(requestedDefaultProfileId) ? requestedDefaultProfileId : defaultProfileIds[0];
     const allowedRootsRaw = (await rl.question(`Allowed roots (comma separated) [${defaults.allowedRoots.join(", ")}]: `)).trim();
     const corsRaw = (await rl.question(`CORS origins (comma separated, optional) [${defaults.corsAllowedOrigins.join(", ")}]: `)).trim();
     const backendBinaryPath = expandHome((await rl.question(`Backend binary path (optional) [${defaults.backendBinaryPath || "auto"}]: `)).trim() || defaults.backendBinaryPath || "");
+    const tunnelProviderInput = (await rl.question(`Tunnel provider [${defaults.tunnel.provider}]: `)).trim();
+    const tunnelBackgroundInput = (await rl.question(`Tunnel runs in background by default? [${defaults.tunnel.background ? "Y/n" : "y/N"}]: `)).trim();
+    const tunnelHostnameInput = (await rl.question(`Tunnel hostname (cloudflared only, optional) [${formatOptionalPrompt(defaults.tunnel.hostname)}]: `)).trim();
+    const tunnelNameInput = (await rl.question(`Tunnel name (cloudflared only, optional) [${formatOptionalPrompt(defaults.tunnel.name)}]: `)).trim();
     const password = await rl.question("Password (leave blank to keep existing hash): ");
     const passwordHash = password.trim() ? hashPassword(password.trim()) : defaults.passwordHash;
 
@@ -136,13 +309,16 @@ async function promptConfig(existing = null) {
       throw new Error("A password is required.");
     }
 
-    const config = {
+    const defaultProfile = profiles.find((profile) => profile.id === defaultProfileId) ?? profiles[0];
+    const config = normalizeConfig({
       host,
       port: Number.isFinite(port) ? port : defaults.port,
       basePath: basePath.startsWith("/") ? basePath : `/${basePath}`,
       codexBin,
-      codexHome,
       dataDir,
+      codexHome: defaultProfile.codexHome,
+      defaultProfileId,
+      profiles,
       allowedRoots:
         allowedRootsRaw
           ? allowedRootsRaw.split(",").map((entry) => expandHome(entry.trim())).filter(Boolean)
@@ -153,8 +329,15 @@ async function promptConfig(existing = null) {
           : defaults.corsAllowedOrigins,
       passwordHash,
       sessionSecret: defaults.sessionSecret || createSessionSecret(),
-      backendBinaryPath
-    };
+      backendBinaryPath,
+      tunnel: {
+        ...defaults.tunnel,
+        provider: normalizeTunnelProvider(tunnelProviderInput || defaults.tunnel.provider),
+        background: parseBooleanInput(tunnelBackgroundInput, defaults.tunnel.background),
+        hostname: tunnelHostnameInput || defaults.tunnel.hostname,
+        name: tunnelNameInput || defaults.tunnel.name
+      }
+    });
 
     await writeConfig(config);
     return config;
@@ -181,6 +364,30 @@ async function readPid() {
   }
 }
 
+async function readNumericFile(filePath) {
+  try {
+    return Number.parseInt((await fs.readFile(filePath, "utf8")).trim(), 10) || null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeNumericFile(filePath, value) {
+  await fs.writeFile(filePath, String(value), "utf8");
+}
+
+async function readTunnelMeta() {
+  try {
+    return JSON.parse(await fs.readFile(tunnelMetaPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function writeTunnelMeta(meta) {
+  await fs.writeFile(tunnelMetaPath, JSON.stringify(meta, null, 2), "utf8");
+}
+
 function isRunning(pid) {
   if (!pid) {
     return false;
@@ -190,6 +397,397 @@ function isRunning(pid) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function buildOriginUrl(config) {
+  return `http://${config.host}:${config.port}`;
+}
+
+function joinPublicUrl(baseUrl, routePath) {
+  const root = String(baseUrl).replace(/\/+$/u, "");
+  const normalizedPath = routePath === "/" ? "/" : `/${String(routePath).replace(/^\/+/u, "")}`;
+  return `${root}${normalizedPath}`;
+}
+
+function buildPublicWorkspaceUrl(baseUrl, config) {
+  return joinPublicUrl(baseUrl, config.basePath || "/");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractTunnelPublicUrl(logText) {
+  if (!logText?.trim()) {
+    return null;
+  }
+
+  const matches = [...logText.matchAll(/https:\/\/[^\s"'`]+/gu)]
+    .map((match) => match[0].replace(/[),.;]+$/u, ""))
+    .filter((value) => !/https:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?/u.test(value));
+
+  if (matches.length === 0) {
+    return null;
+  }
+
+  const preferred = matches.find((value) => /trycloudflare\.com|ngrok/i.test(value));
+  return preferred ?? matches[0];
+}
+
+async function readTunnelPublicUrlFromLog() {
+  try {
+    return extractTunnelPublicUrl(await fs.readFile(tunnelLogPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function resolveTunnelProvider(requestedProvider) {
+  const provider = normalizeTunnelProvider(requestedProvider);
+  if (provider === "cloudflared") {
+    if (!commandAvailable("cloudflared")) {
+      throw new Error("cloudflared is not installed.");
+    }
+    return "cloudflared";
+  }
+  if (provider === "ngrok") {
+    if (!commandAvailable("ngrok")) {
+      throw new Error("ngrok is not installed.");
+    }
+    return "ngrok";
+  }
+  if (commandAvailable("cloudflared")) {
+    return "cloudflared";
+  }
+  if (commandAvailable("ngrok")) {
+    return "ngrok";
+  }
+  throw new Error("Neither cloudflared nor ngrok is installed.");
+}
+
+function buildTunnelLaunch(config, tunnelOptions) {
+  const originUrl = buildOriginUrl(config);
+  const provider = resolveTunnelProvider(tunnelOptions.provider);
+
+  if (provider === "cloudflared") {
+    const args = ["tunnel", "--url", originUrl, "--no-autoupdate", "--loglevel", tunnelOptions.logLevel];
+    if (tunnelOptions.hostname) {
+      args.push("--hostname", tunnelOptions.hostname);
+    }
+    if (tunnelOptions.name) {
+      args.push("--name", tunnelOptions.name);
+    }
+    if (tunnelOptions.overwriteDns) {
+      args.push("--overwrite-dns");
+    }
+    args.push(...tunnelOptions.extraArgs);
+    return {
+      provider,
+      command: "cloudflared",
+      args,
+      originUrl
+    };
+  }
+
+  if (tunnelOptions.hostname || tunnelOptions.name || tunnelOptions.overwriteDns) {
+    throw new Error("The selected tunnel provider does not support --hostname, --name, or --overwrite-dns. Use cloudflared for those options.");
+  }
+
+  const args = ["http", originUrl, ...tunnelOptions.extraArgs];
+  return {
+    provider,
+    command: "ngrok",
+    args,
+    originUrl
+  };
+}
+
+async function readTunnelStatus(config) {
+  const pid = await readNumericFile(tunnelPidPath);
+  const meta = await readTunnelMeta();
+  const running = isRunning(pid);
+
+  if (!running) {
+    await fs.rm(tunnelPidPath, { force: true });
+  }
+
+  const publicUrl = meta?.publicUrl ?? (running ? await readTunnelPublicUrlFromLog() : null);
+  const workspaceUrl = publicUrl ? buildPublicWorkspaceUrl(publicUrl, config) : null;
+
+  if (running && meta && publicUrl && meta.publicUrl !== publicUrl) {
+    const nextMeta = {
+      ...meta,
+      publicUrl,
+      publicWorkspaceUrl: workspaceUrl
+    };
+    await writeTunnelMeta(nextMeta);
+    return {
+      running,
+      pid,
+      meta: nextMeta,
+      publicUrl,
+      workspaceUrl,
+      logPath: tunnelLogPath
+    };
+  }
+
+  return {
+    running,
+    pid,
+    meta,
+    publicUrl,
+    workspaceUrl,
+    logPath: tunnelLogPath
+  };
+}
+
+async function printTunnelStatus(config, jsonOutput = false) {
+  const status = await readTunnelStatus(config);
+  if (jsonOutput) {
+    console.log(JSON.stringify(status, null, 2));
+    return;
+  }
+
+  if (!status.running) {
+    console.log("No active tunnel.");
+    console.log(`Log: ${status.logPath}`);
+    return;
+  }
+
+  console.log("Tunnel is running.");
+  console.log(`Provider: ${status.meta?.provider ?? "unknown"}`);
+  console.log(`PID: ${status.pid}`);
+  console.log(`Origin: ${status.meta?.originUrl ?? buildOriginUrl(config)}`);
+  console.log(`Workspace: ${status.workspaceUrl ?? "waiting for public URL..."}`);
+  if (status.publicUrl) {
+    console.log(`Public base: ${status.publicUrl}`);
+  }
+  console.log(`Log: ${status.logPath}`);
+}
+
+async function stopTunnel() {
+  const pid = await readNumericFile(tunnelPidPath);
+  if (!pid || !isRunning(pid)) {
+    await fs.rm(tunnelPidPath, { force: true });
+    await fs.rm(tunnelMetaPath, { force: true });
+    return { stopped: false };
+  }
+
+  process.kill(pid, "SIGTERM");
+  await fs.rm(tunnelPidPath, { force: true });
+  await fs.rm(tunnelMetaPath, { force: true });
+  return { stopped: true, pid };
+}
+
+function parseTunnelArgs(argv) {
+  const options = {
+    action: "start",
+    provider: null,
+    foreground: null,
+    hostname: null,
+    name: null,
+    overwriteDns: null,
+    logLevel: null,
+    extraArgs: [],
+    json: false,
+    lines: 80,
+    help: false
+  };
+
+  let index = 0;
+  const firstToken = argv[0];
+  if (["start", "status", "stop", "logs"].includes(firstToken)) {
+    options.action = firstToken;
+    index = 1;
+  }
+
+  while (index < argv.length) {
+    const token = argv[index];
+    if (token === "--help" || token === "-h") {
+      options.help = true;
+      index += 1;
+      continue;
+    }
+    if (token === "--json") {
+      options.json = true;
+      index += 1;
+      continue;
+    }
+    if (token === "--foreground") {
+      options.foreground = true;
+      index += 1;
+      continue;
+    }
+    if (token === "--background") {
+      options.foreground = false;
+      index += 1;
+      continue;
+    }
+    if (token === "--overwrite-dns") {
+      options.overwriteDns = true;
+      index += 1;
+      continue;
+    }
+    if (token === "--provider" || token === "--hostname" || token === "--name" || token === "--log-level" || token === "--arg" || token === "--lines") {
+      const nextValue = argv[index + 1];
+      if (!nextValue) {
+        throw new Error(`Missing value for ${token}.`);
+      }
+      if (token === "--provider") {
+        options.provider = nextValue;
+      } else if (token === "--hostname") {
+        options.hostname = nextValue;
+      } else if (token === "--name") {
+        options.name = nextValue;
+      } else if (token === "--log-level") {
+        options.logLevel = nextValue;
+      } else if (token === "--arg") {
+        options.extraArgs.push(nextValue);
+      } else if (token === "--lines") {
+        options.lines = Number.parseInt(nextValue, 10) || options.lines;
+      }
+      index += 2;
+      continue;
+    }
+    throw new Error(`Unknown tunnel option: ${token}`);
+  }
+
+  return options;
+}
+
+function mergeTunnelOptions(config, cliOptions) {
+  return normalizeTunnelConfig({
+    ...config.tunnel,
+    provider: cliOptions.provider ?? config.tunnel.provider,
+    background: cliOptions.foreground === null ? config.tunnel.background : cliOptions.foreground === false ? true : false,
+    hostname: cliOptions.hostname ?? config.tunnel.hostname,
+    name: cliOptions.name ?? config.tunnel.name,
+    overwriteDns: cliOptions.overwriteDns ?? config.tunnel.overwriteDns,
+    logLevel: cliOptions.logLevel ?? config.tunnel.logLevel,
+    extraArgs: [...config.tunnel.extraArgs, ...cliOptions.extraArgs]
+  });
+}
+
+async function waitForTunnelPublicUrl(pid, timeoutMs = 10000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (!isRunning(pid)) {
+      return null;
+    }
+    const publicUrl = await readTunnelPublicUrlFromLog();
+    if (publicUrl) {
+      return publicUrl;
+    }
+    await sleep(350);
+  }
+  return null;
+}
+
+async function startTunnel(config, cliOptions) {
+  await ensureStateDir();
+  const existing = await readTunnelStatus(config);
+  if (existing.running) {
+    return existing;
+  }
+
+  const tunnelOptions = mergeTunnelOptions(config, cliOptions);
+  const launch = buildTunnelLaunch(config, tunnelOptions);
+  await fs.mkdir(path.dirname(tunnelLogPath), { recursive: true });
+  await fs.writeFile(tunnelLogPath, "", "utf8");
+
+  if (tunnelOptions.background) {
+    const logHandle = await fs.open(tunnelLogPath, "a");
+    const child = spawn(launch.command, launch.args, {
+      cwd: packageRoot,
+      detached: true,
+      stdio: ["ignore", logHandle.fd, logHandle.fd]
+    });
+    child.unref();
+    await logHandle.close();
+    await writeNumericFile(tunnelPidPath, child.pid);
+    const meta = {
+      provider: launch.provider,
+      pid: child.pid,
+      command: launch.command,
+      args: launch.args,
+      startedAt: new Date().toISOString(),
+      originUrl: launch.originUrl,
+      localWorkspaceUrl: buildBaseUrl(config),
+      publicUrl: null,
+      publicWorkspaceUrl: null,
+      background: true
+    };
+    await writeTunnelMeta(meta);
+    await sleep(700);
+    if (!isRunning(child.pid)) {
+      throw new Error(`The ${launch.provider} tunnel exited early. Check ${tunnelLogPath}.`);
+    }
+    const publicUrl = await waitForTunnelPublicUrl(child.pid);
+    if (publicUrl) {
+      await writeTunnelMeta({
+        ...meta,
+        publicUrl,
+        publicWorkspaceUrl: buildPublicWorkspaceUrl(publicUrl, config)
+      });
+    }
+    return readTunnelStatus(config);
+  }
+
+  const child = spawn(launch.command, launch.args, {
+    cwd: packageRoot,
+    stdio: "inherit"
+  });
+  await writeNumericFile(tunnelPidPath, child.pid);
+  await writeTunnelMeta({
+    provider: launch.provider,
+    pid: child.pid,
+    command: launch.command,
+    args: launch.args,
+    startedAt: new Date().toISOString(),
+    originUrl: launch.originUrl,
+    localWorkspaceUrl: buildBaseUrl(config),
+    publicUrl: null,
+    publicWorkspaceUrl: null,
+    background: false
+  });
+
+  await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", async (code) => {
+      await fs.rm(tunnelPidPath, { force: true });
+      await fs.rm(tunnelMetaPath, { force: true });
+      if ((code ?? 0) !== 0) {
+        reject(new Error(`Tunnel exited with code ${code ?? 0}.`));
+        return;
+      }
+      resolve(null);
+    });
+  });
+
+  return null;
+}
+
+async function printTunnelLogs(lines, jsonOutput = false) {
+  try {
+    const logText = await fs.readFile(tunnelLogPath, "utf8");
+    const tail = logText.split(/\r?\n/u).filter(Boolean).slice(-Math.max(1, lines));
+    if (jsonOutput) {
+      console.log(JSON.stringify({ logPath: tunnelLogPath, lines: tail }, null, 2));
+      return;
+    }
+    console.log(`Log: ${tunnelLogPath}`);
+    if (tail.length === 0) {
+      console.log("(log file is empty)");
+      return;
+    }
+    console.log(tail.join("\n"));
+  } catch {
+    if (jsonOutput) {
+      console.log(JSON.stringify({ logPath: tunnelLogPath, lines: [], exists: false }, null, 2));
+      return;
+    }
+    console.log(`No tunnel log found at ${tunnelLogPath}.`);
   }
 }
 
@@ -226,6 +824,7 @@ async function startServer(config) {
 
   const backendBinary = await resolveBackendBinary(config);
   const logHandle = await fs.open(logPath, "a");
+  const defaultProfile = config.profiles.find((profile) => profile.id === config.defaultProfileId) ?? config.profiles[0];
   const child = spawn(backendBinary, {
     cwd: packageRoot,
     detached: true,
@@ -236,8 +835,17 @@ async function startServer(config) {
       PORT: String(config.port),
       CODEX_WEBUI_BASE_PATH: String(config.basePath),
       CODEX_WEBUI_CODEX_BIN: String(config.codexBin),
-      CODEX_WEBUI_CODEX_HOME: String(config.codexHome),
+      CODEX_WEBUI_CODEX_HOME: String(defaultProfile.codexHome),
       CODEX_WEBUI_DATA_DIR: String(config.dataDir),
+      CODEX_WEBUI_DEFAULT_PROFILE_ID: String(config.defaultProfileId),
+      CODEX_WEBUI_PROFILES_JSON: JSON.stringify(
+        config.profiles.map((profile) => ({
+          id: profile.id,
+          label: profile.label,
+          codexHome: profile.codexHome,
+          dataDir: profile.dataDir
+        }))
+      ),
       CODEX_WEBUI_ALLOWED_ROOTS: config.allowedRoots.join(path.delimiter),
       CODEX_WEBUI_PASSWORD_HASH: String(config.passwordHash),
       CODEX_WEBUI_SESSION_SECRET: String(config.sessionSecret),
@@ -266,32 +874,55 @@ async function restartServer(config) {
   return startServer(config);
 }
 
-async function runTunnel(config) {
-  const { pid } = await startServer(config);
-  const targetUrl = buildBaseUrl(config);
-  console.log(`Server running at ${buildUrl(config)} (pid ${pid})`);
+function printTunnelUsage() {
+  console.log("Tunnel commands:");
+  console.log("  codex-webui tunnel start [--provider auto|cloudflared|ngrok] [--foreground] [--hostname host] [--name tunnel] [--overwrite-dns] [--log-level level] [--arg value] [--json]");
+  console.log("  codex-webui tunnel status [--json]");
+  console.log("  codex-webui tunnel stop");
+  console.log("  codex-webui tunnel logs [--lines 80] [--json]");
+}
 
-  if (commandAvailable("cloudflared")) {
-    console.log("Starting cloudflared tunnel...");
-    const child = spawn("cloudflared", ["tunnel", "--url", targetUrl], {
-      cwd: packageRoot,
-      stdio: "inherit"
-    });
-    child.on("exit", (code) => process.exit(code ?? 0));
+async function runTunnel(config, argv) {
+  const options = parseTunnelArgs(argv);
+  if (options.help) {
+    printTunnelUsage();
     return;
   }
 
-  if (commandAvailable("ngrok")) {
-    console.log("Starting ngrok tunnel...");
-    const child = spawn("ngrok", ["http", `${config.host}:${config.port}`], {
-      cwd: packageRoot,
-      stdio: "inherit"
-    });
-    child.on("exit", (code) => process.exit(code ?? 0));
+  if (options.action === "status") {
+    await printTunnelStatus(config, options.json);
     return;
   }
 
-  throw new Error("Neither cloudflared nor ngrok is installed.");
+  if (options.action === "stop") {
+    const result = await stopTunnel();
+    console.log(result.stopped ? `Stopped tunnel (pid ${result.pid}).` : "No tunnel is running.");
+    return;
+  }
+
+  if (options.action === "logs") {
+    await printTunnelLogs(options.lines, options.json);
+    return;
+  }
+
+  const server = await startServer(config);
+  console.log(`Server running at ${buildUrl(config)} (pid ${server.pid})`);
+  const status = await startTunnel(config, options);
+  if (status) {
+    if (options.json) {
+      console.log(JSON.stringify(status, null, 2));
+      return;
+    }
+    console.log(`Tunnel provider: ${status.meta?.provider ?? "unknown"}`);
+    console.log(`Tunnel PID: ${status.pid}`);
+    if (status.workspaceUrl) {
+      console.log(`Public workspace: ${status.workspaceUrl}`);
+    } else {
+      console.log(`Public workspace: waiting for public URL, check ${status.logPath}`);
+    }
+    console.log(`Tunnel log: ${status.logPath}`);
+    console.log("Use `codex-webui tunnel status` or `codex-webui tunnel stop` to manage it.");
+  }
 }
 
 function printUsage(config, pid, alreadyRunning) {
@@ -305,11 +936,15 @@ function printUsage(config, pid, alreadyRunning) {
   console.log("  codex-webui config   Re-run the interactive setup");
   console.log("  codex-webui restart  Restart the background server");
   console.log("  codex-webui stop     Stop the background server");
-  console.log("  codex-webui tunnel   Expose the running UI through cloudflared or ngrok");
+  console.log("  codex-webui tunnel start   Start a cloudflared/ngrok tunnel");
+  console.log("  codex-webui tunnel status  Show the current tunnel state");
+  console.log("  codex-webui tunnel stop    Stop the current tunnel");
+  console.log("  codex-webui tunnel logs    Print recent tunnel logs");
 }
 
 async function main() {
   const command = process.argv[2] ?? "";
+  const restArgs = process.argv.slice(3);
   let config = await readConfig();
 
   if (!config || command === "config") {
@@ -333,7 +968,7 @@ async function main() {
   }
 
   if (command === "tunnel") {
-    await runTunnel(config);
+    await runTunnel(config, restArgs);
     return;
   }
 

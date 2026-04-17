@@ -36,12 +36,6 @@
       { label: "Bksp", value: "\u007f", ariaLabel: "Backspace" }
     ],
     [
-      { label: "C", value: "c", ariaLabel: "C" },
-      { label: "D", value: "d", ariaLabel: "D" },
-      { label: "L", value: "l", ariaLabel: "L" },
-      { label: "Z", value: "z", ariaLabel: "Z" }
-    ],
-    [
       { label: "↑", value: "\u001b[A", ariaLabel: "Arrow up" },
       { label: "↓", value: "\u001b[B", ariaLabel: "Arrow down" },
       { label: "←", value: "\u001b[D", ariaLabel: "Arrow left" },
@@ -80,6 +74,47 @@
     }
   }
 
+  function applyCtrlModifier(value: string) {
+    if (value.length !== 1) {
+      return value;
+    }
+
+    const codePoint = value.charCodeAt(0);
+    if ((codePoint >= 65 && codePoint <= 90) || (codePoint >= 97 && codePoint <= 122)) {
+      return String.fromCharCode((codePoint & 31) || codePoint);
+    }
+
+    if (value === "@") {
+      return "\u0000";
+    }
+    if (value === "[") {
+      return "\u001b";
+    }
+    if (value === "\\") {
+      return "\u001c";
+    }
+    if (value === "]") {
+      return "\u001d";
+    }
+    if (value === "^") {
+      return "\u001e";
+    }
+    if (value === "_") {
+      return "\u001f";
+    }
+    if (value === "?") {
+      return "\u007f";
+    }
+
+    return value;
+  }
+
+  function sendTerminalInput(value: string) {
+    const nextValue = ctrlModifierArmed ? applyCtrlModifier(value) : value;
+    ctrlModifierArmed = false;
+    terminalInputSender?.(nextValue);
+  }
+
   function handleMobileTerminalKey(value: string) {
     if (value === "__ctrl__") {
       ctrlModifierArmed = !ctrlModifierArmed;
@@ -87,13 +122,7 @@
       return;
     }
 
-    let nextValue = value;
-    if (ctrlModifierArmed && /^[a-z]$/iu.test(value)) {
-      nextValue = String.fromCharCode(value.toUpperCase().charCodeAt(0) - 64);
-    }
-
-    ctrlModifierArmed = false;
-    terminalInputSender?.(nextValue);
+    sendTerminalInput(value);
     focusTerminalViewport?.();
   }
 
@@ -119,6 +148,7 @@
     let disposed = false;
     let releaseTerminal: (() => void) | null = null;
     let resizeObserver: ResizeObserver | null = null;
+    let inputObserver: MutationObserver | null = null;
     let pendingOutput = "";
     let flushFrame: number | null = null;
     let xterm:
@@ -137,6 +167,22 @@
       }
       xterm.options.theme = getTerminalTheme();
     });
+    const syncTerminalInputAttributes = () => {
+      const helperTextarea = container?.querySelector(".xterm-helper-textarea");
+      if (!(helperTextarea instanceof HTMLTextAreaElement)) {
+        return;
+      }
+
+      helperTextarea.autocapitalize = "none";
+      helperTextarea.autocomplete = "off";
+      helperTextarea.spellcheck = false;
+      helperTextarea.setAttribute("autocorrect", "off");
+      helperTextarea.setAttribute("aria-autocomplete", "none");
+      helperTextarea.setAttribute("data-gramm", "false");
+      helperTextarea.setAttribute("data-gramm_editor", "false");
+      helperTextarea.setAttribute("data-enable-grammarly", "false");
+      helperTextarea.setAttribute("enterkeyhint", "enter");
+    };
 
     void (async () => {
       if (!container) {
@@ -163,9 +209,11 @@
         });
         xterm.loadAddon(fitAddon);
         xterm.open(container);
+        syncTerminalInputAttributes();
         fitAddon.fit();
         xterm.focus();
         focusTerminalViewport = () => {
+          syncTerminalInputAttributes();
           xterm?.focus();
         };
         terminalInputSender = (data: string) => {
@@ -175,13 +223,17 @@
         };
 
         const dataListener = xterm.onData((data) => {
-          terminalInputSender?.(data);
+          sendTerminalInput(data);
         });
 
         resizeObserver = new ResizeObserver(() => {
           fitAddon.fit();
         });
         resizeObserver.observe(container);
+        inputObserver = new MutationObserver(() => {
+          syncTerminalInputAttributes();
+        });
+        inputObserver.observe(container, { childList: true, subtree: true });
 
         const snapshot = await api.readTerminal(terminalId);
         if (disposed || !xterm) {
@@ -244,6 +296,7 @@
         cancelAnimationFrame(flushFrame);
       }
       resizeObserver?.disconnect();
+      inputObserver?.disconnect();
       releaseTerminal?.();
       terminalInputSender = null;
       focusTerminalViewport = null;

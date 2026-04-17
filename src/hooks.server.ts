@@ -4,12 +4,15 @@ import { error, type Handle } from "@sveltejs/kit";
 import { getTextDirection } from "$lib/paraglide/runtime.js";
 import { paraglideMiddleware } from "$lib/paraglide/server.js";
 import { isAuthenticated } from "$lib/server/auth";
-import { getRuntimeConfig } from "$lib/server/env";
+import { getRuntimeConfig, getRuntimeProfile } from "$lib/server/env";
+import { runWithProfile } from "$lib/server/profile-context";
 
 const PUBLIC_API_PATHS = new Set(["/api/auth/login", "/api/auth/logout", "/api/auth/session"]);
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 const CORS_METHODS = "GET,HEAD,POST,PATCH,PUT,DELETE,OPTIONS";
+const PROFILE_COOKIE = "codex_webui_profile";
+const PROFILE_HEADER = "x-codex-webui-profile-id";
 
 function normalizeHostname(hostname: string) {
   return hostname.replace(/^\[|\]$/gu, "").replace(/^::ffff:/u, "");
@@ -116,14 +119,23 @@ export const handle: Handle = async ({ event, resolve }) => {
       const internalProxyToken = process.env.CODEX_WEBUI_INTERNAL_PROXY_TOKEN;
       const isInternalRequest =
         Boolean(internalProxyToken) && event.request.headers.get("x-codex-webui-internal-token") === internalProxyToken;
+      const requestedProfileId =
+        event.request.headers.get(PROFILE_HEADER) ?? event.cookies.get(PROFILE_COOKIE) ?? getRuntimeConfig().defaultProfileId;
+      const activeProfile = getRuntimeProfile(requestedProfileId);
+      event.locals.profileId = activeProfile.id;
 
       event.locals.authenticated = isInternalRequest || isAuthenticated(event.cookies);
 
+      const resolveWithProfile = () =>
+        runWithProfile(activeProfile.id, () =>
+          resolve(event, {
+            transformPageChunk: ({ html }) =>
+              html.replace("%lang%", locale).replace("%dir%", event.locals.textDirection)
+          })
+        );
+
       if (isInternalRequest) {
-        return resolve(event, {
-          transformPageChunk: ({ html }) =>
-            html.replace("%lang%", locale).replace("%dir%", event.locals.textDirection)
-        });
+        return resolveWithProfile();
       }
 
       const routePath = stripBase(event.url.pathname);
@@ -162,10 +174,7 @@ export const handle: Handle = async ({ event, resolve }) => {
         return response;
       }
 
-      const response = await resolve(event, {
-        transformPageChunk: ({ html }) =>
-          html.replace("%lang%", locale).replace("%dir%", event.locals.textDirection)
-      });
+      const response = await resolveWithProfile();
       if (isApiRoute && corsOrigin) {
         applyCorsHeaders(response.headers, corsOrigin, requestedCorsHeaders);
       }

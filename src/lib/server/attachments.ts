@@ -7,7 +7,7 @@ import { error } from "@sveltejs/kit";
 import { buildAttachmentPreamble } from "$lib/attachments";
 import type { AttachmentRecord } from "$lib/types";
 
-import { getRuntimeConfig } from "./env";
+import { getCurrentRuntimeProfile, getRuntimeConfig, type RuntimeProfileConfig } from "./env";
 import { ensureDataDirectories, getThreadUploadsDir, sanitizeFileName } from "./fs";
 
 const IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -17,8 +17,17 @@ type StoredAttachment = AttachmentRecord & {
   metaPath: string;
 };
 
-function getAttachmentPaths(threadId: string, attachmentId: string, originalName: string) {
-  const threadDir = getThreadUploadsDir(threadId);
+function resolveProfile(profile?: RuntimeProfileConfig) {
+  return profile ?? getCurrentRuntimeProfile();
+}
+
+function getAttachmentPathsForProfile(
+  profile: RuntimeProfileConfig,
+  threadId: string,
+  attachmentId: string,
+  originalName: string
+) {
+  const threadDir = getThreadUploadsDir(threadId, profile);
   const base = `${attachmentId}-${sanitizeFileName(originalName)}`;
   return {
     threadDir,
@@ -27,9 +36,10 @@ function getAttachmentPaths(threadId: string, attachmentId: string, originalName
   };
 }
 
-export async function saveUploads(threadId: string, uploads: File[]) {
-  await ensureDataDirectories();
-  const threadDir = getThreadUploadsDir(threadId);
+export async function saveUploads(threadId: string, uploads: File[], profile?: RuntimeProfileConfig) {
+  const activeProfile = resolveProfile(profile);
+  await ensureDataDirectories(activeProfile);
+  const threadDir = getThreadUploadsDir(threadId, activeProfile);
   await fsp.mkdir(threadDir, { recursive: true });
 
   const maxUploadBytes = getRuntimeConfig().maxUploadBytes;
@@ -41,7 +51,7 @@ export async function saveUploads(threadId: string, uploads: File[]) {
     }
 
     const attachmentId = randomUUID();
-    const { filePath, metaPath } = getAttachmentPaths(threadId, attachmentId, upload.name);
+    const { filePath, metaPath } = getAttachmentPathsForProfile(activeProfile, threadId, attachmentId, upload.name);
     const mimeType = upload.type || "application/octet-stream";
     const attachment: StoredAttachment = {
       id: attachmentId,
@@ -78,8 +88,8 @@ async function readStoredAttachment(metaPath: string): Promise<StoredAttachment>
   return parsed;
 }
 
-export async function listAttachments(threadId: string): Promise<AttachmentRecord[]> {
-  const threadDir = getThreadUploadsDir(threadId);
+export async function listAttachments(threadId: string, profile?: RuntimeProfileConfig): Promise<AttachmentRecord[]> {
+  const threadDir = getThreadUploadsDir(threadId, resolveProfile(profile));
   try {
     const entries = await fsp.readdir(threadDir);
     const attachments = await Promise.all(
@@ -96,14 +106,15 @@ export async function listAttachments(threadId: string): Promise<AttachmentRecor
   }
 }
 
-export async function removeAttachment(threadId: string, attachmentId: string) {
-  const attachments = await listAttachments(threadId);
+export async function removeAttachment(threadId: string, attachmentId: string, profile?: RuntimeProfileConfig) {
+  const activeProfile = resolveProfile(profile);
+  const attachments = await listAttachments(threadId, activeProfile);
   const target = attachments.find((attachment: AttachmentRecord) => attachment.id === attachmentId);
   if (!target) {
     throw error(404, "Attachment not found.");
   }
 
-  const { filePath, metaPath } = getAttachmentPaths(threadId, attachmentId, target.originalName);
+  const { filePath, metaPath } = getAttachmentPathsForProfile(activeProfile, threadId, attachmentId, target.originalName);
   await Promise.allSettled([fsp.rm(filePath, { force: true }), fsp.rm(metaPath, { force: true })]);
 }
 

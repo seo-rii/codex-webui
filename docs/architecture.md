@@ -124,8 +124,11 @@ The sidebar is built from two sources:
 
 - live `thread/list` data from `codex app-server`
 - a local JSONL-style session index built from `~/.codex/sessions`
+- `codex-webui`-owned per-session sidebar metadata such as completion or attention highlights
 
 The local index is used because large session histories make direct thread enumeration expensive. The index work runs in a worker so the main Node event loop does not block while the sidebar updates.
+
+Completion and input-required badges are not treated as frontend-only affordances. They are persisted in `codex-webui` state, injected into session summaries, and cleared by backend acknowledgement flows when a user opens the relevant session or resolves the pending request state.
 
 ## Runtime Session Reconciliation
 
@@ -189,6 +192,7 @@ Current examples include:
 
 - queued-work resume prompts restored after restart
 - globally armed or scheduled shutdown-after-queue-completion state
+- persisted per-session completion and attention highlights used by the sidebar
 
 This state is persisted in `CODEX_WEBUI_DATA_DIR`, exposed through config payloads and global WebSocket notifications, and treated as authoritative by the backend so reconnecting clients do not need to rebuild it from local browser memory.
 

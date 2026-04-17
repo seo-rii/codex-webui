@@ -19,6 +19,7 @@ import type {
   SessionQueueItem,
   SessionQueuePayload,
   SessionSummary,
+  SessionSummaryHighlight,
   StartupScheduledShutdownAlert,
   SessionTurnPayload,
   SessionTurnsPagePayload,
@@ -181,7 +182,8 @@ function toSummary(
   thread: Record<string, unknown>,
   preferences: SessionPreferences | null,
   archived = false,
-  queueCount = 0
+  queueCount = 0,
+  highlight: SessionSummaryHighlight | null = null
 ): SessionSummary {
   const normalized = normalizeThread(thread);
   const preview = asText(normalized.preview) ?? "";
@@ -190,6 +192,7 @@ function toSummary(
     name: getDisplayThreadName(asText(normalized.name), preview),
     preview,
     queueCount: Math.max(0, queueCount),
+    highlight,
     cwd: (normalized.cwd as string | null) ?? preferences?.cwd ?? getRuntimeConfig().defaults.cwd,
     archived,
     createdAt: Number(normalized.createdAt ?? 0),
@@ -205,13 +208,15 @@ function toSummary(
 function indexedSessionToSummary(
   indexed: IndexedSessionSummary,
   preferences: SessionPreferences | null,
-  queueCount: number
+  queueCount: number,
+  highlight: SessionSummaryHighlight | null = null
 ): SessionSummary {
   return {
     id: indexed.id,
     name: indexed.name,
     preview: indexed.preview,
     queueCount: Math.max(0, queueCount),
+    highlight,
     cwd: indexed.cwd || preferences?.cwd || getRuntimeConfig().defaults.cwd,
     archived: false,
     createdAt: indexed.createdAt,
@@ -257,6 +262,7 @@ function mergeIndexedSessionsWithRecentLiveSessions(
   indexedEntries: IndexedSessionSummary[],
   preferences: Record<string, SessionPreferences>,
   queueCounts: Record<string, number>,
+  highlightsByThreadId: Record<string, SessionSummaryHighlight>,
   recentLiveSessions: Map<string, SessionSummary>,
   limit: number,
   matcher: ((session: SessionSummary) => boolean) | null = null,
@@ -268,7 +274,12 @@ function mergeIndexedSessionsWithRecentLiveSessions(
       const stored = preferences[entry.id];
       const live = recentLiveSessions.get(entry.id);
       if (!live) {
-        return indexedSessionToSummary(entry, stored ? coercePreferences(stored) : null, queueCounts[entry.id] ?? 0);
+        return indexedSessionToSummary(
+          entry,
+          stored ? coercePreferences(stored) : null,
+          queueCounts[entry.id] ?? 0,
+          highlightsByThreadId[entry.id] ?? null
+        );
       }
 
       return {
@@ -567,9 +578,10 @@ export class CodexGateway {
 
   async listSessions(archived = false, cursor: string | null = null, limit = SESSION_WINDOW_SIZE): Promise<SessionListPayload> {
     if (!archived) {
-      const [preferences, queueCounts, indexedPage, recentLiveSessions] = await Promise.all([
+      const [preferences, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions] = await Promise.all([
         uiStateStore.getAll(),
         uiStateStore.getQueueCounts(),
+        uiStateStore.getSessionHighlights(),
         sessionIndexClient.page(getRuntimeConfig().codexHome, cursor, limit, null),
         this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>())
       ]);
@@ -579,6 +591,7 @@ export class CodexGateway {
           indexedPage.entries,
           preferences,
           queueCounts,
+          highlightsByThreadId,
           recentLiveSessions,
           limit,
           null,
@@ -589,14 +602,15 @@ export class CodexGateway {
     }
 
     const response = asRecord(await this.client.request("thread/list", { limit, archived, cursor }));
-    const preferences = await uiStateStore.getAll();
+    const [preferences, highlightsByThreadId] = await Promise.all([uiStateStore.getAll(), uiStateStore.getSessionHighlights()]);
     const threads = (response.data as Array<Record<string, unknown>> | undefined) ?? [];
     return {
       sessions: threads
         .filter((thread) => !isSubagentThread(thread))
         .map((thread) => {
-          const stored = preferences[String(thread.id)];
-          return toSummary(thread, stored ? coercePreferences(stored) : null, archived);
+          const threadId = String(thread.id);
+          const stored = preferences[threadId];
+          return toSummary(thread, stored ? coercePreferences(stored) : null, archived, 0, highlightsByThreadId[threadId] ?? null);
         })
         .filter((session) => !isSubagentSessionSummary(session))
         .sort(compareSessionSummaries),
@@ -617,9 +631,10 @@ export class CodexGateway {
     }
 
     if (!archived && scope === "summary") {
-      const [preferences, queueCounts, indexedPage, recentLiveSessions] = await Promise.all([
+      const [preferences, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions] = await Promise.all([
         uiStateStore.getAll(),
         uiStateStore.getQueueCounts(),
+        uiStateStore.getSessionHighlights(),
         sessionIndexClient.page(getRuntimeConfig().codexHome, cursor, limit, needle),
         this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>())
       ]);
@@ -629,6 +644,7 @@ export class CodexGateway {
           indexedPage.entries,
           preferences,
           queueCounts,
+          highlightsByThreadId,
           recentLiveSessions,
           limit,
           (session) => `${session.name ?? ""}
@@ -672,16 +688,19 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   private async collectListableSessions(archived: boolean): Promise<SessionSummary[]> {
-    const preferences = await uiStateStore.getAll();
-    const queueCounts = await uiStateStore.getQueueCounts();
+    const [preferences, queueCounts, highlightsByThreadId] = await Promise.all([
+      uiStateStore.getAll(),
+      uiStateStore.getQueueCounts(),
+      uiStateStore.getSessionHighlights()
+    ]);
     if (archived) {
-      return this.listAllThreadSessions(true, preferences, queueCounts);
+      return this.listAllThreadSessions(true, preferences, queueCounts, highlightsByThreadId);
     }
 
     const indexedSessions = (await sessionIndexClient.list(getRuntimeConfig().codexHome).catch(() => [])).filter(
       (session) => !session.isSubagent
     );
-    const liveThreads = await this.listAllThreadSessions(false, preferences, queueCounts);
+    const liveThreads = await this.listAllThreadSessions(false, preferences, queueCounts, highlightsByThreadId);
     const liveById = new Map(liveThreads.map((session) => [session.id, session]));
     const mergedSessions = indexedSessions.map((session) => {
       const live = liveById.get(session.id);
@@ -702,6 +721,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         name: session.name,
         preview: session.preview,
         queueCount: queueCounts[session.id] ?? 0,
+        highlight: highlightsByThreadId[session.id] ?? null,
         cwd: session.cwd || stored?.cwd || getRuntimeConfig().defaults.cwd,
         archived: false,
         createdAt: session.createdAt,
@@ -731,7 +751,8 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   private async listAllThreadSessions(
     archived: boolean,
     preferences: Record<string, Awaited<ReturnType<typeof uiStateStore.getAll>>[string]>,
-    queueCounts: Record<string, number>
+    queueCounts: Record<string, number>,
+    highlightsByThreadId: Record<string, SessionSummaryHighlight>
   ): Promise<SessionSummary[]> {
     const sessions: SessionSummary[] = [];
     let cursor: string | null = null;
@@ -745,7 +766,13 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
           .map((thread) => {
             const threadId = String(thread.id);
             const stored = preferences[threadId];
-            return toSummary(thread, stored ? coercePreferences(stored) : null, archived, queueCounts[threadId] ?? 0);
+            return toSummary(
+              thread,
+              stored ? coercePreferences(stored) : null,
+              archived,
+              queueCounts[threadId] ?? 0,
+              highlightsByThreadId[threadId] ?? null
+            );
           })
           .filter((session) => !isSubagentSessionSummary(session))
       );
@@ -766,7 +793,11 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     }
 
     this.recentLiveSessionsPromise = (async () => {
-      const [preferences, queueCounts] = await Promise.all([uiStateStore.getAll(), uiStateStore.getQueueCounts()]);
+      const [preferences, queueCounts, highlightsByThreadId] = await Promise.all([
+        uiStateStore.getAll(),
+        uiStateStore.getQueueCounts(),
+        uiStateStore.getSessionHighlights()
+      ]);
       const response = asRecord(
         await this.client.request("thread/list", { limit: RECENT_LIVE_THREAD_WINDOW_SIZE, archived: false, cursor: null })
       );
@@ -777,7 +808,13 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
           .map((thread) => {
             const threadId = String(thread.id);
             const stored = preferences[threadId];
-            const summary = toSummary(thread, stored ? coercePreferences(stored) : null, false, queueCounts[threadId] ?? 0);
+            const summary = toSummary(
+              thread,
+              stored ? coercePreferences(stored) : null,
+              false,
+              queueCounts[threadId] ?? 0,
+              highlightsByThreadId[threadId] ?? null
+            );
             return [threadId, summary] as const;
           })
       );
@@ -934,6 +971,8 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       queue = await this.getQueue(threadId);
       void this.maybeDrainQueue(threadId);
     }
+
+    void this.setSessionHighlight(threadId, null, thread, preferences, queue.items.length, runtimeState.status, null);
 
     return {
       thread: {
@@ -1342,9 +1381,10 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   private async findSessionSummaryById(threadId: string, archived: boolean) {
-    const [preferences, queueCounts] = await Promise.all([
+    const [preferences, queueCounts, highlightsByThreadId] = await Promise.all([
       uiStateStore.getAll(),
-      archived ? Promise.resolve({} as Record<string, number>) : uiStateStore.getQueueCounts()
+      archived ? Promise.resolve({} as Record<string, number>) : uiStateStore.getQueueCounts(),
+      uiStateStore.getSessionHighlights()
     ]);
     let cursor: string | null = null;
 
@@ -1354,7 +1394,13 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       const matched = threads.find((thread) => String(thread.id ?? "") === threadId && !isSubagentThread(thread));
       if (matched) {
         const stored = preferences[threadId];
-        return toSummary(matched, stored ? coercePreferences(stored) : null, archived, queueCounts[threadId] ?? 0);
+        return toSummary(
+          matched,
+          stored ? coercePreferences(stored) : null,
+          archived,
+          queueCounts[threadId] ?? 0,
+          highlightsByThreadId[threadId] ?? null
+        );
       }
       cursor = typeof response.nextCursor === "string" && response.nextCursor.trim() ? String(response.nextCursor) : null;
     } while (cursor);
@@ -2146,7 +2192,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       this.loadedThreadIds.add(threadId);
       this.loadedThreadIdsLoadedAt = Date.now();
       void this.cancelScheduledShutdownForActivity();
-      void this.emitSessionSummaryUpdated(threadId, null, null, null, "running", Math.floor(Date.now() / 1000));
+      void this.setSessionHighlight(threadId, null, null, null, null, "running", Math.floor(Date.now() / 1000));
     } else if (method === "turn/completed") {
       const turn = asRecord(params.turn);
       if (this.activeTurns.get(threadId) === String(turn.id ?? "")) {
@@ -2162,7 +2208,18 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
           reason: "completed"
         }
       });
-      void this.emitSessionSummaryUpdated(threadId, null, null, null, "completed", Math.floor(Date.now() / 1000));
+      void this.setSessionHighlight(
+        threadId,
+        {
+          kind: "completed",
+          at: Date.now()
+        },
+        null,
+        null,
+        null,
+        "completed",
+        Math.floor(Date.now() / 1000)
+      );
     } else if (method === "thread/status/changed") {
       const nextStatus = normalizeThreadStatus(params.status) ?? "unknown";
       if (nextStatus !== "running" && nextStatus !== "active") {
@@ -2180,7 +2237,11 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       this.loadedThreadIdsLoadedAt = Date.now();
     } else if (method === "serverRequest/resolved") {
       const requestId = String(params.requestId ?? "");
-      this.pendingRequests.get(threadId)?.delete(requestId);
+      const pendingRequests = this.pendingRequests.get(threadId);
+      pendingRequests?.delete(requestId);
+      if (!pendingRequests || pendingRequests.size === 0) {
+        void this.setSessionHighlight(threadId, null);
+      }
     } else if (method === "thread/tokenUsage/updated") {
       const tokenUsage = normalizeTokenUsage(params.tokenUsage);
       if (tokenUsage) {
@@ -2300,6 +2361,10 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         sessionId: threadId,
         reason: "approval"
       }
+    });
+    void this.setSessionHighlight(threadId, {
+      kind: "attention",
+      at: Date.now()
     });
   }
 
@@ -2611,15 +2676,18 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     preferences: SessionPreferences | null = null,
     queueCount: number | null = null,
     statusOverride: string | null = null,
-    activityAt: number | null = null
+    activityAt: number | null = null,
+    highlightOverride: SessionSummaryHighlight | null | undefined = undefined
   ) {
     try {
       const resolvedThread = normalizeThread(thread ?? (await this.readThread(threadId, false)));
       const resolvedPreferences = preferences ?? (await this.getPreferences(threadId, resolvedThread));
       const resolvedQueueCount = queueCount ?? (await this.getQueue(threadId)).items.length;
+      const resolvedHighlight =
+        highlightOverride === undefined ? await uiStateStore.getSessionHighlight(threadId) : highlightOverride;
       const previousSummary = this.recentLiveSessions.get(threadId);
       const summary = {
-        ...toSummary(resolvedThread, resolvedPreferences, false, resolvedQueueCount),
+        ...toSummary(resolvedThread, resolvedPreferences, false, resolvedQueueCount, resolvedHighlight),
         status: statusOverride ?? (asText(resolvedThread.status) ?? "unknown"),
         updatedAt: Math.max(
           Number(resolvedThread.updatedAt ?? 0),
@@ -2642,6 +2710,31 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     } catch {
       // Ignore non-fatal summary refresh failures so live turn streaming can continue.
     }
+  }
+
+  private async setSessionHighlight(
+    threadId: string,
+    highlight: SessionSummaryHighlight | null,
+    thread: Record<string, unknown> | null = null,
+    preferences: SessionPreferences | null = null,
+    queueCount: number | null = null,
+    statusOverride: string | null = null,
+    activityAt: number | null = null
+  ) {
+    const changed = await uiStateStore.setSessionHighlight(threadId, highlight);
+    if (!changed && highlight === null && statusOverride === null && activityAt === null) {
+      return;
+    }
+
+    await this.emitSessionSummaryUpdated(
+      threadId,
+      thread,
+      preferences,
+      queueCount,
+      statusOverride,
+      activityAt,
+      highlight
+    );
   }
 
   private extractThreadId(method: string, params: Record<string, unknown>) {

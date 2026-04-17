@@ -28,6 +28,7 @@ The goal is not to replace upstream surfaces. The goal is to make Codex usable f
 - Reconnect-safe WebSocket control plane for chat, sessions, Git, terminals, runtime actions, and account flows
 - Session queue, explicit steer flow, persisted queued follow-ups, and resume prompts after restart
 - Composer history recall with keyboard navigation, a quick "reuse last message" chip, and one-click resend/queue for the most recent prompt
+- Session completion and input-required badges are persisted server-side, so they survive reconnects and show up consistently across multiple clients
 - Attachments, Monaco-backed diff/file editing, aggregated live diff, live plan, and subagent activity views
 - Git repository discovery, status, diff, commit inspection, branch checkout, worktree management, and a mobile-friendly Git workspace layout
 - Terminal tabs that survive page reloads as long as the server process stays up
@@ -247,6 +248,10 @@ The detailed session view reconciles the persisted rollout with the live `thread
 ### A session appears in search but not in the sidebar
 
 The sidebar combines a local session index with live app-server data and loads progressively. A selected session is pinned back into view even if it was not part of the current list page yet.
+
+### A session shows "Done" or "Needs input" on one device but not another
+
+Those sidebar badges are backend-owned state, not browser-local UI markers. `codex-webui` persists them in its own runtime store and includes them in session summaries, so reconnecting browsers and newly opened clients see the same completion or attention state until the session is acknowledged.
 
 ### I typed into the composer while a session was loading
 

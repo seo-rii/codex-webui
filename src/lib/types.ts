@@ -28,6 +28,7 @@ export type SessionSummary = {
   name: string | null;
   preview: string;
   queueCount: number;
+  highlight: SessionSummaryHighlight | null;
   cwd: string;
   archived: boolean;
   createdAt: number;
@@ -37,6 +38,11 @@ export type SessionSummary = {
   agentNickname: string | null;
   agentRole: string | null;
   preferences: SessionPreferences | null;
+};
+
+export type SessionSummaryHighlight = {
+  kind: "completed" | "attention";
+  at: number;
 };
 
 export type SessionListPayload = {

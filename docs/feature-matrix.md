@@ -25,7 +25,7 @@ In the comparison columns:
 
 | Capability | codex-webui | Codex app comparison | Codex IDE extension comparison | Notes |
 | --- | --- | --- | --- | --- |
-| Session list and chat history | Implemented | Comparable | Comparable | Progressive loading, search, archive, and reconnect-safe refresh are browser-first additions. |
+| Session list and chat history | Implemented | Comparable | Comparable | Progressive loading, search, archive, reconnect-safe refresh, and backend-persisted sidebar badges are browser-first additions. |
 | Multi-turn streaming chat | Implemented | Comparable | Comparable | Streaming survives tab reloads because execution remains server-side. |
 | Model selection | Implemented | Comparable | Comparable | Exposed from the chat composer shell and persisted in session preferences. |
 | Reasoning effort selection | Implemented | Comparable | Comparable | Matches the app-server preference model rather than copying a specific upstream layout. |
@@ -37,7 +37,7 @@ In the comparison columns:
 | Steer during an active turn | Implemented | Comparable | Comparable | Supports explicit steer while work is active. |
 | Queued follow-up messages | Implemented | Different shape | Comparable | Queue is a first-class server-side feature in `codex-webui`; it survives browser churn. |
 | Resume queued work after restart | Implemented | Different shape | Different shape | Browser-specific persistence flow with optional auto-resume. |
-| Multi-client state sync | Implemented | Different shape | Different shape | Designed for several browser clients watching the same session. |
+| Multi-client state sync | Implemented | Different shape | Different shape | Designed for several browser clients watching the same session, including shared completion and attention badges in the sidebar. |
 | Reconnect-safe execution after disconnect | Implemented | Different shape | Partial | One of the main reasons this project exists. |
 | Session search | Implemented | Comparable | Comparable | Supports summary search and optional deeper search scope. |
 | Session title inference | Implemented | Comparable | Comparable | Titles are inferred from Codex turn flow and session summary updates. |

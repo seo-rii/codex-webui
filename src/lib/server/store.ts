@@ -1,6 +1,6 @@
 import fsp from "node:fs/promises";
 
-import type { SessionPreferences, SessionQueueItem, StartupScheduledShutdownAlert } from "$lib/types";
+import type { SessionPreferences, SessionQueueItem, SessionSummaryHighlight, StartupScheduledShutdownAlert } from "$lib/types";
 
 import { ensureDataDirectories, getStoreFilePath, pathExists } from "./fs";
 
@@ -26,6 +26,7 @@ type UiState = {
       updatedAt: number;
     }
   >;
+  highlightsByThreadId: Record<string, SessionSummaryHighlight>;
 };
 
 class UiStateStore {
@@ -47,7 +48,8 @@ class UiStateStore {
         },
         preferencesByThreadId: {},
         draftsByThreadId: {},
-        queuesByThreadId: {}
+        queuesByThreadId: {},
+        highlightsByThreadId: {}
       };
       return this.state;
     }
@@ -62,7 +64,8 @@ class UiStateStore {
         },
         preferencesByThreadId: parsed.preferencesByThreadId ?? {},
         draftsByThreadId: parsed.draftsByThreadId ?? {},
-        queuesByThreadId: parsed.queuesByThreadId ?? {}
+        queuesByThreadId: parsed.queuesByThreadId ?? {},
+        highlightsByThreadId: parsed.highlightsByThreadId ?? {}
       };
     } catch {
       try {
@@ -78,7 +81,8 @@ class UiStateStore {
         },
         preferencesByThreadId: {},
         draftsByThreadId: {},
-        queuesByThreadId: {}
+        queuesByThreadId: {},
+        highlightsByThreadId: {}
       };
       await this.flush();
     }
@@ -192,6 +196,41 @@ class UiStateStore {
     return Object.fromEntries(
       Object.entries(state.queuesByThreadId).map(([threadId, queue]) => [threadId, queue.items.length])
     );
+  }
+
+  async getSessionHighlight(threadId: string) {
+    const state = await this.load();
+    return state.highlightsByThreadId[threadId] ?? null;
+  }
+
+  async getSessionHighlights() {
+    const state = await this.load();
+    return { ...state.highlightsByThreadId };
+  }
+
+  async setSessionHighlight(threadId: string, highlight: SessionSummaryHighlight | null) {
+    let changed = false;
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      const current = state.highlightsByThreadId[threadId] ?? null;
+      const isSame = current?.kind === highlight?.kind && (current?.at ?? null) === (highlight?.at ?? null);
+      if (isSame) {
+        return;
+      }
+
+      changed = true;
+      if (highlight) {
+        state.highlightsByThreadId[threadId] = {
+          kind: highlight.kind,
+          at: highlight.at
+        };
+      } else {
+        delete state.highlightsByThreadId[threadId];
+      }
+      await this.flush();
+    });
+    await this.writeChain;
+    return changed;
   }
 
   async listResumePendingQueues() {

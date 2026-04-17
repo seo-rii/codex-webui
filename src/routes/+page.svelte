@@ -189,7 +189,6 @@
   let editingQueueId = $state<string | null>(null);
   let editingQueuePrompt = $state("");
   let queuedFollowupsExpanded = $state(true);
-  let sessionHighlights = $state<Record<string, { kind: "completed" | "attention"; at: number }>>({});
   let startupAlertModalOpen = $state(false);
   let startupAlertDismissed = $state(false);
   let startupAlertNow = $state(Date.now());
@@ -652,6 +651,11 @@
   const queueModeActive = $derived.by(() => canQueueComposerMessage());
   const lastComposerHistoryPrompt = $derived.by(() => composerHistory.at(-1) ?? "");
   const selectedSessionSummary = $derived(sessions.find((session) => session.id === selectedSessionId) ?? null);
+  const sessionHighlights = $derived.by(() =>
+    Object.fromEntries(
+      sessions.flatMap((session) => (session.highlight ? ([[session.id, session.highlight]] as const) : []))
+    )
+  );
   const queuedMessages = $derived(conversation?.queue.items ?? []);
   const activeTurn = $derived.by(() => {
     const turnId = conversation?.activeTurnId;
@@ -1382,28 +1386,6 @@
     return [...items].sort(compareSessions);
   }
 
-  function highlightSession(sessionId: string, kind: "completed" | "attention") {
-    if (!sessionId || sessionId === selectedSessionId) {
-      return;
-    }
-    sessionHighlights = {
-      ...sessionHighlights,
-      [sessionId]: {
-        kind,
-        at: Date.now()
-      }
-    };
-  }
-
-  function clearSessionHighlight(sessionId: string | null) {
-    if (!sessionId || !sessionHighlights[sessionId]) {
-      return;
-    }
-    const nextHighlights = { ...sessionHighlights };
-    delete nextHighlights[sessionId];
-    sessionHighlights = nextHighlights;
-  }
-
   function notifyBrowser(title: string, body: string) {
     if (typeof window === "undefined" || typeof Notification === "undefined") {
       return;
@@ -1756,6 +1738,7 @@
       name: getDisplayThreadTitle(state.thread.name, state.thread.preview),
       preview: state.thread.preview,
       queueCount: state.queue.items.length,
+      highlight: selectedSessionSummary?.highlight ?? null,
       cwd: state.thread.cwd,
       archived: selectedSessionSummary?.archived ?? showArchivedSessions,
       createdAt: state.thread.createdAt,
@@ -1907,7 +1890,6 @@
     sendIntent = null;
     editingQueueId = null;
     editingQueuePrompt = "";
-    sessionHighlights = {};
     startupAlertModalOpen = false;
     startupAlertDismissed = false;
     syncSelectedSessionInUrl(null);
@@ -2078,7 +2060,6 @@
   async function selectSession(sessionId: string) {
     if (selectedSessionId === sessionId && conversation) {
       syncSelectedSessionInUrl(sessionId);
-      clearSessionHighlight(sessionId);
       return true;
     }
 
@@ -2116,7 +2097,6 @@
     composerSettingsOpen = false;
     composerSecurityOpen = false;
     activeWorkspaceTabId = "chat";
-    clearSessionHighlight(sessionId);
     disconnectStream();
     connectStream(sessionId);
 
@@ -2195,7 +2175,6 @@
       }
 
       if (payload.kind === "serverRequest") {
-        highlightSession(sessionId, "attention");
         notifyBrowser(m.input_required_notification_title(), m.input_required_notification_body());
       }
 
@@ -2274,13 +2253,6 @@
           ...pendingSessionEvents,
           [sessionId]: [...(pendingSessionEvents[sessionId] ?? []), payload]
         };
-      }
-
-      if (payload.kind === "notification" && payload.method === "turn/completed") {
-        if (payload.method === "turn/completed") {
-          highlightSession(sessionId, "completed");
-          notifyBrowser(m.task_completed_notification_title(), m.task_completed_notification_body());
-        }
       }
     });
   }
@@ -2369,10 +2341,8 @@
         return;
       }
       if (reason === "completed") {
-        highlightSession(sessionId, "completed");
         void notifyBrowser(m.task_completed_notification_title(), m.task_completed_notification_body());
       } else {
-        highlightSession(sessionId, "attention");
         void notifyBrowser(m.input_required_notification_title(), m.input_required_notification_body());
       }
       return;
@@ -2736,6 +2706,7 @@
         name: nextTitle,
         preview: conversation?.thread.preview ?? "",
         queueCount: conversation?.queue.items.length ?? selectedSessionSummary?.queueCount ?? 0,
+        highlight: selectedSessionSummary?.highlight ?? null,
         cwd: conversation?.thread.cwd ?? config?.defaults.cwd ?? "",
         archived,
         createdAt: conversation?.thread.createdAt ?? Math.floor(Date.now() / 1000),

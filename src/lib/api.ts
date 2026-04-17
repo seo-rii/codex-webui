@@ -19,12 +19,14 @@ import type {
   GitWorktreePayload,
   NotificationListPayload,
   NotificationSettings,
+  SavedSessionFilter,
   SessionDetailPayload,
   SessionDraftPayload,
   SessionItemDetailPayload,
   SessionListPayload,
   SessionPreferences,
   SessionSearchScope,
+  SessionSummaryFilter,
   SessionSummary,
   TerminalEvent,
   TerminalListPayload,
@@ -175,12 +177,19 @@ export const api = {
     return ws.request<CodexRuntimeActionPayload>("runtime/update");
   },
 
-  getSessions(archived = false, cursor: string | null = null, limit = 20) {
-    return ws.request<SessionListPayload>("sessions/list", { archived, cursor, limit });
+  getSessions(archived = false, cursor: string | null = null, limit = 20, filter: SessionSummaryFilter | null = null) {
+    return ws.request<SessionListPayload>("sessions/list", { archived, cursor, limit, filter });
   },
 
-  searchSessions(query: string, scope: SessionSearchScope, archived = false, cursor: string | null = null, limit = 20) {
-    return ws.request<SessionListPayload>("sessions/search", { query, scope, archived, cursor, limit });
+  searchSessions(
+    query: string,
+    scope: SessionSearchScope,
+    archived = false,
+    cursor: string | null = null,
+    limit = 20,
+    filter: SessionSummaryFilter | null = null
+  ) {
+    return ws.request<SessionListPayload>("sessions/search", { query, scope, archived, cursor, limit, filter });
   },
 
   createSession(preferences: Partial<SessionPreferences>, name: string | null = null) {
@@ -258,6 +267,21 @@ export const api = {
 
   renameSession(sessionId: string, name: string) {
     return ws.request<{ ok: true }>("session/rename", { sessionId, name });
+  },
+
+  updateSessionOrganization(sessionId: string, patch: Partial<{ pinned: boolean; tags: string[] }>) {
+    return ws.request<{ meta: { pinned: boolean; tags: string[] }; knownTags: string[] }>("session/organization/update", {
+      sessionId,
+      ...patch
+    });
+  },
+
+  saveSessionFilter(filter: SavedSessionFilter) {
+    return ws.request<{ savedFilters: SavedSessionFilter[]; knownTags: string[] }>("sessionFilters/save", { filter });
+  },
+
+  deleteSessionFilter(filterId: string) {
+    return ws.request<{ savedFilters: SavedSessionFilter[]; knownTags: string[] }>("sessionFilters/delete", { filterId });
   },
 
   archiveSession(sessionId: string) {

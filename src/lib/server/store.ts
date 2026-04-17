@@ -4,6 +4,7 @@ import type {
   AppNotification,
   NotificationEventType,
   NotificationSettings,
+  SavedSessionFilter,
   SessionPreferences,
   SessionQueueItem,
   SessionSummaryHighlight,
@@ -21,6 +22,14 @@ type UiState = {
     items: AppNotification[];
     settings: NotificationSettings;
   };
+  sessionMetaByThreadId: Record<
+    string,
+    {
+      pinned: boolean;
+      tags: string[];
+    }
+  >;
+  savedSessionFilters: SavedSessionFilter[];
   preferencesByThreadId: Record<string, SessionPreferences>;
   draftsByThreadId: Record<
     string,
@@ -84,6 +93,8 @@ class UiStateStore {
           items: [],
           settings: { ...DEFAULT_NOTIFICATION_SETTINGS }
         },
+        sessionMetaByThreadId: {},
+        savedSessionFilters: [],
         preferencesByThreadId: {},
         draftsByThreadId: {},
         queuesByThreadId: {},
@@ -104,6 +115,8 @@ class UiStateStore {
           items: Array.isArray(parsed.notifications?.items) ? parsed.notifications.items : [],
           settings: normalizeNotificationSettings(parsed.notifications?.settings)
         },
+        sessionMetaByThreadId: parsed.sessionMetaByThreadId ?? {},
+        savedSessionFilters: Array.isArray(parsed.savedSessionFilters) ? parsed.savedSessionFilters : [],
         preferencesByThreadId: parsed.preferencesByThreadId ?? {},
         draftsByThreadId: parsed.draftsByThreadId ?? {},
         queuesByThreadId: parsed.queuesByThreadId ?? {},
@@ -125,6 +138,8 @@ class UiStateStore {
           items: [],
           settings: { ...DEFAULT_NOTIFICATION_SETTINGS }
         },
+        sessionMetaByThreadId: {},
+        savedSessionFilters: [],
         preferencesByThreadId: {},
         draftsByThreadId: {},
         queuesByThreadId: {},
@@ -261,6 +276,82 @@ class UiStateStore {
   async getAll() {
     const state = await this.load();
     return { ...state.preferencesByThreadId };
+  }
+
+  async getSessionMeta(threadId: string) {
+    const state = await this.load();
+    return state.sessionMetaByThreadId[threadId] ?? { pinned: false, tags: [] };
+  }
+
+  async getAllSessionMeta() {
+    const state = await this.load();
+    return { ...state.sessionMetaByThreadId };
+  }
+
+  async updateSessionMeta(threadId: string, patch: Partial<{ pinned: boolean; tags: string[] }>) {
+    let nextMeta = { pinned: false, tags: [] as string[] };
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      const current = state.sessionMetaByThreadId[threadId] ?? { pinned: false, tags: [] };
+      nextMeta = {
+        pinned: typeof patch.pinned === "boolean" ? patch.pinned : Boolean(current.pinned),
+        tags: Array.isArray(patch.tags)
+          ? [...new Set(patch.tags.map((entry) => entry.trim()).filter((entry) => entry.length > 0))]
+          : [...current.tags]
+      };
+      if (!nextMeta.pinned && nextMeta.tags.length === 0) {
+        delete state.sessionMetaByThreadId[threadId];
+      } else {
+        state.sessionMetaByThreadId[threadId] = nextMeta;
+      }
+      await this.flush();
+    });
+    await this.writeChain;
+    return nextMeta;
+  }
+
+  async getKnownSessionTags() {
+    const state = await this.load();
+    return [...new Set(Object.values(state.sessionMetaByThreadId).flatMap((entry) => entry.tags))].sort((left, right) =>
+      left.localeCompare(right)
+    );
+  }
+
+  async getSavedSessionFilters() {
+    const state = await this.load();
+    return [...state.savedSessionFilters];
+  }
+
+  async saveSessionFilter(filter: SavedSessionFilter) {
+    let savedFilters: SavedSessionFilter[] = [];
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      const nextFilter: SavedSessionFilter = {
+        ...filter,
+        name: filter.name.trim(),
+        tags: [...new Set(filter.tags.map((entry) => entry.trim()).filter((entry) => entry.length > 0))]
+      };
+      state.savedSessionFilters = [
+        nextFilter,
+        ...state.savedSessionFilters.filter((entry) => entry.id !== nextFilter.id)
+      ].slice(0, 40);
+      savedFilters = [...state.savedSessionFilters];
+      await this.flush();
+    });
+    await this.writeChain;
+    return savedFilters;
+  }
+
+  async deleteSessionFilter(filterId: string) {
+    let savedFilters: SavedSessionFilter[] = [];
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      state.savedSessionFilters = state.savedSessionFilters.filter((entry) => entry.id !== filterId);
+      savedFilters = [...state.savedSessionFilters];
+      await this.flush();
+    });
+    await this.writeChain;
+    return savedFilters;
   }
 
   async set(threadId: string, preferences: SessionPreferences) {

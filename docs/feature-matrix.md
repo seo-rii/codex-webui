@@ -40,6 +40,7 @@ In the comparison columns:
 | Multi-client state sync | Implemented | Different shape | Different shape | Designed for several browser clients watching the same session, including shared completion and attention badges in the sidebar. |
 | Reconnect-safe execution after disconnect | Implemented | Different shape | Partial | One of the main reasons this project exists. |
 | Session search | Implemented | Comparable | Comparable | Supports summary search and optional deeper search scope. |
+| Session pinning, tags, and saved filters | Implemented | Different shape | Different shape | Browser-first session organization layer persisted by `codex-webui`, including pinned ordering, reusable filter presets, and server-synced tag metadata. |
 | Session title inference | Implemented | Comparable | Comparable | Titles are inferred from Codex turn flow and session summary updates. |
 | Monaco inline diff for file changes | Implemented | Different shape | Comparable | Browser-native replacement for editor diff affordances. |
 | Aggregated diff view | Implemented | Different shape | Comparable | Exposes grouped file changes per turn and in dedicated tabs. |

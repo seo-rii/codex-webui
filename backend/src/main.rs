@@ -670,6 +670,47 @@ async fn execute_ws_method(
     method: &str,
     params: Value,
 ) -> Result<Value> {
+    fn append_session_filter_query(path: &mut String, params: &Value) {
+        let Some(filter) = params.get("filter") else {
+            return;
+        };
+        if filter
+            .get("pinnedOnly")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            path.push_str("&filterPinned=true");
+        }
+        if filter
+            .get("runningOnly")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            path.push_str("&filterRunning=true");
+        }
+        if filter
+            .get("queuedOnly")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            path.push_str("&filterQueued=true");
+        }
+        let highlight = filter
+            .get("highlight")
+            .and_then(Value::as_str)
+            .filter(|value| *value == "attention" || *value == "completed");
+        if let Some(highlight) = highlight {
+            path.push_str("&filterHighlight=");
+            path.push_str(highlight);
+        }
+        if let Some(tags) = filter.get("tags").and_then(Value::as_array) {
+            for tag in tags.iter().filter_map(Value::as_str).filter(|value| !value.trim().is_empty()) {
+                path.push_str("&filterTag=");
+                path.push_str(&urlencoding::encode(tag));
+            }
+        }
+    }
+
     match method {
         "config/get" => internal_json_request(state, Method::GET, "/api/config", None).await,
         "config/update" => {
@@ -748,6 +789,7 @@ async fn execute_ws_method(
             if let Some(cursor) = cursor {
                 path.push_str(&format!("&cursor={cursor}"));
             }
+            append_session_filter_query(&mut path, &params);
             internal_json_request(state, Method::GET, &path, None).await
         }
         "sessions/search" => {
@@ -775,6 +817,7 @@ async fn execute_ws_method(
             if let Some(cursor) = cursor {
                 path.push_str(&format!("&cursor={cursor}"));
             }
+            append_session_filter_query(&mut path, &params);
             internal_json_request(
                 state,
                 Method::GET,
@@ -789,6 +832,37 @@ async fn execute_ws_method(
                 "name": params.get("name").cloned().unwrap_or(Value::Null),
             });
             internal_json_request(state, Method::POST, "/api/sessions", Some(payload)).await
+        }
+        "session/organization/update" => {
+            let session_id = require_string(&params, "sessionId")?;
+            let payload = json!({
+                "pinned": params.get("pinned").cloned().unwrap_or(Value::Null),
+                "tags": params.get("tags").cloned().unwrap_or(Value::Null)
+            });
+            internal_json_request(
+                state,
+                Method::PATCH,
+                &format!("/api/sessions/{session_id}/organization"),
+                Some(payload),
+            )
+            .await
+        }
+        "sessionFilters/save" => {
+            let payload = json!({
+                "filter": params.get("filter").cloned().unwrap_or(Value::Null)
+            });
+            internal_json_request(state, Method::POST, "/api/session-filters", Some(payload)).await
+        }
+        "sessionFilters/delete" => {
+            let filter_id = require_string(&params, "filterId")?;
+            let filter_id = urlencoding::encode(&filter_id);
+            internal_json_request(
+                state,
+                Method::DELETE,
+                &format!("/api/session-filters?filterId={filter_id}"),
+                None,
+            )
+            .await
         }
         "session/get" => {
             let session_id = require_string(&params, "sessionId")?;

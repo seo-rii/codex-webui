@@ -45,6 +45,7 @@ The internal service contains most Codex-specific application logic:
 - session hydration and turn shaping
 - queue persistence and dispatch
 - notification center persistence and webhook delivery settings
+- session organization persistence for pins, tags, and saved sidebar filters
 - attachment storage
 - Git repository discovery and file operations
 - `config.toml` synchronization
@@ -126,10 +127,13 @@ The sidebar is built from two sources:
 - live `thread/list` data from `codex app-server`
 - a local JSONL-style session index built from `~/.codex/sessions`
 - `codex-webui`-owned per-session sidebar metadata such as completion or attention highlights
+- `codex-webui`-owned per-session organization metadata such as pins and tags
 
 The local index is used because large session histories make direct thread enumeration expensive. The index work runs in a worker so the main Node event loop does not block while the sidebar updates.
 
 Completion and input-required badges are not treated as frontend-only affordances. They are persisted in `codex-webui` state, injected into session summaries, and cleared by backend acknowledgement flows when a user opens the relevant session or resolves the pending request state.
+
+Pins, tags, and saved sidebar filters follow the same principle: they are stored in backend-owned UI state, merged into session summaries before they reach the browser, and broadcast back out through config/session-summary updates so multiple clients stay in sync without inventing local conflict resolution rules.
 
 ## Runtime Session Reconciliation
 
@@ -194,6 +198,7 @@ Current examples include:
 - queued-work resume prompts restored after restart
 - globally armed or scheduled shutdown-after-queue-completion state
 - persisted per-session completion and attention highlights used by the sidebar
+- persisted per-session pins, tags, and saved sidebar filters
 - notification center history, unread state, and webhook settings
 
 This state is persisted in `CODEX_WEBUI_DATA_DIR`, exposed through config payloads and global WebSocket notifications, and treated as authoritative by the backend so reconnecting clients do not need to rebuild it from local browser memory.

@@ -30,6 +30,7 @@
     FileText,
     ListTodo,
     MessageSquare,
+    Pin,
     RefreshCw,
     Search,
     Pencil,
@@ -73,10 +74,12 @@
     GlobalStreamEvent,
     NotificationSettings,
     PendingServerRequest,
+    SavedSessionFilter,
     SessionListPayload,
     SessionPreferences,
     SessionQueueItem,
     SessionSearchScope,
+    SessionSummaryFilter,
     SessionSummary,
     StreamEvent,
     TerminalSummary,
@@ -162,6 +165,14 @@
   let turnLoadErrors = $state<Record<string, string>>({});
   let sessionSearchQuery = $state("");
   let sessionSearchScope = $state<SessionSearchScope>("summary");
+  let sessionFilter = $state<SessionSummaryFilter>({
+    pinnedOnly: false,
+    runningOnly: false,
+    queuedOnly: false,
+    highlight: "all",
+    tags: []
+  });
+  let activeSavedSessionFilterId = $state<string | null>(null);
   let showArchivedSessions = $state(false);
   let accountLoginFlow = $state<CodexAccountLoginFlow | null>(null);
   let composerSettingsOpen = $state(false);
@@ -1367,7 +1378,50 @@
     return status === "running" || status === "active" ? 1 : 0;
   }
 
+  function normalizeSessionFilterState(filter: Partial<SessionSummaryFilter> | null | undefined): SessionSummaryFilter {
+    return {
+      pinnedOnly: Boolean(filter?.pinnedOnly),
+      runningOnly: Boolean(filter?.runningOnly),
+      queuedOnly: Boolean(filter?.queuedOnly),
+      highlight: filter?.highlight === "attention" || filter?.highlight === "completed" ? filter.highlight : "all",
+      tags: Array.isArray(filter?.tags)
+        ? [...new Set(filter.tags.map((entry) => entry.trim()).filter((entry) => entry.length > 0))]
+        : []
+    };
+  }
+
+  function isDefaultSessionFilter(filter: SessionSummaryFilter) {
+    return !filter.pinnedOnly && !filter.runningOnly && !filter.queuedOnly && filter.highlight === "all" && filter.tags.length === 0;
+  }
+
+  function matchesSessionSummaryFilter(session: SessionSummary, filter: SessionSummaryFilter) {
+    if (filter.pinnedOnly && !session.pinned) {
+      return false;
+    }
+    if (filter.runningOnly && getSessionSortPriority(session.status) === 0) {
+      return false;
+    }
+    if (filter.queuedOnly && session.queueCount <= 0) {
+      return false;
+    }
+    if (filter.highlight !== "all" && session.highlight?.kind !== filter.highlight) {
+      return false;
+    }
+    if (filter.tags.length > 0) {
+      const sessionTags = new Set(session.tags.map((entry) => entry.trim()));
+      if (!filter.tags.every((tag) => sessionTags.has(tag))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   function compareSessions(left: SessionSummary, right: SessionSummary) {
+    const pinnedDifference = Number(Boolean(right.pinned)) - Number(Boolean(left.pinned));
+    if (pinnedDifference !== 0) {
+      return pinnedDifference;
+    }
+
     const priorityDifference = getSessionSortPriority(right.status) - getSessionSortPriority(left.status);
     if (priorityDifference !== 0) {
       return priorityDifference;
@@ -1694,7 +1748,13 @@
   }
 
   function shouldPinSession(session: SessionSummary | null) {
-    return Boolean(session && !isSubagentSessionSummary(session) && !sessionSearchQuery.trim() && session.archived === showArchivedSessions);
+    return Boolean(
+      session &&
+        !isSubagentSessionSummary(session) &&
+        !sessionSearchQuery.trim() &&
+        session.archived === showArchivedSessions &&
+        matchesSessionSummaryFilter(session, sessionFilter)
+    );
   }
 
   function upsertSessionSummary(summary: SessionSummary) {
@@ -1727,6 +1787,14 @@
       return;
     }
 
+    if (!matchesSessionSummaryFilter(summary, sessionFilter)) {
+      const nextSessions = sessions.filter((session) => session.id !== summary.id);
+      if (nextSessions.length !== sessions.length) {
+        sessions = sortSessions(nextSessions);
+      }
+      return;
+    }
+
     upsertSessionSummary(summary);
   }
 
@@ -1743,6 +1811,8 @@
       preview: state.thread.preview,
       queueCount: state.queue.items.length,
       highlight: selectedSessionSummary?.highlight ?? null,
+      pinned: selectedSessionSummary?.pinned ?? false,
+      tags: [...(selectedSessionSummary?.tags ?? [])],
       cwd: state.thread.cwd,
       archived: selectedSessionSummary?.archived ?? showArchivedSessions,
       createdAt: state.thread.createdAt,
@@ -1867,6 +1937,8 @@
     turnLoadErrors = {};
     sessionSearchQuery = "";
     sessionSearchScope = "summary";
+    sessionFilter = normalizeSessionFilterState(null);
+    activeSavedSessionFilterId = null;
     showArchivedSessions = false;
     accountLoginFlow = null;
     composerSettingsOpen = false;
@@ -1984,8 +2056,8 @@
 
     try {
       const response = sessionSearchQuery.trim()
-        ? await api.searchSessions(sessionSearchQuery.trim(), sessionSearchScope, showArchivedSessions, null, sessionPageSize)
-        : await api.getSessions(showArchivedSessions, null, sessionPageSize);
+        ? await api.searchSessions(sessionSearchQuery.trim(), sessionSearchScope, showArchivedSessions, null, sessionPageSize, sessionFilter)
+        : await api.getSessions(showArchivedSessions, null, sessionPageSize, sessionFilter);
 
       if (requestVersion !== sessionListRequestVersion) {
         return;
@@ -2079,8 +2151,8 @@
     sessionsLoadingMore = true;
     try {
       const response = sessionSearchQuery.trim()
-        ? await api.searchSessions(sessionSearchQuery.trim(), sessionSearchScope, showArchivedSessions, cursor, sessionPageSize)
-        : await api.getSessions(showArchivedSessions, cursor, sessionPageSize);
+        ? await api.searchSessions(sessionSearchQuery.trim(), sessionSearchScope, showArchivedSessions, cursor, sessionPageSize, sessionFilter)
+        : await api.getSessions(showArchivedSessions, cursor, sessionPageSize, sessionFilter);
 
       if (requestVersion !== sessionListRequestVersion) {
         return;
@@ -2445,6 +2517,12 @@
                 ...(event.params.notifications as Partial<AppConfigPayload["notifications"]>)
               }
             : config.notifications,
+          sessionOrganization: event.params.sessionOrganization
+            ? {
+                ...config.sessionOrganization,
+                ...(event.params.sessionOrganization as Partial<AppConfigPayload["sessionOrganization"]>)
+              }
+            : config.sessionOrganization,
           startup: event.params.startup
             ? {
                 ...config.startup,
@@ -2825,6 +2903,8 @@
         preview: conversation?.thread.preview ?? "",
         queueCount: conversation?.queue.items.length ?? selectedSessionSummary?.queueCount ?? 0,
         highlight: selectedSessionSummary?.highlight ?? null,
+        pinned: selectedSessionSummary?.pinned ?? false,
+        tags: [...(selectedSessionSummary?.tags ?? [])],
         cwd: conversation?.thread.cwd ?? config?.defaults.cwd ?? "",
         archived,
         createdAt: conversation?.thread.createdAt ?? Math.floor(Date.now() / 1000),
@@ -3283,6 +3363,68 @@
     }
   }
 
+  async function toggleSessionPinned(session: SessionSummary) {
+    try {
+      const nextPinned = !session.pinned;
+      const response = await api.updateSessionOrganization(session.id, {
+        pinned: nextPinned
+      });
+      applySessionSummaryUpdate({
+        ...session,
+        pinned: response.meta.pinned,
+        tags: response.meta.tags
+      });
+      if (config) {
+        config = {
+          ...config,
+          sessionOrganization: {
+            ...config.sessionOrganization,
+            knownTags: response.knownTags
+          }
+        };
+      }
+      noticeText = nextPinned ? m.session_pinned_notice() : m.session_unpinned_notice();
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function editSelectedSessionTags() {
+    if (!selectedSessionId || !selectedSessionSummary) {
+      return;
+    }
+
+    const initialValue = selectedSessionSummary.tags.join(", ");
+    const nextValue = typeof window === "undefined" ? null : window.prompt(m.session_tags_prompt(), initialValue);
+    if (nextValue === null) {
+      return;
+    }
+
+    const nextTags = [...new Set(nextValue.split(",").map((entry) => entry.trim()).filter((entry) => entry.length > 0))];
+    try {
+      const response = await api.updateSessionOrganization(selectedSessionId, {
+        tags: nextTags
+      });
+      applySessionSummaryUpdate({
+        ...selectedSessionSummary,
+        pinned: response.meta.pinned,
+        tags: response.meta.tags
+      });
+      if (config) {
+        config = {
+          ...config,
+          sessionOrganization: {
+            ...config.sessionOrganization,
+            knownTags: response.knownTags
+          }
+        };
+      }
+      noticeText = m.session_tags_updated_notice();
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
   async function archiveCurrentSession() {
     if (!selectedSessionId || showArchivedSessions) {
       return;
@@ -3698,6 +3840,71 @@
   function updateSessionSearchScope(scope: SessionSearchScope) {
     sessionSearchScope = scope;
     scheduleSessionRefresh(60);
+  }
+
+  function updateSessionFilter(patch: Partial<SessionSummaryFilter>) {
+    sessionFilter = normalizeSessionFilterState({
+      ...sessionFilter,
+      ...patch
+    });
+    activeSavedSessionFilterId = null;
+    scheduleSessionRefresh(60);
+  }
+
+  function applySavedSessionFilter(filter: SavedSessionFilter | null) {
+    sessionFilter = normalizeSessionFilterState(filter);
+    activeSavedSessionFilterId = filter?.id ?? null;
+    scheduleSessionRefresh(0);
+  }
+
+  async function saveCurrentSessionFilter() {
+    const filterName = typeof window === "undefined" ? "" : window.prompt(m.saved_filter_name_prompt(), "")?.trim() ?? "";
+    if (!filterName) {
+      return;
+    }
+
+    try {
+      const savedFilter: SavedSessionFilter = {
+        id: activeSavedSessionFilterId ?? crypto.randomUUID(),
+        name: filterName,
+        ...sessionFilter
+      };
+      const response = await api.saveSessionFilter(savedFilter);
+      if (config) {
+        config = {
+          ...config,
+          sessionOrganization: {
+            savedFilters: response.savedFilters,
+            knownTags: response.knownTags
+          }
+        };
+      }
+      activeSavedSessionFilterId = savedFilter.id;
+      noticeText = m.saved_filter_saved();
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function deleteSavedSessionFilter(filterId: string) {
+    try {
+      const response = await api.deleteSessionFilter(filterId);
+      if (config) {
+        config = {
+          ...config,
+          sessionOrganization: {
+            savedFilters: response.savedFilters,
+            knownTags: response.knownTags
+          }
+        };
+      }
+      if (activeSavedSessionFilterId === filterId) {
+        activeSavedSessionFilterId = null;
+      }
+      noticeText = m.saved_filter_deleted();
+    } catch (error) {
+      errorText = describeError(error);
+    }
   }
 
   function updateArchivedSessions(nextValue: boolean) {
@@ -5499,6 +5706,10 @@
       sessionsLoadPercent={sessionLoadPercent}
       searchQuery={sessionSearchQuery}
       searchScope={sessionSearchScope}
+      {sessionFilter}
+      savedSessionFilters={config?.sessionOrganization.savedFilters ?? []}
+      knownSessionTags={config?.sessionOrganization.knownTags ?? []}
+      {activeSavedSessionFilterId}
       showArchived={showArchivedSessions}
       showCloseButton={isMobileLayout}
       onArchivedChange={updateArchivedSessions}
@@ -5545,8 +5756,19 @@
       onThemeModeChange={changeThemeMode}
       onSearchQueryChange={updateSessionSearchQuery}
       onSearchScopeChange={updateSessionSearchScope}
+      onSessionFilterChange={updateSessionFilter}
+      onApplySavedFilter={applySavedSessionFilter}
+      onSaveCurrentFilter={() => {
+        void saveCurrentSessionFilter();
+      }}
+      onDeleteSavedFilter={(filterId) => {
+        void deleteSavedSessionFilter(filterId);
+      }}
       onSelect={(sessionId) => {
         void selectSession(sessionId);
+      }}
+      onTogglePin={(session) => {
+        void toggleSessionPinned(session);
       }}
       onToggleArchive={(session) => {
         void archiveSessionFromSidebar(session);
@@ -5591,6 +5813,29 @@
               </span>
             </div>
           {/if}
+          {#if selectedSessionSummary}
+            <div class="mt-1.5 flex flex-wrap items-center gap-1.5">
+              {#if selectedSessionSummary.pinned}
+                <span class="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-700">
+                  <Pin size={10} />
+                  {m.pinned_only()}
+                </span>
+              {/if}
+              {#each selectedSessionSummary.tags as tag (tag)}
+                <span class="inline-flex items-center rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[10px] font-semibold text-gray-500">
+                  {tag}
+                </span>
+              {/each}
+              <button
+                class="ui-animated-button ui-animated-button--soft inline-flex items-center gap-1 rounded-full border border-gray-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-gray-500 hover:text-gray-800"
+                onclick={() => void editSelectedSessionTags()}
+                type="button"
+              >
+                <Pencil size={10} />
+                <span>{m.edit_tags()}</span>
+              </button>
+            </div>
+          {/if}
         </div>
       </div>
 
@@ -5609,6 +5854,22 @@
         {/if}
 
         {#if selectedSessionId}
+          <button
+            class={`ui-animated-button ui-animated-button--icon p-2 rounded-lg transition-all ${
+              selectedSessionSummary?.pinned
+                ? "bg-amber-50 text-amber-600 hover:bg-amber-100"
+                : "text-gray-400 hover:text-amber-600 hover:bg-amber-50"
+            }`}
+            onclick={() => {
+              if (selectedSessionSummary) {
+                void toggleSessionPinned(selectedSessionSummary);
+              }
+            }}
+            title={selectedSessionSummary?.pinned ? m.unpin_thread() : m.pin_thread()}
+            type="button"
+          >
+            <Pin size={18} />
+          </button>
           <button
             class="ui-animated-button ui-animated-button--icon p-2 text-gray-400 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-all"
             onclick={() => {

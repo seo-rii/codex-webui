@@ -16,6 +16,7 @@ import type {
   NotificationListPayload,
   NotificationSettings,
   PendingServerRequest,
+  SavedSessionFilter,
   SessionDetailPayload,
   SessionDraftPayload,
   SessionItemDetailPayload,
@@ -23,6 +24,7 @@ import type {
   SessionPreferences,
   SessionQueueItem,
   SessionQueuePayload,
+  SessionSummaryFilter,
   SessionSummary,
   SessionSummaryHighlight,
   StartupScheduledShutdownAlert,
@@ -199,6 +201,8 @@ function toSummary(
     preview,
     queueCount: Math.max(0, queueCount),
     highlight,
+    pinned: false,
+    tags: [],
     cwd: (normalized.cwd as string | null) ?? preferences?.cwd ?? getRuntimeConfig().defaults.cwd,
     archived,
     createdAt: Number(normalized.createdAt ?? 0),
@@ -223,6 +227,8 @@ function indexedSessionToSummary(
     preview: indexed.preview,
     queueCount: Math.max(0, queueCount),
     highlight,
+    pinned: false,
+    tags: [],
     cwd: indexed.cwd || preferences?.cwd || getRuntimeConfig().defaults.cwd,
     archived: false,
     createdAt: indexed.createdAt,
@@ -246,6 +252,11 @@ function getSessionSortPriority(status: string | null | undefined) {
 }
 
 function compareSessionSummaries(left: SessionSummary, right: SessionSummary) {
+  const pinnedDifference = Number(Boolean(right.pinned)) - Number(Boolean(left.pinned));
+  if (pinnedDifference !== 0) {
+    return pinnedDifference;
+  }
+
   const priorityDifference = getSessionSortPriority(right.status) - getSessionSortPriority(left.status);
   if (priorityDifference !== 0) {
     return priorityDifference;
@@ -267,6 +278,7 @@ function compareSessionSummaries(left: SessionSummary, right: SessionSummary) {
 function mergeIndexedSessionsWithRecentLiveSessions(
   indexedEntries: IndexedSessionSummary[],
   preferences: Record<string, SessionPreferences>,
+  sessionMetaByThreadId: Record<string, { pinned: boolean; tags: string[] }>,
   queueCounts: Record<string, number>,
   highlightsByThreadId: Record<string, SessionSummaryHighlight>,
   recentLiveSessions: Map<string, SessionSummary>,
@@ -280,22 +292,28 @@ function mergeIndexedSessionsWithRecentLiveSessions(
       const stored = preferences[entry.id];
       const live = recentLiveSessions.get(entry.id);
       if (!live) {
-        return indexedSessionToSummary(
-          entry,
-          stored ? coercePreferences(stored) : null,
-          queueCounts[entry.id] ?? 0,
-          highlightsByThreadId[entry.id] ?? null
+        return applySessionMeta(
+          indexedSessionToSummary(
+            entry,
+            stored ? coercePreferences(stored) : null,
+            queueCounts[entry.id] ?? 0,
+            highlightsByThreadId[entry.id] ?? null
+          ),
+          sessionMetaByThreadId[entry.id] ?? null
         );
       }
 
-      return {
-        ...live,
-        name: !isPlaceholderThreadName(live.name) ? live.name : entry.name,
-        preview: live.preview?.trim() ? live.preview : entry.preview,
-        cwd: live.cwd || entry.cwd,
-        createdAt: live.createdAt || entry.createdAt,
-        updatedAt: Math.max(live.updatedAt || 0, entry.updatedAt || 0)
-      } satisfies SessionSummary;
+      return applySessionMeta(
+        {
+          ...live,
+          name: !isPlaceholderThreadName(live.name) ? live.name : entry.name,
+          preview: live.preview?.trim() ? live.preview : entry.preview,
+          cwd: live.cwd || entry.cwd,
+          createdAt: live.createdAt || entry.createdAt,
+          updatedAt: Math.max(live.updatedAt || 0, entry.updatedAt || 0)
+        } satisfies SessionSummary,
+        sessionMetaByThreadId[entry.id] ?? null
+      );
     })
     .filter((session) => !isSubagentSessionSummary(session));
 
@@ -308,7 +326,7 @@ function mergeIndexedSessionsWithRecentLiveSessions(
       if (matcher && !matcher(live)) {
         continue;
       }
-      sessions.push(live);
+      sessions.push(applySessionMeta(live, sessionMetaByThreadId[live.id] ?? null));
       seen.add(live.id);
     }
   }
@@ -433,6 +451,57 @@ function getDisplayThreadName(name: string | null | undefined, preview: string |
   return inferSessionDisplayTitle(preview ?? "");
 }
 
+function applySessionMeta(summary: SessionSummary, meta: { pinned: boolean; tags: string[] } | null | undefined) {
+  return {
+    ...summary,
+    pinned: Boolean(meta?.pinned),
+    tags: Array.isArray(meta?.tags) ? [...meta.tags] : []
+  } satisfies SessionSummary;
+}
+
+function matchesSessionFilter(session: SessionSummary, filter: SessionSummaryFilter | null) {
+  if (!filter) {
+    return true;
+  }
+
+  if (filter.pinnedOnly && !session.pinned) {
+    return false;
+  }
+  if (filter.runningOnly && getSessionSortPriority(session.status) === 0) {
+    return false;
+  }
+  if (filter.queuedOnly && session.queueCount <= 0) {
+    return false;
+  }
+  if (filter.highlight !== "all" && session.highlight?.kind !== filter.highlight) {
+    return false;
+  }
+
+  const requiredTags = filter.tags.map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+  if (requiredTags.length > 0) {
+    const sessionTags = new Set(session.tags.map((entry) => entry.trim()));
+    if (!requiredTags.every((tag) => sessionTags.has(tag))) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function normalizeSessionFilter(filter: Partial<SessionSummaryFilter> | null | undefined): SessionSummaryFilter | null {
+  if (!filter) {
+    return null;
+  }
+
+  return {
+    pinnedOnly: Boolean(filter.pinnedOnly),
+    runningOnly: Boolean(filter.runningOnly),
+    queuedOnly: Boolean(filter.queuedOnly),
+    highlight: filter.highlight === "attention" || filter.highlight === "completed" ? filter.highlight : "all",
+    tags: Array.isArray(filter.tags) ? [...new Set(filter.tags.map((entry) => entry.trim()).filter((entry) => entry.length > 0))] : []
+  };
+}
+
 function buildNotificationPayload(
   type: NotificationEventType,
   sessionId: string | null,
@@ -538,10 +607,12 @@ export class CodexGateway {
       this.client.request("collaborationMode/list", {}),
       this.client.request("account/read", { refreshToken: false })
     ]);
-    const [pausedQueueEntries, globalState, notifications] = await Promise.all([
+    const [pausedQueueEntries, globalState, notifications, savedFilters, knownTags] = await Promise.all([
       uiStateStore.listResumePendingQueues(),
       uiStateStore.getGlobal(),
-      uiStateStore.getNotifications(DEFAULT_NOTIFICATION_LIMIT)
+      uiStateStore.getNotifications(DEFAULT_NOTIFICATION_LIMIT),
+      uiStateStore.getSavedSessionFilters(),
+      uiStateStore.getKnownSessionTags()
     ]);
     const preferences: Record<string, SessionPreferences> = pausedQueueEntries.length > 0 ? await uiStateStore.getAll() : {};
     const indexedSessions =
@@ -629,6 +700,10 @@ export class CodexGateway {
         unreadCount: notifications.unreadCount,
         settings: await uiStateStore.getNotificationSettings()
       },
+      sessionOrganization: {
+        savedFilters,
+        knownTags
+      },
       account: {
         type: (account.type as "apiKey" | "chatgpt" | null) ?? null,
         email: (account.email as string | null) ?? null,
@@ -692,10 +767,50 @@ export class CodexGateway {
     };
   }
 
-  async listSessions(archived = false, cursor: string | null = null, limit = SESSION_WINDOW_SIZE): Promise<SessionListPayload> {
+  async updateSessionOrganization(threadId: string, patch: Partial<{ pinned: boolean; tags: string[] }>) {
+    const nextMeta = await uiStateStore.updateSessionMeta(threadId, patch);
+    await this.emitSessionSummaryUpdated(threadId);
+    await this.emitConfigUpdated();
+    return {
+      meta: nextMeta,
+      knownTags: await uiStateStore.getKnownSessionTags()
+    };
+  }
+
+  async saveSessionFilter(filter: SavedSessionFilter) {
+    if (!filter.name.trim()) {
+      throw new Error("Filter name is required.");
+    }
+    const savedFilters = await uiStateStore.saveSessionFilter({
+      ...filter,
+      name: filter.name.trim()
+    });
+    await this.emitConfigUpdated();
+    return {
+      savedFilters,
+      knownTags: await uiStateStore.getKnownSessionTags()
+    };
+  }
+
+  async deleteSessionFilter(filterId: string) {
+    const savedFilters = await uiStateStore.deleteSessionFilter(filterId);
+    await this.emitConfigUpdated();
+    return {
+      savedFilters,
+      knownTags: await uiStateStore.getKnownSessionTags()
+    };
+  }
+
+  async listSessions(
+    archived = false,
+    cursor: string | null = null,
+    limit = SESSION_WINDOW_SIZE,
+    filter: SessionSummaryFilter | null = null
+  ): Promise<SessionListPayload> {
     if (!archived) {
-      const [preferences, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions] = await Promise.all([
+      const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions] = await Promise.all([
         uiStateStore.getAll(),
+        uiStateStore.getAllSessionMeta(),
         uiStateStore.getQueueCounts(),
         uiStateStore.getSessionHighlights(),
         sessionIndexClient.page(getRuntimeConfig().codexHome, cursor, limit, null),
@@ -706,19 +821,24 @@ export class CodexGateway {
         sessions: mergeIndexedSessionsWithRecentLiveSessions(
           indexedPage.entries,
           preferences,
+          sessionMetaByThreadId,
           queueCounts,
           highlightsByThreadId,
           recentLiveSessions,
           limit,
           null,
           cursor === null || cursor === "0"
-        ),
+        ).filter((session) => matchesSessionFilter(session, filter)),
         nextCursor: indexedPage.nextCursor
       };
     }
 
     const response = asRecord(await this.client.request("thread/list", { limit, archived, cursor }));
-    const [preferences, highlightsByThreadId] = await Promise.all([uiStateStore.getAll(), uiStateStore.getSessionHighlights()]);
+    const [preferences, sessionMetaByThreadId, highlightsByThreadId] = await Promise.all([
+      uiStateStore.getAll(),
+      uiStateStore.getAllSessionMeta(),
+      uiStateStore.getSessionHighlights()
+    ]);
     const threads = (response.data as Array<Record<string, unknown>> | undefined) ?? [];
     return {
       sessions: threads
@@ -726,9 +846,13 @@ export class CodexGateway {
         .map((thread) => {
           const threadId = String(thread.id);
           const stored = preferences[threadId];
-          return toSummary(thread, stored ? coercePreferences(stored) : null, archived, 0, highlightsByThreadId[threadId] ?? null);
+          return applySessionMeta(
+            toSummary(thread, stored ? coercePreferences(stored) : null, archived, 0, highlightsByThreadId[threadId] ?? null),
+            sessionMetaByThreadId[threadId] ?? null
+          );
         })
         .filter((session) => !isSubagentSessionSummary(session))
+        .filter((session) => matchesSessionFilter(session, filter))
         .sort(compareSessionSummaries),
       nextCursor: typeof response.nextCursor === "string" && response.nextCursor.trim() ? String(response.nextCursor) : null
     };
@@ -739,16 +863,18 @@ export class CodexGateway {
     scope: "summary" | "full",
     archived = false,
     cursor: string | null = null,
-    limit = SESSION_WINDOW_SIZE
+    limit = SESSION_WINDOW_SIZE,
+    filter: SessionSummaryFilter | null = null
   ): Promise<SessionListPayload> {
     const needle = query.trim().toLowerCase();
     if (!needle) {
-      return this.listSessions(archived, cursor, limit);
+      return this.listSessions(archived, cursor, limit, filter);
     }
 
     if (!archived && scope === "summary") {
-      const [preferences, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions] = await Promise.all([
+      const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions] = await Promise.all([
         uiStateStore.getAll(),
+        uiStateStore.getAllSessionMeta(),
         uiStateStore.getQueueCounts(),
         uiStateStore.getSessionHighlights(),
         sessionIndexClient.page(getRuntimeConfig().codexHome, cursor, limit, needle),
@@ -759,6 +885,7 @@ export class CodexGateway {
         sessions: mergeIndexedSessionsWithRecentLiveSessions(
           indexedPage.entries,
           preferences,
+          sessionMetaByThreadId,
           queueCounts,
           highlightsByThreadId,
           recentLiveSessions,
@@ -766,12 +893,12 @@ export class CodexGateway {
           (session) => `${session.name ?? ""}
 ${session.preview ?? ""}`.toLowerCase().includes(needle),
           cursor === null || cursor === "0"
-        ),
+        ).filter((session) => matchesSessionFilter(session, filter)),
         nextCursor: indexedPage.nextCursor
       };
     }
 
-    const sessions = await this.collectListableSessions(archived);
+    const sessions = await this.collectListableSessions(archived, filter);
     sessions.sort(compareSessionSummaries);
     const matches: SessionSummary[] = [];
     for (const session of sessions) {
@@ -803,20 +930,21 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     };
   }
 
-  private async collectListableSessions(archived: boolean): Promise<SessionSummary[]> {
-    const [preferences, queueCounts, highlightsByThreadId] = await Promise.all([
+  private async collectListableSessions(archived: boolean, filter: SessionSummaryFilter | null = null): Promise<SessionSummary[]> {
+    const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId] = await Promise.all([
       uiStateStore.getAll(),
+      uiStateStore.getAllSessionMeta(),
       uiStateStore.getQueueCounts(),
       uiStateStore.getSessionHighlights()
     ]);
     if (archived) {
-      return this.listAllThreadSessions(true, preferences, queueCounts, highlightsByThreadId);
+      return this.listAllThreadSessions(true, preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, filter);
     }
 
     const indexedSessions = (await sessionIndexClient.list(getRuntimeConfig().codexHome).catch(() => [])).filter(
       (session) => !session.isSubagent
     );
-    const liveThreads = await this.listAllThreadSessions(false, preferences, queueCounts, highlightsByThreadId);
+    const liveThreads = await this.listAllThreadSessions(false, preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, filter);
     const liveById = new Map(liveThreads.map((session) => [session.id, session]));
     const mergedSessions = indexedSessions.map((session) => {
       const live = liveById.get(session.id);
@@ -832,12 +960,14 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       }
 
       const stored = preferences[session.id];
-      return {
+      const summary = {
         id: session.id,
         name: session.name,
         preview: session.preview,
         queueCount: queueCounts[session.id] ?? 0,
         highlight: highlightsByThreadId[session.id] ?? null,
+        pinned: false,
+        tags: [],
         cwd: session.cwd || stored?.cwd || getRuntimeConfig().defaults.cwd,
         archived: false,
         createdAt: session.createdAt,
@@ -848,6 +978,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         agentRole: null,
         preferences: stored ? coercePreferences(stored) : null
       } satisfies SessionSummary;
+      return applySessionMeta(summary, sessionMetaByThreadId[session.id] ?? null);
     });
 
     for (const live of liveThreads) {
@@ -859,7 +990,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     const dedupedSessions = mergedSessions.filter(
       (session, index, collection) => collection.findIndex((candidate) => candidate.id === session.id) === index
     );
-    const visibleSessions = dedupedSessions.filter((session) => !isSubagentSessionSummary(session));
+    const visibleSessions = dedupedSessions.filter((session) => !isSubagentSessionSummary(session)).filter((session) => matchesSessionFilter(session, filter));
     visibleSessions.sort(compareSessionSummaries);
     return visibleSessions;
   }
@@ -867,8 +998,10 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   private async listAllThreadSessions(
     archived: boolean,
     preferences: Record<string, Awaited<ReturnType<typeof uiStateStore.getAll>>[string]>,
+    sessionMetaByThreadId: Record<string, { pinned: boolean; tags: string[] }>,
     queueCounts: Record<string, number>,
-    highlightsByThreadId: Record<string, SessionSummaryHighlight>
+    highlightsByThreadId: Record<string, SessionSummaryHighlight>,
+    filter: SessionSummaryFilter | null = null
   ): Promise<SessionSummary[]> {
     const sessions: SessionSummary[] = [];
     let cursor: string | null = null;
@@ -882,15 +1015,19 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
           .map((thread) => {
             const threadId = String(thread.id);
             const stored = preferences[threadId];
-            return toSummary(
-              thread,
-              stored ? coercePreferences(stored) : null,
-              archived,
-              queueCounts[threadId] ?? 0,
-              highlightsByThreadId[threadId] ?? null
+            return applySessionMeta(
+              toSummary(
+                thread,
+                stored ? coercePreferences(stored) : null,
+                archived,
+                queueCounts[threadId] ?? 0,
+                highlightsByThreadId[threadId] ?? null
+              ),
+              sessionMetaByThreadId[threadId] ?? null
             );
           })
           .filter((session) => !isSubagentSessionSummary(session))
+          .filter((session) => matchesSessionFilter(session, filter))
       );
       cursor = typeof response.nextCursor === "string" && response.nextCursor.trim() ? String(response.nextCursor) : null;
     } while (cursor);
@@ -909,8 +1046,9 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     }
 
     this.recentLiveSessionsPromise = (async () => {
-      const [preferences, queueCounts, highlightsByThreadId] = await Promise.all([
+      const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId] = await Promise.all([
         uiStateStore.getAll(),
+        uiStateStore.getAllSessionMeta(),
         uiStateStore.getQueueCounts(),
         uiStateStore.getSessionHighlights()
       ]);
@@ -924,12 +1062,15 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
           .map((thread) => {
             const threadId = String(thread.id);
             const stored = preferences[threadId];
-            const summary = toSummary(
-              thread,
-              stored ? coercePreferences(stored) : null,
-              false,
-              queueCounts[threadId] ?? 0,
-              highlightsByThreadId[threadId] ?? null
+            const summary = applySessionMeta(
+              toSummary(
+                thread,
+                stored ? coercePreferences(stored) : null,
+                false,
+                queueCounts[threadId] ?? 0,
+                highlightsByThreadId[threadId] ?? null
+              ),
+              sessionMetaByThreadId[threadId] ?? null
             );
             return [threadId, summary] as const;
           })
@@ -997,7 +1138,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     this.fullTurnsByThread.delete(threadId);
     const thread = normalizeThread(asRecord(response.thread));
     const preferences = await this.getPreferences(threadId, thread);
-    const summary = toSummary(thread, preferences, false);
+    const summary = applySessionMeta(toSummary(thread, preferences, false), await uiStateStore.getSessionMeta(threadId));
     this.recentLiveSessions.set(threadId, summary);
     this.recentLiveSessionsLoadedAt = Date.now();
     return {
@@ -1055,7 +1196,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       thread.name = nextName;
     }
 
-    const summary = toSummary(thread, nextPreferences);
+    const summary = applySessionMeta(toSummary(thread, nextPreferences), await uiStateStore.getSessionMeta(String(thread.id)));
     sessionIndexClient.invalidate();
     this.recentLiveSessions.set(String(thread.id), summary);
     this.recentLiveSessionsLoadedAt = Date.now();
@@ -2569,7 +2710,12 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
 
   private async emitConfigUpdated() {
     const runtimeConfig = getRuntimeConfig();
-    const [globalState, notifications] = await Promise.all([uiStateStore.getGlobal(), uiStateStore.getNotifications(1)]);
+    const [globalState, notifications, savedFilters, knownTags] = await Promise.all([
+      uiStateStore.getGlobal(),
+      uiStateStore.getNotifications(1),
+      uiStateStore.getSavedSessionFilters(),
+      uiStateStore.getKnownSessionTags()
+    ]);
     this.emitGlobal({
       kind: "notification",
       method: "codex-webui/configUpdated",
@@ -2591,6 +2737,10 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         notifications: {
           unreadCount: notifications.unreadCount,
           settings: await uiStateStore.getNotificationSettings()
+        },
+        sessionOrganization: {
+          savedFilters,
+          knownTags
         }
       }
     });
@@ -2894,7 +3044,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       const resolvedHighlight =
         highlightOverride === undefined ? await uiStateStore.getSessionHighlight(threadId) : highlightOverride;
       const previousSummary = this.recentLiveSessions.get(threadId);
-      const summary = {
+      const summary = applySessionMeta({
         ...toSummary(resolvedThread, resolvedPreferences, false, resolvedQueueCount, resolvedHighlight),
         status: statusOverride ?? (asText(resolvedThread.status) ?? "unknown"),
         updatedAt: Math.max(
@@ -2902,7 +3052,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
           previousSummary?.updatedAt ?? 0,
           activityAt ?? 0
         )
-      } satisfies SessionSummary;
+      } satisfies SessionSummary, await uiStateStore.getSessionMeta(threadId));
       if (isSubagentSessionSummary(summary)) {
         return;
       }

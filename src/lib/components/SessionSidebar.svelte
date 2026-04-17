@@ -21,6 +21,7 @@
     Bell,
     ExternalLink,
     Monitor,
+    Pin,
     Moon,
     Sun
   } from "lucide-svelte";
@@ -29,7 +30,16 @@
   import { m } from "$lib/paraglide/messages.js";
   import { getLocale } from "$lib/paraglide/runtime.js";
   import type { ResolvedTheme, ThemeMode } from "$lib/theme";
-  import type { AppNotification, CodexAccountLoginFlow, CodexQuotaStatus, CodexRuntimeStatus, SessionSearchScope, SessionSummary } from "$lib/types";
+  import type {
+    AppNotification,
+    CodexAccountLoginFlow,
+    CodexQuotaStatus,
+    CodexRuntimeStatus,
+    SavedSessionFilter,
+    SessionSearchScope,
+    SessionSummary,
+    SessionSummaryFilter
+  } from "$lib/types";
 
   let {
     sessions,
@@ -44,13 +54,22 @@
     sessionsLoadPercent,
     searchQuery,
     searchScope,
+    sessionFilter,
+    savedSessionFilters,
+    knownSessionTags,
+    activeSavedSessionFilterId,
     showArchived,
     onSelect,
     onCreate,
     onLoadMore,
     onSearchQueryChange,
     onSearchScopeChange,
+    onSessionFilterChange,
+    onApplySavedFilter,
+    onSaveCurrentFilter,
+    onDeleteSavedFilter,
     onArchivedChange,
+    onTogglePin,
     onToggleArchive,
     account,
     quota,
@@ -91,13 +110,22 @@
     sessionsLoadPercent: number;
     searchQuery: string;
     searchScope: SessionSearchScope;
+    sessionFilter: SessionSummaryFilter;
+    savedSessionFilters: SavedSessionFilter[];
+    knownSessionTags: string[];
+    activeSavedSessionFilterId: string | null;
     showArchived: boolean;
     onSelect: (sessionId: string) => void;
     onCreate: () => void;
     onLoadMore: () => void;
     onSearchQueryChange: (query: string) => void;
     onSearchScopeChange: (scope: SessionSearchScope) => void;
+    onSessionFilterChange: (patch: Partial<SessionSummaryFilter>) => void;
+    onApplySavedFilter: (filter: SavedSessionFilter | null) => void;
+    onSaveCurrentFilter: () => void;
+    onDeleteSavedFilter: (filterId: string) => void;
     onArchivedChange: (nextValue: boolean) => void;
+    onTogglePin: (session: SessionSummary) => void;
     onToggleArchive: (session: SessionSummary) => void;
     account:
       | {
@@ -161,9 +189,19 @@
       searchArchived: m.search_archived(),
       searchScopeSummary: m.search_scope_summary(),
       searchScopeFull: m.search_scope_full(),
+      pinnedOnly: m.pinned_only(),
+      runningOnly: m.running_only(),
+      queuedOnly: m.queued_only(),
+      allActivity: m.all_activity(),
+      savedFilters: m.saved_filters(),
+      saveCurrentFilter: m.save_current_filter(),
+      filterTags: m.filter_tags(),
+      noSavedFilters: m.no_saved_filters(),
       noArchivedSessions: m.no_archived_sessions(),
       archiveThread: m.archive_thread(),
       restoreThread: m.restore_thread(),
+      pinThread: m.pin_thread(),
+      unpinThread: m.unpin_thread(),
       noSessions: m.no_sessions(),
       noThreadsMatchingSearch: m.no_threads_matching_search(),
       createNewThreadPrompt: m.create_new_thread_prompt(),
@@ -412,13 +450,29 @@
   }
 
   function searchTriggerSubLabel() {
+    const hasFilters =
+      sessionFilter.pinnedOnly ||
+      sessionFilter.runningOnly ||
+      sessionFilter.queuedOnly ||
+      sessionFilter.highlight !== "all" ||
+      sessionFilter.tags.length > 0;
     if (searchScope === "full") {
       return ui.searchScopeFull;
     }
     if (searchQuery.trim()) {
       return ui.searchScopeSummary;
     }
+    if (hasFilters) {
+      return ui.savedFilters;
+    }
     return null;
+  }
+
+  function toggleFilterTag(tag: string) {
+    const nextTags = sessionFilter.tags.includes(tag)
+      ? sessionFilter.tags.filter((entry) => entry !== tag)
+      : [...sessionFilter.tags, tag];
+    onSessionFilterChange({ tags: nextTags });
   }
 
   $effect(() => {
@@ -693,7 +747,13 @@
         class={`flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition-all ${
           searchPanelOpen
             ? "border-amber-300 bg-white shadow-lg shadow-amber-100/40"
-            : searchQuery.trim() || searchScope === "full"
+            : searchQuery.trim() ||
+                searchScope === "full" ||
+                sessionFilter.pinnedOnly ||
+                sessionFilter.runningOnly ||
+                sessionFilter.queuedOnly ||
+                sessionFilter.highlight !== "all" ||
+                sessionFilter.tags.length > 0
               ? "border-amber-200/80 bg-amber-50/70 shadow-sm"
               : "border-gray-200 bg-white/70 hover:border-gray-300 hover:bg-white hover:shadow-sm"
         }`}
@@ -774,6 +834,146 @@
                 {ui.searchScopeFull}
               </button>
             </div>
+
+            <div class="grid grid-cols-3 gap-2">
+              <button
+                class={`rounded-lg border px-2 py-1.5 text-[11px] font-semibold transition-all ${
+                  sessionFilter.pinnedOnly
+                    ? "border-amber-200 bg-amber-50 text-amber-700"
+                    : "border-gray-200 bg-gray-50 text-gray-500 hover:bg-white hover:text-gray-700"
+                }`}
+                onclick={() => onSessionFilterChange({ pinnedOnly: !sessionFilter.pinnedOnly })}
+                type="button"
+              >
+                {ui.pinnedOnly}
+              </button>
+              <button
+                class={`rounded-lg border px-2 py-1.5 text-[11px] font-semibold transition-all ${
+                  sessionFilter.runningOnly
+                    ? "border-amber-200 bg-amber-50 text-amber-700"
+                    : "border-gray-200 bg-gray-50 text-gray-500 hover:bg-white hover:text-gray-700"
+                }`}
+                onclick={() => onSessionFilterChange({ runningOnly: !sessionFilter.runningOnly })}
+                type="button"
+              >
+                {ui.runningOnly}
+              </button>
+              <button
+                class={`rounded-lg border px-2 py-1.5 text-[11px] font-semibold transition-all ${
+                  sessionFilter.queuedOnly
+                    ? "border-amber-200 bg-amber-50 text-amber-700"
+                    : "border-gray-200 bg-gray-50 text-gray-500 hover:bg-white hover:text-gray-700"
+                }`}
+                onclick={() => onSessionFilterChange({ queuedOnly: !sessionFilter.queuedOnly })}
+                type="button"
+              >
+                {ui.queuedOnly}
+              </button>
+            </div>
+
+            <div class="flex gap-1 rounded-xl bg-gray-100 p-1">
+              <button
+                class={`flex-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-all ${
+                  sessionFilter.highlight === "all" ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"
+                }`}
+                onclick={() => onSessionFilterChange({ highlight: "all" })}
+                type="button"
+              >
+                {ui.allActivity}
+              </button>
+              <button
+                class={`flex-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-all ${
+                  sessionFilter.highlight === "attention" ? "bg-white text-amber-700 shadow-sm" : "text-gray-500 hover:text-gray-700"
+                }`}
+                onclick={() => onSessionFilterChange({ highlight: "attention" })}
+                type="button"
+              >
+                {ui.needsInput}
+              </button>
+              <button
+                class={`flex-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-all ${
+                  sessionFilter.highlight === "completed" ? "bg-white text-emerald-700 shadow-sm" : "text-gray-500 hover:text-gray-700"
+                }`}
+                onclick={() => onSessionFilterChange({ highlight: "completed" })}
+                type="button"
+              >
+                {ui.done}
+              </button>
+            </div>
+
+            {#if knownSessionTags.length > 0}
+              <div class="space-y-2">
+                <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.filterTags}</p>
+                <div class="flex flex-wrap gap-1.5">
+                  {#each knownSessionTags as tag (tag)}
+                    <button
+                      class={`rounded-full border px-2 py-1 text-[10px] font-semibold transition-all ${
+                        sessionFilter.tags.includes(tag)
+                          ? "border-amber-200 bg-amber-50 text-amber-700"
+                          : "border-gray-200 bg-gray-50 text-gray-500 hover:bg-white hover:text-gray-700"
+                      }`}
+                      onclick={() => toggleFilterTag(tag)}
+                      type="button"
+                    >
+                      {tag}
+                    </button>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+
+            <div class="space-y-2">
+              <div class="flex items-center justify-between gap-2">
+                <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.savedFilters}</p>
+                <button
+                  class="rounded-lg border border-gray-200 bg-gray-50 px-2 py-1 text-[10px] font-bold text-gray-600 transition-colors hover:bg-white hover:text-gray-800"
+                  onclick={onSaveCurrentFilter}
+                  type="button"
+                >
+                  {ui.saveCurrentFilter}
+                </button>
+              </div>
+
+              <div class="flex flex-wrap gap-1.5">
+                <button
+                  class={`rounded-full border px-2 py-1 text-[10px] font-semibold transition-all ${
+                    activeSavedSessionFilterId === null && !sessionFilter.pinnedOnly && !sessionFilter.runningOnly && !sessionFilter.queuedOnly && sessionFilter.highlight === "all" && sessionFilter.tags.length === 0
+                      ? "border-gray-900 bg-gray-900 text-white"
+                      : "border-gray-200 bg-gray-50 text-gray-500 hover:bg-white hover:text-gray-700"
+                  }`}
+                  onclick={() => onApplySavedFilter(null)}
+                  type="button"
+                >
+                  {ui.allActivity}
+                </button>
+                {#each savedSessionFilters as filter (filter.id)}
+                  <div class="inline-flex items-center gap-1 rounded-full border border-gray-200 bg-gray-50 pr-1">
+                    <button
+                      class={`rounded-full px-2 py-1 text-[10px] font-semibold transition-all ${
+                        activeSavedSessionFilterId === filter.id
+                          ? "bg-gray-900 text-white"
+                          : "text-gray-600 hover:bg-white hover:text-gray-800"
+                      }`}
+                      onclick={() => onApplySavedFilter(filter)}
+                      type="button"
+                    >
+                      {filter.name}
+                    </button>
+                    <button
+                      class="rounded-full p-1 text-gray-400 transition-colors hover:bg-white hover:text-gray-700"
+                      onclick={() => onDeleteSavedFilter(filter.id)}
+                      title={ui.close}
+                      type="button"
+                    >
+                      <X size={10} />
+                    </button>
+                  </div>
+                {/each}
+              </div>
+              {#if savedSessionFilters.length === 0}
+                <p class="text-[11px] text-gray-400">{ui.noSavedFilters}</p>
+              {/if}
+            </div>
           </div>
         </div>
       {/if}
@@ -824,9 +1024,16 @@
           >
             <div class="flex flex-col gap-1.5">
               <div class="flex items-start justify-between gap-2">
-                <span class="min-w-0 flex-1 truncate text-sm font-medium text-gray-900 transition-colors group-hover:text-amber-700">
-                  {displaySessionTitle(session)}
-                </span>
+                <div class="min-w-0 flex flex-1 items-center gap-1.5">
+                  {#if session.pinned}
+                    <span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-amber-50 text-amber-600">
+                      <Pin size={10} />
+                    </span>
+                  {/if}
+                  <span class="min-w-0 flex-1 truncate text-sm font-medium text-gray-900 transition-colors group-hover:text-amber-700">
+                    {displaySessionTitle(session)}
+                  </span>
+                </div>
                 <div class="flex shrink-0 flex-nowrap items-center gap-1.5 whitespace-nowrap">
                   {#if session.queueCount > 0}
                     <span class="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-slate-600">
@@ -847,6 +1054,21 @@
               <p class="text-xs text-gray-500 line-clamp-1 break-all">
                 {session.preview || ui.newCodexSession}
               </p>
+
+              {#if session.tags.length > 0}
+                <div class="flex flex-wrap gap-1">
+                  {#each session.tags.slice(0, 3) as tag (tag)}
+                    <span class="rounded-full border border-gray-200 bg-white px-1.5 py-0.5 text-[9px] font-semibold text-gray-500">
+                      {tag}
+                    </span>
+                  {/each}
+                  {#if session.tags.length > 3}
+                    <span class="rounded-full border border-gray-200 bg-white px-1.5 py-0.5 text-[9px] font-semibold text-gray-400">
+                      +{session.tags.length - 3}
+                    </span>
+                  {/if}
+                </div>
+              {/if}
               
               <div class="flex items-center justify-between gap-2 mt-1">
                 <span class="text-[10px] text-gray-400 font-medium tracking-tight">
@@ -859,6 +1081,18 @@
                 {/if}
               </div>
             </div>
+          </button>
+          <button
+            aria-label={session.pinned ? ui.unpinThread : ui.pinThread}
+            class="absolute right-9 top-2 z-10 rounded-lg border border-gray-200 bg-white/95 p-1.5 text-gray-400 opacity-0 shadow-sm transition-all pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 hover:border-amber-200 hover:bg-amber-50 hover:text-amber-700"
+            onclick={(event) => {
+              event.stopPropagation();
+              onTogglePin(session);
+            }}
+            title={session.pinned ? ui.unpinThread : ui.pinThread}
+            type="button"
+          >
+            <Pin size={14} />
           </button>
           <button
             aria-label={showArchived ? ui.restoreThread : ui.archiveThread}

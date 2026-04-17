@@ -29,6 +29,8 @@ export type SessionSummary = {
   preview: string;
   queueCount: number;
   highlight: SessionSummaryHighlight | null;
+  pinned: boolean;
+  tags: string[];
   cwd: string;
   archived: boolean;
   createdAt: number;
@@ -38,6 +40,19 @@ export type SessionSummary = {
   agentNickname: string | null;
   agentRole: string | null;
   preferences: SessionPreferences | null;
+};
+
+export type SessionSummaryFilter = {
+  pinnedOnly: boolean;
+  runningOnly: boolean;
+  queuedOnly: boolean;
+  highlight: "all" | "attention" | "completed";
+  tags: string[];
+};
+
+export type SavedSessionFilter = SessionSummaryFilter & {
+  id: string;
+  name: string;
 };
 
 export type SessionSummaryHighlight = {
@@ -203,6 +218,10 @@ export type AppConfigPayload = {
   notifications: {
     unreadCount: number;
     settings: NotificationSettings;
+  };
+  sessionOrganization: {
+    savedFilters: SavedSessionFilter[];
+    knownTags: string[];
   };
   account: {
     type: "apiKey" | "chatgpt" | null;

@@ -964,6 +964,7 @@ fn is_ws_method_allowed(role: UserRole, method: &str) -> bool {
             | "session/itemDetail/get"
             | "notifications/list"
             | "account/get"
+            | "arena/list"
             | "git/repositories/list"
             | "git/status"
             | "git/github/pulls"
@@ -1004,6 +1005,7 @@ fn should_audit_ws_method(method: &str) -> bool {
             | "session/itemDetail/get"
             | "notifications/list"
             | "account/get"
+            | "arena/list"
             | "git/repositories/list"
             | "git/status"
             | "git/github/pulls"
@@ -1703,6 +1705,15 @@ async fn execute_ws_method(
         }
         "account/logout" => {
             internal_json_request(state, Method::POST, "/api/account/logout", Some(json!({}))).await
+        }
+        "arena/list" => internal_json_request(state, Method::GET, "/api/arena", None).await,
+        "arena/start" => {
+            let payload = json!({
+                "prompt": require_string(&params, "prompt")?,
+                "contestants": params.get("contestants").cloned().unwrap_or_else(|| json!([])),
+                "preferences": params.get("preferences").cloned().unwrap_or_else(|| json!({}))
+            });
+            internal_json_request(state, Method::POST, "/api/arena", Some(payload)).await
         }
         "git/repositories/list" => {
             internal_json_request(state, Method::GET, "/api/git/repositories", None).await

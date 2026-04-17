@@ -1,4 +1,5 @@
 import { base } from "$app/paths";
+import type { ArenaListPayload, ArenaRun } from "$lib/arena-types";
 
 import type {
   AutomationDefinition,
@@ -111,6 +112,25 @@ export const api = {
 
   onConnectionState(listener: (state: WsConnectionState) => void) {
     return ws.onConnectionState(listener);
+  },
+
+  listArenaRuns() {
+    return ws.request<ArenaListPayload>("arena/list");
+  },
+
+  startArenaRun(
+    prompt: string,
+    contestants: Array<{
+      model: string;
+      label: string;
+    }>,
+    preferences: Partial<SessionPreferences>
+  ) {
+    return ws.request<ArenaRun>("arena/start", {
+      prompt,
+      contestants,
+      preferences
+    });
   },
 
   subscribeGlobal(listener: (event: GlobalStreamEvent) => void) {

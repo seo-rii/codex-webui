@@ -44,6 +44,7 @@
   import { extractAttachmentPaths, stripAttachmentPreamble } from "$lib/attachments";
   import { api } from "$lib/api";
   import { applyStreamEvent, createConversationState, type ConversationState } from "$lib/chat-state";
+  import ArenaWorkspace from "$lib/components/ArenaWorkspace.svelte";
   import GitWorkspace from "$lib/components/GitWorkspace.svelte";
   import MarkdownMessage from "$lib/components/MarkdownMessage.svelte";
   import MonacoDiffEditor from "$lib/components/MonacoDiffEditor.svelte";
@@ -7073,8 +7074,29 @@
         <div class="h-full overflow-y-auto bg-gray-50/30 p-8">
           <div class="max-w-4xl mx-auto space-y-8">
             <div class="flex items-end justify-between border-b border-gray-200 pb-6"><div><h2 class="text-2xl font-bold text-gray-900">{ui.taskCenter}</h2><p class="text-sm text-gray-500 mt-1">{ui.subagentActivities}</p></div><div class="px-3 py-1 bg-white border border-gray-200 rounded-lg text-xs font-bold text-gray-500 uppercase tracking-widest shadow-sm">{subagentTasks.length} {ui.tasks}</div></div>
-            {#if subagentTasks.length === 0}<div class="py-24 text-center"><div class="w-16 h-16 bg-gray-100 rounded-3xl flex items-center justify-center mx-auto mb-4 text-gray-300"><History size={32} /></div><p class="text-gray-500">{ui.noActiveTasks}</p></div>
-            {:else}<div class="grid grid-cols-1 gap-4">{#each subagentTasks as task (task.key)}<div class="bg-white border border-gray-200 rounded-2xl p-5 shadow-sm hover:shadow-md transition-all group flex items-start justify-between gap-4"><div class="flex items-center gap-4"><div class="w-10 h-10 bg-amber-50 text-amber-600 rounded-xl flex items-center justify-center shadow-inner"><Bot size={20} /></div><div><h4 class="font-bold text-gray-900">{task.tool}</h4><p class="text-[10px] font-bold text-amber-600 uppercase tracking-widest mt-0.5">{task.status}</p></div></div>{#if task.primaryThreadId}<button class="px-4 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-700 hover:bg-gray-50 transition-all shadow-sm" onclick={() => void openSubagentThread(task.primaryThreadId ?? "")}>{ui.openThread}</button>{/if}</div>{/each}</div>{/if}
+            <ArenaWorkspace
+              currentPreferences={conversation?.preferences ?? config?.defaults ?? null}
+              models={config?.models ?? []}
+              readOnly={readOnlyRole}
+              onOpenSession={async (sessionId) => {
+                activeWorkspaceTabId = "chat";
+                await selectSession(sessionId);
+              }}
+              onUseResponse={async (contestant) => {
+                activeWorkspaceTabId = "chat";
+                draft = contestant.response ?? "";
+                await tick();
+                composerTextareaElement?.focus();
+              }}
+            />
+            <section class="space-y-4">
+              <div class="flex items-center justify-between">
+                <h3 class="text-sm font-bold uppercase tracking-[0.22em] text-gray-500">{ui.subagentActivities}</h3>
+                <span class="rounded-full border border-gray-200 bg-white px-3 py-1 text-[11px] font-bold uppercase tracking-[0.18em] text-gray-400 shadow-sm">{subagentTasks.length}</span>
+              </div>
+              {#if subagentTasks.length === 0}<div class="py-16 text-center"><div class="w-14 h-14 bg-gray-100 rounded-3xl flex items-center justify-center mx-auto mb-4 text-gray-300"><History size={28} /></div><p class="text-gray-500">{ui.noActiveTasks}</p></div>
+              {:else}<div class="grid grid-cols-1 gap-4">{#each subagentTasks as task (task.key)}<div class="bg-white border border-gray-200 rounded-2xl p-5 shadow-sm hover:shadow-md transition-all group flex items-start justify-between gap-4"><div class="flex items-center gap-4"><div class="w-10 h-10 bg-amber-50 text-amber-600 rounded-xl flex items-center justify-center shadow-inner"><Bot size={20} /></div><div><h4 class="font-bold text-gray-900">{task.tool}</h4><p class="text-[10px] font-bold text-amber-600 uppercase tracking-widest mt-0.5">{task.status}</p></div></div>{#if task.primaryThreadId}<button class="px-4 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-700 hover:bg-gray-50 transition-all shadow-sm" onclick={() => void openSubagentThread(task.primaryThreadId ?? "")}>{ui.openThread}</button>{/if}</div>{/each}</div>{/if}
+            </section>
           </div>
         </div>
       {:else if activeWorkspaceTabId === "settings"}

@@ -4,6 +4,7 @@ import { createReadStream } from "node:fs";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
+import type { ArenaContestant, ArenaListPayload, ArenaRun } from "$lib/arena-types";
 import type {
   AutomationDefinition,
   AutomationRun,
@@ -43,6 +44,7 @@ import { stripAttachmentPreamble } from "$lib/attachments";
 import { createAppError, parseAppError } from "$lib/errors";
 
 import { listAttachments } from "./attachments";
+import { arenaStore } from "./arena-store";
 import { AppServerClient } from "./app-server/client";
 import { configTomlPath, syncCodexTomlWithPreferences } from "./codex-config";
 import { getCurrentRuntimeProfile, getRuntimeConfig, getRuntimeProfile, type RuntimeProfileConfig } from "./env";
@@ -519,6 +521,27 @@ function applySessionMeta(summary: SessionSummary, meta: { pinned: boolean; tags
     pinned: Boolean(meta?.pinned),
     tags: Array.isArray(meta?.tags) ? [...meta.tags] : []
   } satisfies SessionSummary;
+}
+
+function buildArenaThreadName(prompt: string, label: string) {
+  const title = inferSessionDisplayTitle(prompt) ?? "Arena run";
+  return `Arena · ${title} · ${label}`.slice(0, 120);
+}
+
+function extractArenaResponse(turns: CodexTurn[]) {
+  for (const turn of [...turns].reverse()) {
+    for (const item of [...turn.items].reverse()) {
+      if (item.type !== "agentMessage") {
+        continue;
+      }
+      const text = asText(item.text)?.trim();
+      if (text) {
+        return text;
+      }
+    }
+  }
+
+  return null;
 }
 
 function matchesSessionFilter(session: SessionSummary, filter: SessionSummaryFilter | null) {
@@ -1050,6 +1073,152 @@ export class CodexGateway {
     }
   }
 
+  async listArenaRuns(): Promise<ArenaListPayload> {
+    const runs = await arenaStore.getRuns();
+    const hydratedRuns = await Promise.all(
+      runs.map(async (run) => {
+        let changed = false;
+        const contestants = await Promise.all(
+          run.contestants.map(async (contestant) => {
+            try {
+              const thread = await this.readThread(contestant.sessionId, false);
+              const status = String(normalizeThreadStatus(asRecord(thread).status) ?? contestant.status ?? "unknown");
+              let response = contestant.response;
+              if (!response && !isLiveThreadStatus(status)) {
+                const hydration = await this.ensureSessionHistory(contestant.sessionId, thread);
+                response = extractArenaResponse(hydration.turns);
+              }
+              const updatedAt = Math.max(contestant.updatedAt, Number(asRecord(thread).updatedAt ?? 0), Date.now());
+              if (status !== contestant.status || response !== contestant.response || updatedAt !== contestant.updatedAt) {
+                changed = true;
+              }
+              return {
+                ...contestant,
+                status,
+                response,
+                updatedAt
+              } satisfies ArenaContestant;
+            } catch {
+              return contestant;
+            }
+          })
+        );
+        const status = contestants.some((contestant) => isLiveThreadStatus(contestant.status)) ? "running" : "completed";
+        const updatedRun = {
+          ...run,
+          contestants,
+          status,
+          updatedAt: Math.max(run.updatedAt, ...contestants.map((contestant) => contestant.updatedAt))
+        } satisfies ArenaRun;
+        if (changed || updatedRun.status !== run.status || updatedRun.updatedAt !== run.updatedAt) {
+          await arenaStore.updateRun(run.id, () => updatedRun);
+        }
+        return updatedRun;
+      })
+    );
+
+    return {
+      runs: hydratedRuns.sort((left, right) => right.updatedAt - left.updatedAt)
+    };
+  }
+
+  async startArenaRun(
+    prompt: string,
+    contestants: Array<{
+      model?: string;
+      label?: string;
+    }>,
+    preferences: Partial<SessionPreferences>
+  ) {
+    const trimmedPrompt = prompt.trim();
+    if (!trimmedPrompt) {
+      throw new Error("Prompt is required.");
+    }
+
+    const normalizedContestants = contestants
+      .map((contestant) => ({
+        model: contestant.model?.trim() ?? "",
+        label: contestant.label?.trim() ?? contestant.model?.trim() ?? ""
+      }))
+      .filter((contestant) => contestant.model.length > 0 && contestant.label.length > 0)
+      .filter((contestant, index, collection) => collection.findIndex((entry) => entry.model === contestant.model) === index)
+      .slice(0, 4);
+
+    if (normalizedContestants.length < 2) {
+      throw new Error("Choose at least two models for an arena run.");
+    }
+
+    const nextPreferences = await this.preparePreferences(preferences);
+    const createdAt = Date.now();
+    const arenaContestants: ArenaContestant[] = [];
+
+    for (const contestant of normalizedContestants) {
+      const session = await this.createSession(
+        {
+          ...nextPreferences,
+          model: contestant.model
+        },
+        buildArenaThreadName(trimmedPrompt, contestant.label),
+        { hiddenFromSidebar: true }
+      );
+      arenaContestants.push({
+        id: randomUUID(),
+        sessionId: session.id,
+        model: contestant.model,
+        label: contestant.label,
+        status: "running",
+        response: null,
+        createdAt,
+        updatedAt: createdAt
+      });
+    }
+
+    const run = {
+      id: randomUUID(),
+      prompt: trimmedPrompt,
+      cwd: nextPreferences.cwd,
+      status: "running",
+      createdAt,
+      updatedAt: createdAt,
+      contestants: arenaContestants
+    } satisfies ArenaRun;
+    await arenaStore.saveRun(run);
+
+    await Promise.all(
+      arenaContestants.map(async (contestant) => {
+        try {
+          await this.sendMessage(contestant.sessionId, trimmedPrompt, [], {
+            ...nextPreferences,
+            model: contestant.model
+          });
+        } catch (error) {
+          await arenaStore.updateRun(run.id, (current) => {
+            if (!current) {
+              return current;
+            }
+
+            return {
+              ...current,
+              updatedAt: Date.now(),
+              contestants: current.contestants.map((entry) =>
+                entry.id === contestant.id
+                  ? {
+                      ...entry,
+                      status: "failed",
+                      response: error instanceof Error ? error.message : "Arena run failed.",
+                      updatedAt: Date.now()
+                    }
+                  : entry
+              )
+            };
+          });
+        }
+      })
+    );
+
+    return (await this.listArenaRuns()).runs.find((entry) => entry.id === run.id) ?? run;
+  }
+
   async listSessions(
     archived = false,
     cursor: string | null = null,
@@ -1057,13 +1226,14 @@ export class CodexGateway {
     filter: SessionSummaryFilter | null = null
   ): Promise<SessionListPayload> {
     if (!archived) {
-      const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions] = await Promise.all([
+      const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions, hiddenSessionIds] = await Promise.all([
         uiStateStore.getAll(),
         uiStateStore.getAllSessionMeta(),
         uiStateStore.getQueueCounts(),
         uiStateStore.getSessionHighlights(),
         sessionIndexClient.page(this.profile.codexHome, cursor, limit, null),
-        this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>())
+        this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>()),
+        arenaStore.getHiddenSessionIds()
       ]);
 
       return {
@@ -1077,16 +1247,19 @@ export class CodexGateway {
           limit,
           null,
           cursor === null || cursor === "0"
-        ).filter((session) => matchesSessionFilter(session, filter)),
+        )
+          .filter((session) => !hiddenSessionIds.has(session.id))
+          .filter((session) => matchesSessionFilter(session, filter)),
         nextCursor: indexedPage.nextCursor
       };
     }
 
     const response = asRecord(await this.client.request("thread/list", { limit, archived, cursor }));
-    const [preferences, sessionMetaByThreadId, highlightsByThreadId] = await Promise.all([
+    const [preferences, sessionMetaByThreadId, highlightsByThreadId, hiddenSessionIds] = await Promise.all([
       uiStateStore.getAll(),
       uiStateStore.getAllSessionMeta(),
-      uiStateStore.getSessionHighlights()
+      uiStateStore.getSessionHighlights(),
+      arenaStore.getHiddenSessionIds()
     ]);
     const threads = (response.data as Array<Record<string, unknown>> | undefined) ?? [];
     return {
@@ -1101,6 +1274,7 @@ export class CodexGateway {
           );
         })
         .filter((session) => !isSubagentSessionSummary(session))
+        .filter((session) => !hiddenSessionIds.has(session.id))
         .filter((session) => matchesSessionFilter(session, filter))
         .sort(compareSessionSummaries),
       nextCursor: typeof response.nextCursor === "string" && response.nextCursor.trim() ? String(response.nextCursor) : null
@@ -1121,13 +1295,14 @@ export class CodexGateway {
     }
 
     if (!archived && scope === "summary") {
-      const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions] = await Promise.all([
+      const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions, hiddenSessionIds] = await Promise.all([
         uiStateStore.getAll(),
         uiStateStore.getAllSessionMeta(),
         uiStateStore.getQueueCounts(),
         uiStateStore.getSessionHighlights(),
         sessionIndexClient.page(this.profile.codexHome, cursor, limit, needle),
-        this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>())
+        this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>()),
+        arenaStore.getHiddenSessionIds()
       ]);
 
       return {
@@ -1142,7 +1317,9 @@ export class CodexGateway {
           (session) => `${session.name ?? ""}
 ${session.preview ?? ""}`.toLowerCase().includes(needle),
           cursor === null || cursor === "0"
-        ).filter((session) => matchesSessionFilter(session, filter)),
+        )
+          .filter((session) => !hiddenSessionIds.has(session.id))
+          .filter((session) => matchesSessionFilter(session, filter)),
         nextCursor: indexedPage.nextCursor
       };
     }
@@ -1180,22 +1357,31 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   private async collectListableSessions(archived: boolean, filter: SessionSummaryFilter | null = null): Promise<SessionSummary[]> {
-    const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId] = await Promise.all([
+    const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, hiddenSessionIds] = await Promise.all([
       uiStateStore.getAll(),
       uiStateStore.getAllSessionMeta(),
       uiStateStore.getQueueCounts(),
-      uiStateStore.getSessionHighlights()
+      uiStateStore.getSessionHighlights(),
+      arenaStore.getHiddenSessionIds()
     ]);
     if (archived) {
-      return this.listAllThreadSessions(true, preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, filter);
+      return this.listAllThreadSessions(true, preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, hiddenSessionIds, filter);
     }
 
     const indexedSessions = (await sessionIndexClient.list(this.profile.codexHome).catch(() => [])).filter(
       (session) => !session.isSubagent
     );
-    const liveThreads = await this.listAllThreadSessions(false, preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, filter);
+    const liveThreads = await this.listAllThreadSessions(
+      false,
+      preferences,
+      sessionMetaByThreadId,
+      queueCounts,
+      highlightsByThreadId,
+      hiddenSessionIds,
+      filter
+    );
     const liveById = new Map(liveThreads.map((session) => [session.id, session]));
-    const mergedSessions = indexedSessions.map((session) => {
+    const mergedSessions = indexedSessions.filter((session) => !hiddenSessionIds.has(session.id)).map((session) => {
       const live = liveById.get(session.id);
       if (live) {
         return {
@@ -1239,7 +1425,10 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     const dedupedSessions = mergedSessions.filter(
       (session, index, collection) => collection.findIndex((candidate) => candidate.id === session.id) === index
     );
-    const visibleSessions = dedupedSessions.filter((session) => !isSubagentSessionSummary(session)).filter((session) => matchesSessionFilter(session, filter));
+    const visibleSessions = dedupedSessions
+      .filter((session) => !hiddenSessionIds.has(session.id))
+      .filter((session) => !isSubagentSessionSummary(session))
+      .filter((session) => matchesSessionFilter(session, filter));
     visibleSessions.sort(compareSessionSummaries);
     return visibleSessions;
   }
@@ -1250,6 +1439,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     sessionMetaByThreadId: Record<string, { pinned: boolean; tags: string[] }>,
     queueCounts: Record<string, number>,
     highlightsByThreadId: Record<string, SessionSummaryHighlight>,
+    hiddenSessionIds: Set<string>,
     filter: SessionSummaryFilter | null = null
   ): Promise<SessionSummary[]> {
     const sessions: SessionSummary[] = [];
@@ -1276,6 +1466,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
             );
           })
           .filter((session) => !isSubagentSessionSummary(session))
+          .filter((session) => !hiddenSessionIds.has(session.id))
           .filter((session) => matchesSessionFilter(session, filter))
       );
       cursor = typeof response.nextCursor === "string" && response.nextCursor.trim() ? String(response.nextCursor) : null;
@@ -1295,11 +1486,12 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     }
 
     this.recentLiveSessionsPromise = (async () => {
-      const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId] = await Promise.all([
+      const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, hiddenSessionIds] = await Promise.all([
         uiStateStore.getAll(),
         uiStateStore.getAllSessionMeta(),
         uiStateStore.getQueueCounts(),
-        uiStateStore.getSessionHighlights()
+        uiStateStore.getSessionHighlights(),
+        arenaStore.getHiddenSessionIds()
       ]);
       const response = asRecord(
         await this.client.request("thread/list", { limit: RECENT_LIVE_THREAD_WINDOW_SIZE, archived: false, cursor: null })
@@ -1323,6 +1515,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
             );
             return [threadId, summary] as const;
           })
+          .filter(([threadId]) => !hiddenSessionIds.has(threadId))
       );
       this.recentLiveSessions = nextRecentLiveSessions;
       this.recentLiveSessionsLoadedAt = Date.now();
@@ -1422,7 +1615,13 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     return this.client.request("account/logout", {});
   }
 
-  async createSession(preferences: Partial<SessionPreferences>, name: string | null) {
+  async createSession(
+    preferences: Partial<SessionPreferences>,
+    name: string | null,
+    options: {
+      hiddenFromSidebar?: boolean;
+    } = {}
+  ) {
     const nextPreferences = await this.preparePreferences(preferences);
     const response = asRecord(
       await this.client.request("thread/start", {
@@ -1446,15 +1645,17 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
 
     const summary = applySessionMeta(toSummary(thread, nextPreferences), await uiStateStore.getSessionMeta(String(thread.id)));
     sessionIndexClient.invalidate();
-    this.recentLiveSessions.set(String(thread.id), summary);
-    this.recentLiveSessionsLoadedAt = Date.now();
-    this.emitGlobal({
-      kind: "notification",
-      method: "codex-webui/sessionSummaryUpdated",
-      params: {
-        session: summary
-      }
-    });
+    if (!options.hiddenFromSidebar) {
+      this.recentLiveSessions.set(String(thread.id), summary);
+      this.recentLiveSessionsLoadedAt = Date.now();
+      this.emitGlobal({
+        kind: "notification",
+        method: "codex-webui/sessionSummaryUpdated",
+        params: {
+          session: summary
+        }
+      });
+    }
     return summary;
   }
 
@@ -3686,6 +3887,10 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
           activityAt ?? 0
         )
       } satisfies SessionSummary, await uiStateStore.getSessionMeta(threadId));
+      if ((await arenaStore.getHiddenSessionIds()).has(threadId)) {
+        this.recentLiveSessions.delete(threadId);
+        return;
+      }
       if (isSubagentSessionSummary(summary)) {
         return;
       }

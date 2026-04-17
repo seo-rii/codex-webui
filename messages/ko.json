@@ -387,5 +387,8 @@
   "automation_deleted": "자동화를 삭제했습니다.",
   "automation_started": "자동화를 시작했습니다.",
   "handoff_to_new_thread": "새 스레드로 핸드오프",
-  "opened_handoff_thread": "현재 컨텍스트로 새 핸드오프 스레드를 열었습니다."
+  "opened_handoff_thread": "현재 컨텍스트로 새 핸드오프 스레드를 열었습니다.",
+  "attach_terminal_context": "채팅에 터미널 첨부",
+  "terminal_context_requires_thread": "터미널 컨텍스트를 붙일 스레드를 먼저 선택하세요.",
+  "terminal_context_attached": "{name}을(를) 현재 스레드에 첨부했습니다."
 }

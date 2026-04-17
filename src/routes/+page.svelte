@@ -85,6 +85,7 @@
     SessionSummaryFilter,
     SessionSummary,
     StreamEvent,
+    TerminalContextPayload,
     TerminalSummary,
     UserRole,
     WsConnectionState
@@ -4136,6 +4137,26 @@
     }
   }
 
+  function attachTerminalContext(payload: TerminalContextPayload) {
+    const nextAttachments = payload.attachments.filter(
+      (attachment) => !draftAttachments.some((existingAttachment) => existingAttachment.id === attachment.id)
+    );
+    if (nextAttachments.length === 0) {
+      return;
+    }
+
+    draftAttachments = [...draftAttachments, ...nextAttachments];
+    if (conversation && selectedSessionId === conversation.thread.id) {
+      conversation = {
+        ...conversation,
+        attachments: [...nextAttachments, ...conversation.attachments.filter((attachment) => !nextAttachments.some((nextAttachment) => nextAttachment.id === attachment.id))]
+      };
+    }
+
+    activeWorkspaceTabId = "chat";
+    noticeText = m.terminal_context_attached({ name: nextAttachments[0].originalName });
+  }
+
   function extractLocalFilePath(href: string) {
     const cleanHref = href.split("#")[0]?.split("?")[0] ?? href;
     const lineMatch = cleanHref.match(/^(\/.*?)(?::\d+)?$/u);
@@ -7113,7 +7134,14 @@
       {:else if activeCodeDiffTab}
         <div class="h-full overflow-y-auto bg-gray-50/30 p-8"><div class="max-w-5xl mx-auto space-y-8"><div class="flex items-end justify-between"><div><h2 class="text-2xl font-bold text-gray-900">{activeCodeDiffTab.title}</h2><p class="text-sm text-gray-500 mt-1">{m.files_count({ count: String(activeCodeDiffTab.views.length) })}</p></div><button class="p-2 text-gray-400 hover:text-red-600 rounded-xl transition-all" onclick={() => closeCodeDiffTab(activeCodeDiffTab.id)}><X size={20} /></button></div><div class="space-y-6">{#each activeCodeDiffTab.views as change}<div class="bg-white border border-gray-200 rounded-2xl overflow-hidden shadow-sm"><div class="px-5 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between"><div class="flex items-center gap-3"><span class="text-sm font-bold text-gray-900">{change.path}</span><span class="px-2 py-0.5 bg-amber-100 text-[10px] font-bold text-amber-700 rounded uppercase tracking-widest">{change.kind}</span></div></div><div class="p-0">{#if change.renderable}<MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-6 text-xs font-mono text-gray-600 bg-gray-50/50 overflow-x-auto">{change.diff}</pre>{/if}</div></div>{/each}</div></div></div>
       {:else}
-        <TerminalWorkspace terminalId={activeWorkspaceTabId.replace(/^terminal:/u, "")} />
+        <TerminalWorkspace
+          terminalId={activeWorkspaceTabId.replace(/^terminal:/u, "")}
+          selectedSessionId={selectedSessionId}
+          readOnly={readOnlyRole}
+          onAttachContext={(payload) => {
+            attachTerminalContext(payload);
+          }}
+        />
       {/if}
     </div>
   </main>

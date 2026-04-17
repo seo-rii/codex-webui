@@ -1,18 +1,30 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { Paperclip } from "lucide-svelte";
 
   import { api } from "$lib/api";
   import { localeSignal } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
   import { getResolvedTheme, subscribeThemeChange } from "$lib/theme";
-  import type { TerminalSummary } from "$lib/types";
+  import type { TerminalContextPayload, TerminalSummary } from "$lib/types";
 
-  let { terminalId }: { terminalId: string } = $props();
+  let {
+    terminalId,
+    selectedSessionId = null,
+    readOnly = false,
+    onAttachContext = null
+  }: {
+    terminalId: string;
+    selectedSessionId?: string | null;
+    readOnly?: boolean;
+    onAttachContext?: ((payload: TerminalContextPayload) => void | Promise<void>) | null;
+  } = $props();
 
   let container = $state<HTMLDivElement | null>(null);
   let errorText = $state("");
   let summary = $state<TerminalSummary | null>(null);
   let loading = $state(true);
+  let attachingContext = $state(false);
   let ctrlModifierArmed = $state(false);
   let terminalInputSender: ((data: string) => void) | null = null;
   let focusTerminalViewport: (() => void) | null = null;
@@ -45,9 +57,28 @@
       failedSendInput: m.failed_to_send_terminal_input(),
       failedInitialize: m.failed_to_initialize_terminal(),
       connecting: m.connecting_to_terminal(),
-      loading: m.status_loading()
+      loading: m.status_loading(),
+      attachContext: m.attach_terminal_context(),
+      attachRequiresThread: m.terminal_context_requires_thread()
     };
   });
+
+  async function attachTerminalContext() {
+    if (!selectedSessionId || readOnly || attachingContext) {
+      return;
+    }
+
+    attachingContext = true;
+    errorText = "";
+    try {
+      const payload = await api.attachTerminalContext(selectedSessionId, terminalId);
+      await onAttachContext?.(payload);
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedInitialize;
+    } finally {
+      attachingContext = false;
+    }
+  }
 
   function handleMobileTerminalKey(value: string) {
     if (value === "__ctrl__") {
@@ -229,14 +260,26 @@
       <p class="eyebrow">{ui.terminal}</p>
       <h2>{summary?.title ?? ui.terminal}</h2>
     </div>
-    <div class="terminal-shell__meta">
-      <span class="meta-pill">{summary?.status ?? ui.loading}</span>
-      {#if summary?.exitCode !== null && summary?.exitCode !== undefined}
-        <span class="meta-pill subtle">{m.exit_code({ code: String(summary.exitCode) })}</span>
-      {/if}
-      {#if summary?.cwd}
-        <span class="meta-pill subtle">{summary.cwd}</span>
-      {/if}
+    <div class="terminal-shell__header-actions">
+      <button
+        class="terminal-shell__attach-button"
+        disabled={readOnly || !selectedSessionId || loading || attachingContext}
+        onclick={() => void attachTerminalContext()}
+        title={!selectedSessionId ? ui.attachRequiresThread : ui.attachContext}
+        type="button"
+      >
+        <Paperclip size={14} />
+        <span>{attachingContext ? ui.loading : ui.attachContext}</span>
+      </button>
+      <div class="terminal-shell__meta">
+        <span class="meta-pill">{summary?.status ?? ui.loading}</span>
+        {#if summary?.exitCode !== null && summary?.exitCode !== undefined}
+          <span class="meta-pill subtle">{m.exit_code({ code: String(summary.exitCode) })}</span>
+        {/if}
+        {#if summary?.cwd}
+          <span class="meta-pill subtle">{summary.cwd}</span>
+        {/if}
+      </div>
     </div>
   </div>
 
@@ -284,6 +327,7 @@
   }
 
   .terminal-shell__header,
+  .terminal-shell__header-actions,
   .terminal-shell__meta {
     display: flex;
     gap: 0.75rem;
@@ -295,6 +339,11 @@
     align-items: flex-start;
   }
 
+  .terminal-shell__header-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
   .terminal-shell__header h2 {
     margin: 0.15rem 0 0;
     color: var(--ink-strong);
@@ -304,6 +353,39 @@
   .terminal-shell__meta {
     flex-wrap: wrap;
     justify-content: flex-end;
+  }
+
+  .terminal-shell__attach-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--panel-soft) 82%, transparent);
+    color: var(--ink);
+    padding: 0.55rem 0.95rem;
+    font: 700 0.82rem/1 var(--font-ui);
+    transition:
+      background-color 140ms ease,
+      border-color 140ms ease,
+      color 140ms ease,
+      transform 140ms ease,
+      opacity 140ms ease;
+  }
+
+  .terminal-shell__attach-button:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  .terminal-shell__attach-button:not(:disabled):hover {
+    border-color: color-mix(in srgb, var(--accent, #d85e2a) 44%, var(--line));
+    background: color-mix(in srgb, var(--accent, #d85e2a) 10%, var(--panel-strong));
+    color: var(--ink-strong);
+  }
+
+  .terminal-shell__attach-button:not(:disabled):active {
+    transform: scale(0.99);
   }
 
   .terminal-shell__body {
@@ -351,6 +433,7 @@
       flex-direction: column;
     }
 
+    .terminal-shell__header-actions,
     .terminal-shell__meta {
       justify-content: flex-start;
     }

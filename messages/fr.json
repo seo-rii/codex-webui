@@ -387,5 +387,8 @@
   "automation_deleted": "Automation deleted.",
   "automation_started": "Automation started.",
   "handoff_to_new_thread": "Handoff to a new thread",
-  "opened_handoff_thread": "Opened a new handoff thread with the current context."
+  "opened_handoff_thread": "Opened a new handoff thread with the current context.",
+  "attach_terminal_context": "Attach terminal to chat",
+  "terminal_context_requires_thread": "Select a thread before attaching terminal context.",
+  "terminal_context_attached": "Attached {name} to the current thread."
 }

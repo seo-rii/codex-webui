@@ -1845,6 +1845,88 @@ async fn execute_ws_method(
             let terminal_id = require_string(&params, "terminalId")?;
             read_terminal(state, &terminal_id).await
         }
+        "terminal/context/attach" => {
+            let session_id = require_string(&params, "sessionId")?;
+            let terminal_id = require_string(&params, "terminalId")?;
+            let max_bytes = params
+                .get("maxBytes")
+                .and_then(Value::as_u64)
+                .map(|value| value.clamp(2_048, 128_000) as usize)
+                .unwrap_or(24_000);
+            let session = get_terminal_session(state, &terminal_id).await?;
+            let (summary, snapshot) = session.snapshot().await;
+
+            let mut cleaned = String::with_capacity(snapshot.len());
+            let mut chars = snapshot.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch == '\u{1b}' {
+                    if matches!(chars.peek(), Some('[' | ']' | '(' | ')' | '#' | 'P' | '_' | '^')) {
+                        while let Some(next) = chars.next() {
+                            if ('@'..='~').contains(&next) {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if ch != '\r' {
+                    cleaned.push(ch);
+                }
+            }
+
+            let trimmed = cleaned.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("terminal has no output to attach yet.");
+            }
+
+            let excerpt = if trimmed.len() > max_bytes {
+                let start = trimmed
+                    .char_indices()
+                    .nth(trimmed.chars().count().saturating_sub(max_bytes))
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                trimmed[start..].to_string()
+            } else {
+                trimmed.to_string()
+            };
+
+            let terminal_slug = {
+                let value = sanitize_profile_id(&summary.title);
+                if value.is_empty() {
+                    sanitize_profile_id(&terminal_id)
+                } else {
+                    value
+                }
+            };
+            let captured_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let content = format!(
+                "# Terminal context\n\nTerminal: {}\nWorking directory: {}\nStatus: {}{}\nCaptured at: {}\n\n```text\n{}\n```\n",
+                summary.title,
+                summary.cwd,
+                summary.status,
+                summary
+                    .exit_code
+                    .map(|exit_code| format!(" (exit {})", exit_code))
+                    .unwrap_or_default(),
+                captured_at,
+                excerpt
+            );
+            let upload = UploadFilePayload {
+                name: format!("terminal-{}-{}.md", terminal_slug, captured_at),
+                mime_type: Some("text/markdown".to_string()),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(content.as_bytes()),
+            };
+            let uploaded = upload_attachments(state, &session_id, vec![upload]).await?;
+            Ok(json!({
+                "terminal": summary,
+                "attachments": uploaded.get("attachments").cloned().unwrap_or_else(|| json!([])),
+                "excerpt": excerpt
+            }))
+        }
         "terminal/input" => {
             let terminal_id = require_string(&params, "terminalId")?;
             let data = require_string(&params, "data")?;

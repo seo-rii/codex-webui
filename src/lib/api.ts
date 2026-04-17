@@ -34,6 +34,7 @@ import type {
   SessionSummaryFilter,
   SessionSummary,
   TerminalEvent,
+  TerminalContextPayload,
   TerminalListPayload,
   TerminalSnapshotPayload,
   SessionTurnPayload,
@@ -516,6 +517,14 @@ export const api = {
 
   readTerminal(terminalId: string) {
     return ws.request<TerminalSnapshotPayload>("terminal/read", { terminalId });
+  },
+
+  attachTerminalContext(sessionId: string, terminalId: string, maxBytes = 24_000) {
+    return ws.request<TerminalContextPayload>("terminal/context/attach", {
+      sessionId,
+      terminalId,
+      maxBytes
+    });
   },
 
   sendTerminalInput(terminalId: string, data: string) {

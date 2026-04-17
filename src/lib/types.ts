@@ -441,6 +441,12 @@ export type TerminalSnapshotPayload = {
   snapshot: string;
 };
 
+export type TerminalContextPayload = {
+  terminal: TerminalSummary;
+  attachments: AttachmentRecord[];
+  excerpt: string;
+};
+
 export type TerminalEvent =
   | {
       kind: "notification";

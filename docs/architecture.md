@@ -20,6 +20,7 @@ The browser renders a single workspace page and keeps very little authoritative 
 - credentialed HTTP is used for password login/logout and multipart attachment upload
 - WebSocket RPC is used for session activity, chat, queue operations, Git, terminals, account flows, and runtime actions
 - the UI is optimistic where it helps responsiveness, but server state remains authoritative
+- saved-draft restore is intentionally subordinate to active local composer input, so hydration does not overwrite text the user typed while the session was still loading
 
 ### Rust gateway
 
@@ -162,6 +163,14 @@ Queue state is also part of the global shutdown-after-completion story:
 - if new work appears, the pending shutdown is cancelled and the updated state is broadcast to all clients
 - because the schedule lives on disk and in the Rust/Node backend, it can still fire with zero connected browsers
 
+Queue mutations also use structured application errors for expected conflicts such as:
+
+- empty queued messages
+- queue items that have already been removed or dispatched
+- dispatch attempts while another queued item is already being sent
+
+Those errors are emitted from the backend as stable codes and translated into localized browser copy at the UI layer.
+
 ## Terminal Model
 
 The Rust gateway owns terminal processes.
@@ -204,3 +213,15 @@ The trust boundary is narrow:
 - cross-origin browser access must be explicitly allowed
 
 The model is designed to reduce accidental exposure, not to make an untrusted multi-tenant Codex host safe by default.
+
+## UI Error Contract
+
+For expected user-facing failures, the backend avoids leaking raw timing-dependent strings as the primary UX contract.
+
+Instead:
+
+- route handlers and gateway logic emit stable application error codes
+- the browser parses those codes
+- Paraglide message catalogs provide localized copy for each known case
+
+This keeps common race conditions, queue conflicts, and archive state mismatches understandable across locales without forcing the frontend to pattern-match arbitrary exception text.

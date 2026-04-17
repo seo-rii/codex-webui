@@ -27,10 +27,12 @@ The goal is not to replace upstream surfaces. The goal is to make Codex usable f
 - Password-protected browser access with signed HTTP-only cookies
 - Reconnect-safe WebSocket control plane for chat, sessions, Git, terminals, runtime actions, and account flows
 - Session queue, explicit steer flow, persisted queued follow-ups, and resume prompts after restart
+- Composer history recall with keyboard navigation, a quick "reuse last message" chip, and one-click resend/queue for the most recent prompt
 - Attachments, Monaco-backed diff/file editing, aggregated live diff, live plan, and subagent activity views
-- Git repository discovery, status, diff, commit inspection, branch checkout, and worktree management
+- Git repository discovery, status, diff, commit inspection, branch checkout, worktree management, and a mobile-friendly Git workspace layout
 - Terminal tabs that survive page reloads as long as the server process stays up
 - Runtime install/update checks, quota display, plugin/skill catalog visibility, and `config.toml` editing
+- Structured backend error codes mapped to localized UI messages for common queue, steer, and archive timing failures
 - Global "shutdown after queue completes" control that is synchronized across clients and still executes with no browser attached
 - Base-path deployment, configurable CORS, dark/light themes, and Paraglide-based i18n
 
@@ -172,6 +174,7 @@ Meaning of the main fields:
 - The Settings workspace can edit `config.toml` directly.
 - Changing session or composer preferences syncs the relevant defaults back into `config.toml`.
 - Existing sessions keep their own persisted preferences; changing defaults mainly affects new sessions and future default state.
+- If a saved draft exists while a session is still hydrating, local input typed into the composer wins; draft restore will not clobber text or attachments the user entered during loading.
 - Queued follow-ups are stored server-side and can continue after the page closes as long as the server remains up.
 - Terminals also stay alive while the Rust gateway remains up.
 - "Shutdown after queue completes" is a server-global operational toggle, not a per-session preference.
@@ -244,6 +247,10 @@ The detailed session view reconciles the persisted rollout with the live `thread
 ### A session appears in search but not in the sidebar
 
 The sidebar combines a local session index with live app-server data and loads progressively. A selected session is pinned back into view even if it was not part of the current list page yet.
+
+### I typed into the composer while a session was loading
+
+Composer input is treated as authoritative once you start typing. If an older saved draft for that session exists, `codex-webui` skips restoring it rather than overwriting the text or attachments you already entered locally.
 
 ### Shutdown after queue completion did not trigger
 

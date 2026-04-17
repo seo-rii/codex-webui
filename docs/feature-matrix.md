@@ -33,6 +33,7 @@ In the comparison columns:
 | Speed mode selection | Implemented | Comparable | Comparable | Supports `auto`, `fast`, and `flex` where available from model metadata. |
 | Working directory selection | Implemented | Comparable | Comparable | Chosen per session and constrained to allowed roots. |
 | File attachments | Implemented | Comparable | Comparable | Files and images are persisted server-side and attached to turns or queued work. |
+| Composer history recall and last-message resend | Implemented | Different shape | Different shape | Browser-first affordance for quickly reusing or re-sending the most recent prompt without losing current draft text. |
 | Steer during an active turn | Implemented | Comparable | Comparable | Supports explicit steer while work is active. |
 | Queued follow-up messages | Implemented | Different shape | Comparable | Queue is a first-class server-side feature in `codex-webui`; it survives browser churn. |
 | Resume queued work after restart | Implemented | Different shape | Different shape | Browser-specific persistence flow with optional auto-resume. |
@@ -44,7 +45,7 @@ In the comparison columns:
 | Aggregated diff view | Implemented | Different shape | Comparable | Exposes grouped file changes per turn and in dedicated tabs. |
 | Inline file editing | Implemented | Partial | Comparable | Focused on quick inspection and edits rather than full IDE parity. |
 | Git repository discovery | Implemented | Different shape | Comparable | Discovery is depth-limited and gated on explicit repository selection. |
-| Git status, diff, commit inspection | Implemented | Partial | Comparable | Designed as a browser-side Git workspace, not a full desktop VCS client. |
+| Git status, diff, commit inspection | Implemented | Partial | Comparable | Designed as a browser-side Git workspace, not a full desktop VCS client, and includes a compact mobile navigation mode. |
 | Git worktree management | Implemented | Partial | Comparable | Explicitly exposed in the web UI because multiple browser workspaces benefit from it. |
 | Terminal tabs | Implemented | Different shape | Comparable | Terminals live in the Rust gateway and survive page reloads while the server stays up. |
 | Subagent activity view | Implemented | Comparable | Comparable | Subagent activity is rendered inline and can open related threads in tabs. |
@@ -55,6 +56,7 @@ In the comparison columns:
 | Password-protected remote access | Implemented | Different shape | Not targeted | Core web deployment feature rather than upstream app or extension parity. |
 | Base path and reverse-proxy support | Implemented | Different shape | Not targeted | Important for self-hosted setups. |
 | Configurable CORS | Implemented | Different shape | Not targeted | Needed for controlled remote browser access. |
+| Localized actionable error messages | Implemented | Different shape | Different shape | Common queue, steer, and archive conflicts return stable error codes that the browser maps into locale-aware copy. |
 | System shutdown after queued work completes | Implemented | Different shape | Not targeted | Global server-side control that waits for all queues and active turns to settle, then persists and syncs the scheduled shutdown state across clients. |
 
 ## Areas Where codex-webui Intentionally Differs

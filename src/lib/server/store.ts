@@ -1,6 +1,8 @@
 import fsp from "node:fs/promises";
 
 import type {
+  AutomationDefinition,
+  AutomationRun,
   AppNotification,
   NotificationEventType,
   NotificationSettings,
@@ -32,6 +34,8 @@ type UiState = {
   >;
   savedSessionFilters: SavedSessionFilter[];
   promptPresets: PromptPreset[];
+  automations: AutomationDefinition[];
+  automationRuns: AutomationRun[];
   preferencesByThreadId: Record<string, SessionPreferences>;
   draftsByThreadId: Record<
     string,
@@ -98,6 +102,8 @@ class UiStateStore {
         sessionMetaByThreadId: {},
         savedSessionFilters: [],
         promptPresets: [],
+        automations: [],
+        automationRuns: [],
         preferencesByThreadId: {},
         draftsByThreadId: {},
         queuesByThreadId: {},
@@ -121,6 +127,8 @@ class UiStateStore {
         sessionMetaByThreadId: parsed.sessionMetaByThreadId ?? {},
         savedSessionFilters: Array.isArray(parsed.savedSessionFilters) ? parsed.savedSessionFilters : [],
         promptPresets: Array.isArray(parsed.promptPresets) ? parsed.promptPresets : [],
+        automations: Array.isArray(parsed.automations) ? parsed.automations : [],
+        automationRuns: Array.isArray(parsed.automationRuns) ? parsed.automationRuns : [],
         preferencesByThreadId: parsed.preferencesByThreadId ?? {},
         draftsByThreadId: parsed.draftsByThreadId ?? {},
         queuesByThreadId: parsed.queuesByThreadId ?? {},
@@ -145,6 +153,8 @@ class UiStateStore {
         sessionMetaByThreadId: {},
         savedSessionFilters: [],
         promptPresets: [],
+        automations: [],
+        automationRuns: [],
         preferencesByThreadId: {},
         draftsByThreadId: {},
         queuesByThreadId: {},
@@ -362,6 +372,102 @@ class UiStateStore {
   async getPromptPresets() {
     const state = await this.load();
     return [...state.promptPresets].sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+  }
+
+  async getAutomations() {
+    const state = await this.load();
+    return [...state.automations].sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+  }
+
+  async saveAutomation(automation: AutomationDefinition) {
+    let automations: AutomationDefinition[] = [];
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      const now = Date.now();
+      const current = state.automations.find((entry) => entry.id === automation.id) ?? null;
+      const nextAutomation: AutomationDefinition = {
+        ...automation,
+        name: automation.name.trim(),
+        prompt: automation.prompt,
+        createdAt: current?.createdAt ?? automation.createdAt ?? now,
+        updatedAt: now
+      };
+      state.automations = [nextAutomation, ...state.automations.filter((entry) => entry.id !== nextAutomation.id)].slice(0, 80);
+      automations = [...state.automations];
+      await this.flush();
+    });
+    await this.writeChain;
+    return automations.sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+  }
+
+  async deleteAutomation(automationId: string) {
+    let automations: AutomationDefinition[] = [];
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      state.automations = state.automations.filter((entry) => entry.id !== automationId);
+      automations = [...state.automations];
+      await this.flush();
+    });
+    await this.writeChain;
+    return automations.sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+  }
+
+  async getAutomationRuns(limit = 40) {
+    const state = await this.load();
+    return [...state.automationRuns]
+      .sort((left, right) => (right.startedAt || 0) - (left.startedAt || 0))
+      .slice(0, Math.max(1, limit));
+  }
+
+  async saveAutomationRun(run: AutomationRun) {
+    let automationRuns: AutomationRun[] = [];
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      state.automationRuns = [run, ...state.automationRuns.filter((entry) => entry.id !== run.id)].slice(0, 200);
+      automationRuns = [...state.automationRuns];
+      await this.flush();
+    });
+    await this.writeChain;
+    return automationRuns.sort((left, right) => (right.startedAt || 0) - (left.startedAt || 0));
+  }
+
+  async updateAutomationRun(runId: string, patch: Partial<AutomationRun>) {
+    let updatedRun: AutomationRun | null = null;
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      const runIndex = state.automationRuns.findIndex((entry) => entry.id === runId);
+      if (runIndex < 0) {
+        return;
+      }
+      state.automationRuns[runIndex] = {
+        ...state.automationRuns[runIndex],
+        ...patch
+      };
+      updatedRun = { ...state.automationRuns[runIndex] };
+      await this.flush();
+    });
+    await this.writeChain;
+    return updatedRun;
+  }
+
+  async updateAutomation(automationId: string, patch: Partial<AutomationDefinition>) {
+    let updatedAutomation: AutomationDefinition | null = null;
+    this.writeChain = this.writeChain.then(async () => {
+      const state = await this.load();
+      const automationIndex = state.automations.findIndex((entry) => entry.id === automationId);
+      if (automationIndex < 0) {
+        return;
+      }
+      state.automations[automationIndex] = {
+        ...state.automations[automationIndex],
+        ...patch,
+        updatedAt: Date.now()
+      };
+      updatedAutomation = { ...state.automations[automationIndex] };
+      await this.flush();
+    });
+    await this.writeChain;
+    return updatedAutomation;
   }
 
   async savePromptPreset(preset: PromptPreset) {

@@ -8,6 +8,9 @@ export type AutoApproveMode = "manual" | "turn" | "session";
 export type ItemDetailState = "inline" | "deferred" | "loaded";
 export type SteeringResumeMode = "ask" | "auto";
 export type UserRole = "admin" | "viewer";
+export type AutomationScheduleMode = "manual" | "interval";
+export type AutomationExecutionTarget = "local" | "worktree";
+export type AutomationRunStatus = "running" | "started" | "completed" | "failed";
 
 export type SessionPreferences = {
   cwd: string;
@@ -62,6 +65,41 @@ export type PromptPreset = {
   prompt: string;
   createdAt: number;
   updatedAt: number;
+};
+
+export type AutomationDefinition = {
+  id: string;
+  name: string;
+  prompt: string;
+  enabled: boolean;
+  scheduleMode: AutomationScheduleMode;
+  intervalMinutes: number | null;
+  target: AutomationExecutionTarget;
+  repoPath: string | null;
+  cwd: string | null;
+  model: string | null;
+  effort: ReasoningEffort | null;
+  speed: ServiceSpeed | null;
+  mode: CollaborationMode | null;
+  createdAt: number;
+  updatedAt: number;
+  lastRunAt: number | null;
+  nextRunAt: number | null;
+};
+
+export type AutomationRun = {
+  id: string;
+  automationId: string;
+  automationName: string;
+  status: AutomationRunStatus;
+  trigger: "manual" | "schedule";
+  sessionId: string | null;
+  repoPath: string | null;
+  cwd: string | null;
+  worktreePath: string | null;
+  startedAt: number;
+  completedAt: number | null;
+  error: string | null;
 };
 
 export type SessionSummaryHighlight = {
@@ -243,6 +281,10 @@ export type AppConfigPayload = {
     knownTags: string[];
   };
   promptPresets: PromptPreset[];
+  automations: {
+    items: AutomationDefinition[];
+    recentRuns: AutomationRun[];
+  };
   account: {
     type: "apiKey" | "chatgpt" | null;
     email: string | null;

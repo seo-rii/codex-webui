@@ -1,6 +1,8 @@
 import { base } from "$app/paths";
 
 import type {
+  AutomationDefinition,
+  AutomationRun,
   AppConfigPayload,
   AuditLogPayload,
   AttachmentRecord,
@@ -145,6 +147,25 @@ export const api = {
 
   clearNotifications() {
     return ws.request<NotificationListPayload>("notifications/clear");
+  },
+
+  saveAutomation(automation: AutomationDefinition) {
+    return ws.request<{ automations: AutomationDefinition[] }>("automations/save", {
+      automation
+    });
+  },
+
+  deleteAutomation(automationId: string) {
+    return ws.request<{ automations: AutomationDefinition[] }>("automations/delete", {
+      automationId
+    });
+  },
+
+  runAutomation(automationId: string, trigger: "manual" | "schedule" = "manual") {
+    return ws.request<{ ok: true; session: SessionSummary; run: AutomationRun | null }>("automations/run", {
+      automationId,
+      trigger
+    });
   },
 
   updateNotificationSettings(settings: Partial<NotificationSettings>) {

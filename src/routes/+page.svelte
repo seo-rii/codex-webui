@@ -61,6 +61,7 @@
     type ThemeMode
   } from "$lib/theme";
   import type {
+    AutomationDefinition,
     AppNotification,
     AppConfigPayload,
     AttachmentRecord,
@@ -2608,6 +2609,12 @@
           promptPresets: Array.isArray(event.params.promptPresets)
             ? (event.params.promptPresets as PromptPreset[])
             : config.promptPresets,
+          automations: event.params.automations
+            ? {
+                ...config.automations,
+                ...(event.params.automations as Partial<AppConfigPayload["automations"]>)
+              }
+            : config.automations,
           startup: event.params.startup
             ? {
                 ...config.startup,
@@ -4266,6 +4273,66 @@
         };
       }
       noticeText = m.prompt_preset_deleted();
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function saveAutomation(automation: AutomationDefinition) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    try {
+      const response = await api.saveAutomation(automation);
+      if (config) {
+        config = {
+          ...config,
+          automations: {
+            ...config.automations,
+            items: response.automations
+          }
+        };
+      }
+      noticeText = m.automation_saved();
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function deleteAutomation(automationId: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    try {
+      const response = await api.deleteAutomation(automationId);
+      if (config) {
+        config = {
+          ...config,
+          automations: {
+            ...config.automations,
+            items: response.automations
+          }
+        };
+      }
+      noticeText = m.automation_deleted();
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function runAutomation(automationId: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    try {
+      const response = await api.runAutomation(automationId);
+      applySessionSummaryUpdate(response.session);
+      await selectSession(response.session.id);
+      activeWorkspaceTabId = "chat";
+      noticeText = m.automation_started();
     } catch (error) {
       errorText = describeError(error);
     }
@@ -6670,64 +6737,42 @@
               {/if}
 
               {#if activeLiveTurnId}
-                <div class="border border-amber-200 rounded-2xl bg-white shadow-sm overflow-hidden">
-                  <button class="w-full flex items-start justify-between gap-3 px-3.5 py-2.5 hover:bg-amber-50/40 transition-colors" onclick={() => (liveTurnCardExpanded = !liveTurnCardExpanded)} type="button">
-                    <div class="min-w-0 flex items-start gap-3">
-                      <div class="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-amber-50 text-amber-700 border border-amber-100">
-                        <Zap size={14} />
+                <div class="turn-card-shell border border-amber-200 rounded-2xl bg-white shadow-sm overflow-hidden">
+                  <button class="turn-card-header turn-card-header--amber w-full flex items-center justify-between gap-2.5 px-3 py-2 hover:bg-amber-50/40 transition-colors" data-sticky-level="0" onclick={() => (liveTurnCardExpanded = !liveTurnCardExpanded)} type="button">
+                    <div class="min-w-0 flex items-center gap-2.5">
+                      <div class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-amber-50 text-amber-700 border border-amber-100">
+                        <Zap size={13} />
                       </div>
                       <div class="min-w-0 text-left">
                         <div class="flex flex-wrap items-center gap-1.5">
                           <p class="text-[11px] font-bold uppercase tracking-widest text-amber-700">{ui.liveTurn}</p>
-                          {#if activeLiveTurnPlan}<span class="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-700">{m.steps_count({ count: String(activeLiveTurnPlan.plan.length) })}</span>{/if}
+                          {#if activeLiveTurnPlan}<span class="rounded-full bg-amber-50 px-1.5 py-0.5 text-[9px] font-bold text-amber-700">{m.steps_count({ count: String(activeLiveTurnPlan.plan.length) })}</span>{/if}
                           {#if activeLiveTurnDiff}
-                            <span class="rounded-full bg-gray-100 px-2 py-0.5 text-[10px] font-bold text-gray-600">
+                            <span class="rounded-full bg-gray-100 px-1.5 py-0.5 text-[9px] font-bold text-gray-600">
                               {m.files_count({ count: String(activeLiveTurnDiffViews.length > 0 ? activeLiveTurnDiffViews.length : 1) })}
                             </span>
                           {/if}
                           {#if activeLiveTurnSubagents.length > 0}
-                            <span class="rounded-full bg-sky-50 px-2 py-0.5 text-[10px] font-bold text-sky-700">
+                            <span class="rounded-full bg-sky-50 px-1.5 py-0.5 text-[9px] font-bold text-sky-700">
                               {activeLiveTurnSubagents.length} {ui.tasks}
                             </span>
                           {/if}
                         </div>
-                        {#if activeLiveTurnSummary}
-                          <p class="mt-0.5 truncate text-xs text-gray-500">{activeLiveTurnSummary}</p>
-                        {/if}
                       </div>
                     </div>
-                    <div class="flex items-center gap-1.5 shrink-0 self-center">
+                    <div class="flex items-center gap-1 shrink-0">
                       {#if activeLiveTurnDiff}
-                        <span class="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-700">+{diffLineStats(activeLiveTurnDiff).added}</span>
-                        <span class="rounded-full bg-red-50 px-2 py-0.5 text-[10px] font-bold text-red-700">-{diffLineStats(activeLiveTurnDiff).removed}</span>
+                        <span class="rounded-full bg-emerald-50 px-1.5 py-0.5 text-[9px] font-bold text-emerald-700">+{diffLineStats(activeLiveTurnDiff).added}</span>
+                        <span class="rounded-full bg-red-50 px-1.5 py-0.5 text-[9px] font-bold text-red-700">-{diffLineStats(activeLiveTurnDiff).removed}</span>
                       {/if}
-                      <ChevronDown size={14} class="text-gray-400 {liveTurnCardExpanded ? 'rotate-180' : ''} transition-transform" />
+                      <ChevronDown size={13} class="text-gray-400 {liveTurnCardExpanded ? 'rotate-180' : ''} transition-transform" />
                     </div>
                   </button>
                   {#if liveTurnCardExpanded}
-                    <div class="grid gap-2.5 border-t border-amber-100 bg-amber-50/20 p-2.5 {activeLiveTurnPlan && activeLiveTurnDiff && activeLiveTurnSubagents.length > 0 ? 'lg:grid-cols-2 xl:grid-cols-3' : 'lg:grid-cols-2'}">
-                      {#if activeLiveTurnPlan}
-                        <div class="rounded-xl border border-amber-100 bg-white/85 p-2.5">
-                          <div class="mb-1.5 flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-700">
-                            <ListTodo size={12} />
-                            <span>{ui.livePlan}</span>
-                          </div>
-                          {#if activeLiveTurnPlan.explanation}
-                            <p class="text-[11px] leading-relaxed text-gray-600">{activeLiveTurnPlan.explanation}</p>
-                          {/if}
-                          <ul class="mt-2 max-h-72 space-y-1.5 overflow-auto pr-1">
-                            {#each activeLiveTurnPlan.plan as step (`${step.step}:${step.status}`)}
-                              <li class="flex items-start gap-2 text-[11px] leading-4">
-                                <span class="mt-1 h-1.5 w-1.5 flex-shrink-0 rounded-full {step.status === 'completed' ? 'bg-emerald-500' : 'bg-amber-400 animate-pulse'}"></span>
-                                <span class="{step.status === 'completed' ? 'text-gray-400 line-through' : 'text-gray-700'}">{step.step}</span>
-                              </li>
-                            {/each}
-                          </ul>
-                        </div>
-                      {/if}
+                    <div class="turn-card-expand grid gap-2.5 border-t border-amber-100 bg-amber-50/20 p-2.5 {activeLiveTurnPlan && activeLiveTurnDiff && activeLiveTurnSubagents.length > 0 ? 'lg:grid-cols-2 xl:grid-cols-3' : 'lg:grid-cols-2'}" transition:slide|local={{ duration: 220 }}>
                       {#if activeLiveTurnDiff}
-                        <div class="rounded-xl border border-gray-200 bg-white/85 overflow-hidden">
-                          <div class="flex items-center justify-between gap-2 px-2.5 py-2 border-b border-gray-200">
+                        <div class="turn-card-shell rounded-xl border border-gray-200 bg-white/85 overflow-hidden lg:col-span-2 xl:col-span-3">
+                          <div class="turn-card-header turn-card-header--neutral flex items-center justify-between gap-2 border-b border-gray-200 px-2.5 py-2" data-sticky-level="1">
                             <div class="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.18em] text-gray-500">
                               <FileDiff size={12} />
                               <span>{ui.aggregatedDiff}</span>
@@ -7000,6 +7045,8 @@
               configFilePath={config?.paths.configFilePath ?? ""}
               notificationSettings={config?.notifications.settings ?? null}
               promptPresets={config?.promptPresets ?? []}
+              automations={config?.automations.items ?? []}
+              automationRuns={config?.automations.recentRuns ?? []}
               webRole={webRole}
               readOnly={readOnlyRole}
               onConfigSaved={async () => {
@@ -7014,6 +7061,15 @@
               }}
               onDeletePromptPreset={async (presetId) => {
                 await deletePromptPreset(presetId);
+              }}
+              onSaveAutomation={async (automation) => {
+                await saveAutomation(automation);
+              }}
+              onDeleteAutomation={async (automationId) => {
+                await deleteAutomation(automationId);
+              }}
+              onRunAutomation={async (automationId) => {
+                await runAutomation(automationId);
               }}
             />
           </div>

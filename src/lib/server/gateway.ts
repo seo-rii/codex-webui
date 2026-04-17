@@ -5,6 +5,8 @@ import { readdir } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import type {
+  AutomationDefinition,
+  AutomationRun,
   AppNotification,
   AppConfigPayload,
   AttachmentRecord,
@@ -42,8 +44,8 @@ import { listAttachments } from "./attachments";
 import { AppServerClient } from "./app-server/client";
 import { configTomlPath, syncCodexTomlWithPreferences } from "./codex-config";
 import { getCurrentRuntimeProfile, getRuntimeConfig, getRuntimeProfile, type RuntimeProfileConfig } from "./env";
-import { buildSandboxPolicy, listDirectoryPayload, resolveAllowedDirectory } from "./fs";
-import { resolveGitRepository } from "./git";
+import { buildSandboxPolicy, listDirectoryPayload, resolveAllowedDirectory, sanitizeFileName } from "./fs";
+import { createGitWorktree, resolveGitRepository } from "./git";
 import { runWithProfile } from "./profile-context";
 import { sessionIndexClient, type IndexedSessionSummary } from "./session-index";
 import { uiStateStore } from "./store";
@@ -67,6 +69,7 @@ const DEFERRED_ITEM_TYPES = new Set(["commandExecution", "fileChange", "mcpToolC
 const DEFAULT_THREAD_NAME = "New thread";
 const LIVE_THREAD_STATUSES = new Set(["running", "active"]);
 const DEFAULT_NOTIFICATION_LIMIT = 80;
+const DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT = 40;
 
 type GatewayAccountState = {
   account: Record<string, unknown>;
@@ -419,6 +422,14 @@ function normalizeSessionTitleSource(prompt: string) {
   return stripAttachmentPreamble(prompt).replace(/\s+/g, " ").trim();
 }
 
+function buildAutomationThreadName(name: string) {
+  return `Automation · ${name.trim()}`;
+}
+
+function buildAutomationWorktreeName(name: string) {
+  return sanitizeFileName(name.trim().toLowerCase()).slice(0, 48) || "automation";
+}
+
 function isPlaceholderThreadName(name: string | null | undefined) {
   const normalized = (name ?? "").trim();
   return !normalized || normalized === DEFAULT_THREAD_NAME;
@@ -579,6 +590,7 @@ export class CodexGateway {
   private readonly itemDetailsByThread = new Map<string, Map<string, CodexItem>>();
   private readonly fullTurnsByThread = new Map<string, Map<string, CodexTurn>>();
   private readonly drainingQueues = new Set<string>();
+  private readonly automationTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private recentLiveSessions = new Map<string, SessionSummary>();
   private recentLiveSessionsLoadedAt = 0;
   private recentLiveSessionsPromise: Promise<Map<string, SessionSummary>> | null = null;
@@ -593,6 +605,7 @@ export class CodexGateway {
     this.client = new AppServerClient(profile);
     void uiStateStore.markQueuesPendingResume();
     void this.restorePersistedShutdownState();
+    void this.restoreAutomationSchedules();
     this.client.onNotification((payload) => {
       void runWithProfile(this.profile.id, () => this.handleNotification(payload.method, payload.params));
     });
@@ -627,13 +640,15 @@ export class CodexGateway {
       this.client.request("collaborationMode/list", {}),
       this.readAccountState()
     ]);
-    const [pausedQueueEntries, globalState, notifications, savedFilters, knownTags, promptPresets] = await Promise.all([
+    const [pausedQueueEntries, globalState, notifications, savedFilters, knownTags, promptPresets, automations, automationRuns] = await Promise.all([
       uiStateStore.listResumePendingQueues(),
       uiStateStore.getGlobal(),
       uiStateStore.getNotifications(DEFAULT_NOTIFICATION_LIMIT),
       uiStateStore.getSavedSessionFilters(),
       uiStateStore.getKnownSessionTags(),
-      uiStateStore.getPromptPresets()
+      uiStateStore.getPromptPresets(),
+      uiStateStore.getAutomations(),
+      uiStateStore.getAutomationRuns(DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT)
     ]);
     const preferences: Record<string, SessionPreferences> = pausedQueueEntries.length > 0 ? await uiStateStore.getAll() : {};
     const indexedSessions = pausedQueueEntries.length > 0 ? await sessionIndexClient.list(this.profile.codexHome).catch(() => []) : [];
@@ -725,6 +740,10 @@ export class CodexGateway {
         knownTags
       },
       promptPresets,
+      automations: {
+        items: automations,
+        recentRuns: automationRuns
+      },
       account: {
         type: (account.type as "apiKey" | "chatgpt" | null) ?? null,
         email: (account.email as string | null) ?? null,
@@ -852,6 +871,147 @@ export class CodexGateway {
     return {
       promptPresets
     };
+  }
+
+  async saveAutomation(automation: AutomationDefinition) {
+    if (!automation.name.trim()) {
+      throw new Error("Automation name is required.");
+    }
+    if (!automation.prompt.trim()) {
+      throw new Error("Automation prompt is required.");
+    }
+    if (automation.target === "worktree" && !automation.repoPath?.trim()) {
+      throw new Error("Worktree automations require a repository.");
+    }
+
+    const normalizedInterval =
+      automation.scheduleMode === "interval" ? Math.max(1, Math.round(Number(automation.intervalMinutes ?? 0) || 0)) : null;
+    if (automation.scheduleMode === "interval" && !normalizedInterval) {
+      throw new Error("Automation interval must be at least 1 minute.");
+    }
+
+    const now = Date.now();
+    const nextAutomation = {
+      ...automation,
+      name: automation.name.trim(),
+      prompt: automation.prompt,
+      repoPath: automation.repoPath?.trim() || null,
+      cwd: automation.cwd?.trim() || null,
+      intervalMinutes: normalizedInterval,
+      nextRunAt:
+        automation.enabled && automation.scheduleMode === "interval" && normalizedInterval
+          ? now + normalizedInterval * 60_000
+          : null
+    } satisfies AutomationDefinition;
+
+    const automations = await uiStateStore.saveAutomation(nextAutomation);
+    this.scheduleAutomation(nextAutomation);
+    await this.emitConfigUpdated();
+    return {
+      automations
+    };
+  }
+
+  async deleteAutomation(automationId: string) {
+    this.clearAutomationTimer(automationId);
+    const automations = await uiStateStore.deleteAutomation(automationId);
+    await this.emitConfigUpdated();
+    return {
+      automations
+    };
+  }
+
+  async runAutomation(automationId: string, trigger: "manual" | "schedule" = "manual") {
+    const automation = (await uiStateStore.getAutomations()).find((entry) => entry.id === automationId);
+    if (!automation) {
+      throw new Error("Automation not found.");
+    }
+
+    const runId = randomUUID();
+    const now = Date.now();
+    let worktreePath: string | null = null;
+    let cwd = automation.cwd?.trim() || automation.repoPath?.trim() || this.profile.defaults.cwd;
+    let gitRepoPath = automation.repoPath?.trim() || null;
+
+    const run: AutomationRun = {
+      id: runId,
+      automationId: automation.id,
+      automationName: automation.name,
+      status: "running",
+      trigger,
+      sessionId: null,
+      repoPath: gitRepoPath,
+      cwd,
+      worktreePath: null,
+      startedAt: now,
+      completedAt: null,
+      error: null
+    };
+    await uiStateStore.saveAutomationRun(run);
+    await this.emitConfigUpdated();
+
+    try {
+      if (automation.target === "worktree" && automation.repoPath) {
+        const repo = await resolveGitRepository(automation.repoPath);
+        const timeSuffix = new Date(now).toISOString().replace(/[:.]/gu, "-");
+        worktreePath = path.join(
+          path.dirname(repo.path),
+          ".codex-webui-worktrees",
+          buildAutomationWorktreeName(automation.name),
+          timeSuffix
+        );
+        const branchName = `automation/${buildAutomationWorktreeName(automation.name)}-${timeSuffix.toLowerCase()}`;
+        await createGitWorktree(repo.path, worktreePath, branchName, true, false);
+        cwd = worktreePath;
+        gitRepoPath = worktreePath;
+      }
+
+      const preferences = await this.preparePreferences({
+        cwd,
+        gitRepoPath,
+        model: automation.model,
+        effort: automation.effort,
+        speed: automation.speed ?? undefined,
+        mode: automation.mode ?? undefined
+      });
+
+      const session = await this.createSession(preferences, buildAutomationThreadName(automation.name));
+      await uiStateStore.updateAutomationRun(runId, {
+        sessionId: session.id,
+        repoPath: gitRepoPath,
+        cwd,
+        worktreePath,
+        status: "started"
+      });
+      await this.sendMessage(session.id, automation.prompt, [], preferences);
+
+      const patch: Partial<AutomationDefinition> = {
+        lastRunAt: now
+      };
+      if (automation.enabled && automation.scheduleMode === "interval" && automation.intervalMinutes) {
+        patch.nextRunAt = now + automation.intervalMinutes * 60_000;
+      }
+      const updatedAutomation = await uiStateStore.updateAutomation(automation.id, patch);
+      if (updatedAutomation) {
+        this.scheduleAutomation(updatedAutomation);
+      }
+
+      await this.emitConfigUpdated();
+      return {
+        ok: true,
+        session,
+        run: await uiStateStore.updateAutomationRun(runId, {})
+      };
+    } catch (error) {
+      await uiStateStore.updateAutomationRun(runId, {
+        status: "failed",
+        completedAt: Date.now(),
+        error: error instanceof Error ? error.message : "Failed to run automation.",
+        worktreePath
+      });
+      await this.emitConfigUpdated();
+      throw error;
+    }
   }
 
   async listSessions(
@@ -2674,6 +2834,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       this.loadedThreadIdsLoadedAt = Date.now();
       void this.cancelScheduledShutdownForActivity();
       void this.setSessionHighlight(threadId, null, null, null, null, "running", Math.floor(Date.now() / 1000));
+      void this.finalizeAutomationRunForSession(threadId, "running");
     } else if (method === "turn/completed") {
       const turn = asRecord(params.turn);
       if (this.activeTurns.get(threadId) === String(turn.id ?? "")) {
@@ -2681,6 +2842,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       }
       void this.maybeDrainQueue(threadId);
       void this.maybeScheduleGlobalShutdown(String(turn.id ?? ""));
+      void this.finalizeAutomationRunForSession(threadId, "completed");
       void this.enqueueAppNotification(
         buildNotificationPayload(
           "sessionCompleted",
@@ -2934,12 +3096,14 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
 
   private async emitConfigUpdated() {
     const runtimeConfig = this.runtimeConfig;
-    const [globalState, notifications, savedFilters, knownTags, promptPresets] = await Promise.all([
+    const [globalState, notifications, savedFilters, knownTags, promptPresets, automations, automationRuns] = await Promise.all([
       uiStateStore.getGlobal(),
       uiStateStore.getNotifications(1),
       uiStateStore.getSavedSessionFilters(),
       uiStateStore.getKnownSessionTags(),
-      uiStateStore.getPromptPresets()
+      uiStateStore.getPromptPresets(),
+      uiStateStore.getAutomations(),
+      uiStateStore.getAutomationRuns(DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT)
     ]);
     this.emitGlobal({
       kind: "notification",
@@ -2967,7 +3131,11 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
           savedFilters,
           knownTags
         },
-        promptPresets
+        promptPresets,
+        automations: {
+          items: automations,
+          recentRuns: automationRuns
+        }
       }
     });
   }
@@ -3018,6 +3186,63 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         requiresOpenaiAuth: true
       };
     }
+  }
+
+  private clearAutomationTimer(automationId: string) {
+    const timer = this.automationTimers.get(automationId);
+    if (timer) {
+      clearTimeout(timer);
+      this.automationTimers.delete(automationId);
+    }
+  }
+
+  private async restoreAutomationSchedules() {
+    const automations = await uiStateStore.getAutomations();
+    for (const automation of automations) {
+      this.scheduleAutomation(automation);
+    }
+  }
+
+  private scheduleAutomation(automation: AutomationDefinition) {
+    this.clearAutomationTimer(automation.id);
+    if (!automation.enabled || automation.scheduleMode !== "interval" || !automation.intervalMinutes) {
+      return;
+    }
+
+    const nextRunAt = automation.nextRunAt ?? Date.now() + automation.intervalMinutes * 60_000;
+    const delayMs = Math.max(0, nextRunAt - Date.now());
+    const timer = setTimeout(() => {
+      void this.runAutomation(automation.id, "schedule").catch(async () => {
+        const updatedAutomation = await uiStateStore.updateAutomation(automation.id, {
+          nextRunAt: Date.now() + automation.intervalMinutes! * 60_000
+        });
+        if (updatedAutomation) {
+          this.scheduleAutomation(updatedAutomation);
+        }
+        await this.emitConfigUpdated();
+      });
+    }, delayMs);
+    this.automationTimers.set(automation.id, timer);
+  }
+
+  private async finalizeAutomationRunForSession(
+    sessionId: string,
+    status: Extract<AutomationRun["status"], "running" | "started" | "completed" | "failed">,
+    error: string | null = null
+  ) {
+    const run = (await uiStateStore.getAutomationRuns(200)).find(
+      (entry) => entry.sessionId === sessionId && (entry.status === "running" || entry.status === "started")
+    );
+    if (!run) {
+      return;
+    }
+
+    await uiStateStore.updateAutomationRun(run.id, {
+      status,
+      completedAt: status === "completed" || status === "failed" ? Date.now() : run.completedAt,
+      error
+    });
+    await this.emitConfigUpdated();
   }
 
   private async enqueueAppNotification(notification: AppNotification) {

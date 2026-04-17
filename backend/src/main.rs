@@ -1186,6 +1186,35 @@ async fn execute_ws_method(
             )
             .await
         }
+        "automations/save" => {
+            let payload = json!({
+                "automation": params.get("automation").cloned().unwrap_or(Value::Null)
+            });
+            internal_json_request(state, Method::POST, "/api/automations", Some(payload)).await
+        }
+        "automations/delete" => {
+            let automation_id = require_string(&params, "automationId")?;
+            internal_json_request(
+                state,
+                Method::DELETE,
+                &format!("/api/automations?automationId={automation_id}"),
+                None,
+            )
+            .await
+        }
+        "automations/run" => {
+            let automation_id = require_string(&params, "automationId")?;
+            let payload = json!({
+                "trigger": params.get("trigger").cloned().unwrap_or_else(|| json!("manual"))
+            });
+            internal_json_request(
+                state,
+                Method::POST,
+                &format!("/api/automations/{automation_id}/run"),
+                Some(payload),
+            )
+            .await
+        }
         "runtime/status" => codex_runtime_status(state, false).await,
         "runtime/checkUpdate" => codex_runtime_status(state, true).await,
         "runtime/quota" => {

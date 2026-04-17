@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { History, Pencil, Plug, RefreshCw, Save, Settings2, Sparkles, Trash2 } from "lucide-svelte";
+  import { Clock3, History, Pencil, Play, Plug, RefreshCw, Save, Settings2, Sparkles, Trash2, Wand2 } from "lucide-svelte";
 
   import { api } from "$lib/api";
   import MonacoTextEditor from "$lib/components/MonacoTextEditor.svelte";
@@ -8,6 +8,8 @@
   import { m } from "$lib/paraglide/messages.js";
   import { getLocale } from "$lib/paraglide/runtime.js";
   import type {
+    AutomationDefinition,
+    AutomationRun,
     AuditLogEntry,
     CatalogPayload,
     EditableFilePayload,
@@ -22,22 +24,32 @@
     configFilePath,
     notificationSettings = null,
     promptPresets = [],
+    automations = [],
+    automationRuns = [],
     webRole = "admin",
     readOnly = false,
     onNotificationSettingsSaved = null,
     onSavePromptPreset = null,
     onDeletePromptPreset = null,
+    onSaveAutomation = null,
+    onDeleteAutomation = null,
+    onRunAutomation = null,
     onConfigSaved = null
   }: {
     codexHome: string;
     configFilePath: string;
     notificationSettings?: NotificationSettings | null;
     promptPresets?: PromptPreset[];
+    automations?: AutomationDefinition[];
+    automationRuns?: AutomationRun[];
     webRole?: UserRole | null;
     readOnly?: boolean;
     onNotificationSettingsSaved?: ((settings: Partial<NotificationSettings>) => void | Promise<void>) | null;
     onSavePromptPreset?: ((preset: PromptPreset) => void | Promise<void>) | null;
     onDeletePromptPreset?: ((presetId: string) => void | Promise<void>) | null;
+    onSaveAutomation?: ((automation: AutomationDefinition) => void | Promise<void>) | null;
+    onDeleteAutomation?: ((automationId: string) => void | Promise<void>) | null;
+    onRunAutomation?: ((automationId: string) => void | Promise<void>) | null;
     onConfigSaved?: (() => void | Promise<void>) | null;
   } = $props();
 
@@ -51,6 +63,19 @@
   let presetId = $state<string | null>(null);
   let presetName = $state("");
   let presetPrompt = $state("");
+  let automationId = $state<string | null>(null);
+  let automationName = $state("");
+  let automationPrompt = $state("");
+  let automationEnabled = $state(true);
+  let automationScheduleMode = $state<AutomationDefinition["scheduleMode"]>("manual");
+  let automationIntervalMinutes = $state("60");
+  let automationTarget = $state<AutomationDefinition["target"]>("local");
+  let automationRepoPath = $state("");
+  let automationCwd = $state("");
+  let automationModel = $state("");
+  let automationEffort = $state("");
+  let automationSpeed = $state("");
+  let automationMode = $state("");
   let auditEntries = $state<AuditLogEntry[]>([]);
   let loading = $state(true);
   let saving = $state(false);
@@ -80,6 +105,32 @@
       return true;
     }
     return presetName.trim() !== selectedPromptPreset.name || presetPrompt !== selectedPromptPreset.prompt;
+  });
+  const selectedAutomation = $derived.by(() => automations.find((automation) => automation.id === automationId) ?? null);
+  const automationDirty = $derived.by(() => {
+    if (!automationName.trim() && !automationPrompt.trim()) {
+      return false;
+    }
+
+    const interval = automationScheduleMode === "interval" ? String(Math.max(1, Math.round(Number(automationIntervalMinutes) || 0))) : "";
+    if (!selectedAutomation) {
+      return true;
+    }
+
+    return (
+      automationName.trim() !== selectedAutomation.name ||
+      automationPrompt !== selectedAutomation.prompt ||
+      automationEnabled !== selectedAutomation.enabled ||
+      automationScheduleMode !== selectedAutomation.scheduleMode ||
+      interval !== String(selectedAutomation.intervalMinutes ?? "") ||
+      automationTarget !== selectedAutomation.target ||
+      automationRepoPath.trim() !== (selectedAutomation.repoPath ?? "") ||
+      automationCwd.trim() !== (selectedAutomation.cwd ?? "") ||
+      automationModel.trim() !== (selectedAutomation.model ?? "") ||
+      automationEffort.trim() !== (selectedAutomation.effort ?? "") ||
+      automationSpeed.trim() !== (selectedAutomation.speed ?? "") ||
+      automationMode.trim() !== (selectedAutomation.mode ?? "")
+    );
   });
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
@@ -113,6 +164,29 @@
       roleAdmin: m.role_admin(),
       roleViewer: m.role_viewer(),
       promptPresets: m.prompt_presets(),
+      automations: m.automations(),
+      automationName: m.automation_name(),
+      automationPrompt: m.automation_prompt(),
+      automationTarget: m.automation_target(),
+      automationSchedule: m.automation_schedule(),
+      automationEnabled: m.automation_enabled(),
+      automationIntervalMinutes: m.automation_interval_minutes(),
+      automationRepoPath: m.automation_repo_path(),
+      automationWorkingDirectory: m.automation_working_directory(),
+      automationModelOverride: m.automation_model_override(),
+      automationEffortOverride: m.automation_effort_override(),
+      automationSpeedOverride: m.automation_speed_override(),
+      automationModeOverride: m.automation_mode_override(),
+      automationManual: m.automation_manual(),
+      automationInterval: m.automation_interval(),
+      automationLocalWorkspace: m.automation_local_workspace(),
+      automationManagedWorktree: m.automation_managed_worktree(),
+      saveAutomation: m.save_automation(),
+      runAutomation: m.run_automation(),
+      noAutomations: m.no_automations(),
+      newAutomation: m.new_automation(),
+      recentAutomationRuns: m.recent_automation_runs(),
+      noAutomationRuns: m.no_automation_runs(),
       presetName: m.preset_name(),
       presetPrompt: m.preset_prompt(),
       newPreset: m.new_preset(),
@@ -239,6 +313,38 @@
     presetPrompt = "";
   }
 
+  function startNewAutomation() {
+    automationId = null;
+    automationName = "";
+    automationPrompt = "";
+    automationEnabled = true;
+    automationScheduleMode = "manual";
+    automationIntervalMinutes = "60";
+    automationTarget = "local";
+    automationRepoPath = "";
+    automationCwd = "";
+    automationModel = "";
+    automationEffort = "";
+    automationSpeed = "";
+    automationMode = "";
+  }
+
+  function editAutomation(automation: AutomationDefinition) {
+    automationId = automation.id;
+    automationName = automation.name;
+    automationPrompt = automation.prompt;
+    automationEnabled = automation.enabled;
+    automationScheduleMode = automation.scheduleMode;
+    automationIntervalMinutes = String(automation.intervalMinutes ?? 60);
+    automationTarget = automation.target;
+    automationRepoPath = automation.repoPath ?? "";
+    automationCwd = automation.cwd ?? "";
+    automationModel = automation.model ?? "";
+    automationEffort = automation.effort ?? "";
+    automationSpeed = automation.speed ?? "";
+    automationMode = automation.mode ?? "";
+  }
+
   function editPromptPreset(preset: PromptPreset) {
     presetId = preset.id;
     presetName = preset.name;
@@ -278,6 +384,74 @@
     try {
       await onDeletePromptPreset?.(presetId);
       startNewPreset();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      savingPreset = false;
+    }
+  }
+
+  async function saveAutomation() {
+    if (!automationName.trim() || !automationPrompt.trim() || readOnly) {
+      return;
+    }
+
+    savingPreset = true;
+    errorText = "";
+    try {
+      await onSaveAutomation?.({
+        id: automationId ?? crypto.randomUUID(),
+        name: automationName.trim(),
+        prompt: automationPrompt,
+        enabled: automationEnabled,
+        scheduleMode: automationScheduleMode,
+        intervalMinutes: automationScheduleMode === "interval" ? Math.max(1, Math.round(Number(automationIntervalMinutes) || 0)) : null,
+        target: automationTarget,
+        repoPath: automationRepoPath.trim() || null,
+        cwd: automationCwd.trim() || null,
+        model: automationModel.trim() || null,
+        effort: (automationEffort.trim() || null) as AutomationDefinition["effort"],
+        speed: (automationSpeed.trim() || null) as AutomationDefinition["speed"],
+        mode: (automationMode.trim() || null) as AutomationDefinition["mode"],
+        createdAt: selectedAutomation?.createdAt ?? Date.now(),
+        updatedAt: selectedAutomation?.updatedAt ?? Date.now(),
+        lastRunAt: selectedAutomation?.lastRunAt ?? null,
+        nextRunAt: selectedAutomation?.nextRunAt ?? null
+      });
+      startNewAutomation();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      savingPreset = false;
+    }
+  }
+
+  async function removeAutomation() {
+    if (!automationId || readOnly) {
+      return;
+    }
+
+    savingPreset = true;
+    errorText = "";
+    try {
+      await onDeleteAutomation?.(automationId);
+      startNewAutomation();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      savingPreset = false;
+    }
+  }
+
+  async function runAutomationNow() {
+    if (!automationId || readOnly) {
+      return;
+    }
+
+    savingPreset = true;
+    errorText = "";
+    try {
+      await onRunAutomation?.(automationId);
     } catch (error) {
       errorText = error instanceof Error ? error.message : ui.failedSave;
     } finally {
@@ -450,6 +624,176 @@
                 {/if}
               </div>
             </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel__header">
+            <div class="panel-title">
+              <Wand2 size={16} />
+              <h3>{ui.automations}</h3>
+            </div>
+            <button class="ghost-button" disabled={readOnly} onclick={startNewAutomation} type="button">
+              <Wand2 size={14} />
+              <span>{ui.newAutomation}</span>
+            </button>
+          </div>
+          <div class="settings-grid settings-grid--nested">
+            <div class="catalog-list">
+              {#if automations.length === 0}
+                <p class="field-note">{ui.noAutomations}</p>
+              {:else}
+                {#each automations as automation (automation.id)}
+                  <button
+                    class={`catalog-card catalog-card--button ${automationId === automation.id ? "catalog-card--active" : ""}`}
+                    onclick={() => editAutomation(automation)}
+                    type="button"
+                  >
+                    <div class="catalog-card__title">
+                      <Wand2 size={14} />
+                      <strong>{automation.name}</strong>
+                    </div>
+                    <p>{automation.prompt.split(/\r?\n/u, 1)[0]?.trim() || automation.prompt.trim()}</p>
+                    <small>
+                      {automation.target === "worktree" ? ui.automationManagedWorktree : ui.automationLocalWorkspace}
+                      ·
+                      {automation.scheduleMode === "interval" ? `${ui.automationInterval} · ${automation.intervalMinutes ?? 0}m` : ui.automationManual}
+                      {automation.enabled ? "" : " · paused"}
+                    </small>
+                  </button>
+                {/each}
+              {/if}
+            </div>
+            <div class="settings-meta settings-meta--stack">
+              <label class="field-block">
+                <span>{ui.automationName}</span>
+                <input bind:value={automationName} class="field-input" disabled={readOnly} placeholder={ui.automationName} type="text" />
+              </label>
+              <label class="field-block">
+                <span>{ui.automationPrompt}</span>
+                <textarea bind:value={automationPrompt} class="field-input field-textarea" disabled={readOnly} placeholder={ui.automationPrompt} rows="8"></textarea>
+              </label>
+              <div class="settings-meta">
+                <label class="field-block">
+                  <span>{ui.automationTarget}</span>
+                  <select bind:value={automationTarget} class="field-input" disabled={readOnly}>
+                    <option value="local">{ui.automationLocalWorkspace}</option>
+                    <option value="worktree">{ui.automationManagedWorktree}</option>
+                  </select>
+                </label>
+                <label class="field-block">
+                  <span>{ui.automationSchedule}</span>
+                  <select bind:value={automationScheduleMode} class="field-input" disabled={readOnly}>
+                    <option value="manual">{ui.automationManual}</option>
+                    <option value="interval">{ui.automationInterval}</option>
+                  </select>
+                </label>
+              </div>
+              {#if automationScheduleMode === "interval"}
+                <label class="field-block">
+                  <span>{ui.automationIntervalMinutes}</span>
+                  <input bind:value={automationIntervalMinutes} class="field-input" disabled={readOnly} min="1" step="1" type="number" />
+                </label>
+              {/if}
+              {#if automationTarget === "worktree"}
+                <label class="field-block">
+                  <span>{ui.automationRepoPath}</span>
+                  <input bind:value={automationRepoPath} class="field-input" disabled={readOnly} placeholder="/path/to/repository" type="text" />
+                </label>
+              {/if}
+              <label class="field-block">
+                <span>{ui.automationWorkingDirectory}</span>
+                <input bind:value={automationCwd} class="field-input" disabled={readOnly} placeholder={codexHome} type="text" />
+              </label>
+              <div class="settings-meta">
+                <label class="field-block">
+                  <span>{ui.automationModelOverride}</span>
+                  <input bind:value={automationModel} class="field-input" disabled={readOnly} placeholder="gpt-5.4" type="text" />
+                </label>
+                <label class="field-block">
+                  <span>{ui.automationEffortOverride}</span>
+                  <input bind:value={automationEffort} class="field-input" disabled={readOnly} placeholder="medium" type="text" />
+                </label>
+              </div>
+              <div class="settings-meta">
+                <label class="field-block">
+                  <span>{ui.automationSpeedOverride}</span>
+                  <input bind:value={automationSpeed} class="field-input" disabled={readOnly} placeholder="fast" type="text" />
+                </label>
+                <label class="field-block">
+                  <span>{ui.automationModeOverride}</span>
+                  <input bind:value={automationMode} class="field-input" disabled={readOnly} placeholder="plan" type="text" />
+                </label>
+              </div>
+              <label class="checkbox-card checkbox-card--compact">
+                <input bind:checked={automationEnabled} class="checkbox-input" disabled={readOnly} type="checkbox" />
+                <span aria-hidden="true" class="checkbox-control"></span>
+                <span class="checkbox-copy">
+                  <span class="checkbox-title">{ui.automationEnabled}</span>
+                </span>
+              </label>
+              <div class="settings-shell__actions">
+                <button
+                  class="solid-button"
+                  disabled={readOnly || !automationDirty || savingPreset || !automationName.trim() || !automationPrompt.trim()}
+                  onclick={() => void saveAutomation()}
+                  type="button"
+                >
+                  <Save size={14} />
+                  <span>{savingPreset ? ui.saving : ui.saveAutomation}</span>
+                </button>
+                {#if automationId}
+                  <button class="ghost-button" disabled={readOnly || savingPreset} onclick={() => void runAutomationNow()} type="button">
+                    <Play size={14} />
+                    <span>{ui.runAutomation}</span>
+                  </button>
+                  <button class="ghost-button" disabled={readOnly || savingPreset} onclick={() => void removeAutomation()} type="button">
+                    <Trash2 size={14} />
+                    <span>{ui.remove}</span>
+                  </button>
+                {/if}
+              </div>
+            </div>
+          </div>
+          <div class="catalog-list">
+            <div class="panel__header">
+              <div class="panel-title">
+                <Clock3 size={16} />
+                <h3>{ui.recentAutomationRuns}</h3>
+              </div>
+              <span>{automationRuns.length}</span>
+            </div>
+            {#if automationRuns.length === 0}
+              <p class="field-note">{ui.noAutomationRuns}</p>
+            {:else}
+              <div class="audit-log-list">
+                {#each automationRuns as run (run.id)}
+                  <article class="audit-log-entry">
+                    <div class="audit-log-entry__header">
+                      <strong>{run.automationName}</strong>
+                      <span class={`meta-pill subtle ${run.status === "failed" ? "audit-log-entry__result--error" : "audit-log-entry__result--ok"}`}>
+                        {run.status}
+                      </span>
+                    </div>
+                    <div class="audit-log-entry__meta">
+                      <span>{run.trigger}</span>
+                      <span>{new Intl.DateTimeFormat(getLocale() === "ko" ? "ko-KR" : "en-US", {
+                        month: "short",
+                        day: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit"
+                      }).format(new Date(run.startedAt))}</span>
+                      {#if run.cwd}
+                        <span class="truncate">{run.cwd}</span>
+                      {/if}
+                    </div>
+                    {#if run.error}
+                      <p class="audit-log-entry__error">{run.error}</p>
+                    {/if}
+                  </article>
+                {/each}
+              </div>
+            {/if}
           </div>
         </section>
 

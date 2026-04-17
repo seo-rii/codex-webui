@@ -7,6 +7,7 @@ export type AttachmentKind = "image" | "file";
 export type AutoApproveMode = "manual" | "turn" | "session";
 export type ItemDetailState = "inline" | "deferred" | "loaded";
 export type SteeringResumeMode = "ask" | "auto";
+export type UserRole = "admin" | "viewer";
 
 export type SessionPreferences = {
   cwd: string;
@@ -202,6 +203,16 @@ export type AppNotification = {
   payload: Record<string, unknown>;
 };
 
+export type AuditLogEntry = {
+  id: string;
+  at: number;
+  role: UserRole | "anonymous";
+  method: string;
+  target: string | null;
+  ok: boolean;
+  error: string | null;
+};
+
 export type AppConfigPayload = {
   models: ModelOption[];
   collaborationModes: CollaborationModeOption[];
@@ -243,6 +254,10 @@ export type AppConfigPayload = {
 export type NotificationListPayload = {
   notifications: AppNotification[];
   unreadCount: number;
+};
+
+export type AuditLogPayload = {
+  entries: AuditLogEntry[];
 };
 
 export type SessionSearchScope = "summary" | "full";

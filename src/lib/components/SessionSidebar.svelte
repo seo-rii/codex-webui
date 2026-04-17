@@ -37,6 +37,7 @@
     CodexRuntimeStatus,
     SavedSessionFilter,
     SessionSearchScope,
+    UserRole,
     SessionSummary,
     SessionSummaryFilter
   } from "$lib/types";
@@ -72,6 +73,8 @@
     onTogglePin,
     onToggleArchive,
     account,
+    webRole = "admin",
+    readOnly = false,
     quota,
     quotaBusy,
     runtime,
@@ -135,6 +138,8 @@
           requiresOpenaiAuth: boolean;
         }
       | null;
+    webRole?: UserRole | null;
+    readOnly?: boolean;
     quota: CodexQuotaStatus | null;
     quotaBusy: boolean;
     runtime: CodexRuntimeStatus | null;
@@ -245,7 +250,10 @@
       signInRequired: m.sign_in_required(),
       localRuntime: m.local_runtime(),
       currentDarkMode: m.current_dark_mode(),
-      currentLightMode: m.current_light_mode()
+      currentLightMode: m.current_light_mode(),
+      readOnlyMode: m.read_only_mode(),
+      roleAdmin: m.role_admin(),
+      roleViewer: m.role_viewer()
     };
   });
 
@@ -713,9 +721,15 @@
       {/if}
     </div>
 
-    <button 
-      class="flex items-center gap-2 w-full px-4 py-3 bg-white border border-gray-200 rounded-xl shadow-sm hover:border-amber-500/50 hover:shadow-md transition-all group" 
+      <button 
+      class={`flex w-full items-center gap-2 rounded-xl border px-4 py-3 shadow-sm transition-all group ${
+        readOnly
+          ? "cursor-not-allowed border-gray-200 bg-gray-100/90 text-gray-400 opacity-70"
+          : "bg-white border-gray-200 hover:border-amber-500/50 hover:shadow-md"
+      }`}
+      disabled={readOnly}
       onclick={onCreate}
+      type="button"
     >
       <div class="w-6 h-6 rounded-md bg-amber-50 text-amber-600 flex items-center justify-center group-hover:bg-amber-100 transition-colors">
         <Plus size={18} />
@@ -926,7 +940,8 @@
               <div class="flex items-center justify-between gap-2">
                 <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.savedFilters}</p>
                 <button
-                  class="rounded-lg border border-gray-200 bg-gray-50 px-2 py-1 text-[10px] font-bold text-gray-600 transition-colors hover:bg-white hover:text-gray-800"
+                  class="rounded-lg border border-gray-200 bg-gray-50 px-2 py-1 text-[10px] font-bold text-gray-600 transition-colors hover:bg-white hover:text-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={readOnly}
                   onclick={onSaveCurrentFilter}
                   type="button"
                 >
@@ -960,7 +975,8 @@
                       {filter.name}
                     </button>
                     <button
-                      class="rounded-full p-1 text-gray-400 transition-colors hover:bg-white hover:text-gray-700"
+                      class="rounded-full p-1 text-gray-400 transition-colors hover:bg-white hover:text-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+                      disabled={readOnly}
                       onclick={() => onDeleteSavedFilter(filter.id)}
                       title={ui.close}
                       type="button"
@@ -1084,7 +1100,12 @@
           </button>
           <button
             aria-label={session.pinned ? ui.unpinThread : ui.pinThread}
-            class="absolute right-9 top-2 z-10 rounded-lg border border-gray-200 bg-white/95 p-1.5 text-gray-400 opacity-0 shadow-sm transition-all pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 hover:border-amber-200 hover:bg-amber-50 hover:text-amber-700"
+            class={`absolute right-9 top-2 z-10 rounded-lg border border-gray-200 bg-white/95 p-1.5 text-gray-400 shadow-sm transition-all ${
+              readOnly
+                ? "cursor-not-allowed opacity-45"
+                : "opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 hover:border-amber-200 hover:bg-amber-50 hover:text-amber-700"
+            }`}
+            disabled={readOnly}
             onclick={(event) => {
               event.stopPropagation();
               onTogglePin(session);
@@ -1096,7 +1117,12 @@
           </button>
           <button
             aria-label={showArchived ? ui.restoreThread : ui.archiveThread}
-            class="absolute right-2 top-2 z-10 rounded-lg border border-gray-200 bg-white/95 p-1.5 text-gray-400 opacity-0 shadow-sm transition-all pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 hover:border-amber-200 hover:bg-amber-50 hover:text-amber-700"
+            class={`absolute right-2 top-2 z-10 rounded-lg border border-gray-200 bg-white/95 p-1.5 text-gray-400 shadow-sm transition-all ${
+              readOnly
+                ? "cursor-not-allowed opacity-45"
+                : "opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 hover:border-amber-200 hover:bg-amber-50 hover:text-amber-700"
+            }`}
+            disabled={readOnly}
             onclick={(event) => {
               event.stopPropagation();
               onToggleArchive(session);
@@ -1188,6 +1214,16 @@
           <div>
             <h3 class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-1">{ui.account}</h3>
             <p class="text-sm font-semibold text-gray-900">{accountLabel()}</p>
+            <div class="mt-2 flex flex-wrap items-center gap-1.5">
+              <span class="rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-gray-500">
+                {webRole === "viewer" ? ui.roleViewer : ui.roleAdmin}
+              </span>
+              {#if readOnly}
+                <span class="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-700">
+                  {ui.readOnlyMode}
+                </span>
+              {/if}
+            </div>
           </div>
           <button class="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors" onclick={() => (accountMenuOpen = false)}>
             <X size={16} />
@@ -1286,11 +1322,11 @@
                 <span class="text-gray-500">{ui.binary}</span>
                 <code class="px-1.5 py-0.5 bg-white border border-gray-200 rounded text-[10px]">{runtime?.configuredBin ?? "codex"}</code>
               </div>
-              <label class:checkbox-card--disabled={!systemShutdownAvailable} class="checkbox-card checkbox-card--compact" for="global-shutdown-after-queue">
+              <label class:checkbox-card--disabled={!systemShutdownAvailable || readOnly} class="checkbox-card checkbox-card--compact" for="global-shutdown-after-queue">
                 <input
                   class="checkbox-input"
                   checked={systemShutdownArmed}
-                  disabled={!systemShutdownAvailable}
+                  disabled={!systemShutdownAvailable || readOnly}
                   id="global-shutdown-after-queue"
                   onchange={(event) => onSystemShutdownArmedChange((event.currentTarget as HTMLInputElement).checked)}
                   type="checkbox"
@@ -1306,7 +1342,7 @@
                 {#if !runtime?.installed}
                   <button
                     class="flex-1 px-3 py-1.5 bg-amber-600 rounded-lg text-[10px] font-bold text-white hover:bg-amber-700 transition-all flex items-center justify-center gap-1.5 shadow-sm"
-                    disabled={!runtime?.npmAvailable || runtimeBusyAction === "install"}
+                    disabled={readOnly || !runtime?.npmAvailable || runtimeBusyAction === "install"}
                     onclick={onInstallRuntime}
                   >
                     <Plus size={10} />
@@ -1315,7 +1351,7 @@
                 {:else if runtime?.updateAvailable === true}
                   <button 
                     class="flex-1 px-3 py-1.5 bg-amber-600 rounded-lg text-[10px] font-bold text-white hover:bg-amber-700 transition-all flex items-center justify-center gap-1.5 shadow-sm"
-                    disabled={!runtime?.npmAvailable || runtimeBusyAction === "update"}
+                    disabled={readOnly || !runtime?.npmAvailable || runtimeBusyAction === "update"}
                     onclick={onUpdateRuntime}
                   >
                     <Zap size={10} />
@@ -1346,7 +1382,8 @@
             {ui.refreshQuota}
           </button>
           <button 
-            class="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium text-gray-600 hover:bg-white hover:text-amber-600 rounded-lg transition-all"
+            class="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium text-gray-600 hover:bg-white hover:text-amber-600 rounded-lg transition-all disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={readOnly}
             onclick={() => onStartAccountLogin("chatgpt")}
           >
             <ExternalLink size={14} />

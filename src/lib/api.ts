@@ -2,6 +2,7 @@ import { base } from "$app/paths";
 
 import type {
   AppConfigPayload,
+  AuditLogPayload,
   AttachmentRecord,
   CatalogPayload,
   CodexAccountLoginResponse,
@@ -73,7 +74,7 @@ const ws = new WebSocketRpcClient();
 
 export const api = {
   getAuthSession() {
-    return request<{ authenticated: boolean }>(apiPath("/auth/session"), {
+    return request<{ authenticated: boolean; role: "admin" | "viewer" | null }>(apiPath("/auth/session"), {
       method: "GET"
     });
   },
@@ -132,6 +133,10 @@ export const api = {
 
   getNotifications(limit = 80) {
     return ws.request<NotificationListPayload>("notifications/list", { limit });
+  },
+
+  getAuditLog(limit = 120) {
+    return ws.request<AuditLogPayload>("audit/list", { limit });
   },
 
   markNotificationsRead(ids: string[] | null = null) {

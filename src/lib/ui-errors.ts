@@ -8,6 +8,8 @@ export function describeUiError(value: unknown) {
     switch (parsed.code) {
       case "EMPTY_MESSAGE":
         return m.error_empty_message();
+      case "FORBIDDEN_ROLE":
+        return m.error_forbidden_role();
       case "INVALID_QUEUE_MODE":
         return m.error_invalid_queue_mode();
       case "QUEUE_ITEM_NOT_FOUND":

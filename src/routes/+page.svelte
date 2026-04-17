@@ -84,6 +84,7 @@
     SessionSummary,
     StreamEvent,
     TerminalSummary,
+    UserRole,
     WsConnectionState
   } from "$lib/types";
 
@@ -141,6 +142,7 @@
   let conversation = $state<ConversationState | null>(null);
   let selectedSessionId = $state<string | null>(null);
   let authenticated = $state<boolean | null>(null);
+  let webRole = $state<UserRole | null>(null);
   let loading = $state(true);
   let loadingDetail = $state(false);
   let sessionsBusy = $state(false);
@@ -215,6 +217,7 @@
   let startupAlertModalOpen = $state(false);
   let startupAlertDismissed = $state(false);
   let startupAlertNow = $state(Date.now());
+  const readOnlyRole = $derived(webRole === "viewer");
 
   type FileChangeView = {
     path: string;
@@ -2044,6 +2047,7 @@
   function clearWorkspaceForLoggedOut() {
     resetWorkspaceState();
     authenticated = false;
+    webRole = null;
     runtime = null;
     notifications = [];
     loginBusy = false;
@@ -2078,6 +2082,7 @@
       }
 
       authenticated = true;
+      webRole = authSession.role ?? "admin";
       loginMessage = "";
       ensureGlobalStreamSubscription();
       runtime = await api.getRuntimeStatus();
@@ -2877,6 +2882,10 @@
   }
 
   async function createSession() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!runtime?.installed) {
       errorText = m.codex_cli_required();
       return;
@@ -2893,6 +2902,10 @@
   }
 
   function setPreference<Key extends keyof SessionPreferences>(key: Key, value: SessionPreferences[Key]) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!conversation) {
       return;
     }
@@ -2933,6 +2946,10 @@
   }
 
   async function saveSystemShutdownAfterQueueCompletes(armed: boolean) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     try {
       const nextConfig = await api.saveSystemShutdownAfterQueueCompletes(armed);
       config = nextConfig;
@@ -2943,6 +2960,10 @@
   }
 
   async function saveTitle() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!titleDraft.trim()) {
       return;
     }
@@ -3068,6 +3089,10 @@
     }
 
     if (command === "model") {
+      if (readOnlyRole) {
+        errorText = m.error_forbidden_role();
+        return true;
+      }
       if (!args) {
         errorText = m.slash_argument_required({ command: "/model" });
         return true;
@@ -3084,6 +3109,10 @@
     }
 
     if (command === "plan") {
+      if (readOnlyRole) {
+        errorText = m.error_forbidden_role();
+        return true;
+      }
       if (!args) {
         errorText = m.slash_argument_required({ command: "/plan" });
         return true;
@@ -3116,6 +3145,10 @@
     attachmentSnapshot?: AttachmentRecord[];
     preserveComposer?: boolean;
   }) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!conversation || sending || startingMessage || uploading || queueModeActive) {
       return;
     }
@@ -3199,6 +3232,10 @@
     attachmentSnapshot?: AttachmentRecord[];
     preserveComposer?: boolean;
   }) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!selectedSessionId || !conversation || sending || uploading || !canQueueComposerMessage(conversation) || (!draft.trim() && draftAttachments.length === 0)) {
       if (!options?.promptText?.trim() || !selectedSessionId || !conversation || sending || uploading || !canQueueComposerMessage(conversation)) {
         return;
@@ -3257,6 +3294,10 @@
   }
 
   async function sendSteerPrompt(prompt: string, clearComposer = false) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!selectedSessionId || !running || !prompt.trim() || sending) {
       return;
     }
@@ -3290,6 +3331,10 @@
   }
 
   async function dispatchQueuedMessage(queueId: string, mode: "message" | "steer") {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!selectedSessionId || sending) {
       return;
     }
@@ -3320,6 +3365,10 @@
   }
 
   async function removeQueuedMessage(queueId: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!selectedSessionId || sending) {
       return;
     }
@@ -3354,6 +3403,10 @@
   }
 
   async function saveQueuedMessage(queueId: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!selectedSessionId || sending) {
       return;
     }
@@ -3400,6 +3453,10 @@
   }
 
   async function resumeQueuedMessages() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!selectedSessionId || sending) {
       return;
     }
@@ -3473,6 +3530,10 @@
   }
 
   function promptAttachmentPicker() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (uploading) {
       return;
     }
@@ -3480,6 +3541,10 @@
   }
 
   async function uploadFiles(files: FileList | null) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!files || files.length === 0) {
       return;
     }
@@ -3507,6 +3572,10 @@
   }
 
   async function removeDraftAttachment(attachmentId: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!selectedSessionId) {
       return;
     }
@@ -3519,6 +3588,10 @@
   }
 
   async function interruptTurn() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!selectedSessionId || !running) {
       return;
     }
@@ -3530,6 +3603,10 @@
   }
 
   async function archiveSessionFromSidebar(session: SessionSummary) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     try {
       if (showArchivedSessions || session.archived) {
         const response = await api.unarchiveSession(session.id);
@@ -3550,6 +3627,10 @@
   }
 
   async function toggleSessionPinned(session: SessionSummary) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     try {
       const nextPinned = !session.pinned;
       const response = await api.updateSessionOrganization(session.id, {
@@ -3576,6 +3657,10 @@
   }
 
   async function editSelectedSessionTags() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!selectedSessionId || !selectedSessionSummary) {
       return;
     }
@@ -3612,6 +3697,10 @@
   }
 
   async function archiveCurrentSession() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!selectedSessionId || showArchivedSessions) {
       return;
     }
@@ -3627,6 +3716,10 @@
   }
 
   async function unarchiveCurrentSession() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!selectedSessionId || !showArchivedSessions) {
       return;
     }
@@ -3673,6 +3766,10 @@
   }
 
   async function startAccountLogin(type: "chatgpt" | "chatgptDeviceCode") {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     try {
       const response = await api.startAccountLogin(type);
 
@@ -3711,6 +3808,10 @@
   }
 
   async function cancelAccountLogin(loginId: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     try {
       await api.cancelAccountLogin(loginId);
       accountLoginFlow = null;
@@ -3720,6 +3821,10 @@
   }
 
   async function logoutAccount() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     try {
       await api.logoutAccount();
       accountLoginFlow = null;
@@ -3762,6 +3867,10 @@
   }
 
   async function installCodex() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     runtimeBusyAction = "install";
     errorText = "";
 
@@ -3781,6 +3890,10 @@
   }
 
   async function updateCodex() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     runtimeBusyAction = "update";
     errorText = "";
 
@@ -3973,6 +4086,10 @@
   }
 
   async function createTerminalTab() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     try {
       const snapshot = await api.createTerminal(conversation?.preferences.cwd ?? config?.defaults.cwd ?? null, null);
       terminals = [snapshot.terminal, ...terminals.filter((terminal) => terminal.id !== snapshot.terminal.id)];
@@ -3984,6 +4101,10 @@
   }
 
   async function closeTerminalTab(terminalId: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     try {
       await api.closeTerminal(terminalId);
       terminals = terminals.filter((terminal) => terminal.id !== terminalId);
@@ -4044,6 +4165,10 @@
   }
 
   async function saveCurrentSessionFilter() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     const filterName = typeof window === "undefined" ? "" : window.prompt(m.saved_filter_name_prompt(), "")?.trim() ?? "";
     if (!filterName) {
       return;
@@ -4073,6 +4198,10 @@
   }
 
   async function deleteSavedSessionFilter(filterId: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     try {
       const response = await api.deleteSessionFilter(filterId);
       if (config) {
@@ -4094,6 +4223,10 @@
   }
 
   async function savePromptPreset(preset: PromptPreset) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     try {
       const response = await api.savePromptPreset(preset);
       if (config) {
@@ -4109,6 +4242,10 @@
   }
 
   async function deletePromptPreset(presetId: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     try {
       const response = await api.deletePromptPreset(presetId);
       if (config) {
@@ -4135,6 +4272,10 @@
   }
 
   async function resolvePendingRequest(request: PendingServerRequest, result: unknown) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
     if (!selectedSessionId || !conversation) {
       return;
     }
@@ -5908,6 +6049,8 @@
     <SessionSidebar
       account={config?.account ?? null}
       {accountLoginFlow}
+      webRole={webRole}
+      readOnly={readOnlyRole}
       {notifications}
       notificationsBusy={notificationsBusy}
       notificationsUnreadCount={config?.notifications.unreadCount ?? 0}
@@ -6025,6 +6168,7 @@
               }
             }}
             placeholder={ui.threadTitle}
+            readonly={readOnlyRole}
           />
           {#if selectedModel}
             <div class="flex items-center gap-1.5 mt-0.5">
@@ -6049,7 +6193,8 @@
                 </span>
               {/each}
               <button
-                class="ui-animated-button ui-animated-button--soft inline-flex items-center gap-1 rounded-full border border-gray-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-gray-500 hover:text-gray-800"
+                class="ui-animated-button ui-animated-button--soft inline-flex items-center gap-1 rounded-full border border-gray-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-gray-500 hover:text-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={readOnlyRole}
                 onclick={() => void editSelectedSessionTags()}
                 type="button"
               >
@@ -6082,6 +6227,7 @@
                 ? "bg-amber-50 text-amber-600 hover:bg-amber-100"
                 : "text-gray-400 hover:text-amber-600 hover:bg-amber-50"
             }`}
+            disabled={readOnlyRole}
             onclick={() => {
               if (selectedSessionSummary) {
                 void toggleSessionPinned(selectedSessionSummary);
@@ -6093,7 +6239,8 @@
             <Pin size={18} />
           </button>
           <button
-            class="ui-animated-button ui-animated-button--icon p-2 text-gray-400 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-all"
+            class="ui-animated-button ui-animated-button--icon p-2 text-gray-400 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-all disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={readOnlyRole}
             onclick={() => {
               if (showArchivedSessions) void unarchiveCurrentSession();
               else void archiveCurrentSession();
@@ -6121,7 +6268,8 @@
             <div class="absolute top-10 right-0 w-56 bg-white border border-gray-200 rounded-xl shadow-2xl p-1 z-50">
               {#if isMobileLayout}
                 <button
-                  class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group"
+                  class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={readOnlyRole}
                   onclick={() => {
                     workspaceMenuOpen = false;
                     void createSession();
@@ -6145,7 +6293,7 @@
                 <Settings size={16} class="text-gray-400 group-hover:text-amber-600" />
                 <span>{ui.settingsSkills}</span>
               </button>
-              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" onclick={() => { void createTerminalTab(); workspaceMenuOpen = false; }} type="button">
+              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group disabled:cursor-not-allowed disabled:opacity-50" disabled={readOnlyRole} onclick={() => { void createTerminalTab(); workspaceMenuOpen = false; }} type="button">
                 <Terminal size={16} class="text-gray-400 group-hover:text-amber-600" />
                 <span>{ui.newTerminal}</span>
               </button>
@@ -6672,7 +6820,7 @@
                     </button>
                     <button
                       class="surface-contrast-button ui-animated-button ui-animated-button--soft flex shrink-0 items-center gap-1.5 rounded-xl px-3 py-1.5 text-[10px] font-bold shadow-sm"
-                      disabled={sending || startingMessage || uploading}
+                      disabled={readOnlyRole || sending || startingMessage || uploading}
                       onclick={() => void resendLastComposerMessage()}
                       title={queueModeActive ? ui.queue : ui.send}
                       type="button"
@@ -6702,18 +6850,18 @@
                   </div>
                 {/if}
                 <form class="composer-panel bg-white/95 border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200 focus-within:-translate-y-0.5 focus-within:border-amber-400/70 focus-within:bg-white focus-within:shadow-[0_24px_60px_-34px_rgba(245,158,11,0.65)]" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
-                  <textarea bind:this={composerTextareaElement} bind:value={draft} class="composer-textarea w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 outline-none transition-colors duration-150 focus:outline-none focus:ring-0 focus:placeholder:text-amber-500/70 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} rows="1"></textarea>
+                  <textarea bind:this={composerTextareaElement} bind:value={draft} class="composer-textarea w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 outline-none transition-colors duration-150 focus:outline-none focus:ring-0 focus:placeholder:text-amber-500/70 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} readonly={readOnlyRole} rows="1"></textarea>
                   
                   {#if draftAttachments.length > 0}
                     <div class="px-4 pb-2 flex flex-wrap gap-2">
-                      {#each draftAttachments as attachment (attachment.id)}<button class="px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-xl text-[11px] font-bold text-gray-600 hover:bg-red-50 hover:text-red-600 hover:border-red-200 transition-all flex items-center gap-2 group" onclick={() => void removeDraftAttachment(attachment.id)} type="button"><FileText size={12} /><span>{attachment.originalName}</span><X size={12} class="opacity-0 group-hover:opacity-100 transition-opacity" /></button>{/each}
+                      {#each draftAttachments as attachment (attachment.id)}<button class="px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-xl text-[11px] font-bold text-gray-600 hover:bg-red-50 hover:text-red-600 hover:border-red-200 transition-all flex items-center gap-2 group disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} onclick={() => void removeDraftAttachment(attachment.id)} type="button"><FileText size={12} /><span>{attachment.originalName}</span><X size={12} class="opacity-0 group-hover:opacity-100 transition-opacity" /></button>{/each}
                     </div>
                   {/if}
 
                   <div class="composer-toolbar flex flex-wrap items-center gap-2 border-t border-gray-100 bg-gray-50/80 px-3 py-2.5 transition-colors duration-200 group-focus-within:border-amber-100 group-focus-within:bg-[linear-gradient(180deg,rgba(255,251,235,0.9),rgba(255,255,255,0.98))] sm:px-4 sm:py-3">
                     <div class="flex min-w-0 flex-1 items-center gap-1.5 sm:gap-2">
-                      <input bind:this={filePickerElement} disabled={uploading} hidden multiple onchange={(event) => void uploadFiles((event.currentTarget as HTMLInputElement).files)} type="file" />
-                      <button class="ui-animated-button ui-animated-button--icon rounded-xl p-1.5 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 group-focus-within:bg-white/90 group-focus-within:text-amber-700 sm:p-2" disabled={uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={18} class="animate-spin" />{:else}<Paperclip size={18} />{/if}</button>
+                      <input bind:this={filePickerElement} disabled={readOnlyRole || uploading} hidden multiple onchange={(event) => void uploadFiles((event.currentTarget as HTMLInputElement).files)} type="file" />
+                      <button class="ui-animated-button ui-animated-button--icon rounded-xl p-1.5 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 group-focus-within:bg-white/90 group-focus-within:text-amber-700 sm:p-2 disabled:cursor-not-allowed disabled:opacity-50" disabled={readOnlyRole || uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={18} class="animate-spin" />{:else}<Paperclip size={18} />{/if}</button>
                       {#if conversation}
                         <div class="mx-0.5 hidden h-4 w-px bg-gray-200 sm:block"></div>
                         <button class="composer-compact-trigger ui-animated-button ui-animated-button--soft flex min-w-0 max-w-[8.5rem] items-center gap-1.5 rounded-xl border border-transparent px-2.5 py-1 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:max-w-[11rem] sm:gap-2 sm:px-3 sm:py-1.5 sm:text-[11px]" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button">
@@ -6726,10 +6874,10 @@
                     </div>
                     <div class="flex w-full items-center justify-end gap-1.5 sm:w-auto sm:gap-2">
                       {#if running}
-                        <button class="ui-animated-button ui-animated-button--soft rounded-xl px-3 py-1.5 text-[11px] font-bold text-red-600 transition-all hover:bg-red-50 sm:px-4 sm:py-2 sm:text-xs" onclick={interruptTurn} type="button">{ui.stop}</button>
-                        <button class="ui-animated-button ui-animated-button--soft rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] font-bold text-amber-700 transition-all hover:bg-amber-100 disabled:opacity-50 sm:px-4 sm:py-2 sm:text-xs" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
+                        <button class="ui-animated-button ui-animated-button--soft rounded-xl px-3 py-1.5 text-[11px] font-bold text-red-600 transition-all hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 sm:px-4 sm:py-2 sm:text-xs" disabled={readOnlyRole} onclick={interruptTurn} type="button">{ui.stop}</button>
+                        <button class="ui-animated-button ui-animated-button--soft rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] font-bold text-amber-700 transition-all hover:bg-amber-100 disabled:opacity-50 sm:px-4 sm:py-2 sm:text-xs" disabled={readOnlyRole || sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
                       {/if}
-                      <button class="surface-contrast-button ui-animated-button ui-animated-button--strong rounded-xl bg-gray-900 px-4 py-1.5 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:px-6 sm:py-2 sm:text-xs" disabled={sending || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
+                      <button class="surface-contrast-button ui-animated-button ui-animated-button--strong rounded-xl bg-gray-900 px-4 py-1.5 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:px-6 sm:py-2 sm:text-xs" disabled={readOnlyRole || sending || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
                     </div>
                   </div>
                 </form>
@@ -6739,8 +6887,8 @@
                   <div class="composer-popover absolute bottom-24 left-0 w-80 bg-white border border-gray-200 rounded-2xl shadow-2xl p-4 space-y-4 z-50">
                     <div class="flex items-center justify-between border-b border-gray-100 pb-3 mb-2"><h3 class="text-xs font-bold text-gray-400 uppercase tracking-widest">{ui.composerSettings}</h3><button class="text-gray-400 hover:text-gray-600" onclick={() => (composerSettingsOpen = false)}><X size={16} /></button></div>
                     <div class="grid grid-cols-1 gap-4">
-                      <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-model-select">{ui.model}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all" id="composer-model-select" onchange={(event) => setPreference("model", (event.currentTarget as HTMLSelectElement).value || null)} value={conversation.preferences.model ?? ""}><option value="">{ui.autoDefault}</option>{#each config?.models ?? [] as model}<option value={model.id}>{model.displayName}</option>{/each}</select></div>
-                      <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-effort-select">{m.reasoning()}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all" id="composer-effort-select" onchange={(event) => setPreference("effort", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["effort"])} value={conversation.preferences.effort ?? (reasoningOptions[0] ?? "medium")}>{#each reasoningOptions as option}<option value={option}>{option}</option>{/each}</select></div>
+                      <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-model-select">{ui.model}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} id="composer-model-select" onchange={(event) => setPreference("model", (event.currentTarget as HTMLSelectElement).value || null)} value={conversation.preferences.model ?? ""}><option value="">{ui.autoDefault}</option>{#each config?.models ?? [] as model}<option value={model.id}>{model.displayName}</option>{/each}</select></div>
+                      <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-effort-select">{m.reasoning()}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} id="composer-effort-select" onchange={(event) => setPreference("effort", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["effort"])} value={conversation.preferences.effort ?? (reasoningOptions[0] ?? "medium")}>{#each reasoningOptions as option}<option value={option}>{option}</option>{/each}</select></div>
                       <div class="space-y-2 rounded-2xl border border-gray-200/80 bg-gray-50/80 p-3">
                         <div class="flex items-center justify-between gap-3">
                           <div class="space-y-0.5">
@@ -6753,6 +6901,7 @@
                                 ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
                                 : "border-gray-200 bg-white text-gray-500 hover:border-gray-300 hover:text-gray-700"
                             }`}
+                            disabled={readOnlyRole}
                             onclick={() => {
                               if (!conversation) {
                                 return;
@@ -6781,6 +6930,7 @@
                                   ? "bg-gray-900 text-white shadow-sm"
                                   : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"
                               }`}
+                              disabled={readOnlyRole}
                               onclick={() => {
                                 if (!conversation) {
                                   return;
@@ -6801,11 +6951,12 @@
                   <div class="composer-popover absolute bottom-24 left-0 w-80 bg-white border border-gray-200 rounded-2xl shadow-2xl p-4 space-y-4 z-50">
                     <div class="flex items-center justify-between border-b border-gray-100 pb-3 mb-2"><h3 class="text-xs font-bold text-gray-400 uppercase tracking-widest">{ui.securitySession}</h3><button class="text-gray-400 hover:text-gray-600" onclick={() => (composerSecurityOpen = false)}><X size={16} /></button></div>
                     <div class="space-y-4">
-                      <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-approval-select">{ui.approvalMode}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all" id="composer-approval-select" onchange={(event) => setPreference("autoApproveMode", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["autoApproveMode"])} value={conversation.preferences.autoApproveMode ?? "manual"}><option value="manual">{ui.manual}</option><option value="turn">{ui.autoOnce}</option><option value="session">{ui.autoSession}</option></select></div>
+                      <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-approval-select">{ui.approvalMode}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} id="composer-approval-select" onchange={(event) => setPreference("autoApproveMode", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["autoApproveMode"])} value={conversation.preferences.autoApproveMode ?? "manual"}><option value="manual">{ui.manual}</option><option value="turn">{ui.autoOnce}</option><option value="session">{ui.autoSession}</option></select></div>
                       <label class="checkbox-card" for="network-access">
                         <input
                           class="checkbox-input"
                           checked={conversation.preferences.networkAccess ?? false}
+                          disabled={readOnlyRole}
                           onchange={(event) => setPreference("networkAccess", (event.currentTarget as HTMLInputElement).checked)}
                           type="checkbox"
                           id="network-access"
@@ -6838,6 +6989,8 @@
               configFilePath={config?.paths.configFilePath ?? ""}
               notificationSettings={config?.notifications.settings ?? null}
               promptPresets={config?.promptPresets ?? []}
+              webRole={webRole}
+              readOnly={readOnlyRole}
               onConfigSaved={async () => {
                 config = await api.getConfig();
                 syncStartupAlertModal(config);

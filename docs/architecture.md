@@ -29,6 +29,7 @@ The Rust process is the public entrypoint.
 It is responsible for:
 
 - password validation and signed cookie issuance
+- admin/viewer role resolution for browser sessions
 - static asset serving
 - public WebSocket upgrade handling and fan-out
 - long-lived terminal processes
@@ -36,6 +37,7 @@ It is responsible for:
 - quota fetching
 - spawning and supervising the internal Node service
 - enforcing base path and CORS policy
+- appending audit-log entries for privileged login and WebSocket actions
 
 ### Internal SvelteKit/Node service
 
@@ -112,6 +114,7 @@ Several kinds of state live on disk:
 - user defaults under `~/.codex/config.toml`
 - `codex-webui` runtime state under `CODEX_WEBUI_DATA_DIR`
 - uploaded attachments under `CODEX_WEBUI_DATA_DIR/uploads`
+- privileged-action audit history under `CODEX_WEBUI_DATA_DIR/audit-log.jsonl`
 - CLI background server metadata under `~/.codex/codex-webui/`
 
 This separation matters:
@@ -205,6 +208,7 @@ Current examples include:
 - persisted per-session pins, tags, and saved sidebar filters
 - persisted prompt presets used by the composer and settings workspace
 - notification center history, unread state, and webhook settings
+- persisted audit history for privileged login and RPC activity
 
 This state is persisted in `CODEX_WEBUI_DATA_DIR`, exposed through config payloads and global WebSocket notifications, and treated as authoritative by the backend so reconnecting clients do not need to rebuild it from local browser memory.
 
@@ -223,6 +227,7 @@ The trust boundary is narrow:
 
 - public browser traffic reaches only the Rust gateway
 - the internal Node service is protected behind the gateway
+- browser sessions can authenticate as either admin or viewer, and the Rust gateway enforces the write boundary before forwarding WebSocket methods
 - filesystem browsing is limited to allowed roots plus Codex-owned config/runtime paths
 - Git actions require explicit repository selection
 - cookies are signed and HTTP-only
@@ -240,4 +245,4 @@ Instead:
 - the browser parses those codes
 - Paraglide message catalogs provide localized copy for each known case
 
-This keeps common race conditions, queue conflicts, and archive state mismatches understandable across locales without forcing the frontend to pattern-match arbitrary exception text.
+This keeps common race conditions, queue conflicts, archive state mismatches, and read-only role violations understandable across locales without forcing the frontend to pattern-match arbitrary exception text.

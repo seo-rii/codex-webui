@@ -36,6 +36,7 @@ The goal is not to replace upstream surfaces. The goal is to make Codex usable f
 - Persistent notification center with unread sync, plus Slack and generic webhook delivery for completion, attention, queue-failure, and shutdown events
 - Session pinning, per-session tags, and saved sidebar filters that persist on the server and stay synchronized across clients
 - Prompt presets stored server-side, plus composer slash commands for presets, queueing, steering, model changes, and plan-mode toggles
+- Optional admin/viewer role split with server-enforced read-only access and a persisted audit log for privileged actions
 - Structured backend error codes mapped to localized UI messages for common queue, steer, and archive timing failures
 - Global "shutdown after queue completes" control that is synchronized across clients and still executes with no browser attached
 - Base-path deployment, configurable CORS, dark/light themes, and Paraglide-based i18n
@@ -187,6 +188,7 @@ Meaning of the main fields:
 - Notification center history and webhook settings are also persisted in `codex-webui` runtime state so multiple clients see the same unread counts and delivery configuration.
 - Session organization metadata such as pins, tags, and saved sidebar filters also lives in `codex-webui` runtime state rather than ephemeral browser storage.
 - Prompt presets also live in `codex-webui` runtime state so slash-command behavior stays consistent across browsers.
+- Audit entries for privileged login and WebSocket actions are appended to `CODEX_WEBUI_DATA_DIR/audit-log.jsonl`.
 
 ## Environment Overrides
 
@@ -194,6 +196,8 @@ The Rust gateway and the internal Node service honor a focused set of `CODEX_WEB
 
 - `CODEX_WEBUI_PASSWORD_HASH`
 - `CODEX_WEBUI_PASSWORD`
+- `CODEX_WEBUI_VIEWER_PASSWORD_HASH`
+- `CODEX_WEBUI_VIEWER_PASSWORD`
 - `CODEX_WEBUI_SESSION_SECRET`
 - `CODEX_WEBUI_CORS_ALLOWED_ORIGINS`
 - `CODEX_WEBUI_ALLOWED_ROOTS`
@@ -213,11 +217,13 @@ See [.env.example](./.env.example) for a concise example set.
 ## Security Notes
 
 - Prefer `CODEX_WEBUI_PASSWORD_HASH` over plaintext password variables.
+- If you need read-only browser access, prefer `CODEX_WEBUI_VIEWER_PASSWORD_HASH` over the plaintext viewer password variable.
 - Keep `CODEX_WEBUI_SESSION_SECRET` unique per deployment.
 - Restrict `CODEX_WEBUI_ALLOWED_ROOTS` to the smallest practical set.
 - Leave cookies on `SameSite=Strict` unless you explicitly need cross-site browser sessions.
 - Run behind HTTPS in production.
 - Do not expose the internal SvelteKit service directly.
+- Use the viewer password for observation-only access instead of sharing the admin password when multiple humans need browser visibility.
 - Git actions are intentionally gated on explicit repository selection.
 - System shutdown support is disabled by default and must be explicitly enabled.
 - The shutdown control is global to the running server, so all connected clients see the same armed and scheduled state.

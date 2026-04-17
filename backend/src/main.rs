@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
-    env,
-    fs,
+    env, fs,
     net::{SocketAddr, TcpListener},
     path::PathBuf,
     process::Stdio,
@@ -9,38 +8,39 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::{
-    body::{to_bytes, Body},
+    Json, Router,
+    body::{Body, to_bytes},
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Request, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{
-        header::{self, HeaderValue},
         HeaderMap, Method, StatusCode, Uri,
+        header::{self, HeaderValue},
     },
     response::{IntoResponse, Redirect, Response},
     routing::{any, get},
-    Json, Router,
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
 use reqwest::multipart::{Form, Part};
-use scrypt::{scrypt, Params as ScryptParams};
+use scrypt::{Params as ScryptParams, scrypt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
+use time::Duration as CookieDuration;
 use tokio::{
+    fs as tokio_fs,
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
-    sync::{broadcast, mpsc, Mutex},
+    sync::{Mutex, broadcast, mpsc},
 };
 use tokio_util::io::StreamReader;
-use time::Duration as CookieDuration;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -65,6 +65,7 @@ const TERMINAL_RELAY_PREFIX: &str = "__terminal__:";
 struct Config {
     project_root: PathBuf,
     codex_home: PathBuf,
+    data_dir: PathBuf,
     base_path: String,
     public_host: String,
     public_port: u16,
@@ -76,6 +77,8 @@ struct Config {
     codex_bin: String,
     password: Option<String>,
     password_hash: Option<String>,
+    viewer_password: Option<String>,
+    viewer_password_hash: Option<String>,
     session_secret: Option<String>,
     cookie_same_site: SameSiteMode,
     cookie_secure_mode: CookieSecureMode,
@@ -94,6 +97,18 @@ enum CookieSecureMode {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum UserRole {
+    Admin,
+    Viewer,
+}
+
+#[derive(Clone, Debug)]
+struct AuthContext {
+    role: UserRole,
 }
 
 #[derive(Clone)]
@@ -180,8 +195,14 @@ struct UsageWindowShape {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum ClientEnvelope {
-    Request { id: String, method: String, params: Value },
-    Ping { nonce: Option<String> },
+    Request {
+        id: String,
+        method: String,
+        params: Value,
+    },
+    Ping {
+        nonce: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -209,8 +230,12 @@ enum ServerEnvelope {
         terminal_id: String,
         event: Value,
     },
-    GlobalEvent { event: Value },
-    Pong { nonce: Option<String> },
+    GlobalEvent {
+        event: Value,
+    },
+    Pong {
+        nonce: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,6 +248,17 @@ struct UploadFilePayload {
     name: String,
     mime_type: Option<String>,
     data_base64: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AuditLogEntry {
+    id: String,
+    at: u64,
+    role: String,
+    method: String,
+    target: Option<String>,
+    ok: bool,
+    error: Option<String>,
 }
 
 impl TerminalSession {
@@ -245,7 +281,10 @@ impl TerminalSession {
             .write_all(data.as_bytes())
             .await
             .context("failed to write terminal input")?;
-        writer.flush().await.context("failed to flush terminal input")?;
+        writer
+            .flush()
+            .await
+            .context("failed to flush terminal input")?;
         self.summary.lock().await.last_activity_at = now_unix_ms();
         Ok(())
     }
@@ -287,7 +326,9 @@ impl TerminalSession {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -338,7 +379,10 @@ impl Config {
         let base_path = normalize_base_path(env::var("CODEX_WEBUI_BASE_PATH").ok());
         let public_host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let public_port = parse_port(env::var("PORT").ok(), 4173)?;
-        let internal_port = parse_port(env::var("CODEX_WEBUI_INTERNAL_PORT").ok(), choose_free_port()?)?;
+        let internal_port = parse_port(
+            env::var("CODEX_WEBUI_INTERNAL_PORT").ok(),
+            choose_free_port()?,
+        )?;
         let internal_proxy_token = Uuid::new_v4().to_string();
         let node_entry = project_root.join("build/index.js");
         if !node_entry.exists() {
@@ -351,6 +395,9 @@ impl Config {
         Ok(Self {
             project_root,
             codex_home: resolve_codex_home()?,
+            data_dir: env::var("CODEX_WEBUI_DATA_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| cwd.join(".data")),
             base_path,
             public_host,
             public_port,
@@ -362,19 +409,23 @@ impl Config {
             codex_bin: env::var("CODEX_WEBUI_CODEX_BIN").unwrap_or_else(|_| "codex".to_string()),
             password: env::var("CODEX_WEBUI_PASSWORD").ok(),
             password_hash: env::var("CODEX_WEBUI_PASSWORD_HASH").ok(),
+            viewer_password: env::var("CODEX_WEBUI_VIEWER_PASSWORD").ok(),
+            viewer_password_hash: env::var("CODEX_WEBUI_VIEWER_PASSWORD_HASH").ok(),
             session_secret: env::var("CODEX_WEBUI_SESSION_SECRET").ok(),
-            cookie_same_site: parse_same_site(env::var("CODEX_WEBUI_COOKIE_SAMESITE").ok().as_deref()),
-            cookie_secure_mode: parse_secure_mode(env::var("CODEX_WEBUI_COOKIE_SECURE").ok().as_deref()),
-            cors_allowed_origins: parse_cors_origins(env::var("CODEX_WEBUI_CORS_ALLOWED_ORIGINS").ok())?,
+            cookie_same_site: parse_same_site(
+                env::var("CODEX_WEBUI_COOKIE_SAMESITE").ok().as_deref(),
+            ),
+            cookie_secure_mode: parse_secure_mode(
+                env::var("CODEX_WEBUI_COOKIE_SECURE").ok().as_deref(),
+            ),
+            cors_allowed_origins: parse_cors_origins(
+                env::var("CODEX_WEBUI_CORS_ALLOWED_ORIGINS").ok(),
+            )?,
         })
     }
 }
 
-async fn handle_http(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    request: Request,
-) -> Response {
+async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Request) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
     let headers = request.headers().clone();
@@ -391,7 +442,11 @@ async fn handle_http(
             }
 
             if route_path.starts_with("/api/") {
-                return (StatusCode::NOT_FOUND, "This backend only exposes auth over HTTP.").into_response();
+                return (
+                    StatusCode::NOT_FOUND,
+                    "This backend only exposes auth over HTTP.",
+                )
+                    .into_response();
             }
 
             return proxy_to_internal(state, method, uri, headers, request).await;
@@ -404,11 +459,11 @@ async fn handle_ws(
     jar: CookieJar,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !is_authenticated(&state.config, &jar) {
+    let Some(auth) = auth_context(&state.config, &jar) else {
         return (StatusCode::UNAUTHORIZED, "Authentication required.").into_response();
-    }
+    };
 
-    ws.on_upgrade(move |socket| websocket_session(socket, state))
+    ws.on_upgrade(move |socket| websocket_session(socket, state, auth))
         .into_response()
 }
 
@@ -445,8 +500,18 @@ async fn handle_auth_http(
         (Method::POST, "/api/auth/login") => auth_login(state.clone(), jar, headers, request).await,
         (Method::POST, "/api/auth/logout") => Ok(auth_logout(jar)),
         (Method::GET, "/api/auth/session") => {
-            let authenticated = is_authenticated(&state.config, &jar);
-            Ok((jar, Json(json!({ "authenticated": authenticated }))).into_response())
+            let auth = auth_context(&state.config, &jar);
+            Ok((
+                jar,
+                Json(json!({
+                    "authenticated": auth.is_some(),
+                    "role": auth.map(|context| match context.role {
+                        UserRole::Admin => "admin",
+                        UserRole::Viewer => "viewer",
+                    })
+                })),
+            )
+                .into_response())
         }
         _ => Ok((StatusCode::NOT_FOUND, "Not found").into_response()),
     };
@@ -477,7 +542,8 @@ async fn auth_login(
     let body = to_bytes(request.into_body(), usize::MAX)
         .await
         .map_err(|_| "Invalid request body.".to_string())?;
-    let payload: LoginPayload = serde_json::from_slice(&body).unwrap_or(LoginPayload { password: None });
+    let payload: LoginPayload =
+        serde_json::from_slice(&body).unwrap_or(LoginPayload { password: None });
     let password = payload.password.unwrap_or_default();
     let identifier = headers
         .get("x-forwarded-for")
@@ -495,16 +561,56 @@ async fn auth_login(
         ));
     }
 
-    let verified = verify_password(&state.config, &password).map_err(|error| error.to_string())?;
-    if !verified {
+    let Some(role) =
+        authenticate_role(&state.config, &password).map_err(|error| error.to_string())?
+    else {
         record_login_failure(&state, &identifier).await;
+        let _ = append_audit_log(
+            &state.config,
+            AuditLogEntry {
+                id: Uuid::new_v4().to_string(),
+                at: now_unix_ms(),
+                role: "anonymous".to_string(),
+                method: "auth/login".to_string(),
+                target: None,
+                ok: false,
+                error: Some("Invalid password.".to_string()),
+            },
+        )
+        .await;
         return Ok(json_error(StatusCode::UNAUTHORIZED, "Invalid password."));
-    }
+    };
 
     clear_login_failures(&state, &identifier).await;
-    let next_jar = issue_auth_cookie(&state.config, jar, secure_request)
+    let next_jar = issue_auth_cookie(&state.config, jar, secure_request, role)
         .map_err(|error| error.to_string())?;
-    Ok((next_jar, Json(json!({ "ok": true }))).into_response())
+    let _ = append_audit_log(
+        &state.config,
+        AuditLogEntry {
+            id: Uuid::new_v4().to_string(),
+            at: now_unix_ms(),
+            role: match role {
+                UserRole::Admin => "admin".to_string(),
+                UserRole::Viewer => "viewer".to_string(),
+            },
+            method: "auth/login".to_string(),
+            target: None,
+            ok: true,
+            error: None,
+        },
+    )
+    .await;
+    Ok((
+        next_jar,
+        Json(json!({
+            "ok": true,
+            "role": match role {
+                UserRole::Admin => "admin",
+                UserRole::Viewer => "viewer",
+            }
+        })),
+    )
+        .into_response())
 }
 
 fn auth_logout(jar: CookieJar) -> Response {
@@ -534,17 +640,7 @@ async fn proxy_to_internal(
         Err(_) => return (StatusCode::BAD_REQUEST, "Failed to read request body.").into_response(),
     };
 
-    match forward_request(
-        &state,
-        method,
-        &target,
-        headers,
-        body.to_vec(),
-        None,
-        None,
-    )
-    .await
-    {
+    match forward_request(&state, method, &target, headers, body.to_vec(), None, None).await {
         Ok(response) => response,
         Err(error) => {
             error!("proxy error: {error:#}");
@@ -553,7 +649,7 @@ async fn proxy_to_internal(
     }
 }
 
-async fn websocket_session(socket: WebSocket, state: AppState) {
+async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext) {
     let (mut sender, mut receiver) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerEnvelope>();
     let connection_id = Uuid::new_v4().to_string();
@@ -599,9 +695,10 @@ async fn websocket_session(socket: WebSocket, state: AppState) {
                 let state = state.clone();
                 let out_tx = out_tx.clone();
                 let subscriptions = Arc::clone(&subscriptions);
+                let auth = auth.clone();
                 tokio::spawn(async move {
                     if let Err(error) =
-                        handle_ws_message(&state, &out_tx, &subscriptions, payload).await
+                        handle_ws_message(&state, &out_tx, &subscriptions, &auth, payload).await
                     {
                         error!("websocket request failed: {error:#}");
                     }
@@ -628,6 +725,7 @@ async fn handle_ws_message(
     state: &AppState,
     out_tx: &mpsc::UnboundedSender<ServerEnvelope>,
     subscriptions: &Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    auth: &AuthContext,
     payload: ClientEnvelope,
 ) -> Result<()> {
     match payload {
@@ -640,7 +738,17 @@ async fn handle_ws_message(
                 return Ok(());
             }
 
-            let message = match execute_ws_method(state, out_tx, subscriptions, &method, params).await {
+            let audit_target = summarize_audit_target(&params);
+            let message = match execute_ws_method(
+                state,
+                out_tx,
+                subscriptions,
+                auth,
+                &method,
+                params,
+            )
+            .await
+            {
                 Ok(result) => ServerEnvelope::Response {
                     id: id.clone(),
                     ok: true,
@@ -654,6 +762,35 @@ async fn handle_ws_message(
                     error: Some(error.to_string()),
                 },
             };
+            if should_audit_ws_method(&method) {
+                let log_config = state.config.clone();
+                let role = auth.role;
+                let method_name = method.clone();
+                let target = audit_target;
+                let error = match &message {
+                    ServerEnvelope::Response { error, .. } => error.clone(),
+                    _ => None,
+                };
+                let ok = matches!(&message, ServerEnvelope::Response { ok: true, .. });
+                tokio::spawn(async move {
+                    let _ = append_audit_log(
+                        &log_config,
+                        AuditLogEntry {
+                            id: Uuid::new_v4().to_string(),
+                            at: now_unix_ms(),
+                            role: match role {
+                                UserRole::Admin => "admin".to_string(),
+                                UserRole::Viewer => "viewer".to_string(),
+                            },
+                            method: method_name,
+                            target,
+                            ok,
+                            error,
+                        },
+                    )
+                    .await;
+                });
+            }
 
             cache_response(state, &id, message.clone()).await;
             let _ = out_tx.send(message);
@@ -663,13 +800,162 @@ async fn handle_ws_message(
     Ok(())
 }
 
+fn is_ws_method_allowed(role: UserRole, method: &str) -> bool {
+    if role == UserRole::Admin {
+        return true;
+    }
+
+    matches!(
+        method,
+        "config/get"
+            | "runtime/status"
+            | "runtime/checkUpdate"
+            | "runtime/quota"
+            | "catalog/get"
+            | "directories/browse"
+            | "editor/file/get"
+            | "sessions/list"
+            | "sessions/search"
+            | "session/get"
+            | "session/draft/get"
+            | "session/queue/get"
+            | "session/olderTurns/get"
+            | "session/turn/get"
+            | "session/itemDetail/get"
+            | "notifications/list"
+            | "account/get"
+            | "git/repositories/list"
+            | "git/status"
+            | "git/commit/diff"
+            | "git/file/get"
+            | "git/file/resolve"
+            | "git/worktrees/list"
+            | "terminal/list"
+            | "terminal/read"
+            | "session/subscribe"
+            | "session/unsubscribe"
+            | "events/subscribe"
+            | "events/unsubscribe"
+            | "terminal/subscribe"
+            | "terminal/unsubscribe"
+            | "audit/list"
+    )
+}
+
+fn should_audit_ws_method(method: &str) -> bool {
+    !matches!(
+        method,
+        "config/get"
+            | "runtime/status"
+            | "runtime/checkUpdate"
+            | "runtime/quota"
+            | "catalog/get"
+            | "directories/browse"
+            | "editor/file/get"
+            | "sessions/list"
+            | "sessions/search"
+            | "session/get"
+            | "session/draft/get"
+            | "session/queue/get"
+            | "session/olderTurns/get"
+            | "session/turn/get"
+            | "session/itemDetail/get"
+            | "notifications/list"
+            | "account/get"
+            | "git/repositories/list"
+            | "git/status"
+            | "git/commit/diff"
+            | "git/file/get"
+            | "git/file/resolve"
+            | "git/worktrees/list"
+            | "terminal/list"
+            | "terminal/read"
+            | "session/subscribe"
+            | "session/unsubscribe"
+            | "events/subscribe"
+            | "events/unsubscribe"
+            | "terminal/subscribe"
+            | "terminal/unsubscribe"
+    )
+}
+
+fn summarize_audit_target(params: &Value) -> Option<String> {
+    for key in [
+        "sessionId",
+        "threadId",
+        "terminalId",
+        "queueId",
+        "turnId",
+        "presetId",
+        "filterId",
+        "repoPath",
+        "filePath",
+    ] {
+        if let Some(value) = params
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+async fn append_audit_log(config: &Config, entry: AuditLogEntry) -> Result<()> {
+    tokio_fs::create_dir_all(&config.data_dir)
+        .await
+        .context("failed to create data directory")?;
+    let path = config.data_dir.join("audit-log.jsonl");
+    let mut file = tokio_fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .context("failed to open audit log")?;
+    let line = serde_json::to_string(&entry).context("failed to serialize audit log entry")?;
+    file.write_all(line.as_bytes())
+        .await
+        .context("failed to write audit log entry")?;
+    file.write_all(b"\n")
+        .await
+        .context("failed to finalize audit log entry")?;
+    Ok(())
+}
+
+async fn list_audit_log(config: &Config, limit: usize) -> Result<Value> {
+    let path = config.data_dir.join("audit-log.jsonl");
+    let raw = match tokio_fs::read_to_string(path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).context("failed to read audit log"),
+    };
+
+    let mut entries = raw
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<AuditLogEntry>(line).ok())
+        .take(limit.max(1))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| right.at.cmp(&left.at));
+
+    Ok(json!({ "entries": entries }))
+}
+
 async fn execute_ws_method(
     state: &AppState,
     out_tx: &mpsc::UnboundedSender<ServerEnvelope>,
     subscriptions: &Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    auth: &AuthContext,
     method: &str,
     params: Value,
 ) -> Result<Value> {
+    if !is_ws_method_allowed(auth.role, method) {
+        return Err(anyhow!(
+            "{{\"code\":\"FORBIDDEN_ROLE\",\"message\":\"This action requires an admin role.\"}}"
+        ));
+    }
+
     fn append_session_filter_query(path: &mut String, params: &Value) {
         let Some(filter) = params.get("filter") else {
             return;
@@ -704,7 +990,11 @@ async fn execute_ws_method(
             path.push_str(highlight);
         }
         if let Some(tags) = filter.get("tags").and_then(Value::as_array) {
-            for tag in tags.iter().filter_map(Value::as_str).filter(|value| !value.trim().is_empty()) {
+            for tag in tags
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
                 path.push_str("&filterTag=");
                 path.push_str(&urlencoding::encode(tag));
             }
@@ -720,11 +1010,18 @@ async fn execute_ws_method(
             internal_json_request(state, Method::PATCH, "/api/config", Some(payload)).await
         }
         "notifications/list" => {
-            let limit = params
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(80);
-            internal_json_request(state, Method::GET, &format!("/api/notifications?limit={limit}"), None).await
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(80);
+            internal_json_request(
+                state,
+                Method::GET,
+                &format!("/api/notifications?limit={limit}"),
+                None,
+            )
+            .await
+        }
+        "audit/list" => {
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(120) as usize;
+            list_audit_log(&state.config, limit).await
         }
         "notifications/markRead" => {
             let payload = json!({
@@ -741,15 +1038,26 @@ async fn execute_ws_method(
                 "slackWebhookUrl": params.get("slackWebhookUrl").cloned().unwrap_or(Value::Null),
                 "webhookUrl": params.get("webhookUrl").cloned().unwrap_or(Value::Null)
             });
-            internal_json_request(state, Method::PATCH, "/api/notifications/settings", Some(payload)).await
+            internal_json_request(
+                state,
+                Method::PATCH,
+                "/api/notifications/settings",
+                Some(payload),
+            )
+            .await
         }
         "runtime/status" => codex_runtime_status(state, false).await,
         "runtime/checkUpdate" => codex_runtime_status(state, true).await,
-        "runtime/quota" => codex_quota_status(
-            state,
-            params.get("refresh").and_then(Value::as_bool).unwrap_or(false),
-        )
-        .await,
+        "runtime/quota" => {
+            codex_quota_status(
+                state,
+                params
+                    .get("refresh")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            )
+            .await
+        }
         "catalog/get" => internal_json_request(state, Method::GET, "/api/catalog", None).await,
         "editor/file/get" => {
             let file_path_raw = require_string(&params, "filePath")?;
@@ -781,10 +1089,7 @@ async fn execute_ws_method(
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .map(urlencoding::encode);
-            let limit = params
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(20);
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
             let mut path = format!("/api/sessions?archived={archived}&limit={limit}");
             if let Some(cursor) = cursor {
                 path.push_str(&format!("&cursor={cursor}"));
@@ -809,22 +1114,15 @@ async fn execute_ws_method(
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .map(urlencoding::encode);
-            let limit = params
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(20);
-            let mut path = format!("/api/sessions?query={query}&scope={scope}&archived={archived}&limit={limit}");
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
+            let mut path = format!(
+                "/api/sessions?query={query}&scope={scope}&archived={archived}&limit={limit}"
+            );
             if let Some(cursor) = cursor {
                 path.push_str(&format!("&cursor={cursor}"));
             }
             append_session_filter_query(&mut path, &params);
-            internal_json_request(
-                state,
-                Method::GET,
-                &path,
-                None,
-            )
-            .await
+            internal_json_request(state, Method::GET, &path, None).await
         }
         "session/create" => {
             let payload = json!({
@@ -883,10 +1181,7 @@ async fn execute_ws_method(
         }
         "session/get" => {
             let session_id = require_string(&params, "sessionId")?;
-            let limit = params
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(20);
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
             internal_json_request(
                 state,
                 Method::GET,
@@ -899,14 +1194,13 @@ async fn execute_ws_method(
             let session_id = require_string(&params, "sessionId")?;
             let before_turn_id = require_string(&params, "beforeTurnId")?;
             let before_turn_id = urlencoding::encode(&before_turn_id);
-            let limit = params
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(20);
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
             internal_json_request(
                 state,
                 Method::GET,
-                &format!("/api/sessions/{session_id}/turns?beforeTurnId={before_turn_id}&limit={limit}"),
+                &format!(
+                    "/api/sessions/{session_id}/turns?beforeTurnId={before_turn_id}&limit={limit}"
+                ),
                 None,
             )
             .await
@@ -1180,10 +1474,20 @@ async fn execute_ws_method(
             let payload = json!({
                 "loginId": require_string(&params, "loginId")?
             });
-            internal_json_request(state, Method::POST, "/api/account/login/cancel", Some(payload)).await
+            internal_json_request(
+                state,
+                Method::POST,
+                "/api/account/login/cancel",
+                Some(payload),
+            )
+            .await
         }
-        "account/logout" => internal_json_request(state, Method::POST, "/api/account/logout", Some(json!({}))).await,
-        "git/repositories/list" => internal_json_request(state, Method::GET, "/api/git/repositories", None).await,
+        "account/logout" => {
+            internal_json_request(state, Method::POST, "/api/account/logout", Some(json!({}))).await
+        }
+        "git/repositories/list" => {
+            internal_json_request(state, Method::GET, "/api/git/repositories", None).await
+        }
         "git/status" => {
             let repo_path_raw = require_string(&params, "repoPath")?;
             let repo_path = urlencoding::encode(&repo_path_raw);
@@ -1300,8 +1604,14 @@ async fn execute_ws_method(
         }
         "terminal/list" => list_terminals(state).await,
         "terminal/create" => {
-            let cwd = params.get("cwd").and_then(Value::as_str).map(str::to_string);
-            let title = params.get("title").and_then(Value::as_str).map(str::to_string);
+            let cwd = params
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let title = params
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             create_terminal(state.clone(), cwd, title).await
         }
         "terminal/read" => {
@@ -1319,7 +1629,13 @@ async fn execute_ws_method(
         }
         "session/subscribe" => {
             let session_id = require_string(&params, "sessionId")?;
-            subscribe_session(state.clone(), out_tx.clone(), subscriptions.clone(), session_id.clone()).await?;
+            subscribe_session(
+                state.clone(),
+                out_tx.clone(),
+                subscriptions.clone(),
+                session_id.clone(),
+            )
+            .await?;
             Ok(json!({ "subscribed": true, "sessionId": session_id }))
         }
         "session/unsubscribe" => {
@@ -1332,7 +1648,13 @@ async fn execute_ws_method(
         }
         "terminal/subscribe" => {
             let terminal_id = require_string(&params, "terminalId")?;
-            subscribe_terminal(state.clone(), out_tx.clone(), subscriptions.clone(), terminal_id.clone()).await?;
+            subscribe_terminal(
+                state.clone(),
+                out_tx.clone(),
+                subscriptions.clone(),
+                terminal_id.clone(),
+            )
+            .await?;
             Ok(json!({ "subscribed": true, "terminalId": terminal_id }))
         }
         "terminal/unsubscribe" => {
@@ -1411,7 +1733,9 @@ async fn subscribe_terminal(
                     });
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!("websocket lagged on terminal {terminal_key}: skipped {skipped} messages");
+                    warn!(
+                        "websocket lagged on terminal {terminal_key}: skipped {skipped} messages"
+                    );
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -1453,7 +1777,10 @@ async fn subscribe_global(
     Ok(())
 }
 
-async fn ensure_stream_relay(state: &AppState, session_id: &str) -> Result<broadcast::Sender<Value>> {
+async fn ensure_stream_relay(
+    state: &AppState,
+    session_id: &str,
+) -> Result<broadcast::Sender<Value>> {
     let mut relays = state.relays.lock().await;
     if let Some(existing) = relays.get(session_id) {
         return Ok(existing.clone());
@@ -1467,7 +1794,9 @@ async fn ensure_stream_relay(state: &AppState, session_id: &str) -> Result<broad
     let relay_sender = sender.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(error) = stream_session_events(state.clone(), relay_sender.clone(), session_id.clone()).await {
+            if let Err(error) =
+                stream_session_events(state.clone(), relay_sender.clone(), session_id.clone()).await
+            {
                 warn!("session stream relay failed for {session_id}: {error:#}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -1500,7 +1829,11 @@ async fn ensure_global_relay(state: &AppState) -> Result<broadcast::Sender<Value
     Ok(sender)
 }
 
-async fn stream_session_events(state: AppState, sender: broadcast::Sender<Value>, session_id: String) -> Result<()> {
+async fn stream_session_events(
+    state: AppState,
+    sender: broadcast::Sender<Value>,
+    session_id: String,
+) -> Result<()> {
     let target = internal_url(&state.config, &format!("/api/sessions/{session_id}/stream"));
     let response = state
         .http
@@ -1545,7 +1878,9 @@ async fn stream_global_events(state: AppState, sender: broadcast::Sender<Value>)
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("internal global SSE request failed with {status}: {body}"));
+        return Err(anyhow!(
+            "internal global SSE request failed with {status}: {body}"
+        ));
     }
 
     let stream = response
@@ -1554,9 +1889,14 @@ async fn stream_global_events(state: AppState, sender: broadcast::Sender<Value>)
     let reader = StreamReader::new(stream);
     let mut lines = BufReader::new(reader).lines();
 
-    while let Some(line) = lines.next_line().await.context("failed to read global SSE line")? {
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .context("failed to read global SSE line")?
+    {
         if let Some(data) = line.strip_prefix("data: ") {
-            let payload: Value = serde_json::from_str(data).context("invalid global SSE json payload")?;
+            let payload: Value =
+                serde_json::from_str(data).context("invalid global SSE json payload")?;
             let _ = sender.send(payload);
         }
     }
@@ -1604,7 +1944,8 @@ async fn emit_terminals_updated(state: &AppState) {
 }
 
 async fn get_terminal_session(state: &AppState, terminal_id: &str) -> Result<Arc<TerminalSession>> {
-    state.terminals
+    state
+        .terminals
         .lock()
         .await
         .get(terminal_id)
@@ -1616,8 +1957,12 @@ async fn validate_terminal_cwd(state: &AppState, requested_cwd: Option<String>) 
     let candidate = requested_cwd
         .map(PathBuf::from)
         .unwrap_or_else(|| state.config.project_root.clone());
-    let resolved = fs::canonicalize(&candidate)
-        .with_context(|| format!("terminal working directory is invalid: {}", candidate.display()))?;
+    let resolved = fs::canonicalize(&candidate).with_context(|| {
+        format!(
+            "terminal working directory is invalid: {}",
+            candidate.display()
+        )
+    })?;
     let metadata = fs::metadata(&resolved)
         .with_context(|| format!("failed to inspect {}", resolved.display()))?;
     if !metadata.is_dir() {
@@ -1631,7 +1976,12 @@ async fn validate_terminal_cwd(state: &AppState, requested_cwd: Option<String>) 
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|entry| entry.get("path").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|entry| {
+            entry
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .collect::<Vec<_>>();
 
     let allowed = allowed_roots.iter().any(|root| {
@@ -1675,7 +2025,11 @@ async fn spawn_terminal_process(cwd: &str) -> Result<Child> {
     }
 }
 
-async fn create_terminal(state: AppState, cwd: Option<String>, title: Option<String>) -> Result<Value> {
+async fn create_terminal(
+    state: AppState,
+    cwd: Option<String>,
+    title: Option<String>,
+) -> Result<Value> {
     let cwd = validate_terminal_cwd(&state, cwd).await?;
     let mut child = spawn_terminal_process(&cwd).await?;
     let stdout = child
@@ -1968,9 +2322,22 @@ async fn fetch_codex_quota(state: &AppState) -> Result<Value> {
         });
     }
 
-    let payload: UsageResponseShape = response.json().await.context("invalid Codex quota response")?;
-    let five_hour = normalize_quota_window(payload.rate_limit.as_ref().and_then(|rate_limit| rate_limit.primary_window.as_ref()));
-    let weekly = normalize_quota_window(payload.rate_limit.as_ref().and_then(|rate_limit| rate_limit.secondary_window.as_ref()));
+    let payload: UsageResponseShape = response
+        .json()
+        .await
+        .context("invalid Codex quota response")?;
+    let five_hour = normalize_quota_window(
+        payload
+            .rate_limit
+            .as_ref()
+            .and_then(|rate_limit| rate_limit.primary_window.as_ref()),
+    );
+    let weekly = normalize_quota_window(
+        payload
+            .rate_limit
+            .as_ref()
+            .and_then(|rate_limit| rate_limit.secondary_window.as_ref()),
+    );
 
     Ok(json!({
         "available": five_hour.is_some() || weekly.is_some(),
@@ -1993,12 +2360,15 @@ fn read_codex_auth(config: &Config) -> Result<AuthFile> {
 
 fn normalize_quota_window(window: Option<&UsageWindowShape>) -> Option<Value> {
     let window = window?;
-    let used_percent = (window.used_percent.unwrap_or(0.0)).clamp(0.0, 100.0).round() as u64;
+    let used_percent = (window.used_percent.unwrap_or(0.0))
+        .clamp(0.0, 100.0)
+        .round() as u64;
     let reset_after_seconds = window
         .reset_after_seconds
         .filter(|value| *value > 0)
         .map(|value| value as u64);
-    let reset_at = reset_after_seconds.map(|seconds| now_unix_ms().saturating_add(seconds.saturating_mul(1000)));
+    let reset_at = reset_after_seconds
+        .map(|seconds| now_unix_ms().saturating_add(seconds.saturating_mul(1000)));
 
     Some(json!({
         "usedPercent": used_percent,
@@ -2090,10 +2460,14 @@ async fn run_command_with_timeout(
 }
 
 async fn command_available(name: &str) -> bool {
-    run_command_with_timeout(which_command(), vec![name.to_string()], Duration::from_secs(2))
-        .await
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    run_command_with_timeout(
+        which_command(),
+        vec![name.to_string()],
+        Duration::from_secs(2),
+    )
+    .await
+    .map(|output| output.status.success())
+    .unwrap_or(false)
 }
 
 async fn resolve_binary_path(command: &str) -> Option<String> {
@@ -2102,35 +2476,31 @@ async fn resolve_binary_path(command: &str) -> Option<String> {
         return Some(candidate.display().to_string());
     }
 
-    let output = run_command_with_timeout(which_command(), vec![command.to_string()], Duration::from_secs(2))
-        .await
-        .ok()?;
+    let output = run_command_with_timeout(
+        which_command(),
+        vec![command.to_string()],
+        Duration::from_secs(2),
+    )
+    .await
+    .ok()?;
     if !output.status.success() {
         return None;
     }
 
-    let path = String::from_utf8_lossy(&output.stdout).lines().next()?.trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path)
-    }
+    let path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    if path.is_empty() { None } else { Some(path) }
 }
 
 fn which_command() -> &'static str {
-    if cfg!(windows) {
-        "where"
-    } else {
-        "which"
-    }
+    if cfg!(windows) { "where" } else { "which" }
 }
 
 fn npm_command() -> &'static str {
-    if cfg!(windows) {
-        "npm.cmd"
-    } else {
-        "npm"
-    }
+    if cfg!(windows) { "npm.cmd" } else { "npm" }
 }
 
 fn extract_semver(value: &str) -> Option<(u64, u64, u64)> {
@@ -2212,7 +2582,11 @@ fn now_rfc3339() -> String {
         .unwrap_or_else(|_| String::new())
 }
 
-async fn upload_attachments(state: &AppState, session_id: &str, files: Vec<UploadFilePayload>) -> Result<Value> {
+async fn upload_attachments(
+    state: &AppState,
+    session_id: &str,
+    files: Vec<UploadFilePayload>,
+) -> Result<Value> {
     let mut form = Form::new();
     for file in files {
         let bytes = base64::engine::general_purpose::STANDARD
@@ -2220,7 +2594,11 @@ async fn upload_attachments(state: &AppState, session_id: &str, files: Vec<Uploa
             .context("invalid base64 attachment payload")?;
         let part = Part::bytes(bytes)
             .file_name(file.name.clone())
-            .mime_str(file.mime_type.as_deref().unwrap_or("application/octet-stream"))
+            .mime_str(
+                file.mime_type
+                    .as_deref()
+                    .unwrap_or("application/octet-stream"),
+            )
             .context("invalid attachment mime type")?;
         form = form.part("files", part);
     }
@@ -2287,11 +2665,17 @@ async fn forward_request(
 ) -> Result<Response> {
     let mut request = state
         .http
-        .request(reqwest::Method::from_bytes(method.as_str().as_bytes())?, target.to_string())
+        .request(
+            reqwest::Method::from_bytes(method.as_str().as_bytes())?,
+            target.to_string(),
+        )
         .header(INTERNAL_HEADER, &state.config.internal_proxy_token);
 
     for (name, value) in headers.iter() {
-        if name == header::HOST || name == header::CONTENT_LENGTH || name.as_str() == INTERNAL_HEADER {
+        if name == header::HOST
+            || name == header::CONTENT_LENGTH
+            || name.as_str() == INTERNAL_HEADER
+        {
             continue;
         }
         request = request.header(name, value);
@@ -2306,9 +2690,13 @@ async fn forward_request(
     }
 
     let upstream = request.send().await.context("failed to forward request")?;
-    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let upstream_headers = upstream.headers().clone();
-    let bytes = upstream.bytes().await.context("failed to read upstream response")?;
+    let bytes = upstream
+        .bytes()
+        .await
+        .context("failed to read upstream response")?;
 
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = status;
@@ -2359,15 +2747,18 @@ async fn clear_login_failures(state: &AppState, identifier: &str) {
     state.login_attempts.lock().await.remove(identifier);
 }
 
-fn verify_password(config: &Config, input: &str) -> Result<bool> {
-    if let Some(password) = &config.password {
+fn verify_password_pair(
+    plain: Option<&String>,
+    hashed: Option<&String>,
+    input: &str,
+    required_error: &str,
+) -> Result<bool> {
+    if let Some(password) = plain {
         return Ok(password.as_bytes().ct_eq(input.as_bytes()).into());
     }
 
-    let Some(password_hash) = &config.password_hash else {
-        return Err(anyhow!(
-            "Set CODEX_WEBUI_PASSWORD_HASH or CODEX_WEBUI_PASSWORD before using the Rust gateway."
-        ));
+    let Some(password_hash) = hashed else {
+        return Err(anyhow!(required_error.to_string()));
     };
 
     let mut parts = password_hash.split('$');
@@ -2393,13 +2784,45 @@ fn verify_password(config: &Config, input: &str) -> Result<bool> {
         .context("invalid password hash key")?;
     let params = ScryptParams::new(14, 8, 1, expected.len())?;
     let mut derived = vec![0_u8; expected.len()];
-    scrypt(input.as_bytes(), &salt, &params, &mut derived).context("failed to derive password hash")?;
+    scrypt(input.as_bytes(), &salt, &params, &mut derived)
+        .context("failed to derive password hash")?;
     Ok(derived.ct_eq(&expected).into())
 }
 
-fn issue_auth_cookie(config: &Config, jar: CookieJar, secure_request: bool) -> Result<CookieJar> {
+fn authenticate_role(config: &Config, input: &str) -> Result<Option<UserRole>> {
+    if verify_password_pair(
+        config.password.as_ref(),
+        config.password_hash.as_ref(),
+        input,
+        "Set CODEX_WEBUI_PASSWORD_HASH or CODEX_WEBUI_PASSWORD before using the Rust gateway.",
+    )? {
+        return Ok(Some(UserRole::Admin));
+    }
+
+    if config.viewer_password.is_none() && config.viewer_password_hash.is_none() {
+        return Ok(None);
+    }
+
+    if verify_password_pair(
+        config.viewer_password.as_ref(),
+        config.viewer_password_hash.as_ref(),
+        input,
+        "Failed to verify viewer password.",
+    )? {
+        return Ok(Some(UserRole::Viewer));
+    }
+
+    Ok(None)
+}
+
+fn issue_auth_cookie(
+    config: &Config,
+    jar: CookieJar,
+    secure_request: bool,
+    role: UserRole,
+) -> Result<CookieJar> {
     let secure = resolve_cookie_secure(config, secure_request)?;
-    let cookie_value = make_auth_token(config)?;
+    let cookie_value = make_auth_token(config, role)?;
     let mut cookie = Cookie::new(AUTH_COOKIE, cookie_value);
     cookie.set_path("/");
     cookie.set_http_only(true);
@@ -2414,7 +2837,9 @@ fn issue_auth_cookie(config: &Config, jar: CookieJar, secure_request: bool) -> R
 }
 
 fn resolve_cookie_secure(config: &Config, secure_request: bool) -> Result<bool> {
-    if config.cookie_same_site == SameSiteMode::None && config.cookie_secure_mode == CookieSecureMode::Never {
+    if config.cookie_same_site == SameSiteMode::None
+        && config.cookie_secure_mode == CookieSecureMode::Never
+    {
         return Err(anyhow!(
             "CODEX_WEBUI_COOKIE_SAMESITE=none cannot be combined with CODEX_WEBUI_COOKIE_SECURE=never."
         ));
@@ -2435,35 +2860,58 @@ fn resolve_cookie_secure(config: &Config, secure_request: bool) -> Result<bool> 
     }
 }
 
-fn make_auth_token(config: &Config) -> Result<String> {
+fn make_auth_token(config: &Config, role: UserRole) -> Result<String> {
     let now = now_millis();
     let expires = now + 7 * 24 * 60 * 60 * 1000;
     let nonce = Uuid::new_v4().simple().to_string();
-    let payload = format!("{now}.{expires}.{nonce}");
+    let payload = format!(
+        "{now}.{expires}.{}.{}",
+        match role {
+            UserRole::Admin => "admin",
+            UserRole::Viewer => "viewer",
+        },
+        nonce
+    );
     let signature = sign(config, &payload)?;
     Ok(format!("{payload}.{signature}"))
 }
 
-fn is_authenticated(config: &Config, jar: &CookieJar) -> bool {
+fn auth_context(config: &Config, jar: &CookieJar) -> Option<AuthContext> {
     let Some(cookie) = jar.get(AUTH_COOKIE) else {
-        return false;
+        return None;
     };
     let token = cookie.value();
     let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 4 {
-        return false;
+    if parts.len() != 4 && parts.len() != 5 {
+        return None;
     }
-    let payload = parts[..3].join(".");
+    let payload = parts[..parts.len() - 1].join(".");
     let Ok(expected) = sign(config, &payload) else {
-        return false;
+        return None;
     };
-    if expected.as_bytes().ct_eq(parts[3].as_bytes()).unwrap_u8() != 1 {
-        return false;
+    if expected
+        .as_bytes()
+        .ct_eq(parts[parts.len() - 1].as_bytes())
+        .unwrap_u8()
+        != 1
+    {
+        return None;
     }
-    parts[1]
-        .parse::<u128>()
-        .map(|expires| now_millis() < expires)
-        .unwrap_or(false)
+    let expires = parts[1].parse::<u128>().ok()?;
+    if now_millis() >= expires {
+        return None;
+    }
+
+    let role = if parts.len() == 5 {
+        match parts[2] {
+            "viewer" => UserRole::Viewer,
+            _ => UserRole::Admin,
+        }
+    } else {
+        UserRole::Admin
+    };
+
+    Some(AuthContext { role })
 }
 
 fn sign(config: &Config, payload: &str) -> Result<String> {
@@ -2473,13 +2921,17 @@ fn sign(config: &Config, payload: &str) -> Result<String> {
         .or_else(|| config.password_hash.clone())
         .or_else(|| config.password.clone())
         .unwrap_or_default();
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).context("failed to initialize HMAC")?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).context("failed to initialize HMAC")?;
     mac.update(payload.as_bytes());
     Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
 }
 
 fn request_is_secure(headers: &HeaderMap) -> bool {
-    if let Some(forwarded) = headers.get("x-forwarded-proto").and_then(|value| value.to_str().ok()) {
+    if let Some(forwarded) = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+    {
         return forwarded.eq_ignore_ascii_case("https");
     }
     false
@@ -2494,7 +2946,11 @@ fn extract_origin(headers: &HeaderMap) -> Option<String> {
 
 fn allowed_cors_origin(config: &Config, origin: &Option<String>) -> Option<String> {
     let origin = origin.as_ref()?;
-    if config.cors_allowed_origins.iter().any(|allowed| allowed == origin) {
+    if config
+        .cors_allowed_origins
+        .iter()
+        .any(|allowed| allowed == origin)
+    {
         Some(origin.clone())
     } else {
         None
@@ -2614,7 +3070,9 @@ fn with_base(base_path: &str, route_path: &str) -> String {
 
 fn parse_port(value: Option<String>, fallback: u16) -> Result<u16> {
     match value {
-        Some(value) => value.parse::<u16>().with_context(|| format!("invalid port: {value}")),
+        Some(value) => value
+            .parse::<u16>()
+            .with_context(|| format!("invalid port: {value}")),
         None => Ok(fallback),
     }
 }
@@ -2652,7 +3110,8 @@ fn choose_free_port() -> Result<u16> {
 }
 
 fn resolve_codex_home() -> Result<PathBuf> {
-    if let Some(value) = env::var_os("CODEX_WEBUI_CODEX_HOME").or_else(|| env::var_os("CODEX_HOME")) {
+    if let Some(value) = env::var_os("CODEX_WEBUI_CODEX_HOME").or_else(|| env::var_os("CODEX_HOME"))
+    {
         return Ok(PathBuf::from(value));
     }
 
@@ -2711,12 +3170,17 @@ async fn spawn_internal_node(config: &Config) -> Result<Child> {
         .envs(env::vars())
         .env("HOST", "127.0.0.1")
         .env("PORT", config.internal_port.to_string())
-        .env("CODEX_WEBUI_INTERNAL_PROXY_TOKEN", &config.internal_proxy_token)
+        .env(
+            "CODEX_WEBUI_INTERNAL_PROXY_TOKEN",
+            &config.internal_proxy_token,
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    let mut child = command.spawn().context("failed to spawn internal Node backend")?;
+    let mut child = command
+        .spawn()
+        .context("failed to spawn internal Node backend")?;
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
@@ -2745,7 +3209,10 @@ async fn wait_for_internal_node(config: &Config, http: &reqwest::Client) -> Resu
             .await
         {
             if response.status().is_success() || response.status().is_redirection() {
-                info!("Internal Node backend is ready at {}", config.internal_base_url);
+                info!(
+                    "Internal Node backend is ready at {}",
+                    config.internal_base_url
+                );
                 return Ok(());
             }
         }

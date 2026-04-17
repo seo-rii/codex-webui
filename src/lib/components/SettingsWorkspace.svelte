@@ -1,18 +1,29 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { Pencil, Plug, RefreshCw, Save, Settings2, Sparkles, Trash2 } from "lucide-svelte";
+  import { History, Pencil, Plug, RefreshCw, Save, Settings2, Sparkles, Trash2 } from "lucide-svelte";
 
   import { api } from "$lib/api";
   import MonacoTextEditor from "$lib/components/MonacoTextEditor.svelte";
   import { localeSignal } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
-  import type { CatalogPayload, EditableFilePayload, NotificationEventType, NotificationSettings, PromptPreset } from "$lib/types";
+  import { getLocale } from "$lib/paraglide/runtime.js";
+  import type {
+    AuditLogEntry,
+    CatalogPayload,
+    EditableFilePayload,
+    NotificationEventType,
+    NotificationSettings,
+    PromptPreset,
+    UserRole
+  } from "$lib/types";
 
   let {
     codexHome,
     configFilePath,
     notificationSettings = null,
     promptPresets = [],
+    webRole = "admin",
+    readOnly = false,
     onNotificationSettingsSaved = null,
     onSavePromptPreset = null,
     onDeletePromptPreset = null,
@@ -22,6 +33,8 @@
     configFilePath: string;
     notificationSettings?: NotificationSettings | null;
     promptPresets?: PromptPreset[];
+    webRole?: UserRole | null;
+    readOnly?: boolean;
     onNotificationSettingsSaved?: ((settings: Partial<NotificationSettings>) => void | Promise<void>) | null;
     onSavePromptPreset?: ((preset: PromptPreset) => void | Promise<void>) | null;
     onDeletePromptPreset?: ((presetId: string) => void | Promise<void>) | null;
@@ -38,6 +51,7 @@
   let presetId = $state<string | null>(null);
   let presetName = $state("");
   let presetPrompt = $state("");
+  let auditEntries = $state<AuditLogEntry[]>([]);
   let loading = $state(true);
   let saving = $state(false);
   let reloading = $state(false);
@@ -72,6 +86,7 @@
 
     return {
       settings: m.settings(),
+      account: m.account(),
       workspace: m.codex_workspace(),
       reload: m.reload(),
       saving: m.saving(),
@@ -92,6 +107,11 @@
       notificationInputRequired: m.notification_input_required(),
       notificationQueueFailed: m.notification_queue_failed(),
       notificationShutdownScheduled: m.notification_shutdown_scheduled(),
+      auditLog: m.audit_log(),
+      auditLogEmpty: m.audit_log_empty(),
+      readOnlyMode: m.read_only_mode(),
+      roleAdmin: m.role_admin(),
+      roleViewer: m.role_viewer(),
       promptPresets: m.prompt_presets(),
       presetName: m.preset_name(),
       presetPrompt: m.preset_prompt(),
@@ -102,7 +122,8 @@
       noPlugins: m.no_installed_plugins(),
       noDescription: m.no_description(),
       installedSkills: m.installed_skills(),
-      noSkills: m.no_local_skills()
+      noSkills: m.no_local_skills(),
+      remove: m.remove()
     };
   });
 
@@ -171,10 +192,15 @@
     errorText = "";
 
     try {
-      const [nextFile, nextCatalog] = await Promise.all([api.getEditableFile(configFilePath), api.getCatalog()]);
+      const [nextFile, nextCatalog, nextAudit] = await Promise.all([
+        api.getEditableFile(configFilePath),
+        api.getCatalog(),
+        webRole === "admin" ? api.getAuditLog(120) : Promise.resolve({ entries: [] as AuditLogEntry[] })
+      ]);
       configFile = nextFile;
       editorValue = nextFile.content;
       catalog = nextCatalog;
+      auditEntries = nextAudit.entries;
     } catch (error) {
       errorText = error instanceof Error ? error.message : ui.failedLoad;
     } finally {
@@ -189,7 +215,7 @@
   }
 
   async function saveConfigFile() {
-    if (!configFile || !dirty) {
+    if (!configFile || !dirty || readOnly) {
       return;
     }
 
@@ -220,7 +246,7 @@
   }
 
   async function savePromptPreset() {
-    if (!presetName.trim() || !presetPrompt.trim()) {
+    if (!presetName.trim() || !presetPrompt.trim() || readOnly) {
       return;
     }
 
@@ -243,7 +269,7 @@
   }
 
   async function removePromptPreset() {
-    if (!presetId) {
+    if (!presetId || readOnly) {
       return;
     }
 
@@ -267,11 +293,17 @@
       <h2>{ui.workspace}</h2>
     </div>
     <div class="settings-shell__actions">
+      <span class={`meta-pill ${readOnly ? "" : "subtle"}`}>
+        {webRole === "viewer" ? ui.roleViewer : ui.roleAdmin}
+        {#if readOnly}
+          · {ui.readOnlyMode}
+        {/if}
+      </span>
       <button class="ghost-button" disabled={reloading || loading} onclick={() => void reloadConfigFile()} type="button">
         <RefreshCw size={14} class={reloading ? "animate-spin" : ""} />
         <span>{ui.reload}</span>
       </button>
-      <button class="solid-button" disabled={!dirty || saving || !configFile} onclick={() => void saveConfigFile()} type="button">
+      <button class="solid-button" disabled={readOnly || !dirty || saving || !configFile} onclick={() => void saveConfigFile()} type="button">
         <Save size={14} />
         <span>{saving ? ui.saving : ui.saveConfig}</span>
       </button>
@@ -305,8 +337,15 @@
             <span>{ui.editableFile}</span>
             <strong>{configFile.displayName}</strong>
           </div>
+          <div class="meta-card">
+            <span>{ui.account}</span>
+            <strong>{webRole === "viewer" ? ui.roleViewer : ui.roleAdmin}</strong>
+          </div>
         </div>
-        <MonacoTextEditor bind:value={editorValue} height={460} path={configFile.path} />
+        {#if readOnly}
+          <div class="field-note field-note--read-only">{ui.readOnlyMode}</div>
+        {/if}
+        <MonacoTextEditor bind:value={editorValue} height={460} path={configFile.path} readonly={readOnly} />
       </section>
 
       <section class="settings-column">
@@ -324,11 +363,11 @@
             <div class="settings-meta">
               <label class="field-block">
                 <span>{ui.slackWebhookUrl}</span>
-                <input bind:value={notificationSlackWebhookUrl} class="field-input" placeholder="https://hooks.slack.com/services/..." type="url" />
+                <input bind:value={notificationSlackWebhookUrl} class="field-input" disabled={readOnly} placeholder="https://hooks.slack.com/services/..." type="url" />
               </label>
               <label class="field-block">
                 <span>{ui.genericWebhookUrl}</span>
-                <input bind:value={notificationWebhookUrl} class="field-input" placeholder="https://example.com/codex-webhook" type="url" />
+                <input bind:value={notificationWebhookUrl} class="field-input" disabled={readOnly} placeholder="https://example.com/codex-webhook" type="url" />
               </label>
             </div>
             <div class="catalog-list">
@@ -338,6 +377,7 @@
                   <input
                     class="checkbox-input"
                     checked={notificationEventTypes.includes(eventType as NotificationEventType)}
+                    disabled={readOnly}
                     onchange={(event) => toggleNotificationEvent(eventType as NotificationEventType, (event.currentTarget as HTMLInputElement).checked)}
                     type="checkbox"
                   />
@@ -349,7 +389,7 @@
               {/each}
             </div>
             <div class="settings-shell__actions">
-              <button class="solid-button" disabled={!notificationDirty || savingNotifications} onclick={() => void saveNotifications()} type="button">
+              <button class="solid-button" disabled={readOnly || !notificationDirty || savingNotifications} onclick={() => void saveNotifications()} type="button">
                 <Save size={14} />
                 <span>{savingNotifications ? ui.saving : ui.saveNotificationSettings}</span>
               </button>
@@ -363,7 +403,7 @@
               <Pencil size={16} />
               <h3>{ui.promptPresets}</h3>
             </div>
-            <button class="ghost-button" onclick={startNewPreset} type="button">
+            <button class="ghost-button" disabled={readOnly} onclick={startNewPreset} type="button">
               <Pencil size={14} />
               <span>{ui.newPreset}</span>
             </button>
@@ -391,27 +431,72 @@
             <div class="settings-meta settings-meta--stack">
               <label class="field-block">
                 <span>{ui.presetName}</span>
-                <input bind:value={presetName} class="field-input" placeholder={ui.presetName} type="text" />
+                <input bind:value={presetName} class="field-input" disabled={readOnly} placeholder={ui.presetName} type="text" />
               </label>
               <label class="field-block">
                 <span>{ui.presetPrompt}</span>
-                <textarea bind:value={presetPrompt} class="field-input field-textarea" placeholder={ui.presetPrompt} rows="8"></textarea>
+                <textarea bind:value={presetPrompt} class="field-input field-textarea" disabled={readOnly} placeholder={ui.presetPrompt} rows="8"></textarea>
               </label>
               <div class="settings-shell__actions">
-                <button class="solid-button" disabled={!promptPresetDirty || savingPreset || !presetName.trim() || !presetPrompt.trim()} onclick={() => void savePromptPreset()} type="button">
+                <button class="solid-button" disabled={readOnly || !promptPresetDirty || savingPreset || !presetName.trim() || !presetPrompt.trim()} onclick={() => void savePromptPreset()} type="button">
                   <Save size={14} />
                   <span>{savingPreset ? ui.saving : ui.savePreset}</span>
                 </button>
                 {#if presetId}
-                  <button class="ghost-button" disabled={savingPreset} onclick={() => void removePromptPreset()} type="button">
+                  <button class="ghost-button" disabled={readOnly || savingPreset} onclick={() => void removePromptPreset()} type="button">
                     <Trash2 size={14} />
-                    <span>{m.remove()}</span>
+                    <span>{ui.remove}</span>
                   </button>
                 {/if}
               </div>
             </div>
           </div>
         </section>
+
+        {#if webRole === "admin"}
+          <section class="panel">
+            <div class="panel__header">
+              <div class="panel-title">
+                <History size={16} />
+                <h3>{ui.auditLog}</h3>
+              </div>
+              <span>{auditEntries.length}</span>
+            </div>
+            <div class="catalog-list">
+              {#if auditEntries.length === 0}
+                <p class="field-note">{ui.auditLogEmpty}</p>
+              {:else}
+                <div class="audit-log-list">
+                  {#each auditEntries as entry (entry.id)}
+                    <article class="audit-log-entry">
+                      <div class="audit-log-entry__header">
+                        <strong>{entry.method}</strong>
+                        <span class={`meta-pill subtle ${entry.ok ? "audit-log-entry__result--ok" : "audit-log-entry__result--error"}`}>
+                          {entry.ok ? "OK" : "ERR"}
+                        </span>
+                      </div>
+                      <div class="audit-log-entry__meta">
+                        <span>{new Intl.DateTimeFormat(getLocale() === "ko" ? "ko-KR" : "en-US", {
+                          month: "short",
+                          day: "numeric",
+                          hour: "2-digit",
+                          minute: "2-digit"
+                        }).format(new Date(entry.at))}</span>
+                        <span>{entry.role === "viewer" ? ui.roleViewer : entry.role === "admin" ? ui.roleAdmin : entry.role}</span>
+                        {#if entry.target}
+                          <span class="truncate">{entry.target}</span>
+                        {/if}
+                      </div>
+                      {#if entry.error}
+                        <p class="audit-log-entry__error">{entry.error}</p>
+                      {/if}
+                    </article>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          </section>
+        {/if}
 
         <section class="panel">
           <div class="panel__header">
@@ -585,6 +670,14 @@
     resize: vertical;
   }
 
+  .field-note--read-only {
+    border: 1px solid rgba(245, 158, 11, 0.18);
+    border-radius: 0.95rem;
+    background: rgba(255, 247, 237, 0.88);
+    color: #9a6700;
+    padding: 0.8rem 0.95rem;
+  }
+
   .panel {
     display: grid;
     gap: 0.9rem;
@@ -593,6 +686,62 @@
     background: rgba(255, 255, 255, 0.88);
     padding: 1.05rem;
     box-shadow: 0 16px 30px rgba(58, 39, 20, 0.07);
+  }
+
+  .audit-log-list {
+    display: grid;
+    gap: 0.7rem;
+    max-height: 28rem;
+    overflow: auto;
+    padding-right: 0.15rem;
+  }
+
+  .audit-log-entry {
+    display: grid;
+    gap: 0.45rem;
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 1rem;
+    background: rgba(248, 250, 252, 0.8);
+    padding: 0.8rem 0.9rem;
+  }
+
+  .audit-log-entry__header,
+  .audit-log-entry__meta {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    min-width: 0;
+  }
+
+  .audit-log-entry__header {
+    justify-content: space-between;
+  }
+
+  .audit-log-entry__header strong {
+    min-width: 0;
+    color: var(--ink-strong);
+    font-size: 0.86rem;
+  }
+
+  .audit-log-entry__meta {
+    flex-wrap: wrap;
+    color: var(--muted);
+    font-size: 0.72rem;
+  }
+
+  .audit-log-entry__result--ok {
+    color: #047857;
+  }
+
+  .audit-log-entry__result--error {
+    color: #b91c1c;
+  }
+
+  .audit-log-entry__error {
+    margin: 0;
+    color: #b91c1c;
+    font-size: 0.76rem;
+    line-height: 1.45;
   }
 
   .panel__header {

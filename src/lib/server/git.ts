@@ -644,6 +644,20 @@ export async function unstageGitChanges(repoPath: string, filePath: string | nul
   return getGitStatus(repository.path);
 }
 
+export async function fetchGitRepository(repoPath: string) {
+  const repository = await resolveGitRepository(repoPath);
+  await runGitText(repository.path, ["fetch", "--all", "--prune"]);
+  repositoryCache = null;
+  return getGitStatus(repository.path);
+}
+
+export async function pullGitRepository(repoPath: string) {
+  const repository = await resolveGitRepository(repoPath);
+  await runGitText(repository.path, ["pull", "--ff-only"]);
+  repositoryCache = null;
+  return getGitStatus(repository.path);
+}
+
 export async function commitGitChanges(repoPath: string, message: string) {
   const repository = await resolveGitRepository(repoPath);
   if (!message.trim()) {

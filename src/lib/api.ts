@@ -443,6 +443,18 @@ export const api = {
     });
   },
 
+  fetchGitRepository(repoPath: string) {
+    return ws.request<GitStatusPayload>("git/fetch", {
+      repoPath
+    });
+  },
+
+  pullGitRepository(repoPath: string) {
+    return ws.request<GitStatusPayload>("git/pull", {
+      repoPath
+    });
+  },
+
   commitGit(repoPath: string, message: string) {
     return ws.request<GitStatusPayload>("git/commit", {
       repoPath,

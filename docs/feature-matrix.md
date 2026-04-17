@@ -48,7 +48,7 @@ In the comparison columns:
 | Aggregated diff view | Implemented | Different shape | Comparable | Exposes grouped file changes per turn and in dedicated tabs. |
 | Inline file editing | Implemented | Partial | Comparable | Focused on quick inspection and edits rather than full IDE parity. |
 | Git repository discovery | Implemented | Different shape | Comparable | Discovery is depth-limited and gated on explicit repository selection. |
-| Git status, diff, commit inspection | Implemented | Partial | Comparable | Designed as a browser-side Git workspace, not a full desktop VCS client, and includes a compact mobile navigation mode. |
+| Git status, fetch/pull, diff, commit inspection | Implemented | Partial | Comparable | Designed as a browser-side Git workspace, not a full desktop VCS client, and includes compact action rows, fetch/pull controls, and a mobile-friendly navigation mode. |
 | Git worktree management | Implemented | Partial | Comparable | Explicitly exposed in the web UI because multiple browser workspaces benefit from it. |
 | Terminal tabs | Implemented | Different shape | Comparable | Terminals live in the Rust gateway and survive page reloads while the server stays up. |
 | Subagent activity view | Implemented | Comparable | Comparable | Subagent activity is rendered inline and can open related threads in tabs. |

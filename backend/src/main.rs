@@ -1574,6 +1574,18 @@ async fn execute_ws_method(
             });
             internal_json_request(state, Method::POST, "/api/git/unstage", Some(payload)).await
         }
+        "git/fetch" => {
+            let payload = json!({
+                "repoPath": require_string(&params, "repoPath")?
+            });
+            internal_json_request(state, Method::POST, "/api/git/fetch", Some(payload)).await
+        }
+        "git/pull" => {
+            let payload = json!({
+                "repoPath": require_string(&params, "repoPath")?
+            });
+            internal_json_request(state, Method::POST, "/api/git/pull", Some(payload)).await
+        }
         "git/commit" => {
             let payload = json!({
                 "repoPath": require_string(&params, "repoPath")?,

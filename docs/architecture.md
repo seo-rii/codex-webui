@@ -50,7 +50,7 @@ The internal service contains most Codex-specific application logic:
 - session organization persistence for pins, tags, and saved sidebar filters
 - prompt preset persistence for composer shortcuts and slash-command expansion
 - attachment storage
-- Git repository discovery and file operations
+- Git repository discovery, fetch/pull flows, and file operations
 - `config.toml` synchronization
 - plugin and skill catalog reads
 - local session indexing and search

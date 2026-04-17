@@ -12,12 +12,14 @@
 
   let {
     selectedRepoPath,
+    readOnly = false,
     onSelectRepo,
     openRequest = null,
     onOpenDiffTab = null,
     onOpenCommitDiff = null
   }: {
     selectedRepoPath: string | null;
+    readOnly?: boolean;
     onSelectRepo: (repoPath: string | null) => void;
     openRequest?: GitOpenRequest | null;
     onOpenDiffTab?: ((repoPath: string, filePath: string) => void) | null;
@@ -43,6 +45,7 @@
   let loadingFile = $state(false);
   let savingFile = $state(false);
   let gitBusy = $state(false);
+  let gitBusyAction = $state<"fetch" | "pull" | null>(null);
   let worktreeBusy = $state(false);
   let openingCommitHash = $state<string | null>(null);
   let errorText = $state("");
@@ -73,6 +76,10 @@
       addWorktree: m.add_worktree(),
       stageAll: m.stage_all(),
       unstageAll: m.unstage_all(),
+      fetch: m.fetch(),
+      fetching: m.fetching(),
+      pull: m.pull(),
+      pulling: m.pulling(),
       switchBranch: m.switch_branch(),
       newBranchName: m.new_branch_name(),
       create: m.create(),
@@ -281,7 +288,7 @@
   }
 
   async function saveFile() {
-    if (!selectedRepoPath || !filePayload || filePayload.isBinary) {
+    if (!selectedRepoPath || !filePayload || filePayload.isBinary || readOnly) {
       return;
     }
 
@@ -300,7 +307,7 @@
   }
 
   async function stage(filePath: string | null = null) {
-    if (!selectedRepoPath) {
+    if (!selectedRepoPath || readOnly) {
       return;
     }
 
@@ -317,7 +324,7 @@
   }
 
   async function unstage(filePath: string | null = null) {
-    if (!selectedRepoPath) {
+    if (!selectedRepoPath || readOnly) {
       return;
     }
 
@@ -334,7 +341,7 @@
   }
 
   async function commit() {
-    if (!selectedRepoPath || !commitMessage.trim()) {
+    if (!selectedRepoPath || readOnly || !commitMessage.trim()) {
       return;
     }
 
@@ -352,7 +359,7 @@
   }
 
   async function switchBranch(branchName: string) {
-    if (!selectedRepoPath || !branchName) {
+    if (!selectedRepoPath || readOnly || !branchName) {
       return;
     }
 
@@ -369,7 +376,7 @@
   }
 
   async function createBranch() {
-    if (!selectedRepoPath || !newBranchName.trim()) {
+    if (!selectedRepoPath || readOnly || !newBranchName.trim()) {
       return;
     }
 
@@ -387,7 +394,7 @@
   }
 
   async function createWorktree() {
-    if (!selectedRepoPath || !newWorktreePath.trim()) {
+    if (!selectedRepoPath || readOnly || !newWorktreePath.trim()) {
       return;
     }
 
@@ -416,7 +423,7 @@
   }
 
   async function removeWorktree(worktreePath: string) {
-    if (!selectedRepoPath) {
+    if (!selectedRepoPath || readOnly) {
       return;
     }
 
@@ -445,6 +452,44 @@
   function describeError(value: unknown) {
     const message = describeUiError(value);
     return message === m.unknown_error() ? ui.gitErrorGeneric : message;
+  }
+
+  async function fetchRepository() {
+    if (!selectedRepoPath || readOnly) {
+      return;
+    }
+
+    gitBusy = true;
+    gitBusyAction = "fetch";
+    errorText = "";
+
+    try {
+      status = await api.fetchGitRepository(selectedRepoPath);
+    } catch (error) {
+      errorText = describeError(error);
+    } finally {
+      gitBusy = false;
+      gitBusyAction = null;
+    }
+  }
+
+  async function pullRepository() {
+    if (!selectedRepoPath || readOnly) {
+      return;
+    }
+
+    gitBusy = true;
+    gitBusyAction = "pull";
+    errorText = "";
+
+    try {
+      status = await api.pullGitRepository(selectedRepoPath);
+    } catch (error) {
+      errorText = describeError(error);
+    } finally {
+      gitBusy = false;
+      gitBusyAction = null;
+    }
   }
 
   $effect(() => {
@@ -499,7 +544,17 @@
       <div class="meta-pill">{status.branch ?? ui.detachedHead}</div>
       <div class="meta-pill subtle">{m.ahead_behind({ ahead: String(status.ahead), behind: String(status.behind) })}</div>
       <div class="meta-pill subtle">{ui.worktrees}</div>
-      <button class="ghost-button" type="button" onclick={() => refreshStatus(selectedRepoPath)}>{ui.refresh}</button>
+      <div class="git-actions git-actions--compact">
+        <button class="ghost-button small" disabled={readOnly || gitBusy || loadingStatus} type="button" onclick={fetchRepository}>
+          {gitBusyAction === "fetch" ? ui.fetching : ui.fetch}
+        </button>
+        <button class="ghost-button small" disabled={readOnly || gitBusy || loadingStatus} type="button" onclick={pullRepository}>
+          {gitBusyAction === "pull" ? ui.pulling : ui.pull}
+        </button>
+        <button class="ghost-button small" disabled={readOnly || gitBusy} type="button" onclick={() => stage(null)}>{ui.stageAll}</button>
+        <button class="ghost-button small" disabled={readOnly || gitBusy} type="button" onclick={() => unstage(null)}>{ui.unstageAll}</button>
+        <button class="ghost-button small" type="button" onclick={() => refreshStatus(selectedRepoPath)}>{ui.refresh}</button>
+      </div>
     </div>
 
     {#if isMobileLayout}
@@ -516,40 +571,35 @@
       <div class="toolbar-row toolbar-row--fields">
         <label class="field field--inline field--grow">
           <span>{ui.worktreePath}</span>
-          <input bind:value={newWorktreePath} placeholder="/path/to/worktree" type="text" />
+          <input bind:value={newWorktreePath} disabled={readOnly} placeholder="/path/to/worktree" type="text" />
         </label>
         <label class="field field--inline field--grow">
           <span>{ui.worktreeBranch}</span>
-          <input bind:value={newWorktreeBranch} disabled={detachWorktree} placeholder={detachWorktree ? ui.detachedHeadShort : ui.branchOrNewBranch} type="text" />
+          <input bind:value={newWorktreeBranch} disabled={readOnly || detachWorktree} placeholder={detachWorktree ? ui.detachedHeadShort : ui.branchOrNewBranch} type="text" />
         </label>
-        <label class:checkbox-card--disabled={detachWorktree} class="checkbox-card checkbox-card--compact">
-          <input bind:checked={createWorktreeBranch} class="checkbox-input" disabled={detachWorktree} type="checkbox" />
+        <label class:checkbox-card--disabled={readOnly || detachWorktree} class="checkbox-card checkbox-card--compact">
+          <input bind:checked={createWorktreeBranch} class="checkbox-input" disabled={readOnly || detachWorktree} type="checkbox" />
           <span aria-hidden="true" class="checkbox-control"></span>
           <span class="checkbox-copy">
             <span class="checkbox-title">{ui.createBranchOption}</span>
           </span>
         </label>
-        <label class="checkbox-card checkbox-card--compact">
-          <input bind:checked={detachWorktree} class="checkbox-input" type="checkbox" />
+        <label class:checkbox-card--disabled={readOnly} class="checkbox-card checkbox-card--compact">
+          <input bind:checked={detachWorktree} class="checkbox-input" disabled={readOnly} type="checkbox" />
           <span aria-hidden="true" class="checkbox-control"></span>
           <span class="checkbox-copy">
             <span class="checkbox-title">{ui.detachHeadOption}</span>
           </span>
         </label>
-        <button class="solid-button" disabled={!newWorktreePath.trim() || (!detachWorktree && !newWorktreeBranch.trim()) || worktreeBusy} type="button" onclick={createWorktree}>
+        <button class="solid-button" disabled={readOnly || !newWorktreePath.trim() || (!detachWorktree && !newWorktreeBranch.trim()) || worktreeBusy} type="button" onclick={createWorktree}>
           {worktreeBusy ? ui.creating : ui.addWorktree}
         </button>
-      </div>
-
-      <div class="git-actions toolbar-row">
-        <button class="ghost-button" disabled={gitBusy} type="button" onclick={() => stage(null)}>{ui.stageAll}</button>
-        <button class="ghost-button" disabled={gitBusy} type="button" onclick={() => unstage(null)}>{ui.unstageAll}</button>
       </div>
 
       <div class="toolbar-row toolbar-row--fields">
         <label class="field field--inline field--grow">
           <span>{ui.switchBranch}</span>
-          <select onchange={(event) => void switchBranch((event.currentTarget as HTMLSelectElement).value)} value={status.branch ?? ""}>
+          <select disabled={readOnly} onchange={(event) => void switchBranch((event.currentTarget as HTMLSelectElement).value)} value={status.branch ?? ""}>
             <option value="">{ui.switchBranch}</option>
             {#each status.branches as branch (branch.name)}
               <option value={branch.name}>{branch.name}{branch.current ? ` · ${ui.current}` : ""}</option>
@@ -558,17 +608,17 @@
         </label>
 
         <div class="inline-field inline-field--compact">
-          <input bind:value={newBranchName} placeholder={ui.newBranchName} type="text" />
-          <button class="ghost-button" disabled={!newBranchName.trim() || gitBusy} type="button" onclick={createBranch}>{ui.create}</button>
+          <input bind:value={newBranchName} disabled={readOnly} placeholder={ui.newBranchName} type="text" />
+          <button class="ghost-button" disabled={readOnly || !newBranchName.trim() || gitBusy} type="button" onclick={createBranch}>{ui.create}</button>
         </div>
       </div>
 
       <div class="toolbar-row toolbar-row--fields">
         <label class="field field--inline field--grow">
           <span>{ui.commit}</span>
-          <input bind:value={commitMessage} placeholder={ui.commitMessage} type="text" />
+          <input bind:value={commitMessage} disabled={readOnly} placeholder={ui.commitMessage} type="text" />
         </label>
-        <button class="solid-button" disabled={!commitMessage.trim() || gitBusy} type="button" onclick={commit}>{ui.commit}</button>
+        <button class="solid-button" disabled={readOnly || !commitMessage.trim() || gitBusy} type="button" onclick={commit}>{ui.commit}</button>
       </div>
     {/if}
 
@@ -594,7 +644,7 @@
                 <div class="file-actions">
                   <button class="ghost-button small" type="button" onclick={() => void selectRepository(worktree.path)}>{ui.open}</button>
                   {#if !worktree.current}
-                    <button class="ghost-button small" disabled={worktreeBusy} type="button" onclick={() => void removeWorktree(worktree.path)}>{ui.remove}</button>
+                    <button class="ghost-button small" disabled={readOnly || worktreeBusy} type="button" onclick={() => void removeWorktree(worktree.path)}>{ui.remove}</button>
                   {/if}
                 </div>
               </article>
@@ -623,8 +673,8 @@
                     <small>{file.stagedLabel} / {file.unstagedLabel}</small>
                   </button>
                   <div class="file-actions">
-                    <button class="ghost-button small" type="button" onclick={() => stage(file.path)}>{ui.stage}</button>
-                    <button class="ghost-button small" type="button" onclick={() => unstage(file.path)}>{ui.unstage}</button>
+                    <button class="ghost-button small" disabled={readOnly || gitBusy} type="button" onclick={() => stage(file.path)}>{ui.stage}</button>
+                    <button class="ghost-button small" disabled={readOnly || gitBusy} type="button" onclick={() => unstage(file.path)}>{ui.unstage}</button>
                     {#if isMobileLayout && onOpenDiffTab && selectedRepoPath}
                       <button class="ghost-button small" type="button" onclick={() => onOpenDiffTab(selectedRepoPath, file.path)}>{ui.openTab}</button>
                     {/if}
@@ -660,8 +710,8 @@
                     <span>{groupedFile.status?.stagedLabel ?? "clean"} / {groupedFile.status?.unstagedLabel ?? "clean"}</span>
                   </div>
                   <div class="git-actions">
-                    <button class="ghost-button" type="button" onclick={() => groupedFile && stage(groupedFile.filePath)}>{ui.stage}</button>
-                    <button class="ghost-button" type="button" onclick={() => groupedFile && unstage(groupedFile.filePath)}>{ui.unstage}</button>
+                    <button class="ghost-button" disabled={readOnly || gitBusy} type="button" onclick={() => groupedFile && stage(groupedFile.filePath)}>{ui.stage}</button>
+                    <button class="ghost-button" disabled={readOnly || gitBusy} type="button" onclick={() => groupedFile && unstage(groupedFile.filePath)}>{ui.unstage}</button>
                     {#if onOpenDiffTab}
                       <button class="ghost-button" type="button" onclick={() => onOpenDiffTab(groupedFile.repoPath, groupedFile.filePath)}>{ui.singleTab}</button>
                     {/if}
@@ -688,8 +738,8 @@
               <span>{filePayload.status?.stagedLabel ?? "clean"} / {filePayload.status?.unstagedLabel ?? "clean"}</span>
             </div>
             <div class="git-actions">
-              <button class="ghost-button" type="button" onclick={() => filePayload && stage(filePayload.filePath)}>{ui.stage}</button>
-              <button class="ghost-button" type="button" onclick={() => filePayload && unstage(filePayload.filePath)}>{ui.unstage}</button>
+              <button class="ghost-button" disabled={readOnly || gitBusy} type="button" onclick={() => filePayload && stage(filePayload.filePath)}>{ui.stage}</button>
+              <button class="ghost-button" disabled={readOnly || gitBusy} type="button" onclick={() => filePayload && unstage(filePayload.filePath)}>{ui.unstage}</button>
               <button class="ghost-button" type="button" onclick={closeEditor}>{ui.close}</button>
             </div>
           </div>
@@ -709,11 +759,11 @@
               <section class="panel">
                 <div class="panel__header">
                   <h3>{ui.edit}</h3>
-                  <button class="solid-button" disabled={savingFile} type="button" onclick={saveFile}>
+                  <button class="solid-button" disabled={readOnly || savingFile} type="button" onclick={saveFile}>
                     {savingFile ? ui.saving : ui.saveFile}
                   </button>
                 </div>
-                <MonacoTextEditor bind:value={editorValue} height={340} path={filePayload.filePath} />
+                <MonacoTextEditor bind:value={editorValue} height={340} path={filePayload.filePath} readonly={readOnly} />
               </section>
             </div>
           {/if}
@@ -746,10 +796,10 @@
 <style>
   .git-shell {
     display: grid;
-    gap: 1rem;
+    gap: 0.8rem;
     min-height: 0;
     overflow: auto;
-    padding: 1rem;
+    padding: 0.9rem;
     background: var(--panel-strong);
   }
 
@@ -765,7 +815,7 @@
 
   .toolbar-row {
     display: flex;
-    gap: 0.75rem;
+    gap: 0.55rem;
     align-items: center;
     flex-wrap: wrap;
   }
@@ -812,15 +862,15 @@
     border-radius: 1rem;
     background: rgba(255, 255, 255, 0.86);
     color: var(--ink);
-    padding: 0.85rem 0.95rem;
+    padding: 0.68rem 0.82rem;
   }
 
   .meta-pill {
     border-radius: 999px;
     background: rgba(255, 255, 255, 0.82);
     color: var(--ink);
-    padding: 0.45rem 0.8rem;
-    font-size: 0.8rem;
+    padding: 0.32rem 0.65rem;
+    font-size: 0.74rem;
   }
 
   .meta-pill.subtle {
@@ -831,7 +881,7 @@
   .editor-stack,
   .grouped-diff-list {
     display: grid;
-    gap: 1rem;
+    gap: 0.8rem;
   }
 
   .panel-grid {
@@ -844,11 +894,11 @@
 
   .panel {
     display: grid;
-    gap: 0.8rem;
+    gap: 0.7rem;
     border: 1px solid rgba(83, 61, 42, 0.1);
     border-radius: 1.15rem;
     background: rgba(255, 255, 255, 0.76);
-    padding: 1rem;
+    padding: 0.88rem;
   }
 
   .panel--detail {
@@ -857,7 +907,7 @@
   }
 
   .grouped-diff-panel {
-    padding: 0.85rem;
+    padding: 0.76rem;
   }
 
   .panel__header {
@@ -870,7 +920,7 @@
   .file-list,
   .commit-list {
     display: grid;
-    gap: 0.75rem;
+    gap: 0.55rem;
     max-height: 20rem;
     overflow: auto;
   }
@@ -878,11 +928,11 @@
   .file-row,
   .commit-row {
     display: flex;
-    gap: 0.75rem;
+    gap: 0.55rem;
     align-items: center;
     border-radius: 1rem;
     background: rgba(249, 245, 239, 0.75);
-    padding: 0.8rem;
+    padding: 0.62rem 0.72rem;
   }
 
   .file-link {
@@ -934,10 +984,15 @@
 
   .file-actions {
     display: flex;
-    gap: 0.5rem;
+    gap: 0.4rem;
     flex-wrap: wrap;
     justify-content: flex-end;
     flex: 0 0 auto;
+  }
+
+  .git-actions--compact {
+    flex: 1 1 auto;
+    justify-content: flex-end;
   }
 
   .commit-row p {
@@ -950,7 +1005,7 @@
   }
 
   .small {
-    padding: 0.45rem 0.8rem;
+    padding: 0.34rem 0.62rem;
   }
 
   .error-banner.small {
@@ -1001,7 +1056,6 @@
 
     .git-header,
     .git-meta,
-    .git-actions,
     .inline-field,
     .toolbar-row,
     .file-row,

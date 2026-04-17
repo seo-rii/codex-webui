@@ -201,6 +201,7 @@
   let settingsTabOpen = $state(false);
   let gitDiffTabs = $state<GitDiffTab[]>([]);
   let codeDiffTabs = $state<CodeDiffTab[]>([]);
+  let viewerGitRepoPath = $state<string | null>(null);
   let pendingSteerResume = $state<{ sessionId: string; draft: string; updatedAt: number | null } | null>(null);
   let dismissedQueueResumeBySessionId = $state<Record<string, boolean>>({});
   let draftSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -218,6 +219,11 @@
   let startupAlertDismissed = $state(false);
   let startupAlertNow = $state(Date.now());
   const readOnlyRole = $derived(webRole === "viewer");
+
+  $effect(() => {
+    selectedSessionId;
+    viewerGitRepoPath = null;
+  });
 
   type FileChangeView = {
     path: string;
@@ -2048,6 +2054,7 @@
     resetWorkspaceState();
     authenticated = false;
     webRole = null;
+    viewerGitRepoPath = null;
     runtime = null;
     notifications = [];
     loginBusy = false;
@@ -3931,6 +3938,10 @@
   }
 
   function handleRepoSelect(repoPath: string | null) {
+    if (readOnlyRole) {
+      viewerGitRepoPath = repoPath;
+      return;
+    }
     setPreference("gitRepoPath", repoPath);
   }
 
@@ -4125,7 +4136,7 @@
   async function openGitFileFromMessage(href: string) {
     try {
       const resolved = await api.resolveGitFile(extractLocalFilePath(href));
-      if (conversation?.preferences.gitRepoPath !== resolved.repoPath) {
+      if ((viewerGitRepoPath ?? conversation?.preferences.gitRepoPath ?? null) !== resolved.repoPath) {
         handleRepoSelect(resolved.repoPath);
       }
       if (resolved.filePath) {
@@ -7012,7 +7023,8 @@
           onOpenCommitDiff={openGitCommitDiffTab}
           onOpenDiffTab={openGitDiffTab}
           onSelectRepo={handleRepoSelect}
-          selectedRepoPath={conversation?.preferences.gitRepoPath ?? null}
+          readOnly={readOnlyRole}
+          selectedRepoPath={readOnlyRole ? (viewerGitRepoPath ?? conversation?.preferences.gitRepoPath ?? null) : (conversation?.preferences.gitRepoPath ?? null)}
         />
       {:else if activeGitDiffTab}
         <GitWorkspace
@@ -7020,6 +7032,7 @@
           onOpenDiffTab={openGitDiffTab}
           onSelectRepo={(repoPath) => handleGitDiffTabRepoSelect(activeGitDiffTab.id, repoPath)}
           openRequest={activeGitDiffTab.request}
+          readOnly={readOnlyRole}
           selectedRepoPath={activeGitDiffTab.repoPath}
         />
       {:else if activeCodeDiffTab}

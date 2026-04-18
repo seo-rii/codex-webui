@@ -49,6 +49,7 @@ import { createAppError, parseAppError } from "$lib/errors";
 import { listAttachments } from "./attachments";
 import { arenaStore } from "./arena-store";
 import { AppServerClient } from "./app-server/client";
+import { getAutostartState, saveAutostartEnabled } from "./autostart";
 import { configTomlPath, syncCodexTomlWithPreferences } from "./codex-config";
 import { getCurrentRuntimeProfile, getRuntimeConfig, getRuntimeProfile, type RuntimeProfileConfig } from "./env";
 import { buildSandboxPolicy, listDirectoryPayload, resolveAllowedDirectory, sanitizeFileName } from "./fs";
@@ -378,7 +379,7 @@ function mergeIndexedSessionsWithRecentLiveSessions(
 
 function findActiveTurnId(thread: Record<string, unknown>) {
   const turns = Array.isArray(thread.turns) ? (thread.turns as Array<Record<string, unknown>>) : [];
-  const activeTurn = [...turns].reverse().find((turn) => String(turn.status ?? "") === "inProgress");
+  const activeTurn = [...turns].reverse().find((turn) => isInProgressTurnStatus(turn.status));
   return activeTurn ? String(activeTurn.id ?? "") : null;
 }
 
@@ -405,8 +406,17 @@ function getThreadActiveTurnId(thread: Record<string, unknown>, fallback: string
   return resolveTrackedActiveTurnId(thread, fallback);
 }
 
+function isInProgressTurnStatus(value: unknown) {
+  return String(value ?? "") === "inProgress";
+}
+
+function isTerminalTurnStatus(value: unknown) {
+  const status = String(value ?? "");
+  return status === "completed" || status === "failed" || status === "stopped" || status === "cancelled" || status === "aborted";
+}
+
 function normalizeStoppedTurn(turn: CodexTurn): CodexTurn {
-  if (String(turn.status ?? "") !== "inProgress") {
+  if (!isInProgressTurnStatus(turn.status)) {
     return turn;
   }
 
@@ -517,6 +527,74 @@ function extractDraftTextFromItem(item: CodexItem) {
   }
 
   return stripAttachmentPreamble(flatten(item.text) || flatten(item.message) || flatten(item.value) || flatten(item)).trim();
+}
+
+function normalizeSessionPreviewSource(prompt: string | null | undefined) {
+  return stripAttachmentPreamble(prompt ?? "").replace(/\s+/g, " ").trim();
+}
+
+function deriveSessionSummaryPreview(preview: string | null | undefined, turns: CodexTurn[]) {
+  const normalizedPreview = normalizeSessionPreviewSource(preview);
+  let previewMatchesCommentary = false;
+
+  if (normalizedPreview) {
+    outer: for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+      const turn = turns[turnIndex];
+      for (let itemIndex = turn.items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+        const item = turn.items[itemIndex];
+        if (item.type !== "agentMessage" || String(item.phase ?? "") !== "commentary") {
+          continue;
+        }
+
+        const commentaryText = normalizeSessionPreviewSource(extractDraftTextFromItem(item));
+        if (
+          commentaryText &&
+          (commentaryText === normalizedPreview ||
+            commentaryText.startsWith(normalizedPreview) ||
+            normalizedPreview.startsWith(commentaryText))
+        ) {
+          previewMatchesCommentary = true;
+          break outer;
+        }
+      }
+    }
+
+    if (!previewMatchesCommentary) {
+      return normalizedPreview;
+    }
+  }
+
+  for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+    const turn = turns[turnIndex];
+    for (let itemIndex = turn.items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+      const item = turn.items[itemIndex];
+      if (item.type !== "agentMessage" || String(item.phase ?? "") === "commentary") {
+        continue;
+      }
+
+      const text = normalizeSessionPreviewSource(extractDraftTextFromItem(item));
+      if (text) {
+        return text;
+      }
+    }
+  }
+
+  for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+    const turn = turns[turnIndex];
+    for (let itemIndex = turn.items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+      const item = turn.items[itemIndex];
+      if (item.type !== "userMessage") {
+        continue;
+      }
+
+      const text = normalizeSessionPreviewSource(extractDraftTextFromItem(item));
+      if (text) {
+        return text;
+      }
+    }
+  }
+
+  return normalizedPreview;
 }
 
 function inferPersistedSessionTitle(prompt: string) {
@@ -721,7 +799,7 @@ export class CodexGateway {
       this.client.request("collaborationMode/list", {}),
       this.readAccountState()
     ]);
-    const [pausedQueueEntries, globalState, notifications, savedFilters, knownTags, promptPresets, automations, automationRuns, theme] = await Promise.all([
+    const [pausedQueueEntries, globalState, notifications, savedFilters, knownTags, promptPresets, automations, automationRuns, theme, autostart] = await Promise.all([
       uiStateStore.listResumePendingQueues(),
       uiStateStore.getGlobal(),
       uiStateStore.getNotifications(DEFAULT_NOTIFICATION_LIMIT),
@@ -730,7 +808,8 @@ export class CodexGateway {
       uiStateStore.getPromptPresets(),
       uiStateStore.getAutomations(),
       uiStateStore.getAutomationRuns(DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT),
-      getStoredThemeSettings(this.profile)
+      getStoredThemeSettings(this.profile),
+      getAutostartState()
     ]);
     const preferences: Record<string, SessionPreferences> = pausedQueueEntries.length > 0 ? await uiStateStore.getAll() : {};
     const indexedSessions = pausedQueueEntries.length > 0 ? await sessionIndexClient.list(this.profile.codexHome).catch(() => []) : [];
@@ -800,6 +879,7 @@ export class CodexGateway {
       git: {
         discoveryDepth: this.runtimeConfig.gitDiscoveryDepth
       },
+      autostart,
       systemShutdown,
       startup: {
         pausedQueues,
@@ -1247,19 +1327,26 @@ export class CodexGateway {
     filter: SessionSummaryFilter | null = null
   ): Promise<SessionListPayload> {
     if (!archived) {
-      const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions, hiddenSessionIds] = await Promise.all([
+      const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions, hiddenSessionIds, loadedThreadIds] = await Promise.all([
         uiStateStore.getAll(),
         uiStateStore.getAllSessionMeta(),
         uiStateStore.getQueueCounts(),
         uiStateStore.getSessionHighlights(),
         sessionIndexClient.page(this.profile.codexHome, cursor, limit, null),
         this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>()),
-        arenaStore.getHiddenSessionIds()
+        arenaStore.getHiddenSessionIds(),
+        this.getLoadedThreadIds().catch(() => null)
       ]);
+      const indexedEntries = await Promise.all(
+        indexedPage.entries.map(async (entry) => ({
+          ...entry,
+          status: await this.resolveRuntimeSummaryStatus(entry.id, entry.status, loadedThreadIds)
+        }))
+      );
 
       return {
         sessions: mergeIndexedSessionsWithRecentLiveSessions(
-          indexedPage.entries,
+          indexedEntries,
           preferences,
           sessionMetaByThreadId,
           queueCounts,
@@ -1316,19 +1403,26 @@ export class CodexGateway {
     }
 
     if (!archived && scope === "summary") {
-      const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions, hiddenSessionIds] = await Promise.all([
+      const [preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, indexedPage, recentLiveSessions, hiddenSessionIds, loadedThreadIds] = await Promise.all([
         uiStateStore.getAll(),
         uiStateStore.getAllSessionMeta(),
         uiStateStore.getQueueCounts(),
         uiStateStore.getSessionHighlights(),
         sessionIndexClient.page(this.profile.codexHome, cursor, limit, needle),
         this.getRecentLiveSessionSummaries().catch(() => new Map<string, SessionSummary>()),
-        arenaStore.getHiddenSessionIds()
+        arenaStore.getHiddenSessionIds(),
+        this.getLoadedThreadIds().catch(() => null)
       ]);
+      const indexedEntries = await Promise.all(
+        indexedPage.entries.map(async (entry) => ({
+          ...entry,
+          status: await this.resolveRuntimeSummaryStatus(entry.id, entry.status, loadedThreadIds)
+        }))
+      );
 
       return {
         sessions: mergeIndexedSessionsWithRecentLiveSessions(
-          indexedPage.entries,
+          indexedEntries,
           preferences,
           sessionMetaByThreadId,
           queueCounts,
@@ -1385,6 +1479,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       uiStateStore.getSessionHighlights(),
       arenaStore.getHiddenSessionIds()
     ]);
+    const loadedThreadIds = await this.getLoadedThreadIds().catch(() => null);
     if (archived) {
       return this.listAllThreadSessions(true, preferences, sessionMetaByThreadId, queueCounts, highlightsByThreadId, hiddenSessionIds, filter);
     }
@@ -1402,40 +1497,42 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       filter
     );
     const liveById = new Map(liveThreads.map((session) => [session.id, session]));
-    const mergedSessions = indexedSessions.filter((session) => !hiddenSessionIds.has(session.id)).map((session) => {
-      const live = liveById.get(session.id);
-      if (live) {
-        return {
-          ...live,
-          name: !isPlaceholderThreadName(live.name) ? live.name : session.name,
-          preview: live.preview?.trim() ? live.preview : session.preview,
-          cwd: live.cwd || session.cwd,
-          createdAt: live.createdAt || session.createdAt,
-          updatedAt: Math.max(live.updatedAt || 0, session.updatedAt || 0)
-        };
-      }
+    const mergedSessions = await Promise.all(
+      indexedSessions.filter((session) => !hiddenSessionIds.has(session.id)).map(async (session) => {
+        const live = liveById.get(session.id);
+        if (live) {
+          return {
+            ...live,
+            name: !isPlaceholderThreadName(live.name) ? live.name : session.name,
+            preview: live.preview?.trim() ? live.preview : session.preview,
+            cwd: live.cwd || session.cwd,
+            createdAt: live.createdAt || session.createdAt,
+            updatedAt: Math.max(live.updatedAt || 0, session.updatedAt || 0)
+          };
+        }
 
-      const stored = preferences[session.id];
-      const summary = {
-        id: session.id,
-        name: session.name,
-        preview: session.preview,
-        queueCount: queueCounts[session.id] ?? 0,
-        highlight: highlightsByThreadId[session.id] ?? null,
-        pinned: false,
-        tags: [],
-        cwd: session.cwd || stored?.cwd || this.profile.defaults.cwd,
-        archived: false,
-        createdAt: session.createdAt,
-        updatedAt: session.updatedAt,
-        status: session.status || "unknown",
-        isSubagent: session.isSubagent,
-        agentNickname: null,
-        agentRole: null,
-        preferences: stored ? coercePreferences(stored) : null
-      } satisfies SessionSummary;
-      return applySessionMeta(summary, sessionMetaByThreadId[session.id] ?? null);
-    });
+        const stored = preferences[session.id];
+        const summary = {
+          id: session.id,
+          name: session.name,
+          preview: session.preview,
+          queueCount: queueCounts[session.id] ?? 0,
+          highlight: highlightsByThreadId[session.id] ?? null,
+          pinned: false,
+          tags: [],
+          cwd: session.cwd || stored?.cwd || this.profile.defaults.cwd,
+          archived: false,
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt,
+          status: await this.resolveRuntimeSummaryStatus(session.id, session.status || "unknown", loadedThreadIds),
+          isSubagent: session.isSubagent,
+          agentNickname: null,
+          agentRole: null,
+          preferences: stored ? coercePreferences(stored) : null
+        } satisfies SessionSummary;
+        return applySessionMeta(summary, sessionMetaByThreadId[session.id] ?? null);
+      })
+    );
 
     for (const live of liveThreads) {
       if (!mergedSessions.some((session) => session.id === live.id)) {
@@ -1465,27 +1562,31 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   ): Promise<SessionSummary[]> {
     const sessions: SessionSummary[] = [];
     let cursor: string | null = null;
+    const loadedThreadIds = await this.getLoadedThreadIds().catch(() => null);
 
     do {
       const response = asRecord(await this.client.request("thread/list", { limit: 200, archived, cursor }));
       const threads = (response.data as Array<Record<string, unknown>> | undefined) ?? [];
-      sessions.push(
-        ...threads
+      const nextSessions = await Promise.all(
+        threads
           .filter((thread) => !isSubagentThread(thread))
-          .map((thread) => {
+          .map(async (thread) => {
             const threadId = String(thread.id);
             const stored = preferences[threadId];
-            return applySessionMeta(
-              toSummary(
-                thread,
-                stored ? coercePreferences(stored) : null,
-                archived,
-                queueCounts[threadId] ?? 0,
-                highlightsByThreadId[threadId] ?? null
-              ),
-              sessionMetaByThreadId[threadId] ?? null
+            const summary = await this.buildRuntimeSessionSummary(
+              thread,
+              stored ? coercePreferences(stored) : null,
+              archived,
+              queueCounts[threadId] ?? 0,
+              highlightsByThreadId[threadId] ?? null,
+              null,
+              loadedThreadIds
             );
+            return applySessionMeta(summary, sessionMetaByThreadId[threadId] ?? null);
           })
+      );
+      sessions.push(
+        ...nextSessions
           .filter((session) => !isSubagentSessionSummary(session))
           .filter((session) => !hiddenSessionIds.has(session.id))
           .filter((session) => matchesSessionFilter(session, filter))
@@ -1514,30 +1615,33 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         uiStateStore.getSessionHighlights(),
         arenaStore.getHiddenSessionIds()
       ]);
+      const loadedThreadIds = await this.getLoadedThreadIds().catch(() => null);
       const response = asRecord(
         await this.client.request("thread/list", { limit: RECENT_LIVE_THREAD_WINDOW_SIZE, archived: false, cursor: null })
       );
       const threads = (response.data as Array<Record<string, unknown>> | undefined) ?? [];
-      const nextRecentLiveSessions = new Map(
+      const nextRecentLiveEntries = await Promise.all(
         threads
           .filter((thread) => !isSubagentThread(thread))
-          .map((thread) => {
+          .map(async (thread) => {
             const threadId = String(thread.id);
             const stored = preferences[threadId];
             const summary = applySessionMeta(
-              toSummary(
+              await this.buildRuntimeSessionSummary(
                 thread,
                 stored ? coercePreferences(stored) : null,
                 false,
                 queueCounts[threadId] ?? 0,
-                highlightsByThreadId[threadId] ?? null
+                highlightsByThreadId[threadId] ?? null,
+                null,
+                loadedThreadIds
               ),
               sessionMetaByThreadId[threadId] ?? null
             );
             return [threadId, summary] as const;
           })
-          .filter(([threadId]) => !hiddenSessionIds.has(threadId))
       );
+      const nextRecentLiveSessions = new Map(nextRecentLiveEntries.filter(([threadId]) => !hiddenSessionIds.has(threadId)));
       this.recentLiveSessions = nextRecentLiveSessions;
       this.recentLiveSessionsLoadedAt = Date.now();
       return nextRecentLiveSessions;
@@ -2084,6 +2188,15 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     return this.getConfig();
   }
 
+  async saveAutostart(enabled: boolean) {
+    const nextState = await saveAutostartEnabled(Boolean(enabled));
+    if (!nextState.available && enabled) {
+      throw new Error("Automatic startup is unavailable on this system.");
+    }
+    await this.emitConfigUpdated();
+    return this.getConfig();
+  }
+
   async saveThemeSettings(settings: ThemeSettings) {
     await updateStoredThemeSettings(settings, this.profile);
     await this.emitConfigUpdated();
@@ -2389,7 +2502,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       const matched = threads.find((thread) => String(thread.id ?? "") === threadId && !isSubagentThread(thread));
       if (matched) {
         const stored = preferences[threadId];
-        return toSummary(
+        return this.buildRuntimeSessionSummary(
           matched,
           stored ? coercePreferences(stored) : null,
           archived,
@@ -2476,24 +2589,30 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     threadId: string,
     thread: Record<string, unknown>,
     turns: CodexTurn[],
-    fallbackActiveTurnId: string | null = null
+    fallbackActiveTurnId: string | null = null,
+    preloadedLoadedThreadIds: Set<string> | null | undefined = undefined
   ) {
     const persistedActiveTurnId = findActiveTurnId({ turns });
-    let loadedThreadIds: Set<string> | null = null;
-    try {
-      loadedThreadIds = await this.getLoadedThreadIds();
-    } catch {
-      loadedThreadIds = null;
+    let loadedThreadIds = preloadedLoadedThreadIds;
+    if (loadedThreadIds === undefined) {
+      try {
+        loadedThreadIds = await this.getLoadedThreadIds();
+      } catch {
+        loadedThreadIds = null;
+      }
     }
 
     const loadedThreadIdsAvailable = loadedThreadIds !== null;
     const loadedInMemory = loadedThreadIdsAvailable
-      ? loadedThreadIds!.has(threadId) || this.activeTurns.has(threadId)
+      ? loadedThreadIds!.has(threadId)
       : this.activeTurns.has(threadId) || isLiveThreadStatus(thread.status);
     const staleRunning =
       loadedThreadIdsAvailable && !loadedInMemory && (isLiveThreadStatus(thread.status) || Boolean(persistedActiveTurnId));
-    const status = staleRunning ? "stopped" : String(normalizeThreadStatus(thread.status) ?? "unknown");
     const normalizedTurns = staleRunning ? turns.map((turn) => normalizeStoppedTurn(turn)) : turns;
+    const baseStatus = staleRunning ? "stopped" : String(normalizeThreadStatus(thread.status) ?? "unknown");
+    const hasTrackedLiveTurn = normalizedTurns.some((turn) => isInProgressTurnStatus(turn.status));
+    const status =
+      !staleRunning && LIVE_THREAD_STATUSES.has(baseStatus) && !hasTrackedLiveTurn && normalizedTurns.length > 0 ? "completed" : baseStatus;
     const activeTurnId = loadedInMemory
       ? getThreadActiveTurnId(
           {
@@ -2518,6 +2637,125 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       turns: normalizedTurns,
       activeTurnId
     };
+  }
+
+  private async getRuntimeTurnsForSummary(
+    threadId: string,
+    thread: Record<string, unknown>,
+    preloadedLoadedThreadIds: Set<string> | null | undefined = undefined
+  ) {
+    const normalizedThread = normalizeThread(thread);
+    const inlineTurns = Array.isArray(normalizedThread.turns) ? (normalizedThread.turns as CodexTurn[]) : [];
+    let loadedThreadIds = preloadedLoadedThreadIds;
+    if (loadedThreadIds === undefined) {
+      try {
+        loadedThreadIds = await this.getLoadedThreadIds();
+      } catch {
+        loadedThreadIds = null;
+      }
+    }
+
+    if (
+      inlineTurns.length > 0 ||
+      !isLiveThreadStatus(normalizedThread.status) ||
+      loadedThreadIds === null ||
+      !loadedThreadIds.has(threadId) ||
+      this.activeTurns.has(threadId)
+    ) {
+      return {
+        turns: inlineTurns,
+        loadedThreadIds
+      };
+    }
+
+    try {
+      const hydration = await this.ensureSessionHistory(threadId, normalizedThread);
+      if (hydration.turns.length > 0) {
+        return {
+          turns: hydration.turns,
+          loadedThreadIds
+        };
+      }
+    } catch {
+      // Fall back to thread summary status when the rollout cannot be hydrated.
+    }
+
+    return {
+      turns: inlineTurns,
+      loadedThreadIds
+    };
+  }
+
+  private async buildRuntimeSessionSummary(
+    thread: Record<string, unknown>,
+    preferences: SessionPreferences | null,
+    archived = false,
+    queueCount = 0,
+    highlight: SessionSummaryHighlight | null = null,
+    statusOverride: string | null = null,
+    preloadedLoadedThreadIds: Set<string> | null | undefined = undefined
+  ) {
+    const normalizedThread = normalizeThread(thread);
+    const threadId = String(normalizedThread.id ?? "");
+    const runtimeThread =
+      statusOverride === null
+        ? normalizedThread
+        : {
+            ...normalizedThread,
+            status: statusOverride
+          };
+    const summaryRuntime = await this.getRuntimeTurnsForSummary(threadId, runtimeThread, preloadedLoadedThreadIds);
+    const summaryPreview = deriveSessionSummaryPreview(asText(normalizedThread.preview), summaryRuntime.turns);
+    const runtimeState = await this.resolveRuntimeSessionState(
+      threadId,
+      runtimeThread,
+      summaryRuntime.turns,
+      this.activeTurns.get(threadId) ?? null,
+      summaryRuntime.loadedThreadIds
+    );
+
+    return {
+      ...toSummary(
+        {
+          ...normalizedThread,
+          preview: summaryPreview,
+          status: runtimeState.status
+        },
+        preferences,
+        archived,
+        queueCount,
+        highlight
+      ),
+      name: getDisplayThreadName(asText(normalizedThread.name), summaryPreview),
+      preview: summaryPreview,
+      status: runtimeState.status
+    } satisfies SessionSummary;
+  }
+
+  private async resolveRuntimeSummaryStatus(
+    threadId: string,
+    status: unknown,
+    preloadedLoadedThreadIds: Set<string> | null | undefined = undefined
+  ) {
+    const summaryRuntime = await this.getRuntimeTurnsForSummary(
+      threadId,
+      {
+        id: threadId,
+        status
+      },
+      preloadedLoadedThreadIds
+    );
+    const runtimeState = await this.resolveRuntimeSessionState(
+      threadId,
+      {
+        id: threadId,
+        status
+      },
+      summaryRuntime.turns,
+      this.activeTurns.get(threadId) ?? null,
+      summaryRuntime.loadedThreadIds
+    );
+    return runtimeState.status;
   }
 
   private async resolveActiveTurnId(threadId: string) {
@@ -3088,12 +3326,18 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
                   ...normalizedLiveTurn,
                   items: mergedItems,
                   status:
-                    String(normalizedLiveTurn.status ?? "") === "inProgress" || String(existingTurn.status ?? "") !== "inProgress"
-                      ? normalizedLiveTurn.status
-                      : existingTurn.status,
+                    isTerminalTurnStatus(existingTurn.status) && isInProgressTurnStatus(normalizedLiveTurn.status)
+                      ? existingTurn.status
+                      : normalizedLiveTurn.status ?? existingTurn.status,
                   startedAt: normalizedLiveTurn.startedAt ?? existingTurn.startedAt,
-                  completedAt: normalizedLiveTurn.completedAt ?? existingTurn.completedAt,
-                  durationMs: normalizedLiveTurn.durationMs ?? existingTurn.durationMs,
+                  completedAt:
+                    isTerminalTurnStatus(existingTurn.status) && isInProgressTurnStatus(normalizedLiveTurn.status)
+                      ? existingTurn.completedAt
+                      : normalizedLiveTurn.completedAt ?? existingTurn.completedAt,
+                  durationMs:
+                    isTerminalTurnStatus(existingTurn.status) && isInProgressTurnStatus(normalizedLiveTurn.status)
+                      ? existingTurn.durationMs
+                      : normalizedLiveTurn.durationMs ?? existingTurn.durationMs,
                   error: normalizedLiveTurn.error ?? existingTurn.error
                 });
               }
@@ -3463,7 +3707,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   private async emitConfigUpdated() {
-    const [globalState, notifications, savedFilters, knownTags, promptPresets, automations, automationRuns, theme] = await Promise.all([
+    const [globalState, notifications, savedFilters, knownTags, promptPresets, automations, automationRuns, theme, autostart] = await Promise.all([
       uiStateStore.getGlobal(),
       uiStateStore.getNotifications(1),
       uiStateStore.getSavedSessionFilters(),
@@ -3471,7 +3715,8 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       uiStateStore.getPromptPresets(),
       uiStateStore.getAutomations(),
       uiStateStore.getAutomationRuns(DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT),
-      getStoredThemeSettings(this.profile)
+      getStoredThemeSettings(this.profile),
+      getAutostartState()
     ]);
     const systemShutdown = await this.getSystemShutdownState(globalState);
     this.emitGlobal({
@@ -3479,6 +3724,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       method: "codex-webui/configUpdated",
       params: {
         defaults: this.profile.defaults,
+        autostart,
         systemShutdown,
         startup: {
           scheduledShutdown:
@@ -4040,8 +4286,14 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         highlightOverride === undefined ? await uiStateStore.getSessionHighlight(threadId) : highlightOverride;
       const previousSummary = this.recentLiveSessions.get(threadId);
       const summary = applySessionMeta({
-        ...toSummary(resolvedThread, resolvedPreferences, false, resolvedQueueCount, resolvedHighlight),
-        status: statusOverride ?? (asText(resolvedThread.status) ?? "unknown"),
+        ...(await this.buildRuntimeSessionSummary(
+          resolvedThread,
+          resolvedPreferences,
+          false,
+          resolvedQueueCount,
+          resolvedHighlight,
+          statusOverride
+        )),
         updatedAt: Math.max(
           Number(resolvedThread.updatedAt ?? 0),
           previousSummary?.updatedAt ?? 0,

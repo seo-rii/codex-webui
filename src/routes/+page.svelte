@@ -78,6 +78,7 @@
     GitCommit,
     GitOpenRequest,
     GlobalStreamEvent,
+    LoginHcaptchaConfig,
     NotificationSettings,
     PendingServerRequest,
     PromptPreset,
@@ -99,6 +100,7 @@
   } from "$lib/types";
 
   type WorkspaceTabId = "chat" | "tasks" | "git" | "settings" | `git-diff:${string}` | `code-diff:${string}` | `terminal:${string}`;
+  type ComposerSettingsTabId = "session" | "security";
   type GitDiffTab = {
     id: `git-diff:${string}`;
     repoPath: string;
@@ -166,6 +168,10 @@
   let loginPassword = $state("");
   let loginBusy = $state(false);
   let loginMessage = $state("");
+  let loginHcaptcha = $state<LoginHcaptchaConfig>({ enabled: false, siteKey: null });
+  let loginHcaptchaToken = $state("");
+  let loginHcaptchaWidgetId = $state<string | number | null>(null);
+  let loginHcaptchaContainer = $state<HTMLDivElement | null>(null);
   let draft = $state("");
   let draftAttachments = $state<AttachmentRecord[]>([]);
   let titleDraft = $state("");
@@ -198,7 +204,8 @@
   let showArchivedSessions = $state(false);
   let accountLoginFlow = $state<CodexAccountLoginFlow | null>(null);
   let composerSettingsOpen = $state(false);
-  let composerSecurityOpen = $state(false);
+  let composerSettingsTab = $state<ComposerSettingsTabId>("session");
+  let composerSettingsAnchor = $state<ComposerSettingsTabId>("session");
   let connectionState = $state<WsConnectionState>("idle");
   let themeMode = $state<ThemeMode>("system");
   let resolvedTheme = $state<ResolvedTheme>("light");
@@ -312,8 +319,10 @@
   const staleSessionCatchupHiddenThresholdMs = 45_000;
   const staleSessionCatchupEventThreshold = 40;
   const staleSessionCatchupWindowMs = 7_500;
+  const composerTextareaMinHeight = 52;
   const sessionQueryParamKey = "session";
   const notificationPromptStorageKey = "codex-webui.notifications.permission-prompted";
+  let loginHcaptchaScriptPromise: Promise<void> | null = null;
 
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
@@ -329,6 +338,8 @@
       signingIn: m.signing_in(),
       enterPassword: m.enter_password(),
       loginFailed: m.login_failed(),
+      completeHcaptcha: m.complete_hcaptcha(),
+      hcaptchaLoadFailed: m.hcaptcha_load_failed(),
       language: m.language(),
       close: m.close(),
       newThread: m.new_thread(),
@@ -625,6 +636,86 @@
     return inferDisplayThreadTitle(formatValue(preview));
   }
 
+  function normalizeSessionSummaryPreviewText(value: unknown) {
+    return stripAttachmentPreamble(formatValue(value)).replace(/\s+/g, " ").trim();
+  }
+
+  function deriveConversationSummaryPreview(
+    preview: string | null | undefined,
+    turns: ConversationState["thread"]["turns"] | null | undefined
+  ) {
+    const normalizedPreview = normalizeSessionSummaryPreviewText(preview);
+    let previewMatchesCommentary = false;
+
+    if (normalizedPreview && turns) {
+      outer: for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+        const turn = turns[turnIndex];
+        for (let itemIndex = turn.items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+          const item = turn.items[itemIndex];
+          if (item.type !== "agentMessage" || String(item.phase ?? "") !== "commentary") {
+            continue;
+          }
+
+          const commentaryText = normalizeSessionSummaryPreviewText(getUserText(item as Record<string, unknown>));
+          if (
+            commentaryText &&
+            (commentaryText === normalizedPreview ||
+              commentaryText.startsWith(normalizedPreview) ||
+              normalizedPreview.startsWith(commentaryText))
+          ) {
+            previewMatchesCommentary = true;
+            break outer;
+          }
+        }
+      }
+    }
+
+    if (normalizedPreview && !previewMatchesCommentary) {
+      return normalizedPreview;
+    }
+
+    if (turns) {
+      for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+        const turn = turns[turnIndex];
+        for (let itemIndex = turn.items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+          const item = turn.items[itemIndex];
+          if (item.type !== "agentMessage" || String(item.phase ?? "") === "commentary") {
+            continue;
+          }
+
+          const text = normalizeSessionSummaryPreviewText(getUserText(item as Record<string, unknown>));
+          if (text) {
+            return text;
+          }
+        }
+      }
+
+      for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+        const turn = turns[turnIndex];
+        for (let itemIndex = turn.items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+          const item = turn.items[itemIndex];
+          if (item.type !== "userMessage") {
+            continue;
+          }
+
+          const text = normalizeSessionSummaryPreviewText(getUserText(item as Record<string, unknown>));
+          if (text) {
+            return text;
+          }
+        }
+      }
+    }
+
+    return normalizedPreview;
+  }
+
+  function getConversationDisplayTitle(state: ConversationState | null | undefined) {
+    if (!state) {
+      return null;
+    }
+    return getDisplayThreadTitle(state.thread.name, deriveConversationSummaryPreview(state.thread.preview, state.thread.turns));
+  }
+
   function createDraftConversation(preferences: SessionPreferences, title: string | null = null): ConversationState {
     const now = Math.floor(Date.now() / 1000);
     return {
@@ -702,7 +793,6 @@
     loadingOlderTurns = false;
     mobileSidebarOpen = false;
     composerSettingsOpen = false;
-    composerSecurityOpen = false;
     activeWorkspaceTabId = "chat";
     syncSelectedSessionInUrl(null);
     queueMicrotask(() => {
@@ -861,12 +951,58 @@
     await runSessionTurnSearch(false);
   }
 
+  function getSelectedSessionBinding() {
+    const sessionId = selectedSessionId;
+    const state = conversation;
+    if (!sessionId || !state || state.thread.id !== sessionId) {
+      return null;
+    }
+
+    return {
+      sessionId,
+      state
+    };
+  }
+
+  function requestSelectedSessionResync(showMessage = true) {
+    const sessionId = selectedSessionId;
+    if (!sessionId) {
+      return;
+    }
+
+    if (showMessage) {
+      errorText = ui.sessionResyncing;
+      noticeText = "";
+    }
+
+    void refreshSelectedSessionState(sessionId, Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize), true).catch(
+      (error) => {
+        if (selectedSessionId === sessionId) {
+          errorText = describeError(error);
+        }
+      }
+    );
+  }
+
+  function ensureSelectedSessionBinding(showMessage = true) {
+    const binding = getSelectedSessionBinding();
+    if (binding) {
+      return binding;
+    }
+
+    requestSelectedSessionResync(showMessage);
+    return null;
+  }
+
   async function ensureSessionForComposer() {
-    if (selectedSessionId && conversation) {
-      return {
-        sessionId: selectedSessionId,
-        state: conversation
-      };
+    const selectedBinding = getSelectedSessionBinding();
+    if (selectedBinding) {
+      return selectedBinding;
+    }
+
+    if (selectedSessionId) {
+      requestSelectedSessionResync();
+      return null;
     }
 
     if (!runtime?.installed) {
@@ -950,6 +1086,7 @@
   const itemDetailRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let transcriptElement = $state<HTMLDivElement | undefined>(undefined);
   let transcriptContentElement = $state<HTMLDivElement | undefined>(undefined);
+  let transcriptDockElement = $state<HTMLDivElement | undefined>(undefined);
   let stickTranscriptToBottom = $state(true);
   let forceTranscriptScroll = $state(false);
   let composerSettingsTriggerElement = $state<HTMLButtonElement | undefined>(undefined);
@@ -964,8 +1101,6 @@
   let staleSessionCatchupTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionTurnSearchRequestVersion = 0;
   let sessionTurnSearchPopoverStyle = $state("");
-  let composerSecurityPopoverElement = $state<HTMLDivElement | undefined>(undefined);
-  let composerSecurityPopoverStyle = $state("");
   let titleInputElement = $state<HTMLInputElement | undefined>(undefined);
   let composerTextareaElement = $state<HTMLTextAreaElement | undefined>(undefined);
   let composerPanelElement = $state<HTMLFormElement | undefined>(undefined);
@@ -975,8 +1110,10 @@
   let transcriptScrollFrame: number | null = null;
   let composerTextareaResizeFrame: number | null = null;
   let transcriptResizeObserver: ResizeObserver | null = null;
+  let transcriptDockResizeObserver: ResizeObserver | null = null;
   let composerToolbarResizeObserver: ResizeObserver | null = null;
   let composerToolbarCompact = $state(true);
+  let transcriptDockReservePx = $state(196);
   let transcriptScrollGeneration = 0;
   let composerHistory = $state<string[]>([]);
   let composerHistoryIndex = $state(-1);
@@ -987,34 +1124,65 @@
   let lastLoadedConversationId = $state<string | null>(null);
   let lastActiveLiveTurnId = $state<string | null>(null);
 
-  function hasConversationLiveTurn(currentConversation: ConversationState | null = conversation) {
-    if (!currentConversation) {
-      return false;
+  function isLiveConversationStatus(status: string | null | undefined) {
+    return status === "running" || status === "active";
+  }
+
+  function getConversationLiveTurn(currentConversation: ConversationState | null = conversation) {
+    if (!currentConversation || !isLiveConversationStatus(currentConversation.thread.status)) {
+      return null;
     }
 
     if (currentConversation.activeTurnId) {
-      return true;
+      const trackedTurn = currentConversation.thread.turns.find((turn) => turn.id === currentConversation.activeTurnId) ?? null;
+      if (trackedTurn && String(trackedTurn.status ?? "") === "inProgress") {
+        return trackedTurn;
+      }
     }
 
-    return currentConversation.thread.turns.some((turn) => String(turn.status ?? "") === "inProgress");
+    for (let index = currentConversation.thread.turns.length - 1; index >= 0; index -= 1) {
+      const candidate = currentConversation.thread.turns[index];
+      if (String(candidate.status ?? "") === "inProgress") {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  function hasConversationLiveTurn(currentConversation: ConversationState | null = conversation) {
+    return Boolean(getConversationLiveTurn(currentConversation));
   }
 
   function normalizeConversationExecutionState(currentConversation: ConversationState) {
-    if (
-      currentConversation.thread.turns.length === 0 ||
-      hasConversationLiveTurn(currentConversation) ||
-      (currentConversation.thread.status !== "running" && currentConversation.thread.status !== "active")
-    ) {
+    const liveTurn = getConversationLiveTurn(currentConversation);
+    if (liveTurn) {
+      if (currentConversation.activeTurnId === liveTurn.id) {
+        return currentConversation;
+      }
+
+      return {
+        ...currentConversation,
+        activeTurnId: liveTurn.id
+      };
+    }
+
+    const shouldKeepLiveShell = currentConversation.thread.turns.length === 0 && isLiveConversationStatus(currentConversation.thread.status);
+    const nextStatus = !shouldKeepLiveShell && isLiveConversationStatus(currentConversation.thread.status) ? "completed" : currentConversation.thread.status;
+    if (currentConversation.activeTurnId === null && nextStatus === currentConversation.thread.status) {
       return currentConversation;
     }
 
     return {
       ...currentConversation,
       activeTurnId: null,
-      thread: {
-        ...currentConversation.thread,
-        status: "completed"
-      }
+      thread:
+        nextStatus === currentConversation.thread.status
+          ? currentConversation.thread
+          : {
+              ...currentConversation.thread,
+              status: nextStatus
+            }
     };
   }
 
@@ -1053,13 +1221,7 @@
     )
   );
   const queuedMessages = $derived(conversation?.queue.items ?? []);
-  const activeTurn = $derived.by(() => {
-    const turnId = conversation?.activeTurnId;
-    if (!turnId || !conversation) {
-      return null;
-    }
-    return conversation.thread.turns.find((turn) => turn.id === turnId) ?? null;
-  });
+  const activeTurn = $derived.by(() => getConversationLiveTurn());
   const activeLiveTurnSubagents = $derived.by(() => {
     if (!activeTurn) {
       return [] as SubagentTaskEntry[];
@@ -1112,6 +1274,30 @@
     }
     return hasConversationEchoedOptimisticMessage(conversation, optimisticMessage) ? null : optimisticMessage;
   });
+  const optimisticAnchorTurnId = $derived.by(() => {
+    if (!visibleOptimisticMessage || !conversation || conversation.thread.id !== visibleOptimisticMessage.sessionId) {
+      return null;
+    }
+
+    for (let index = conversation.thread.turns.length - 1; index >= visibleOptimisticMessage.baselineTurnCount; index -= 1) {
+      const turn = conversation.thread.turns[index];
+      const hasUserMessage = turn.items.some((item) => item.type === "userMessage");
+      if (hasUserMessage) {
+        continue;
+      }
+
+      const hasAgentEntries = turn.items.some((item) => item.type !== "userMessage");
+      const isLiveTurn = turn.id === conversation.activeTurnId || String(turn.status ?? "") === "inProgress";
+      if (hasAgentEntries || isLiveTurn) {
+        return turn.id;
+      }
+    }
+
+    return null;
+  });
+  const standaloneOptimisticMessage = $derived.by(() =>
+    optimisticAnchorTurnId ? null : visibleOptimisticMessage
+  );
   const showQueueResumeBanner = $derived.by(
     () =>
       Boolean(
@@ -1494,9 +1680,6 @@
       if (composerSettingsOpen) {
         void updateComposerSettingsPopoverPosition();
       }
-      if (composerSecurityOpen) {
-        void updateComposerSecurityPopoverPosition();
-      }
       if (sessionTurnSearchOpen) {
         void updateSessionTurnSearchPopoverPosition();
       }
@@ -1605,6 +1788,8 @@
       }
       transcriptResizeObserver?.disconnect();
       transcriptResizeObserver = null;
+      transcriptDockResizeObserver?.disconnect();
+      transcriptDockResizeObserver = null;
       for (const timer of itemDetailRefreshTimers.values()) {
         clearTimeout(timer);
       }
@@ -1629,6 +1814,83 @@
   });
 
   $effect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    if (authenticated !== false || !loginHcaptcha.enabled || !loginHcaptcha.siteKey || !loginHcaptchaContainer) {
+      return;
+    }
+    if (loginHcaptchaWidgetId !== null) {
+      return;
+    }
+
+    let cancelled = false;
+    const renderWidget = async () => {
+      try {
+        if (!window.hcaptcha) {
+          if (!loginHcaptchaScriptPromise) {
+            loginHcaptchaScriptPromise = new Promise<void>((resolve, reject) => {
+              const existingScript = document.querySelector<HTMLScriptElement>('script[data-codex-webui-hcaptcha="true"]');
+              if (existingScript) {
+                if (existingScript.dataset.loaded === "true") {
+                  resolve();
+                  return;
+                }
+                existingScript.addEventListener("load", () => resolve(), { once: true });
+                existingScript.addEventListener("error", () => reject(new Error("Failed to load hCaptcha.")), { once: true });
+                return;
+              }
+
+              const script = document.createElement("script");
+              script.src = "https://js.hcaptcha.com/1/api.js?render=explicit";
+              script.async = true;
+              script.defer = true;
+              script.dataset.codexWebuiHcaptcha = "true";
+              script.addEventListener("load", () => {
+                script.dataset.loaded = "true";
+                resolve();
+              }, { once: true });
+              script.addEventListener("error", () => reject(new Error("Failed to load hCaptcha.")), { once: true });
+              document.head.appendChild(script);
+            });
+          }
+          await loginHcaptchaScriptPromise;
+        }
+
+        const siteKey = loginHcaptcha.siteKey;
+        if (cancelled || !window.hcaptcha || !loginHcaptchaContainer || !siteKey) {
+          return;
+        }
+
+        loginHcaptchaWidgetId = window.hcaptcha.render(loginHcaptchaContainer, {
+          sitekey: siteKey,
+          theme: resolvedTheme === "dark" ? "dark" : "light",
+          callback: (token) => {
+            loginHcaptchaToken = token;
+            loginMessage = "";
+          },
+          "expired-callback": () => {
+            loginHcaptchaToken = "";
+          },
+          "error-callback": () => {
+            loginHcaptchaToken = "";
+          }
+        });
+      } catch {
+        if (!cancelled) {
+          loginMessage = ui.hcaptchaLoadFailed;
+        }
+      }
+    };
+
+    void renderWidget();
+
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  $effect(() => {
     const scheduledFor = config?.startup.scheduledShutdown?.scheduledFor ?? null;
     if (!scheduledFor) {
       return;
@@ -1645,7 +1907,7 @@
   });
 
   $effect(() => {
-    const nextDisplayTitle = getDisplayThreadTitle(conversation?.thread.name, conversation?.thread.preview) ?? "";
+    const nextDisplayTitle = getConversationDisplayTitle(conversation) ?? "";
     const activeTitleInput = titleInputElement;
     if (
       activeTitleInput &&
@@ -1709,6 +1971,31 @@
     return () => {
       transcriptResizeObserver?.disconnect();
       transcriptResizeObserver = null;
+    };
+  });
+
+  $effect(() => {
+    if (typeof window === "undefined" || activeWorkspaceTabId !== "chat") {
+      transcriptDockResizeObserver?.disconnect();
+      transcriptDockResizeObserver = null;
+      return;
+    }
+
+    const dock = transcriptDockElement;
+    if (!dock) {
+      return;
+    }
+
+    syncTranscriptDockReserve();
+    transcriptDockResizeObserver?.disconnect();
+    transcriptDockResizeObserver = new ResizeObserver(() => {
+      syncTranscriptDockReserve();
+    });
+    transcriptDockResizeObserver.observe(dock);
+
+    return () => {
+      transcriptDockResizeObserver?.disconnect();
+      transcriptDockResizeObserver = null;
     };
   });
 
@@ -1782,15 +2069,9 @@
       composerSettingsPopoverStyle = "";
       return;
     }
+    const _composerSettingsTab = composerSettingsTab;
+    const _composerSettingsAnchor = composerSettingsAnchor;
     void updateComposerSettingsPopoverPosition();
-  });
-
-  $effect(() => {
-    if (!composerSecurityOpen) {
-      composerSecurityPopoverStyle = "";
-      return;
-    }
-    void updateComposerSecurityPopoverPosition();
   });
 
   $effect(() => {
@@ -2364,11 +2645,12 @@
 
   function buildSessionSummaryFromConversation(state: ConversationState): SessionSummary {
     const hasLiveTurn = hasConversationLiveTurn(state);
+    const preview = deriveConversationSummaryPreview(state.thread.preview, state.thread.turns);
 
     return {
       id: state.thread.id,
-      name: getDisplayThreadTitle(state.thread.name, state.thread.preview),
-      preview: state.thread.preview,
+      name: getDisplayThreadTitle(state.thread.name, preview),
+      preview,
       queueCount: state.queue.items.length,
       highlight: selectedSessionSummary?.highlight ?? null,
       pinned: selectedSessionSummary?.pinned ?? false,
@@ -2503,9 +2785,7 @@
     showArchivedSessions = false;
     accountLoginFlow = null;
     composerSettingsOpen = false;
-    composerSecurityOpen = false;
     composerSettingsPopoverStyle = "";
-    composerSecurityPopoverStyle = "";
     loadingOlderTurns = false;
     olderTurnsAutoLoadEnabled = true;
     olderTurnsAutoLoadPaused = false;
@@ -2541,6 +2821,8 @@
     runtime = null;
     notifications = [];
     loginBusy = false;
+    loginHcaptchaToken = "";
+    loginHcaptchaWidgetId = null;
     notificationsBusy = false;
     releaseGlobalStream?.();
     releaseGlobalStream = null;
@@ -2575,6 +2857,7 @@
 
     try {
       const authSession = await api.getAuthSession();
+      loginHcaptcha = authSession.hcaptcha ?? { enabled: false, siteKey: null };
       if (!authSession.authenticated) {
         clearWorkspaceForLoggedOut();
         loading = false;
@@ -2815,7 +3098,6 @@
     clearStaleSessionCatchup();
     mobileSidebarOpen = false;
     composerSettingsOpen = false;
-    composerSecurityOpen = false;
     activeWorkspaceTabId = "chat";
     disconnectStream();
     connectStream(sessionId);
@@ -2909,7 +3191,7 @@
           };
         }
 
-        conversation = applyStreamEvent(conversation, payload);
+        conversation = normalizeConversationExecutionState(applyStreamEvent(conversation, payload));
         if (
           pendingQueueModeSessionId === sessionId &&
           payload.kind === "notification" &&
@@ -2937,7 +3219,7 @@
             if (conversation.queue.resumeRequired && conversation.queue.items.length > 0) {
               nextPausedQueues.unshift({
                 sessionId,
-                name: getDisplayThreadTitle(conversation.thread.name, conversation.thread.preview),
+                name: getConversationDisplayTitle(conversation),
                 cwd: conversation.thread.cwd,
                 pendingCount: conversation.queue.items.length,
                 updatedAt: conversation.queue.updatedAt
@@ -3018,7 +3300,7 @@
     if (pendingQueueModeSessionId === sessionId && hasConversationLiveTurn(nextConversation)) {
       pendingQueueModeSessionId = null;
     }
-    titleDraft = getDisplayThreadTitle(detail.thread.name, detail.thread.preview) ?? "";
+    titleDraft = getConversationDisplayTitle(nextConversation) ?? "";
     const existingSummary = sessions.find((session) => session.id === detail.thread.id) ?? null;
     upsertSessionSummary({
       ...buildSessionSummaryFromConversation(nextConversation),
@@ -3051,6 +3333,7 @@
 
     try {
       const authSession = await api.getAuthSession();
+      loginHcaptcha = authSession.hcaptcha ?? { enabled: false, siteKey: null };
       if (!authSession.authenticated) {
         clearWorkspaceForLoggedOut();
         return;
@@ -3124,6 +3407,8 @@
         config = {
           ...config,
           defaults: (event.params.defaults as SessionPreferences | undefined) ?? config.defaults,
+          autostart:
+            (event.params.autostart as AppConfigPayload["autostart"] | undefined) ?? config.autostart,
           systemShutdown:
             (event.params.systemShutdown as AppConfigPayload["systemShutdown"] | undefined) ?? config.systemShutdown,
           notifications: event.params.notifications
@@ -3284,7 +3569,8 @@
   }
 
   $effect(() => {
-    const sessionId = selectedSessionId;
+    const selectedBinding = getSelectedSessionBinding();
+    const sessionId = selectedBinding?.sessionId ?? null;
     const currentDraft = draft;
     const intent: "message" | "queue" = queueModeActive ? "queue" : "message";
     const hasPendingSteerResume = pendingSteerResume?.sessionId === sessionId && !currentDraft.trim();
@@ -3300,6 +3586,10 @@
     draftSaveTimer = setTimeout(async () => {
       draftSaveTimer = null;
       try {
+        const currentBinding = getSelectedSessionBinding();
+        if (!currentBinding || currentBinding.sessionId !== sessionId) {
+          return;
+        }
         if (currentDraft.trim()) {
           await api.saveSessionDraft(sessionId, currentDraft, intent);
         } else {
@@ -3469,17 +3759,25 @@
   }
 
   function schedulePreferenceSave() {
-    if (!selectedSessionId || !conversation) {
+    const selectedBinding = getSelectedSessionBinding();
+    if (!selectedBinding) {
+      requestSelectedSessionResync(false);
       return;
     }
+    const sessionId = selectedBinding.sessionId;
     if (saveTimer) {
       clearTimeout(saveTimer);
     }
     saveTimer = setTimeout(async () => {
       try {
-        const saved = await api.savePreferences(selectedSessionId!, conversation!.preferences);
+        const currentBinding = getSelectedSessionBinding();
+        if (!currentBinding || currentBinding.sessionId !== sessionId) {
+          requestSelectedSessionResync(false);
+          return;
+        }
+        const saved = await api.savePreferences(sessionId, currentBinding.state.preferences);
         const nextConfig = await api.getConfig();
-        if (conversation?.thread.id === selectedSessionId) {
+        if (conversation?.thread.id === sessionId) {
           conversation = {
             ...conversation,
             preferences: saved
@@ -3504,6 +3802,21 @@
       config = nextConfig;
       syncConfiguredTheme(nextConfig);
       syncStartupAlertModal(nextConfig, Boolean(nextConfig.startup.scheduledShutdown));
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function saveAutostartEnabled(enabled: boolean) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    try {
+      const nextConfig = await api.saveAutostartEnabled(enabled);
+      config = nextConfig;
+      syncConfiguredTheme(nextConfig);
+      syncStartupAlertModal(nextConfig);
     } catch (error) {
       errorText = describeError(error);
     }
@@ -3534,7 +3847,7 @@
     }
 
     const nextTitle = titleDraft.trim();
-    const currentDisplayTitle = getDisplayThreadTitle(conversation?.thread.name, conversation?.thread.preview) ?? "";
+    const currentDisplayTitle = getConversationDisplayTitle(conversation) ?? "";
     if (nextTitle === currentDisplayTitle) {
       return;
     }
@@ -3756,7 +4069,6 @@
         draftAttachments = [];
         scheduleComposerTextareaResize();
         composerSettingsOpen = false;
-        composerSecurityOpen = false;
       }
 
       void api
@@ -3800,12 +4112,18 @@
       errorText = m.error_forbidden_role();
       return;
     }
-    if (!selectedSessionId || !conversation || sending || uploading || !canQueueComposerMessage(conversation) || (!draft.trim() && draftAttachments.length === 0)) {
-      if (!options?.promptText?.trim() || !selectedSessionId || !conversation || sending || uploading || !canQueueComposerMessage(conversation)) {
-        return;
-      }
+    const selectedBinding = ensureSelectedSessionBinding();
+    if (!selectedBinding) {
+      return;
+    }
+    if (sending || uploading || !canQueueComposerMessage(selectedBinding.state)) {
+      return;
+    }
+    if (!options?.promptText?.trim() && !draft.trim() && draftAttachments.length === 0) {
+      return;
     }
 
+    const sessionId = selectedBinding.sessionId;
     const draftText = options?.promptText ?? draft;
     const attachmentSnapshot = options?.attachmentSnapshot ?? [...draftAttachments];
     const prompt = draftText.trim();
@@ -3819,11 +4137,11 @@
     noticeText = "";
 
     try {
-      const queue = await api.enqueueSessionMessage(selectedSessionId, {
+      const queue = await api.enqueueSessionMessage(sessionId, {
         prompt: draftText,
         attachmentIds: attachmentSnapshot.map((attachment) => attachment.id)
       });
-      if (conversation?.thread.id === selectedSessionId) {
+      if (conversation?.thread.id === sessionId) {
         conversation = {
           ...conversation,
           queue
@@ -3841,14 +4159,13 @@
       }
 
       recordComposerHistory(prompt);
-      rememberLastComposerPromptChip(selectedSessionId, prompt);
+      rememberLastComposerPromptChip(sessionId, prompt);
       if (!preserveComposer) {
         draft = "";
         draftAttachments = [];
         scheduleComposerTextareaResize();
         composerSettingsOpen = false;
-        composerSecurityOpen = false;
-        void api.clearSessionDraft(selectedSessionId).catch(() => {});
+        void api.clearSessionDraft(sessionId).catch(() => {});
       }
       noticeText = m.queue_notice();
     } catch (error) {
@@ -3864,26 +4181,28 @@
       errorText = m.error_forbidden_role();
       return;
     }
-    if (!selectedSessionId || !running || !prompt.trim() || sending) {
+    const selectedBinding = ensureSelectedSessionBinding();
+    if (!selectedBinding || !running || !prompt.trim() || sending) {
       return;
     }
 
+    const sessionId = selectedBinding.sessionId;
     const normalizedPrompt = prompt.trim();
     sending = true;
     sendIntent = "steer";
     try {
       await api.steerTurn(
-        selectedSessionId,
+        sessionId,
         normalizedPrompt,
         clearComposer || draft.trim() === normalizedPrompt ? draftAttachments.map((attachment) => attachment.id) : []
       );
       recordComposerHistory(normalizedPrompt);
-      rememberLastComposerPromptChip(selectedSessionId, normalizedPrompt);
+      rememberLastComposerPromptChip(sessionId, normalizedPrompt);
       if (clearComposer || draft.trim() === normalizedPrompt) {
         draft = "";
         draftAttachments = [];
         scheduleComposerTextareaResize();
-        void api.clearSessionDraft(selectedSessionId).catch(() => {});
+        void api.clearSessionDraft(sessionId).catch(() => {});
       }
       pendingSteerResume = null;
     } catch (error) {
@@ -3903,18 +4222,20 @@
       errorText = m.error_forbidden_role();
       return;
     }
-    if (!selectedSessionId || sending) {
+    const selectedBinding = ensureSelectedSessionBinding();
+    if (!selectedBinding || sending) {
       return;
     }
 
+    const sessionId = selectedBinding.sessionId;
     sending = true;
     sendIntent = mode === "steer" ? "steer" : "queue";
     errorText = "";
     noticeText = "";
 
     try {
-      const queue = await api.dispatchQueuedMessage(selectedSessionId, queueId, mode);
-      if (conversation?.thread.id === selectedSessionId) {
+      const queue = await api.dispatchQueuedMessage(sessionId, queueId, mode);
+      if (conversation?.thread.id === sessionId) {
         conversation = {
           ...conversation,
           queue
@@ -3922,7 +4243,7 @@
       }
       dismissedQueueResumeBySessionId = {
         ...dismissedQueueResumeBySessionId,
-        [selectedSessionId]: false
+        [sessionId]: false
       };
     } catch (error) {
       errorText = describeError(error);
@@ -4001,10 +4322,12 @@
     queueDragState = null;
     (event.currentTarget as HTMLElement | null)?.releasePointerCapture?.(event.pointerId);
 
-    if (!selectedSessionId || dragState.targetQueueId === null || dragState.targetPosition === null) {
+    const selectedBinding = ensureSelectedSessionBinding(false);
+    if (!selectedBinding || dragState.targetQueueId === null || dragState.targetPosition === null) {
       return;
     }
 
+    const sessionId = selectedBinding.sessionId;
     const nextQueueIds = queuedMessages
       .filter((item) => item.id !== dragState.queueId)
       .map((item) => item.id);
@@ -4026,8 +4349,8 @@
     errorText = "";
     noticeText = "";
     try {
-      const queue = await api.reorderQueuedMessages(selectedSessionId, nextQueueIds);
-      if (conversation?.thread.id === selectedSessionId) {
+      const queue = await api.reorderQueuedMessages(sessionId, nextQueueIds);
+      if (conversation?.thread.id === sessionId) {
         conversation = {
           ...conversation,
           queue
@@ -4060,13 +4383,15 @@
       errorText = m.error_forbidden_role();
       return;
     }
-    if (!selectedSessionId || sending) {
+    const selectedBinding = ensureSelectedSessionBinding();
+    if (!selectedBinding || sending) {
       return;
     }
 
+    const sessionId = selectedBinding.sessionId;
     try {
-      const queue = await api.removeQueuedMessage(selectedSessionId, queueId);
-      if (conversation?.thread.id === selectedSessionId) {
+      const queue = await api.removeQueuedMessage(sessionId, queueId);
+      if (conversation?.thread.id === sessionId) {
         conversation = {
           ...conversation,
           queue
@@ -4098,7 +4423,8 @@
       errorText = m.error_forbidden_role();
       return;
     }
-    if (!selectedSessionId || sending) {
+    const selectedBinding = ensureSelectedSessionBinding();
+    if (!selectedBinding || sending) {
       return;
     }
     const queuedItem = queuedMessages.find((item) => item.id === queueId);
@@ -4119,11 +4445,11 @@
     noticeText = "";
 
     try {
-      const queue = await api.updateQueuedMessage(selectedSessionId, queueId, {
+      const queue = await api.updateQueuedMessage(selectedBinding.sessionId, queueId, {
         prompt: nextPrompt,
         attachmentIds: queuedItem.attachmentIds
       });
-      if (conversation?.thread.id === selectedSessionId) {
+      if (conversation?.thread.id === selectedBinding.sessionId) {
         conversation = {
           ...conversation,
           queue
@@ -4148,18 +4474,20 @@
       errorText = m.error_forbidden_role();
       return;
     }
-    if (!selectedSessionId || sending) {
+    const selectedBinding = ensureSelectedSessionBinding();
+    if (!selectedBinding || sending) {
       return;
     }
 
+    const sessionId = selectedBinding.sessionId;
     sending = true;
     sendIntent = "queue";
     errorText = "";
     noticeText = "";
 
     try {
-      const queue = await api.resumeSessionQueue(selectedSessionId);
-      if (conversation?.thread.id === selectedSessionId) {
+      const queue = await api.resumeSessionQueue(sessionId);
+      if (conversation?.thread.id === sessionId) {
         conversation = {
           ...conversation,
           queue
@@ -4167,7 +4495,7 @@
       }
       dismissedQueueResumeBySessionId = {
         ...dismissedQueueResumeBySessionId,
-        [selectedSessionId]: false
+        [sessionId]: false
       };
     } catch (error) {
       errorText = describeError(error);
@@ -4276,11 +4604,12 @@
       errorText = m.error_forbidden_role();
       return;
     }
-    if (!selectedSessionId) {
+    const selectedBinding = ensureSelectedSessionBinding(false);
+    if (!selectedBinding) {
       return;
     }
     try {
-      await api.deleteAttachment(selectedSessionId, attachmentId);
+      await api.deleteAttachment(selectedBinding.sessionId, attachmentId);
       draftAttachments = draftAttachments.filter((attachment) => attachment.id !== attachmentId);
     } catch (error) {
       errorText = describeError(error);
@@ -4292,11 +4621,12 @@
       errorText = m.error_forbidden_role();
       return;
     }
-    if (!selectedSessionId || !running) {
+    const selectedBinding = ensureSelectedSessionBinding(false);
+    if (!selectedBinding || !running) {
       return;
     }
     try {
-      await api.abortTurn(selectedSessionId);
+      await api.abortTurn(selectedBinding.sessionId);
     } catch (error) {
       errorText = describeError(error);
     }
@@ -4449,18 +4779,26 @@
       loginMessage = ui.enterPassword;
       return;
     }
+    if (loginHcaptcha.enabled && !loginHcaptchaToken) {
+      loginMessage = ui.completeHcaptcha;
+      return;
+    }
 
     loginBusy = true;
     loginMessage = "";
 
     try {
-      await api.login(loginPassword.trim());
+      await api.login(loginPassword.trim(), loginHcaptchaToken || null);
       loginPassword = "";
       await bootstrap();
     } catch (error) {
       authenticated = false;
       loginMessage = error instanceof Error ? error.message : ui.loginFailed;
     } finally {
+      if (loginHcaptcha.enabled && loginHcaptchaWidgetId !== null) {
+        loginHcaptchaToken = "";
+        window.hcaptcha?.reset?.(loginHcaptchaWidgetId);
+      }
       loginBusy = false;
     }
   }
@@ -5081,15 +5419,18 @@
       errorText = m.error_forbidden_role();
       return;
     }
-    if (!selectedSessionId || !conversation) {
+    const selectedBinding = ensureSelectedSessionBinding();
+    if (!selectedBinding) {
       return;
     }
     try {
-      await api.resolveRequest(selectedSessionId, request.id, result);
-      conversation = {
-        ...conversation,
-        pendingRequests: conversation.pendingRequests.filter((pending) => pending.id !== request.id)
-      };
+      await api.resolveRequest(selectedBinding.sessionId, request.id, result);
+      if (conversation?.thread.id === selectedBinding.sessionId) {
+        conversation = {
+          ...conversation,
+          pendingRequests: conversation.pendingRequests.filter((pending) => pending.id !== request.id)
+        };
+      }
     } catch (error) {
       errorText = describeError(error);
     }
@@ -5350,12 +5691,33 @@
     if (!textarea || typeof window === "undefined") {
       return;
     }
-    const minHeight = 52;
+    const minHeight = composerTextareaMinHeight;
     const maxHeight = 240;
     textarea.style.height = "0px";
     const nextHeight = Math.max(minHeight, Math.min(textarea.scrollHeight, maxHeight));
     textarea.style.height = `${nextHeight}px`;
     textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+    syncTranscriptDockReserve();
+  }
+
+  function syncTranscriptDockReserve() {
+    const dock = transcriptDockElement;
+    if (!dock) {
+      return;
+    }
+
+    const textareaHeight = composerTextareaElement?.offsetHeight ?? composerTextareaMinHeight;
+    const overlap = Math.max(0, textareaHeight - composerTextareaMinHeight);
+    const nextReserve = Math.max(152, Math.round(dock.offsetHeight - overlap));
+
+    if (Math.abs(nextReserve - transcriptDockReservePx) <= 1) {
+      return;
+    }
+
+    transcriptDockReservePx = nextReserve;
+    if (!loadingOlderTurns && (stickTranscriptToBottom || forceTranscriptScroll)) {
+      scheduleTranscriptScrollToBottom();
+    }
   }
 
   function scheduleComposerTextareaResize() {
@@ -6405,15 +6767,7 @@
   }
 
   function isTurnRunning(turnId: string) {
-    if (!conversation?.activeTurnId || conversation.activeTurnId !== turnId) {
-      return false;
-    }
-
-    if (conversation.thread.status === "running" || conversation.thread.status === "active") {
-      return true;
-    }
-
-    return conversation.thread.turns.some((turn) => turn.id === turnId && String(turn.status ?? "") === "inProgress");
+    return getConversationLiveTurn()?.id === turnId;
   }
 
   function isContextCompactionRunning(turnId: string, item: CodexItem) {
@@ -6613,18 +6967,21 @@
   }
 
   async function updateComposerSettingsPopoverPosition() {
-    if (!composerSettingsOpen || !composerSettingsTriggerElement || !composerSettingsPopoverElement || typeof window === "undefined") {
+    const triggerElement = composerSettingsAnchor === "security" ? composerSecurityTriggerElement : composerSettingsTriggerElement;
+
+    if (!composerSettingsOpen || !triggerElement || !composerSettingsPopoverElement || typeof window === "undefined") {
       return;
     }
 
     await tick();
     const margin = 12;
-    const triggerRect = composerSettingsTriggerElement.getBoundingClientRect();
+    const triggerRect = triggerElement.getBoundingClientRect();
     const popoverRect = composerSettingsPopoverElement.getBoundingClientRect();
+    const preferredWidth = popoverRect.width || 304;
     const width =
       window.innerWidth <= 760
-        ? Math.min(window.innerWidth - margin * 2, 420)
-        : Math.min(Math.max(popoverRect.width || 420, Math.min(triggerRect.width, 420)), window.innerWidth - margin * 2);
+        ? Math.min(window.innerWidth - margin * 2, preferredWidth)
+        : Math.min(Math.max(preferredWidth, Math.min(triggerRect.width + 24, 360)), window.innerWidth - margin * 2);
     let left = triggerRect.left;
     if (left + width > window.innerWidth - margin) {
       left = window.innerWidth - width - margin;
@@ -6642,38 +6999,6 @@
     }
 
     composerSettingsPopoverStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.max(220, window.innerHeight - margin * 2)}px;opacity:1;pointer-events:auto;`;
-  }
-
-  async function updateComposerSecurityPopoverPosition() {
-    if (!composerSecurityOpen || !composerSecurityTriggerElement || !composerSecurityPopoverElement || typeof window === "undefined") {
-      return;
-    }
-
-    await tick();
-    const margin = 12;
-    const triggerRect = composerSecurityTriggerElement.getBoundingClientRect();
-    const popoverRect = composerSecurityPopoverElement.getBoundingClientRect();
-    const width =
-      window.innerWidth <= 760
-        ? Math.min(window.innerWidth - margin * 2, 440)
-        : Math.min(Math.max(popoverRect.width || 440, Math.min(triggerRect.width + 80, 440)), window.innerWidth - margin * 2);
-    let left = triggerRect.left;
-    if (left + width > window.innerWidth - margin) {
-      left = window.innerWidth - width - margin;
-    }
-    if (left < margin) {
-      left = margin;
-    }
-
-    let top = triggerRect.top - popoverRect.height - 12;
-    if (top < margin) {
-      top = triggerRect.bottom + 12;
-    }
-    if (top + popoverRect.height > window.innerHeight - margin) {
-      top = Math.max(margin, window.innerHeight - popoverRect.height - margin);
-    }
-
-    composerSecurityPopoverStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.max(240, window.innerHeight - margin * 2)}px;opacity:1;pointer-events:auto;`;
   }
 
   async function updateSessionTurnSearchPopoverPosition() {
@@ -6881,7 +7206,7 @@
     </div>
 
     {#if authenticated === false}
-      <div class="absolute inset-0 bg-gray-950/30 backdrop-blur-sm"></div>
+      <div class="ui-scrim ui-scrim--soft absolute inset-0"></div>
       <div class="absolute inset-0 z-10 flex items-center justify-center p-4 sm:p-6">
         <div class="w-full max-w-xl rounded-[2rem] border border-white/70 bg-white/92 p-6 shadow-[0_32px_90px_rgba(15,23,42,0.24)] backdrop-blur-2xl sm:p-8">
           <div class="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
@@ -6913,7 +7238,7 @@
             </label>
           </div>
 
-          <form class="mt-8 space-y-5" onsubmit={(event) => {
+          <form class="mt-8 space-y-5" data-testid="login-form" onsubmit={(event) => {
             event.preventDefault();
             void handleLogin();
           }}>
@@ -6923,14 +7248,23 @@
                 bind:value={loginPassword}
                 autocomplete="current-password"
                 class="w-full rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-900 shadow-sm outline-none transition focus:border-amber-500 focus:ring-4 focus:ring-amber-100"
+                data-testid="login-password"
                 placeholder={ui.password}
                 type="password"
               />
             </label>
 
+            {#if loginHcaptcha.enabled && loginHcaptcha.siteKey}
+              <div
+                bind:this={loginHcaptchaContainer}
+                class="min-h-[82px] overflow-hidden rounded-2xl border border-gray-200 bg-white px-3 py-3 shadow-sm"
+              ></div>
+            {/if}
+
             <button
               class="inline-flex min-w-32 items-center justify-center rounded-2xl bg-amber-600 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-amber-200/70 transition hover:bg-amber-700 disabled:cursor-not-allowed disabled:bg-amber-300"
-              disabled={loginBusy}
+              data-testid="login-submit"
+              disabled={loginBusy || (loginHcaptcha.enabled && !loginHcaptchaToken)}
               type="submit"
             >
               {loginBusy ? ui.signingIn : ui.signIn}
@@ -6951,7 +7285,7 @@
     {/if}
   </div>
 {:else}
-<div class="flex h-[100dvh] min-h-[100dvh] w-full bg-white overflow-hidden font-sans text-gray-900">
+<div class="flex h-[100dvh] min-h-[100dvh] w-full bg-white overflow-hidden font-sans text-gray-900" data-testid="workspace-shell">
   {#if showConnectionSnackbar || feedbackSnackbar}
     <div class="pointer-events-none fixed inset-x-0 top-0 z-[110] flex justify-center px-3 pt-3 sm:px-6">
       <div class="flex w-full max-w-xl flex-col gap-2">
@@ -7019,7 +7353,7 @@
     class={[
       "h-full border-r border-gray-200 transition-all duration-300",
       isMobileLayout
-        ? "fixed inset-y-0 left-0 z-40 max-w-[calc(100vw-1.5rem)] shadow-2xl"
+        ? "fixed inset-y-0 left-0 z-[60] max-w-[calc(100vw-1.5rem)] shadow-2xl"
         : "flex-shrink-0 z-30"
     ]}
   >
@@ -7267,7 +7601,7 @@
           </button>
 
           {#if workspaceMenuOpen}
-            <div class="absolute top-10 right-0 w-56 bg-white border border-gray-200 rounded-xl shadow-2xl p-1 z-50">
+            <div class="absolute top-10 right-0 z-[72] w-56 rounded-xl border border-gray-200 bg-white p-1 shadow-2xl">
               {#if isMobileLayout}
                 <button
                   class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group disabled:cursor-not-allowed disabled:opacity-50"
@@ -7361,7 +7695,12 @@
     <div class="flex-1 overflow-hidden relative">
       {#if activeWorkspaceTabId === "chat"}
         <div class="h-full flex flex-col relative bg-white">
-          <div bind:this={transcriptElement} class="flex-1 overflow-y-auto pt-8 pb-8" onscroll={handleTranscriptScroll}>
+          <div
+            bind:this={transcriptElement}
+            class="chat-transcript flex-1 overflow-y-auto pt-8 pb-8"
+            onscroll={handleTranscriptScroll}
+            style={`padding-bottom: calc(${transcriptDockReservePx}px + env(safe-area-inset-bottom));`}
+          >
             <div bind:this={transcriptContentElement} class="max-w-3xl mx-auto px-6 space-y-12">
               {#if loading || loadingDetail}
                 <div class="space-y-6 animate-pulse mt-8">
@@ -7412,6 +7751,14 @@
                         </div>
                       </div>
                     {/each}
+
+                    {#if optimisticAnchorTurnId === turn.id && visibleOptimisticMessage}
+                      <div class="flex flex-col items-end gap-3 max-w-[85%] ml-auto opacity-70">
+                        <div class="px-5 py-3 bg-gray-100 rounded-2xl text-gray-800 shadow-sm border border-gray-200/50">
+                          <MarkdownMessage compact text={visibleOptimisticMessage.prompt} />
+                        </div>
+                      </div>
+                    {/if}
 
                     <div class="flex gap-4">
                       <div class="flex-shrink-0 w-8 h-8 rounded-lg bg-amber-600 text-white flex items-center justify-center shadow-sm mt-1"><Bot size={18} /></div>
@@ -7515,10 +7862,10 @@
                   </div>
                 {/each}
 
-                {#if visibleOptimisticMessage}
+                {#if standaloneOptimisticMessage}
                   <div class="flex flex-col items-end gap-3 max-w-[85%] ml-auto opacity-70">
                     <div class="px-5 py-3 bg-gray-100 rounded-2xl text-gray-800 shadow-sm border border-gray-200/50">
-                      <MarkdownMessage compact text={visibleOptimisticMessage.prompt} />
+                      <MarkdownMessage compact text={standaloneOptimisticMessage.prompt} />
                     </div>
                   </div>
                 {/if}
@@ -7579,8 +7926,8 @@
           </div>
 
           <!-- Bottom Area -->
-          <div class="transcript-dock flex-shrink-0 px-6 pb-6 pt-4 z-10">
-            <div class="max-w-3xl mx-auto w-full space-y-4">
+          <div bind:this={transcriptDockElement} class="transcript-dock pointer-events-none absolute inset-x-0 bottom-0 z-30 px-6 pb-6 pt-4">
+            <div class="pointer-events-auto max-w-3xl mx-auto w-full space-y-4">
               {#if pendingSteerResume && pendingSteerResume.sessionId === selectedSessionId}
                 <div class="p-4 bg-amber-600 text-white rounded-2xl shadow-xl flex flex-col md:flex-row items-center gap-4 animate-in slide-in-from-bottom-8 duration-500">
                   <div class="flex-1"><p class="text-sm font-bold flex items-center gap-2"><Clock size={16} /> {ui.savedDraftFound}</p><p class="text-xs opacity-90 mt-0.5">{ui.resumeSavedSteeringPrompt}</p></div>
@@ -7598,7 +7945,7 @@
               {#if queuedMessages.length > 0}
                 <div class="border border-gray-200 rounded-2xl bg-gray-50/80 shadow-sm overflow-hidden">
                   <button
-                    class={`flex w-full items-center justify-between gap-3 bg-white/80 px-3.5 py-2.5 text-left transition-colors hover:bg-white ${queuedFollowupsExpanded ? "border-b border-gray-200" : ""}`}
+                    class={`flex w-full items-center justify-between gap-3 bg-white/80 px-3 py-2 text-left transition-colors hover:bg-white ${queuedFollowupsExpanded ? "border-b border-gray-200" : ""}`}
                     onclick={() => (queuedFollowupsExpanded = !queuedFollowupsExpanded)}
                     type="button"
                   >
@@ -7617,12 +7964,12 @@
                   </button>
                   {#if queuedFollowupsExpanded}
                     <div
-                      class="max-h-52 overflow-y-auto divide-y divide-gray-200 overscroll-contain"
+                      class="max-h-48 overflow-y-auto divide-y divide-gray-200 overscroll-contain"
                       transition:slide|local={{ duration: 220 }}
                     >
                       {#each queuedMessages as item (item.id)}
                         <div
-                          class={`relative px-3.5 py-2.5 transition-colors ${queueDragState?.queueId === item.id ? "bg-amber-50/60" : ""}`}
+                          class={`relative px-3 py-2 transition-colors ${queueDragState?.queueId === item.id ? "bg-amber-50/60" : ""}`}
                           data-queue-item-id={item.id}
                         >
                           {#if showQueueDropIndicator(item.id, "before")}
@@ -7634,7 +7981,7 @@
                           <div class="flex items-start gap-2.5">
                             <button
                               aria-label={ui.reorderQueue ?? "Reorder queued message"}
-                              class={`mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-400 transition-colors ${sending || queueReorderBusy || queuedMessages.length < 2 ? "cursor-not-allowed opacity-45" : queueDragState?.queueId === item.id ? "cursor-grabbing border-amber-300 bg-amber-50 text-amber-700 shadow-sm" : "cursor-grab hover:bg-gray-100 hover:text-gray-700"}`}
+                              class={`mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-400 transition-colors ${sending || queueReorderBusy || queuedMessages.length < 2 ? "cursor-not-allowed opacity-45" : queueDragState?.queueId === item.id ? "cursor-grabbing border-amber-300 bg-amber-50 text-amber-700 shadow-sm" : "cursor-grab hover:bg-gray-100 hover:text-gray-700"}`}
                               disabled={sending || queueReorderBusy || queuedMessages.length < 2}
                               onlostpointercapture={cancelQueueDrag}
                               onpointercancel={cancelQueueDrag}
@@ -7645,11 +7992,11 @@
                               title={ui.reorderQueue ?? "Reorder queued message"}
                               type="button"
                             >
-                              <GripVertical size={14} />
+                              <GripVertical size={13} />
                             </button>
                             <div class="min-w-0 flex-1">
-                              <div class="flex flex-col gap-2.5 md:flex-row md:items-start md:justify-between">
-                                <div class="min-w-0 flex-1 space-y-1.5">
+                              <div class={`grid min-w-0 gap-2 ${editingQueueId === item.id ? "grid-cols-1" : "sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"}`}>
+                                <div class="min-w-0 space-y-1">
                                   {#if editingQueueId === item.id}
                                     <div class="space-y-2">
                                       <textarea
@@ -7677,9 +8024,9 @@
                                       <p class="text-[11px] text-gray-400">{m.attached_files_stay()}</p>
                                     </div>
                                   {:else}
-                                    <p class="text-[13px] leading-5 text-gray-700 break-words">{summarizeQueueItem(item)}</p>
+                                    <p class="text-[12px] leading-4 text-gray-700 break-words sm:truncate">{summarizeQueueItem(item)}</p>
                                     {#if item.attachmentNames.length > 0}
-                                      <div class="flex flex-wrap gap-1.5">
+                                      <div class="flex flex-wrap gap-1">
                                         <span class="inline-flex items-center gap-1 rounded-full border border-gray-200 bg-white px-2 py-1 text-[10px] font-semibold text-gray-500">
                                           <Paperclip size={10} />
                                           <span>{m.attached_files_count({ count: String(item.attachmentNames.length) })}</span>
@@ -7688,16 +8035,16 @@
                                     {/if}
                                   {/if}
                                 </div>
-                                <div class="flex flex-wrap items-center gap-2 md:justify-end">
+                                <div class={`flex flex-wrap items-center gap-1.5 ${editingQueueId === item.id ? "" : "sm:justify-end"}`}>
                                   {#if editingQueueId === item.id}
-                                    <button class="inline-flex h-8 items-center justify-center rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 text-[11px] font-bold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.queueSave}</button>
-                                    <button class="inline-flex h-8 items-center justify-center rounded-lg border border-gray-200 bg-white px-2.5 text-[11px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={cancelQueuedMessageEdit} type="button">{ui.cancel}</button>
+                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-emerald-200 bg-emerald-50 px-2 text-[10px] font-bold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.queueSave}</button>
+                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-gray-200 bg-white px-2 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={cancelQueuedMessageEdit} type="button">{ui.cancel}</button>
                                   {:else}
-                                    <button class="inline-flex h-8 items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-2.5 text-[11px] font-bold text-amber-700 transition-colors hover:bg-amber-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={() => void dispatchQueuedMessage(item.id, "steer")} type="button">{ui.steerNow}</button>
-                                    <button class="inline-flex h-8 items-center justify-center rounded-lg border border-gray-200 bg-white px-2.5 text-[11px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={() => void dispatchQueuedMessage(item.id, "message")} type="button">{ui.sendNow}</button>
+                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-2 text-[10px] font-bold text-amber-700 transition-colors hover:bg-amber-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={() => void dispatchQueuedMessage(item.id, "steer")} type="button">{ui.steerNow}</button>
+                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-gray-200 bg-white px-2 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={() => void dispatchQueuedMessage(item.id, "message")} type="button">{ui.sendNow}</button>
                                     <button
                                       aria-label={ui.edit}
-                                      class="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-gray-200 bg-white p-0 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:opacity-50"
+                                      class="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-gray-200 bg-white p-0 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:opacity-50"
                                       disabled={sending || queueReorderBusy}
                                       onclick={() => beginQueuedMessageEdit(item)}
                                       title={ui.edit}
@@ -7706,7 +8053,7 @@
                                       <Pencil size={14} />
                                     </button>
                                   {/if}
-                                  <button class="inline-flex h-8 w-8 items-center justify-center rounded-lg p-0 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:opacity-50" aria-label={m.remove_queued_message()} disabled={sending || queueReorderBusy} onclick={() => void removeQueuedMessage(item.id)} type="button"><Trash2 size={14} /></button>
+                                  <button class="inline-flex h-7 w-7 items-center justify-center rounded-lg p-0 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:opacity-50" aria-label={m.remove_queued_message()} disabled={sending || queueReorderBusy} onclick={() => void removeQueuedMessage(item.id)} type="button"><Trash2 size={14} /></button>
                                 </div>
                               </div>
                             </div>
@@ -7930,7 +8277,25 @@
                       <button class="ui-animated-button ui-animated-button--icon inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl p-0 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 group-focus-within:bg-white/90 group-focus-within:text-amber-700 disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9" disabled={readOnlyRole || uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={16} class="animate-spin" />{:else}<Paperclip size={16} />{/if}</button>
                       {#if conversation}
                         <div class="mx-0.5 hidden h-4 w-px bg-gray-200 sm:block"></div>
-                        <button bind:this={composerSettingsTriggerElement} class="composer-compact-trigger ui-animated-button ui-animated-button--soft flex h-8 min-w-0 max-w-[10.5rem] items-center gap-1.5 rounded-xl border border-transparent px-2.5 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:h-9 sm:max-w-[13.5rem] sm:gap-2 sm:px-3 sm:text-[11px]" onclick={() => { composerSettingsOpen = !composerSettingsOpen; composerSecurityOpen = false; }} type="button">
+                        <button
+                          bind:this={composerSettingsTriggerElement}
+                          class={`composer-compact-trigger ui-animated-button ui-animated-button--soft flex h-8 min-w-0 max-w-[10.5rem] items-center gap-1.5 rounded-xl border px-2.5 text-[10px] font-bold transition-all group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:h-9 sm:max-w-[13.5rem] sm:gap-2 sm:px-3 sm:text-[11px] ${
+                            composerSettingsOpen && composerSettingsTab === "session"
+                              ? "border-amber-200 bg-white text-gray-900 shadow-sm"
+                              : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-white hover:text-gray-900"
+                          }`}
+                          onclick={() => {
+                            if (composerSettingsOpen && composerSettingsAnchor === "session" && composerSettingsTab === "session") {
+                              composerSettingsOpen = false;
+                              return;
+                            }
+
+                            composerSettingsAnchor = "session";
+                            composerSettingsTab = "session";
+                            composerSettingsOpen = true;
+                          }}
+                          type="button"
+                        >
                           {#if isFastSpeedMode(composerSettingsSummary.speed)}
                             <span class="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-700">
                               <Zap size={12} />
@@ -7944,9 +8309,31 @@
                               {ui.speedFlex}
                             </span>
                           {/if}
-                          <ChevronDown size={14} class={`shrink-0 transition-transform ${composerSettingsOpen ? "rotate-180" : ""}`} />
+                          <ChevronDown size={14} class={`shrink-0 transition-transform ${composerSettingsOpen && composerSettingsTab === "session" ? "rotate-180" : ""}`} />
                         </button>
-                        <button bind:this={composerSecurityTriggerElement} class="composer-compact-trigger ui-animated-button ui-animated-button--soft flex h-8 shrink-0 items-center gap-1.5 rounded-xl border border-transparent px-2.5 text-[10px] font-bold text-gray-500 transition-all hover:border-gray-200 hover:bg-white hover:text-gray-900 group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:h-9 sm:gap-2 sm:px-3 sm:text-[11px]" onclick={() => { composerSecurityOpen = !composerSecurityOpen; composerSettingsOpen = false; }} title={ui.securitySession} type="button"><Shield size={14} class="text-gray-400" /><span class="hidden lg:inline">{ui.securitySession}</span></button>
+                        <button
+                          bind:this={composerSecurityTriggerElement}
+                          class={`composer-compact-trigger ui-animated-button ui-animated-button--soft flex h-8 shrink-0 items-center gap-1.5 rounded-xl border px-2.5 text-[10px] font-bold transition-all group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:h-9 sm:gap-2 sm:px-3 sm:text-[11px] ${
+                            composerSettingsOpen && composerSettingsTab === "security"
+                              ? "border-sky-200 bg-white text-sky-800 shadow-sm"
+                              : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-white hover:text-gray-900"
+                          }`}
+                          onclick={() => {
+                            if (composerSettingsOpen && composerSettingsAnchor === "security" && composerSettingsTab === "security") {
+                              composerSettingsOpen = false;
+                              return;
+                            }
+
+                            composerSettingsAnchor = "security";
+                            composerSettingsTab = "security";
+                            composerSettingsOpen = true;
+                          }}
+                          title={ui.securitySession}
+                          type="button"
+                        >
+                          <Shield size={14} class={composerSettingsOpen && composerSettingsTab === "security" ? "text-sky-600" : "text-gray-400"} />
+                          <span class="hidden lg:inline">{ui.securitySession}</span>
+                        </button>
                       {/if}
                     </div>
                     <div class={`flex items-center justify-end gap-1.5 sm:gap-2 ${composerToolbarCompact ? "basis-full" : "shrink-0"}`}>
@@ -7961,150 +8348,216 @@
 
                 <!-- Settings Popovers -->
                 {#if composerSettingsOpen && conversation}
-                  <div bind:this={composerSettingsPopoverElement} class="composer-popover absolute bottom-24 left-0 w-80 bg-white border border-gray-200 rounded-2xl shadow-2xl p-4 space-y-4 z-50" style={composerSettingsPopoverStyle}>
-                    <div class="flex items-center justify-between border-b border-gray-100 pb-3 mb-2"><h3 class="text-xs font-bold text-gray-400 uppercase tracking-widest">{ui.composerSettings}</h3><button class="text-gray-400 hover:text-gray-600" onclick={() => (composerSettingsOpen = false)}><X size={16} /></button></div>
-                    <div class="grid grid-cols-1 gap-4">
-                      <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-model-select">{ui.model}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} id="composer-model-select" onchange={(event) => setPreference("model", (event.currentTarget as HTMLSelectElement).value || null)} value={conversation.preferences.model ?? ""}><option value="">{ui.autoDefault}</option>{#each config?.models ?? [] as model}<option value={model.id}>{model.displayName}</option>{/each}</select></div>
-                      <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-effort-select">{m.reasoning()}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} id="composer-effort-select" onchange={(event) => setPreference("effort", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["effort"])} value={conversation.preferences.effort ?? (reasoningOptions[0] ?? "medium")}>{#each reasoningOptions as option}<option value={option}>{option}</option>{/each}</select></div>
-                      <div class="space-y-2 rounded-2xl border border-gray-200/80 bg-gray-50/80 p-3">
-                        <div class="flex items-center gap-2">
-                          <span class={`inline-flex h-7 w-7 items-center justify-center rounded-xl border ${
-                            conversation.preferences.sendOnEnter
-                              ? "border-amber-200 bg-amber-100 text-amber-700"
-                              : "border-gray-200 bg-white text-gray-500"
-                          }`}>
-                            <Keyboard size={13} />
-                          </span>
-                          <div class="min-w-0">
-                            <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.sendShortcut}</p>
-                            <p class="text-[11px] text-gray-500">{ui.sendShortcutDescription}</p>
-                          </div>
+                  <div
+                    bind:this={composerSettingsPopoverElement}
+                    class="composer-popover fixed z-[72] w-[19rem] max-w-[calc(100vw-1rem)] rounded-2xl border border-gray-200 bg-white p-3.5 shadow-2xl"
+                    style={composerSettingsPopoverStyle || "opacity:0;pointer-events:none;"}
+                  >
+                    <div class="mb-2.5 flex items-center justify-between border-b border-gray-100 pb-2.5">
+                      <div>
+                        <h3 class="text-xs font-bold uppercase tracking-widest text-gray-400">{ui.settings}</h3>
+                        <p class="mt-1 text-[11px] font-medium text-gray-500">{composerSettingsTab === "session" ? ui.composerSettings : ui.securitySession}</p>
+                      </div>
+                      <button class="text-gray-400 hover:text-gray-600" onclick={() => (composerSettingsOpen = false)} type="button">
+                        <X size={16} />
+                      </button>
+                    </div>
+                    <div aria-label={ui.settings} class="mb-3 grid grid-cols-2 gap-1 rounded-2xl border border-gray-200 bg-gray-50 p-1" role="tablist">
+                      <button
+                        aria-selected={composerSettingsTab === "session"}
+                        class={`ui-animated-button ui-animated-button--soft flex items-center justify-center rounded-xl px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
+                          composerSettingsTab === "session"
+                            ? "border border-amber-200 bg-white text-amber-700 shadow-sm"
+                            : "border border-transparent text-gray-500 hover:bg-white hover:text-gray-700"
+                        }`}
+                        onclick={() => {
+                          composerSettingsAnchor = "session";
+                          composerSettingsTab = "session";
+                        }}
+                        role="tab"
+                        type="button"
+                      >
+                        {ui.composerSettings}
+                      </button>
+                      <button
+                        aria-selected={composerSettingsTab === "security"}
+                        class={`ui-animated-button ui-animated-button--soft flex items-center justify-center rounded-xl px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
+                          composerSettingsTab === "security"
+                            ? "border border-sky-200 bg-white text-sky-700 shadow-sm"
+                            : "border border-transparent text-gray-500 hover:bg-white hover:text-gray-700"
+                        }`}
+                        onclick={() => {
+                          composerSettingsAnchor = "security";
+                          composerSettingsTab = "security";
+                        }}
+                        role="tab"
+                        type="button"
+                      >
+                        {ui.securitySession}
+                      </button>
+                    </div>
+                    {#if composerSettingsTab === "session"}
+                      <div class="grid grid-cols-1 gap-3" role="tabpanel">
+                        <div class="space-y-1">
+                          <label class="px-1 text-[10px] font-bold uppercase tracking-widest text-gray-400" for="composer-model-select">{ui.model}</label>
+                          <select class="w-full rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm transition-all focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/10 disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} id="composer-model-select" onchange={(event) => setPreference("model", (event.currentTarget as HTMLSelectElement).value || null)} value={conversation.preferences.model ?? ""}>
+                            <option value="">{ui.autoDefault}</option>
+                            {#each config?.models ?? [] as model (model.id)}
+                              <option value={model.id}>{model.displayName}</option>
+                            {/each}
+                          </select>
                         </div>
-                        <div class="grid grid-cols-2 gap-1.5 rounded-2xl border border-gray-200 bg-white p-1 shadow-sm">
-                          <button
-                            class={`ui-animated-button ui-animated-button--soft flex min-h-[2.85rem] items-center justify-center rounded-xl border px-2 py-2 text-[10px] font-bold transition-all sm:text-[11px] ${
-                              !conversation.preferences.sendOnEnter
-                                ? "border-gray-900 bg-gray-900 text-white shadow-sm"
-                                : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
-                            }`}
-                            disabled={readOnlyRole}
-                            onclick={() => setPreference("sendOnEnter", false)}
-                            type="button"
-                          >
-                            <span>{ui.sendShortcutCtrlEnter}</span>
-                          </button>
-                          <button
-                            class={`ui-animated-button ui-animated-button--soft flex min-h-[2.85rem] items-center justify-center rounded-xl border px-2 py-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                        <div class="space-y-1">
+                          <label class="px-1 text-[10px] font-bold uppercase tracking-widest text-gray-400" for="composer-effort-select">{m.reasoning()}</label>
+                          <select class="w-full rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm transition-all focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/10 disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} id="composer-effort-select" onchange={(event) => setPreference("effort", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["effort"])} value={conversation.preferences.effort ?? (reasoningOptions[0] ?? "medium")}>
+                            {#each reasoningOptions as option (option)}
+                              <option value={option}>{option}</option>
+                            {/each}
+                          </select>
+                        </div>
+                        <div class="flex items-center justify-between gap-2 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
+                          <div class="flex min-w-0 items-center gap-2">
+                            <span class={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border ${
                               conversation.preferences.sendOnEnter
-                                ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
-                                : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
-                            }`}
-                            disabled={readOnlyRole}
-                            onclick={() => setPreference("sendOnEnter", true)}
-                            type="button"
-                          >
-                            <span>{ui.sendShortcutEnter}</span>
-                          </button>
-                        </div>
-                      </div>
-                      <div class="space-y-2 rounded-2xl border border-gray-200/80 bg-gray-50/80 p-3">
-                        <div class="flex items-center justify-between gap-3">
-                          <div class="space-y-0.5">
-                            <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.planMode}</p>
-                            <p class="text-[11px] text-gray-500">{(conversation.preferences.mode ?? "default") === "plan" ? m.plan_mode_enabled() : ui.planMode}</p>
+                                ? "border-amber-200 bg-amber-100 text-amber-700"
+                                : "border-gray-200 bg-white text-gray-500"
+                            }`}>
+                              <Keyboard size={12} />
+                            </span>
+                            <div class="min-w-0">
+                              <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.sendShortcut}</p>
+                              <p class="truncate text-[11px] text-gray-500">{conversation.preferences.sendOnEnter ? ui.sendShortcutEnter : ui.sendShortcutCtrlEnter}</p>
+                            </div>
                           </div>
-                          <button
-                            class={`ui-animated-button ui-animated-button--soft inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
-                              (conversation.preferences.mode ?? "default") === "plan"
-                                ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
-                                : "border-gray-200 bg-white text-gray-500 hover:border-gray-300 hover:text-gray-700"
-                            }`}
-                            disabled={readOnlyRole}
-                            onclick={() => {
-                              if (!conversation) {
-                                return;
-                              }
-                              setPreference("mode", (conversation.preferences.mode ?? "default") === "plan" ? "default" : "plan");
-                            }}
-                            type="button"
-                          >
-                            <ListTodo size={13} class="shrink-0" />
-                            <span>{ui.planMode}</span>
-                          </button>
-                        </div>
-                      </div>
-                      <div class="space-y-2 rounded-2xl border border-gray-200/80 bg-gray-50/80 p-3">
-                        <div class="flex items-center gap-2">
-                          <span class={`inline-flex h-7 w-7 items-center justify-center rounded-xl border ${
-                            isFastSpeedMode(conversation.preferences.speed)
-                              ? "border-amber-200 bg-amber-100 text-amber-700"
-                              : "border-gray-200 bg-white text-gray-500"
-                          }`}>
-                            {#if isFastSpeedMode(conversation.preferences.speed)}
-                              <Zap size={13} />
-                            {:else}
-                              <Cpu size={13} />
-                            {/if}
-                          </span>
-                          <div class="min-w-0">
-                            <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.speed}</p>
-                            <p class="text-[11px] text-gray-500">{getSpeedOptionLabel(conversation.preferences.speed ?? "auto")}</p>
-                          </div>
-                        </div>
-                        <div class="grid grid-cols-3 gap-1.5 rounded-2xl border border-gray-200 bg-white p-1 shadow-sm">
-                          {#each speedOptions as option}
+                          <div class="grid shrink-0 grid-cols-2 gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
                             <button
-                              class={`ui-animated-button ui-animated-button--soft flex min-h-[3.1rem] flex-col items-center justify-center gap-1 rounded-xl border px-2 py-2 text-[10px] font-bold transition-all sm:text-[11px] ${
-                                (conversation.preferences.speed ?? "auto") === option
-                                  ? option === "fast"
-                                    ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
-                                    : option === "flex"
-                                      ? "border-sky-200 bg-sky-50 text-sky-700 shadow-sm"
-                                      : "border-gray-900 bg-gray-900 text-white shadow-sm"
+                              class={`ui-animated-button ui-animated-button--soft flex h-8 min-w-[5.2rem] items-center justify-center rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                                !conversation.preferences.sendOnEnter
+                                  ? "border-gray-900 bg-gray-900 text-white shadow-sm"
                                   : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
+                              }`}
+                              disabled={readOnlyRole}
+                              onclick={() => setPreference("sendOnEnter", false)}
+                              type="button"
+                            >
+                              <span>{ui.sendShortcutCtrlEnter}</span>
+                            </button>
+                            <button
+                              class={`ui-animated-button ui-animated-button--soft flex h-8 min-w-[5.2rem] items-center justify-center rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                                conversation.preferences.sendOnEnter
+                                  ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
+                                  : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
+                              }`}
+                              disabled={readOnlyRole}
+                              onclick={() => setPreference("sendOnEnter", true)}
+                              type="button"
+                            >
+                              <span>{ui.sendShortcutEnter}</span>
+                            </button>
+                          </div>
+                        </div>
+                        <div class="rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
+                          <div class="flex items-center justify-between gap-3">
+                            <div class="space-y-0.5">
+                              <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.planMode}</p>
+                              <p class="text-[11px] text-gray-500">{(conversation.preferences.mode ?? "default") === "plan" ? m.plan_mode_enabled() : ui.planMode}</p>
+                            </div>
+                            <button
+                              class={`ui-animated-button ui-animated-button--soft inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
+                                (conversation.preferences.mode ?? "default") === "plan"
+                                  ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
+                                  : "border-gray-200 bg-white text-gray-500 hover:border-gray-300 hover:text-gray-700"
                               }`}
                               disabled={readOnlyRole}
                               onclick={() => {
                                 if (!conversation) {
                                   return;
                                 }
-                                setPreference("speed", option as SessionPreferences["speed"]);
+                                setPreference("mode", (conversation.preferences.mode ?? "default") === "plan" ? "default" : "plan");
                               }}
                               type="button"
                             >
-                              {#if option === "fast"}
-                                <Zap size={13} class="shrink-0" />
-                              {:else}
-                                <Cpu size={13} class="shrink-0 opacity-80" />
-                              {/if}
-                              <span>{getSpeedOptionLabel(option as SessionPreferences["speed"])}</span>
+                              <ListTodo size={13} class="shrink-0" />
+                              <span>{ui.planMode}</span>
                             </button>
-                          {/each}
+                          </div>
+                        </div>
+                        <div class="flex items-center justify-between gap-2 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
+                          <div class="flex min-w-0 items-center gap-2">
+                            <span class={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border ${
+                              isFastSpeedMode(conversation.preferences.speed)
+                                ? "border-amber-200 bg-amber-100 text-amber-700"
+                                : "border-gray-200 bg-white text-gray-500"
+                            }`}>
+                              {#if isFastSpeedMode(conversation.preferences.speed)}
+                                <Zap size={12} />
+                              {:else}
+                                <Cpu size={12} />
+                              {/if}
+                            </span>
+                            <div class="min-w-0">
+                              <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.speed}</p>
+                              <p class="truncate text-[11px] text-gray-500">{getSpeedOptionLabel(conversation.preferences.speed ?? "auto")}</p>
+                            </div>
+                          </div>
+                          <div class="grid shrink-0 grid-cols-3 gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
+                            {#each speedOptions as option (option)}
+                              <button
+                                class={`ui-animated-button ui-animated-button--soft flex h-8 min-w-[4.1rem] items-center justify-center gap-1 rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                                  (conversation.preferences.speed ?? "auto") === option
+                                    ? option === "fast"
+                                      ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
+                                      : option === "flex"
+                                        ? "border-sky-200 bg-sky-50 text-sky-700 shadow-sm"
+                                        : "border-gray-900 bg-gray-900 text-white shadow-sm"
+                                    : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
+                                }`}
+                                disabled={readOnlyRole}
+                                onclick={() => {
+                                  if (!conversation) {
+                                    return;
+                                  }
+                                  setPreference("speed", option as SessionPreferences["speed"]);
+                                }}
+                                type="button"
+                              >
+                                {#if option === "fast"}
+                                  <Zap size={12} class="shrink-0" />
+                                {:else}
+                                  <Cpu size={12} class="shrink-0 opacity-80" />
+                                {/if}
+                                <span class="truncate">{getSpeedOptionLabel(option as SessionPreferences["speed"])}</span>
+                              </button>
+                            {/each}
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  </div>
-                {/if}
-                {#if composerSecurityOpen && conversation}
-                  <div bind:this={composerSecurityPopoverElement} class="composer-popover absolute bottom-24 left-0 w-80 bg-white border border-gray-200 rounded-2xl shadow-2xl p-4 space-y-4 z-50" style={composerSecurityPopoverStyle}>
-                    <div class="flex items-center justify-between border-b border-gray-100 pb-3 mb-2"><h3 class="text-xs font-bold text-gray-400 uppercase tracking-widest">{ui.securitySession}</h3><button class="text-gray-400 hover:text-gray-600" onclick={() => (composerSecurityOpen = false)}><X size={16} /></button></div>
-                    <div class="space-y-4">
-                      <div class="space-y-1"><label class="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-1" for="composer-approval-select">{ui.approvalMode}</label><select class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/10 focus:border-amber-500 transition-all disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} id="composer-approval-select" onchange={(event) => setPreference("autoApproveMode", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["autoApproveMode"])} value={conversation.preferences.autoApproveMode ?? "manual"}><option value="manual">{ui.manual}</option><option value="turn">{ui.autoOnce}</option><option value="session">{ui.autoSession}</option></select></div>
-                      <label class="checkbox-card" for="network-access">
-                        <input
-                          class="checkbox-input"
-                          checked={conversation.preferences.networkAccess ?? false}
-                          disabled={readOnlyRole}
-                          onchange={(event) => setPreference("networkAccess", (event.currentTarget as HTMLInputElement).checked)}
-                          type="checkbox"
-                          id="network-access"
-                        />
-                        <span aria-hidden="true" class="checkbox-control"></span>
-                        <span class="checkbox-copy">
-                          <span class="checkbox-title">{ui.allowNetworkAccess}</span>
-                        </span>
-                      </label>
-                    </div>
+                    {:else}
+                      <div class="space-y-4" role="tabpanel">
+                        <div class="space-y-1">
+                          <label class="px-1 text-[10px] font-bold uppercase tracking-widest text-gray-400" for="composer-approval-select">{ui.approvalMode}</label>
+                          <select class="w-full rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm transition-all focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/10 disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} id="composer-approval-select" onchange={(event) => setPreference("autoApproveMode", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["autoApproveMode"])} value={conversation.preferences.autoApproveMode ?? "manual"}>
+                            <option value="manual">{ui.manual}</option>
+                            <option value="turn">{ui.autoOnce}</option>
+                            <option value="session">{ui.autoSession}</option>
+                          </select>
+                        </div>
+                        <label class="checkbox-card" for="network-access">
+                          <input
+                            class="checkbox-input"
+                            checked={conversation.preferences.networkAccess ?? false}
+                            disabled={readOnlyRole}
+                            onchange={(event) => setPreference("networkAccess", (event.currentTarget as HTMLInputElement).checked)}
+                            type="checkbox"
+                            id="network-access"
+                          />
+                          <span aria-hidden="true" class="checkbox-control"></span>
+                          <span class="checkbox-copy">
+                            <span class="checkbox-title">{ui.allowNetworkAccess}</span>
+                          </span>
+                        </label>
+                      </div>
+                    {/if}
                   </div>
                 {/if}
               </div>
@@ -8146,6 +8599,7 @@
             <SettingsWorkspace
               codexHome={config?.paths.codexHome ?? ""}
               configFilePath={config?.paths.configFilePath ?? ""}
+              autostart={config?.autostart ?? null}
               notificationSettings={config?.notifications.settings ?? null}
               promptPresets={config?.promptPresets ?? []}
               automations={config?.automations.items ?? []}
@@ -8159,6 +8613,9 @@
                 config = await api.getConfig();
                 syncConfiguredTheme(config);
                 syncStartupAlertModal(config);
+              }}
+              onAutostartSaved={async (enabled) => {
+                await saveAutostartEnabled(enabled);
               }}
               onSaveThemeSettings={async (theme) => {
                 await saveThemeSettings(theme);
@@ -8220,15 +8677,15 @@
 {#if selectedSessionId && activeWorkspaceTabId === "chat" && sessionTurnSearchOpen}
   <div
     bind:this={sessionTurnSearchPopoverElement}
-    class="composer-popover fixed z-[72] overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl"
+    class="composer-popover search-popover fixed z-[72] overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl"
     style={sessionTurnSearchPopoverStyle || "opacity:0;pointer-events:none;"}
   >
-    <div class="flex items-center gap-2 border-b border-gray-100 px-3 py-2.5">
+    <div class="search-popover__header flex items-center gap-2 border-b border-gray-100 px-3 py-2.5">
       <Search size={14} class="shrink-0 text-gray-400" />
       <input
         bind:this={sessionTurnSearchInputElement}
         bind:value={sessionTurnSearchQuery}
-        class="w-full border-none bg-transparent p-0 text-sm text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-0"
+        class="search-popover__input w-full border-none bg-transparent p-0 text-sm text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-0"
         oninput={() => scheduleSessionTurnSearch(true)}
         onkeydown={(event) => {
           if (event.key === "Escape") {
@@ -8246,12 +8703,12 @@
       {#if sessionTurnSearchBusy}
         <RefreshCw size={14} class="shrink-0 animate-spin text-gray-400" />
       {:else if sessionTurnSearchQuery.trim()}
-        <span class="shrink-0 text-[10px] font-bold uppercase tracking-widest text-gray-400">
+        <span class="search-popover__meta shrink-0 text-[10px] font-bold uppercase tracking-widest text-gray-400">
           {sessionTurnSearchTotalMatches} {sessionSearchCopy.results}
         </span>
       {/if}
       <button
-        class="ui-animated-button ui-animated-button--icon rounded-lg p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700"
+        class="search-popover__close ui-animated-button ui-animated-button--icon rounded-lg p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700"
         onclick={() => resetSessionTurnSearch()}
         title={ui.close}
         type="button"
@@ -8261,23 +8718,23 @@
     </div>
     <div class="max-h-72 overflow-y-auto overscroll-contain">
       {#if sessionTurnSearchError}
-        <div class="px-3 py-3 text-xs text-red-600">{sessionTurnSearchError}</div>
+        <div class="search-popover__empty px-3 py-3 text-xs text-red-600">{sessionTurnSearchError}</div>
       {:else if !sessionTurnSearchQuery.trim()}
-        <div class="px-3 py-3 text-xs leading-relaxed text-gray-500">{sessionSearchCopy.hint}</div>
+        <div class="search-popover__empty px-3 py-3 text-xs leading-relaxed text-gray-500">{sessionSearchCopy.hint}</div>
       {:else if !sessionTurnSearchBusy && sessionTurnSearchResults.length === 0}
-        <div class="px-3 py-3 text-xs text-gray-500">{sessionSearchCopy.noResults}</div>
+        <div class="search-popover__empty px-3 py-3 text-xs text-gray-500">{sessionSearchCopy.noResults}</div>
       {:else}
-        <div class="divide-y divide-gray-100">
+        <div class="search-popover__list divide-y divide-gray-100">
           {#each sessionTurnSearchResults as result (`${result.turnId}:${result.itemId ?? 'turn'}:${result.preview}`)}
             <button
-              class="ui-animated-button ui-animated-button--soft flex w-full items-start justify-between gap-3 px-3 py-3 text-left transition-colors hover:bg-amber-50/60"
+              class="search-popover__item ui-animated-button ui-animated-button--soft flex w-full items-start justify-between gap-3 px-3 py-3 text-left transition-colors hover:bg-amber-50/60"
               disabled={sessionTurnSearchJumpingTurnId === result.turnId}
               onclick={() => void jumpToSessionSearchResult(result)}
               type="button"
             >
               <div class="min-w-0 flex-1">
                 <div class="flex flex-wrap items-center gap-1.5">
-                  <span class="rounded-full bg-gray-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-gray-500">
+                  <span class="search-popover__badge rounded-full bg-gray-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-gray-500">
                     {sessionSearchCopy.turn} {result.turnIndex + 1}
                   </span>
                   <span class="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-amber-700">
@@ -8338,7 +8795,7 @@
   <div
     aria-labelledby="startup-alert-title"
     aria-modal="true"
-    class="fixed inset-0 z-[115] overflow-y-auto bg-gray-950/70 backdrop-blur-xl"
+    class="ui-scrim ui-scrim--modal fixed inset-0 z-[115] overflow-y-auto"
     role="dialog"
   >
     <div class="flex min-h-full items-center justify-center p-4 sm:p-8">
@@ -8435,7 +8892,7 @@
                     {ui.startupAlertShutdownThread(
                       sessions.find((session) => session.id === startupScheduledShutdown.sessionId)?.name ||
                         (conversation?.thread.id === startupScheduledShutdown.sessionId
-                          ? getDisplayThreadTitle(conversation?.thread.name, conversation?.thread.preview) || getDefaultThreadTitle()
+                          ? getConversationDisplayTitle(conversation) || getDefaultThreadTitle()
                           : startupScheduledShutdown.sessionId)
                     )}
                   </div>
@@ -8455,7 +8912,7 @@
 {#if isMobileLayout && mobileSidebarOpen}
   <button
     aria-label={ui.closeThreadList}
-    class="fixed inset-0 bg-gray-900/40 backdrop-blur-sm z-30 transition-all"
+    class="ui-scrim ui-scrim--soft fixed inset-0 z-50 transition-all"
     onclick={closeMobileSidebar}
     type="button"
   ></button>
@@ -8465,7 +8922,7 @@
   <div class="fixed inset-0 z-[100] flex items-center justify-center p-6">
     <button
       aria-label="Close folder picker"
-      class="absolute inset-0 bg-gray-900/60 backdrop-blur-md"
+      class="ui-scrim ui-scrim--strong absolute inset-0"
       onclick={() => (browserOpen = false)}
       type="button"
     ></button>
@@ -8503,6 +8960,24 @@
     }
   }
 
+  @keyframes diff-loading-bar {
+    0% {
+      transform: translateX(-68%) scaleX(0.55);
+    }
+
+    45% {
+      transform: translateX(8%) scaleX(0.82);
+    }
+
+    75% {
+      transform: translateX(72%) scaleX(1);
+    }
+
+    100% {
+      transform: translateX(164%) scaleX(0.62);
+    }
+  }
+
   .thinking-indicator {
     backdrop-filter: blur(10px);
   }
@@ -8514,6 +8989,13 @@
     -webkit-background-clip: text;
     color: transparent;
     animation: thinking-shimmer 1.9s linear infinite;
+  }
+
+  .diff-loading-bar {
+    width: 46%;
+    transform-origin: left center;
+    animation: diff-loading-bar 1.45s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+    will-change: transform;
   }
 
   .snackbar-card {
@@ -8558,6 +9040,9 @@
   }
 
   .transcript-dock {
+    position: absolute;
+    inset-inline: 0;
+    bottom: 0;
     background: linear-gradient(
       180deg,
       rgba(255, 255, 255, 0) 0%,
@@ -8569,6 +9054,43 @@
 
   .composer-panel {
     backdrop-filter: blur(18px);
+  }
+
+  .ui-scrim {
+    backdrop-filter: blur(14px);
+  }
+
+  .ui-scrim--soft {
+    background: linear-gradient(180deg, rgba(15, 23, 42, 0.2), rgba(15, 23, 42, 0.36));
+  }
+
+  .ui-scrim--strong {
+    background: linear-gradient(180deg, rgba(15, 23, 42, 0.36), rgba(15, 23, 42, 0.58));
+  }
+
+  .ui-scrim--modal {
+    background: linear-gradient(180deg, rgba(15, 23, 42, 0.48), rgba(15, 23, 42, 0.72));
+  }
+
+  .search-popover {
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.98));
+    box-shadow: 0 26px 60px -34px rgba(15, 23, 42, 0.34);
+  }
+
+  .search-popover__header {
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.86), rgba(248, 250, 252, 0.96));
+  }
+
+  .search-popover__item {
+    transition:
+      background-color 160ms ease,
+      color 160ms ease;
+  }
+
+  .search-popover__badge {
+    transition:
+      background-color 160ms ease,
+      color 160ms ease;
   }
 
   .composer-popover {
@@ -8603,6 +9125,64 @@
       rgba(11, 18, 32, 0.95) 56%,
       rgba(11, 18, 32, 0.99) 100%
     );
+  }
+
+  :global(:root[data-theme="dark"]) .ui-scrim--soft {
+    background: linear-gradient(180deg, rgba(2, 6, 23, 0.34), rgba(2, 6, 23, 0.56));
+  }
+
+  :global(:root[data-theme="dark"]) .ui-scrim--strong {
+    background: linear-gradient(180deg, rgba(2, 6, 23, 0.5), rgba(2, 6, 23, 0.72));
+  }
+
+  :global(:root[data-theme="dark"]) .ui-scrim--modal {
+    background: linear-gradient(180deg, rgba(2, 6, 23, 0.64), rgba(2, 6, 23, 0.82));
+  }
+
+  :global(:root[data-theme="dark"]) .search-popover {
+    border-color: rgba(71, 85, 105, 0.5) !important;
+    background: linear-gradient(180deg, rgba(17, 24, 39, 0.98), rgba(11, 18, 32, 1)) !important;
+    box-shadow: 0 34px 72px -40px rgba(2, 6, 23, 0.94) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .search-popover__header {
+    border-color: rgba(71, 85, 105, 0.36) !important;
+    background: linear-gradient(180deg, rgba(17, 24, 39, 0.92), rgba(15, 23, 42, 0.98)) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .search-popover__input {
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .search-popover__input::placeholder {
+    color: #64748b !important;
+  }
+
+  :global(:root[data-theme="dark"]) .search-popover__meta,
+  :global(:root[data-theme="dark"]) .search-popover__empty {
+    color: #94a3b8 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .search-popover__list {
+    border-color: rgba(71, 85, 105, 0.24) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .search-popover__item {
+    color: #e2e8f0 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .search-popover__item:hover {
+    background: rgba(245, 158, 11, 0.12) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .search-popover__badge {
+    background: rgba(51, 65, 85, 0.82) !important;
+    color: #cbd5e1 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .search-popover__close:hover {
+    background: rgba(51, 65, 85, 0.78) !important;
+    color: #f8fafc !important;
   }
 
   :global(:root[data-theme="dark"]) .queue-resume-banner {
@@ -8683,24 +9263,24 @@
 
   .turn-card-header {
     position: sticky;
-    top: 0.85rem;
+    top: 0.45rem;
     z-index: 26;
     backdrop-filter: blur(14px);
     box-shadow: 0 14px 28px -26px rgba(15, 23, 42, 0.38);
   }
 
   .turn-card-header[data-sticky-level="1"] {
-    top: 4.15rem;
+    top: 3.7rem;
     z-index: 25;
   }
 
   .turn-card-header[data-sticky-level="2"] {
-    top: 7.45rem;
+    top: 6.95rem;
     z-index: 24;
   }
 
   .turn-card-header[data-sticky-level="3"] {
-    top: 10.7rem;
+    top: 10.2rem;
     z-index: 23;
   }
 
@@ -8749,6 +9329,24 @@
   }
 
 </style>
+
+{#snippet renderDiffLoadingCard(label: string)}
+  <div class="space-y-3 p-4 sm:p-5">
+    <div class="flex items-center justify-between gap-3">
+      <div class="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-gray-500">
+        <RefreshCw size={12} class="animate-spin text-amber-500" />
+        <span>{label}</span>
+      </div>
+      <span class="text-[10px] font-medium text-gray-400">{m.loading()}</span>
+    </div>
+    <div
+      aria-hidden="true"
+      class="overflow-hidden rounded-full bg-gray-200/80"
+    >
+      <div class="diff-loading-bar h-1.5 rounded-full bg-gradient-to-r from-amber-300 via-amber-500 to-orange-400"></div>
+    </div>
+  </div>
+{/snippet}
 
 {#snippet renderTurnItem(turnId: string, item: CodexItem, stickyLevel = 0)}
   {#if item.type === "agentMessage"}
@@ -8845,7 +9443,12 @@
       </button>
       {#if isItemExpanded(turnId, item.id)}
         <div class="turn-card-expand p-0 border-t border-gray-100" transition:slide|local={{ duration: 220 }}>
-          {#if isItemDetailLoading(turnId, item.id)}<div class="p-8 flex items-center justify-center gap-2 text-gray-400 text-xs italic"><RefreshCw size={16} class="animate-spin" />{ui.fetching}</div>
+          {#if isItemDetailLoading(turnId, item.id)}
+            {#if item.type === "fileChange"}
+              {@render renderDiffLoadingCard(ui.computingDiffs)}
+            {:else}
+              <div class="p-8 flex items-center justify-center gap-2 text-gray-400 text-xs italic"><RefreshCw size={16} class="animate-spin" />{ui.fetching}</div>
+            {/if}
           {:else if getItemDetailError(turnId, item.id)}<div class="p-4 bg-red-50 text-red-600 text-xs border-t border-red-100">{getItemDetailError(turnId, item.id)}</div>
           {:else if item.type === "fileChange" && getFileChangeViews(item).length > 0}
             <div class="p-0 space-y-0">{#each getFileChangeViews(item) as change}<div class="border-b border-gray-100 last:border-0"><button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-5 py-2 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel + 1} onclick={() => toggleFileChangeEntry(turnId, item.id, change)}><div class="flex items-center gap-2"><span class="text-[10px] font-mono font-bold text-gray-600">{change.path}</span><span class="px-1.5 py-0.5 bg-gray-100 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{change.kind}</span></div><ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turnId, item.id, change) ? 'rotate-180' : ''} transition-transform" /></button>{#if isFileChangeEntryExpanded(turnId, item.id, change)}<div class="turn-card-expand bg-gray-50 p-0 border-t border-gray-100" transition:slide|local={{ duration: 180 }}>{#if change.renderable}<MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-4 text-[10px] font-mono text-gray-600 overflow-x-auto">{change.diff}</pre>{/if}</div>{/if}</div>{/each}</div>
@@ -8893,7 +9496,7 @@
         {/if}
       </div>
       {#if isItemExpanded(turnId, entry.key)}
-        <div class="turn-card-expand border-t border-gray-100" transition:slide|local={{ duration: 220 }}>{#if isItemDetailLoading(turnId, entry.key)}<div class="p-6 flex justify-center text-gray-400 italic text-xs">{ui.computingDiffs}</div>
+        <div class="turn-card-expand border-t border-gray-100" transition:slide|local={{ duration: 220 }}>{#if isItemDetailLoading(turnId, entry.key)}{@render renderDiffLoadingCard(ui.computingDiffs)}
           {:else}<div class="p-0">{#each getFileChangeGroupViews(entry.items) as change}<div class="border-b border-gray-100 last:border-0"><button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-5 py-2 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel + 1} onclick={() => toggleFileChangeEntry(turnId, entry.key, change)}><span class="text-[10px] font-mono font-bold text-gray-600">{change.path}</span><ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turnId, entry.key, change) ? 'rotate-180' : ''} transition-transform" /></button>{#if isFileChangeEntryExpanded(turnId, entry.key, change)}<div class="turn-card-expand bg-gray-50 border-t border-gray-100" transition:slide|local={{ duration: 180 }}>{#if change.renderable}<MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-4 text-[10px] font-mono text-gray-600 overflow-x-auto">{change.diff}</pre>{/if}</div>{/if}</div>{/each}</div>{/if}</div>
       {/if}
     </div>

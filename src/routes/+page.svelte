@@ -159,6 +159,7 @@
   let sessionsBusy = $state(false);
   let sending = $state(false);
   let startingMessage = $state(false);
+  let submitComposerBusy = $state(false);
   let uploading = $state(false);
   let errorText = $state("");
   let noticeText = $state("");
@@ -986,6 +987,37 @@
   let lastLoadedConversationId = $state<string | null>(null);
   let lastActiveLiveTurnId = $state<string | null>(null);
 
+  function hasConversationLiveTurn(currentConversation: ConversationState | null = conversation) {
+    if (!currentConversation) {
+      return false;
+    }
+
+    if (currentConversation.activeTurnId) {
+      return true;
+    }
+
+    return currentConversation.thread.turns.some((turn) => String(turn.status ?? "") === "inProgress");
+  }
+
+  function normalizeConversationExecutionState(currentConversation: ConversationState) {
+    if (
+      currentConversation.thread.turns.length === 0 ||
+      hasConversationLiveTurn(currentConversation) ||
+      (currentConversation.thread.status !== "running" && currentConversation.thread.status !== "active")
+    ) {
+      return currentConversation;
+    }
+
+    return {
+      ...currentConversation,
+      activeTurnId: null,
+      thread: {
+        ...currentConversation.thread,
+        status: "completed"
+      }
+    };
+  }
+
   function hasQueueableConversationActivity(currentConversation: ConversationState | null = conversation) {
     if (!currentConversation || !selectedSessionId) {
       return false;
@@ -1001,17 +1033,7 @@
       return true;
     }
 
-    if (currentConversation.thread.status === "running" || currentConversation.thread.status === "active") {
-      return true;
-    }
-
-    if (!currentConversation.activeTurnId) {
-      return false;
-    }
-
-    return currentConversation.thread.turns.some(
-      (turn) => turn.id === currentConversation.activeTurnId && String(turn.status ?? "") === "inProgress"
-    );
+    return hasConversationLiveTurn(currentConversation);
   }
 
   function canQueueComposerMessage(currentConversation: ConversationState | null = conversation) {
@@ -1020,15 +1042,7 @@
 
   const running = $derived.by(() => {
     const currentConversation = conversation;
-    if (!currentConversation?.activeTurnId) {
-      return false;
-    }
-    if (currentConversation.thread.status === "running" || currentConversation.thread.status === "active") {
-      return true;
-    }
-    return currentConversation.thread.turns.some(
-      (turn) => turn.id === currentConversation.activeTurnId && String(turn.status ?? "") === "inProgress"
-    );
+    return hasConversationLiveTurn(currentConversation);
   });
   const queueModeActive = $derived.by(() => canQueueComposerMessage());
   const lastComposerHistoryPrompt = $derived.by(() => lastComposerPromptChip?.prompt ?? "");
@@ -2349,11 +2363,7 @@
   }
 
   function buildSessionSummaryFromConversation(state: ConversationState): SessionSummary {
-    const hasLiveTurn =
-      Boolean(state.activeTurnId) ||
-      state.thread.status === "running" ||
-      state.thread.status === "active" ||
-      state.thread.turns.some((turn) => String(turn.status ?? "") === "inProgress");
+    const hasLiveTurn = hasConversationLiveTurn(state);
 
     return {
       id: state.thread.id,
@@ -3003,11 +3013,9 @@
   function applyLoadedSessionDetail(sessionId: string, detail: SessionDetailPayload) {
     let nextConversation = createConversationState(detail);
     nextConversation = flushPendingSessionEvents(sessionId, nextConversation);
+    nextConversation = normalizeConversationExecutionState(nextConversation);
     conversation = nextConversation;
-    if (
-      pendingQueueModeSessionId === sessionId &&
-      (nextConversation.activeTurnId || nextConversation.thread.status === "running" || nextConversation.thread.status === "active")
-    ) {
+    if (pendingQueueModeSessionId === sessionId && hasConversationLiveTurn(nextConversation)) {
       pendingQueueModeSessionId = null;
     }
     titleDraft = getDisplayThreadTitle(detail.thread.name, detail.thread.preview) ?? "";
@@ -3715,9 +3723,6 @@
     const prompt = draftText.trim();
     const attachmentNames = attachmentSnapshot.map((attachment) => attachment.originalName);
     const preserveComposer = options?.preserveComposer ?? false;
-    if (!options?.promptText && (await handleSlashCommand(draftText))) {
-      return;
-    }
     startingMessage = true;
     errorText = "";
     noticeText = "";
@@ -3725,6 +3730,7 @@
     try {
       const materialized = await ensureSessionForComposer();
       if (!materialized) {
+        startingMessage = false;
         return;
       }
 
@@ -3842,6 +3848,7 @@
         scheduleComposerTextareaResize();
         composerSettingsOpen = false;
         composerSecurityOpen = false;
+        void api.clearSessionDraft(selectedSessionId).catch(() => {});
       }
       noticeText = m.queue_notice();
     } catch (error) {
@@ -3876,6 +3883,7 @@
         draft = "";
         draftAttachments = [];
         scheduleComposerTextareaResize();
+        void api.clearSessionDraft(selectedSessionId).catch(() => {});
       }
       pendingSteerResume = null;
     } catch (error) {
@@ -4170,14 +4178,23 @@
   }
 
   async function submitComposer() {
-    if (await handleSlashCommand(draft)) {
+    if (submitComposerBusy || sending || startingMessage || uploading) {
       return;
     }
-    if (queueModeActive) {
-      await queueMessage();
-      return;
+
+    submitComposerBusy = true;
+    try {
+      if (await handleSlashCommand(draft)) {
+        return;
+      }
+      if (queueModeActive) {
+        await queueMessage();
+        return;
+      }
+      await sendMessage();
+    } finally {
+      submitComposerBusy = false;
     }
-    await sendMessage();
   }
 
   function reuseLastComposerMessage() {
@@ -7135,7 +7152,7 @@
               placeholder={ui.threadTitle}
               readonly={readOnlyRole}
             />
-            {#if conversation?.thread.status === "running" || conversation?.thread.status === "active"}
+            {#if running}
               <span
                 aria-label={ui.generatingResponse}
                 class="inline-flex h-2.5 w-2.5 shrink-0 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.45)] animate-pulse"
@@ -7937,7 +7954,7 @@
                         <button class="ui-animated-button ui-animated-button--soft inline-flex h-8 items-center justify-center rounded-xl px-3 text-[11px] font-bold text-red-600 transition-all hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:px-4 sm:text-xs" disabled={readOnlyRole} onclick={interruptTurn} type="button">{ui.stop}</button>
                         <button class="ui-animated-button ui-animated-button--soft inline-flex h-8 items-center justify-center rounded-xl border border-amber-200 bg-amber-50 px-3 text-[11px] font-bold text-amber-700 transition-all hover:bg-amber-100 disabled:opacity-50 sm:h-9 sm:px-4 sm:text-xs" disabled={readOnlyRole || sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
                       {/if}
-                      <button class="surface-contrast-button ui-animated-button ui-animated-button--strong inline-flex h-8 items-center justify-center rounded-xl bg-gray-900 px-4 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:h-9 sm:px-6 sm:text-xs" disabled={readOnlyRole || sending || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
+                      <button class="surface-contrast-button ui-animated-button ui-animated-button--strong inline-flex h-8 items-center justify-center rounded-xl bg-gray-900 px-4 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:h-9 sm:px-6 sm:text-xs" disabled={readOnlyRole || sending || startingMessage || submitComposerBusy || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
                     </div>
                   </div>
                 </form>

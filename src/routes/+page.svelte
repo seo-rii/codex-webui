@@ -235,6 +235,7 @@
   let mobileSidebarOpen = $state(false);
   let isMobileLayout = $state(false);
   let optimisticMessage = $state<OptimisticMessageState | null>(null);
+  let optimisticQueuedItemsBySessionId = $state<Record<string, SessionQueueItem[]>>({});
   let pendingQueueModeSessionId = $state<string | null>(null);
   let liveTurnCardExpanded = $state(false);
   let sendIntent = $state<"message" | "steer" | "queue" | null>(null);
@@ -1101,6 +1102,7 @@
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let hydrationRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let selectedSessionDetailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionListRequestVersion = 0;
   const itemDetailRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let transcriptElement = $state<HTMLDivElement | undefined>(undefined);
@@ -1240,7 +1242,15 @@
       sessions.flatMap((session) => (session.highlight ? ([[session.id, session.highlight]] as const) : []))
     )
   );
-  const queuedMessages = $derived(conversation?.queue.items ?? []);
+  const queuedMessages = $derived.by(() => {
+    const sessionId = conversation?.thread.id ?? null;
+    if (!sessionId) {
+      return [] as SessionQueueItem[];
+    }
+
+    return [...(conversation?.queue.items ?? []), ...(optimisticQueuedItemsBySessionId[sessionId] ?? [])];
+  });
+  const hasOptimisticQueuedMessages = $derived.by(() => queuedMessages.some((item) => isOptimisticQueueItem(item)));
   const activeTurn = $derived.by(() => getConversationLiveTurn());
   const activeLiveTurnSubagents = $derived.by(() => {
     if (!activeTurn) {
@@ -1827,6 +1837,9 @@
       if (sessionRefreshTimer) {
         clearTimeout(sessionRefreshTimer);
       }
+      if (selectedSessionDetailRefreshTimer) {
+        clearTimeout(selectedSessionDetailRefreshTimer);
+      }
       if (saveTimer) {
         clearTimeout(saveTimer);
       }
@@ -2201,6 +2214,15 @@
     if (hasEcho || hasCompletedReplacementTurn) {
       optimisticMessage = null;
     }
+  });
+
+  $effect(() => {
+    const sessionId = conversation?.thread.id ?? null;
+    if (!sessionId) {
+      return;
+    }
+
+    reconcileOptimisticQueuedItems(sessionId, conversation?.queue.items ?? []);
   });
 
   $effect(() => {
@@ -2812,6 +2834,22 @@
     }, nextDelay);
   }
 
+  function scheduleSelectedSessionStateRefresh(sessionId: string, delay = 160) {
+    if (selectedSessionDetailRefreshTimer) {
+      clearTimeout(selectedSessionDetailRefreshTimer);
+    }
+
+    const nextDelay = delay === 0 ? 0 : Math.max(delay, 180);
+    selectedSessionDetailRefreshTimer = setTimeout(() => {
+      selectedSessionDetailRefreshTimer = null;
+      if (selectedSessionId !== sessionId) {
+        return;
+      }
+
+      void refreshSelectedSessionState(sessionId, Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize)).catch(() => {});
+    }, nextDelay);
+  }
+
   function getRequestedSessionIdFromUrl() {
     if (typeof window === "undefined") {
       return null;
@@ -2846,6 +2884,10 @@
     if (sessionRefreshTimer) {
       clearTimeout(sessionRefreshTimer);
       sessionRefreshTimer = null;
+    }
+    if (selectedSessionDetailRefreshTimer) {
+      clearTimeout(selectedSessionDetailRefreshTimer);
+      selectedSessionDetailRefreshTimer = null;
     }
     if (saveTimer) {
       clearTimeout(saveTimer);
@@ -2913,6 +2955,7 @@
     draftPersistencePaused = false;
     mobileSidebarOpen = false;
     optimisticMessage = null;
+    optimisticQueuedItemsBySessionId = {};
     pendingQueueModeSessionId = null;
     liveTurnCardExpanded = false;
     sendIntent = null;
@@ -4165,16 +4208,7 @@
       const activeConversation = materialized.state;
       const attachmentIds = attachmentSnapshot.map((attachment) => attachment.id);
       const preferences = activeConversation.preferences;
-      optimisticMessage = {
-        sessionId,
-        prompt,
-        attachmentNames,
-        createdAt: Date.now(),
-        baselineTurnId: activeConversation.thread.turns.at(-1)?.id ?? null,
-        baselineTurnCount: activeConversation.thread.turns.length
-      };
-      stickTranscriptToBottom = true;
-      forceTranscriptScroll = true;
+      setOptimisticMessageState(sessionId, prompt, attachmentNames, activeConversation);
       pendingQueueModeSessionId = sessionId;
       recordComposerHistory(prompt);
       rememberLastComposerPromptChip(sessionId, prompt);
@@ -4193,14 +4227,13 @@
         })
       .then(() => {
         scheduleSessionRefresh(80);
+        scheduleSelectedSessionStateRefresh(sessionId, 80);
       })
         .catch((error) => {
           if (pendingQueueModeSessionId === sessionId) {
             pendingQueueModeSessionId = null;
           }
-          if (optimisticMessage?.sessionId === sessionId && optimisticMessage.prompt === prompt) {
-            optimisticMessage = null;
-          }
+          clearOptimisticMessageState(sessionId, prompt);
           if (!preserveComposer && selectedSessionId === sessionId && !draft.trim() && draftAttachments.length === 0) {
             draft = draftText;
             draftAttachments = attachmentSnapshot;
@@ -4249,6 +4282,7 @@
     sendIntent = "queue";
     errorText = "";
     noticeText = "";
+    const optimisticQueueId = addOptimisticQueuedItem(sessionId, draftText, attachmentSnapshot);
 
     try {
       const queue = await api.enqueueSessionMessage(sessionId, {
@@ -4268,9 +4302,12 @@
         queue.items.some((item) => item.id === queue.enqueueItemId);
 
       if (!enqueueConfirmed) {
+        removeOptimisticQueuedItem(sessionId, optimisticQueueId);
         errorText = m.queue_enqueue_failed();
         return;
       }
+
+      reconcileOptimisticQueuedItems(sessionId, queue.items);
 
       recordComposerHistory(prompt);
       rememberLastComposerPromptChip(sessionId, prompt);
@@ -4283,6 +4320,7 @@
       }
       noticeText = m.queue_notice();
     } catch (error) {
+      removeOptimisticQueuedItem(sessionId, optimisticQueueId);
       errorText = describeError(error);
     } finally {
       sending = false;
@@ -4302,14 +4340,26 @@
 
     const sessionId = selectedBinding.sessionId;
     const normalizedPrompt = prompt.trim();
+    const steerAttachmentSnapshot =
+      clearComposer || draft.trim() === normalizedPrompt ? [...draftAttachments] : [];
     sending = true;
     sendIntent = "steer";
+    errorText = "";
+    noticeText = "";
+    setOptimisticMessageState(
+      sessionId,
+      normalizedPrompt,
+      steerAttachmentSnapshot.map((attachment) => attachment.originalName),
+      selectedBinding.state
+    );
     try {
       await api.steerTurn(
         sessionId,
         normalizedPrompt,
-        clearComposer || draft.trim() === normalizedPrompt ? draftAttachments.map((attachment) => attachment.id) : []
+        steerAttachmentSnapshot.map((attachment) => attachment.id)
       );
+      scheduleSessionRefresh(80);
+      scheduleSelectedSessionStateRefresh(sessionId, 80);
       recordComposerHistory(normalizedPrompt);
       rememberLastComposerPromptChip(sessionId, normalizedPrompt);
       if (clearComposer || draft.trim() === normalizedPrompt) {
@@ -4320,6 +4370,7 @@
       }
       pendingSteerResume = null;
     } catch (error) {
+      clearOptimisticMessageState(sessionId, normalizedPrompt);
       errorText = describeError(error);
     } finally {
       sending = false;
@@ -4342,10 +4393,16 @@
     }
 
     const sessionId = selectedBinding.sessionId;
+    const queuedItem = selectedBinding.state.queue.items.find((item) => item.id === queueId) ?? null;
+    if (!queuedItem) {
+      requestSelectedSessionResync(false);
+      return;
+    }
     sending = true;
-    sendIntent = mode === "steer" ? "steer" : "queue";
+    sendIntent = mode;
     errorText = "";
     noticeText = "";
+    setOptimisticMessageState(sessionId, queuedItem.prompt, queuedItem.attachmentNames, selectedBinding.state);
 
     try {
       const queue = await api.dispatchQueuedMessage(sessionId, queueId, mode);
@@ -4355,11 +4412,14 @@
           queue
         };
       }
+      scheduleSessionRefresh(80);
+      scheduleSelectedSessionStateRefresh(sessionId, 80);
       dismissedQueueResumeBySessionId = {
         ...dismissedQueueResumeBySessionId,
         [sessionId]: false
       };
     } catch (error) {
+      clearOptimisticMessageState(sessionId, queuedItem.prompt);
       errorText = describeError(error);
     } finally {
       sending = false;
@@ -4401,7 +4461,7 @@
   }
 
   function startQueueDrag(event: PointerEvent, queueId: string) {
-    if (sending || queueReorderBusy || queuedMessages.length < 2) {
+    if (sending || queueReorderBusy || queuedMessages.length < 2 || hasOptimisticQueuedMessages) {
       return;
     }
 
@@ -5655,6 +5715,129 @@
     return text.replace(/\s+/g, " ").trim();
   }
 
+  function setOptimisticMessageState(
+    sessionId: string,
+    prompt: string,
+    attachmentNames: string[],
+    currentConversation: ConversationState
+  ) {
+    const normalizedPrompt = prompt.trim();
+    const normalizedAttachmentNames = attachmentNames.map((name) => name.trim()).filter(Boolean);
+    if (!normalizedPrompt && normalizedAttachmentNames.length === 0) {
+      return;
+    }
+
+    optimisticMessage = {
+      sessionId,
+      prompt: normalizedPrompt,
+      attachmentNames: normalizedAttachmentNames,
+      createdAt: Date.now(),
+      baselineTurnId: currentConversation.thread.turns.at(-1)?.id ?? null,
+      baselineTurnCount: currentConversation.thread.turns.length
+    };
+    stickTranscriptToBottom = true;
+    forceTranscriptScroll = true;
+  }
+
+  function clearOptimisticMessageState(sessionId: string, prompt: string | null = null) {
+    if (!optimisticMessage || optimisticMessage.sessionId !== sessionId) {
+      return;
+    }
+    if (prompt !== null && normalizeMessageForComparison(optimisticMessage.prompt) !== normalizeMessageForComparison(prompt)) {
+      return;
+    }
+    optimisticMessage = null;
+  }
+
+  function buildQueueItemSignature(prompt: string, attachmentIds: string[]) {
+    return `${normalizeMessageForComparison(prompt)}\u0000${[...attachmentIds].sort().join("\u0001")}`;
+  }
+
+  function addOptimisticQueuedItem(sessionId: string, prompt: string, attachments: AttachmentRecord[]) {
+    const item: SessionQueueItem = {
+      id: `optimistic:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+      prompt,
+      attachmentIds: attachments.map((attachment) => attachment.id),
+      attachmentNames: attachments.map((attachment) => attachment.originalName),
+      createdAt: Date.now()
+    };
+
+    optimisticQueuedItemsBySessionId = {
+      ...optimisticQueuedItemsBySessionId,
+      [sessionId]: [...(optimisticQueuedItemsBySessionId[sessionId] ?? []), item]
+    };
+
+    return item.id;
+  }
+
+  function removeOptimisticQueuedItem(sessionId: string, queueId: string) {
+    const existing = optimisticQueuedItemsBySessionId[sessionId] ?? [];
+    if (existing.length === 0) {
+      return;
+    }
+
+    const nextItems = existing.filter((item) => item.id !== queueId);
+    if (nextItems.length === existing.length) {
+      return;
+    }
+
+    if (nextItems.length === 0) {
+      const remaining = { ...optimisticQueuedItemsBySessionId };
+      delete remaining[sessionId];
+      optimisticQueuedItemsBySessionId = remaining;
+      return;
+    }
+
+    optimisticQueuedItemsBySessionId = {
+      ...optimisticQueuedItemsBySessionId,
+      [sessionId]: nextItems
+    };
+  }
+
+  function reconcileOptimisticQueuedItems(sessionId: string, queueItems: SessionQueueItem[]) {
+    const optimisticItems = optimisticQueuedItemsBySessionId[sessionId] ?? [];
+    if (optimisticItems.length === 0) {
+      return;
+    }
+
+    const realCounts = new Map<string, number>();
+    for (const item of queueItems) {
+      const signature = buildQueueItemSignature(item.prompt, item.attachmentIds);
+      realCounts.set(signature, (realCounts.get(signature) ?? 0) + 1);
+    }
+
+    const nextItems = optimisticItems.filter((item) => {
+      const signature = buildQueueItemSignature(item.prompt, item.attachmentIds);
+      const remaining = realCounts.get(signature) ?? 0;
+      if (remaining <= 0) {
+        return true;
+      }
+
+      realCounts.set(signature, remaining - 1);
+      return false;
+    });
+
+    if (nextItems.length === optimisticItems.length) {
+      return;
+    }
+
+    if (nextItems.length === 0) {
+      const remaining = { ...optimisticQueuedItemsBySessionId };
+      delete remaining[sessionId];
+      optimisticQueuedItemsBySessionId = remaining;
+      return;
+    }
+
+    optimisticQueuedItemsBySessionId = {
+      ...optimisticQueuedItemsBySessionId,
+      [sessionId]: nextItems
+    };
+  }
+
+  function isOptimisticQueueItem(item: SessionQueueItem) {
+    return item.id.startsWith("optimistic:");
+  }
+
   function hasConversationEchoedOptimisticMessage(
     currentConversation: ConversationState,
     optimistic: OptimisticMessageState
@@ -6573,7 +6756,8 @@
       return formatValue(item.query) || m.search_details();
     }
     if (item.type === "contextCompaction") {
-      return isContextCompactionRunning(conversation?.activeTurnId ?? "", item)
+      const liveTurn = getConversationLiveTurn();
+      return liveTurn && liveTurn.items.some((candidate) => candidate.id === item.id) && isContextCompactionRunning(liveTurn.id, item)
         ? ui.contextCompressionInProgress
         : ui.contextCompressionCompleted;
     }
@@ -6947,7 +7131,21 @@
     if (String(item.lifecycleStatus ?? "") === "completed") {
       return false;
     }
-    return String(item.lifecycleStatus ?? "") === "inProgress" || isTurnRunning(turnId);
+    if (!isTurnRunning(turnId)) {
+      return false;
+    }
+
+    const turn = conversation?.thread.turns.find((candidate) => candidate.id === turnId) ?? null;
+    if (!turn) {
+      return false;
+    }
+
+    const lastItem = turn.items.at(-1);
+    if (!lastItem || lastItem.id !== item.id) {
+      return false;
+    }
+
+    return true;
   }
 
   function getFinalAgentItem(turn: ConversationState["thread"]["turns"][number]) {
@@ -8146,6 +8344,7 @@
                       transition:slide|local={{ duration: 220 }}
                     >
                       {#each queuedMessages as item (item.id)}
+                        {@const itemPending = isOptimisticQueueItem(item)}
                         <div
                           class={`relative px-3 py-2 transition-colors ${queueDragState?.queueId === item.id ? "bg-amber-50/60" : ""}`}
                           data-queue-item-id={item.id}
@@ -8159,8 +8358,8 @@
                           <div class="flex items-start gap-2.5">
                             <button
                               aria-label={ui.reorderQueue ?? "Reorder queued message"}
-                              class={`mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-400 transition-colors ${sending || queueReorderBusy || queuedMessages.length < 2 ? "cursor-not-allowed opacity-45" : queueDragState?.queueId === item.id ? "cursor-grabbing border-amber-300 bg-amber-50 text-amber-700 shadow-sm" : "cursor-grab hover:bg-gray-100 hover:text-gray-700"}`}
-                              disabled={sending || queueReorderBusy || queuedMessages.length < 2}
+                              class={`mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-400 transition-colors ${sending || queueReorderBusy || queuedMessages.length < 2 || hasOptimisticQueuedMessages ? "cursor-not-allowed opacity-45" : queueDragState?.queueId === item.id ? "cursor-grabbing border-amber-300 bg-amber-50 text-amber-700 shadow-sm" : "cursor-grab hover:bg-gray-100 hover:text-gray-700"}`}
+                              disabled={sending || queueReorderBusy || queuedMessages.length < 2 || hasOptimisticQueuedMessages}
                               onlostpointercapture={cancelQueueDrag}
                               onpointercancel={cancelQueueDrag}
                               onpointerdown={(event) => startQueueDrag(event, item.id)}
@@ -8202,7 +8401,15 @@
                                       <p class="text-[11px] text-gray-400">{m.attached_files_stay()}</p>
                                     </div>
                                   {:else}
-                                    <p class="text-[12px] leading-4 text-gray-700 break-words sm:truncate">{summarizeQueueItem(item)}</p>
+                                    <div class="flex flex-wrap items-center gap-1.5">
+                                      <p class="min-w-0 flex-1 text-[12px] leading-4 text-gray-700 break-words sm:truncate">{summarizeQueueItem(item)}</p>
+                                      {#if itemPending}
+                                        <span class="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-amber-700">
+                                          <RefreshCw size={10} class="animate-spin" />
+                                          {m.loading()}
+                                        </span>
+                                      {/if}
+                                    </div>
                                     {#if item.attachmentNames.length > 0}
                                       <div class="flex flex-wrap gap-1">
                                         <span class="inline-flex items-center gap-1 rounded-full border border-gray-200 bg-white px-2 py-1 text-[10px] font-semibold text-gray-500">
@@ -8215,15 +8422,15 @@
                                 </div>
                                 <div class={`flex flex-wrap items-center gap-1.5 ${editingQueueId === item.id ? "" : "sm:justify-end"}`}>
                                   {#if editingQueueId === item.id}
-                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-emerald-200 bg-emerald-50 px-2 text-[10px] font-bold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.queueSave}</button>
-                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-gray-200 bg-white px-2 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={cancelQueuedMessageEdit} type="button">{ui.cancel}</button>
+                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-emerald-200 bg-emerald-50 px-2 text-[10px] font-bold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50" disabled={sending || queueReorderBusy || itemPending} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.queueSave}</button>
+                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-gray-200 bg-white px-2 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy || itemPending} onclick={cancelQueuedMessageEdit} type="button">{ui.cancel}</button>
                                   {:else}
-                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-2 text-[10px] font-bold text-amber-700 transition-colors hover:bg-amber-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={() => void dispatchQueuedMessage(item.id, "steer")} type="button">{ui.steerNow}</button>
-                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-gray-200 bg-white px-2 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy} onclick={() => void dispatchQueuedMessage(item.id, "message")} type="button">{ui.sendNow}</button>
+                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-2 text-[10px] font-bold text-amber-700 transition-colors hover:bg-amber-100 disabled:opacity-50" disabled={sending || queueReorderBusy || itemPending} onclick={() => void dispatchQueuedMessage(item.id, "steer")} type="button">{ui.steerNow}</button>
+                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-gray-200 bg-white px-2 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy || itemPending} onclick={() => void dispatchQueuedMessage(item.id, "message")} type="button">{ui.sendNow}</button>
                                     <button
                                       aria-label={ui.edit}
                                       class="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-gray-200 bg-white p-0 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:opacity-50"
-                                      disabled={sending || queueReorderBusy}
+                                      disabled={sending || queueReorderBusy || itemPending}
                                       onclick={() => beginQueuedMessageEdit(item)}
                                       title={ui.edit}
                                       type="button"
@@ -8231,7 +8438,7 @@
                                       <Pencil size={14} />
                                     </button>
                                   {/if}
-                                  <button class="inline-flex h-7 w-7 items-center justify-center rounded-lg p-0 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:opacity-50" aria-label={m.remove_queued_message()} disabled={sending || queueReorderBusy} onclick={() => void removeQueuedMessage(item.id)} type="button"><Trash2 size={14} /></button>
+                                  <button class="inline-flex h-7 w-7 items-center justify-center rounded-lg p-0 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:opacity-50" aria-label={m.remove_queued_message()} disabled={sending || queueReorderBusy || itemPending} onclick={() => void removeQueuedMessage(item.id)} type="button"><Trash2 size={14} /></button>
                                 </div>
                               </div>
                             </div>

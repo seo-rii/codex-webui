@@ -581,10 +581,10 @@ impl Config {
             choose_free_port()?,
         )?;
         let internal_proxy_token = Uuid::new_v4().to_string();
-        let node_entry = project_root.join("build/node/index.js");
+        let node_entry = project_root.join("build/internal/index.js");
         if !node_entry.exists() {
             return Err(anyhow!(
-                "missing internal SvelteKit build at {}. Run `pnpm build` in codex-webui first.",
+                "missing internal API build at {}. Run `pnpm build` in codex-webui first.",
                 node_entry.display()
             ));
         }
@@ -4144,7 +4144,7 @@ fn load_dotenv(cwd: &PathBuf) {
 }
 
 fn resolve_project_root(cwd: &PathBuf) -> PathBuf {
-    if cwd.join("build/node/index.js").exists() || cwd.join("svelte.config.js").exists() {
+    if cwd.join("build/internal/index.js").exists() || cwd.join("svelte.config.js").exists() {
         return cwd.clone();
     }
 
@@ -4155,7 +4155,7 @@ fn resolve_project_root(cwd: &PathBuf) -> PathBuf {
     {
         if let Some(parent) = cwd.parent() {
             let parent = parent.to_path_buf();
-            if parent.join("build/node/index.js").exists() || parent.join("svelte.config.js").exists() {
+            if parent.join("build/internal/index.js").exists() || parent.join("svelte.config.js").exists() {
                 return parent;
             }
         }
@@ -4217,7 +4217,7 @@ async fn wait_for_internal_node(
     http: &reqwest::Client,
     stderr_tail: &Arc<Mutex<VecDeque<String>>>,
 ) -> Result<()> {
-    let target = format!("{}/", config.internal_base_url);
+    let target = format!("{}/health", config.internal_base_url);
 
     for _ in 0..100 {
         if let Ok(response) = http
@@ -4227,10 +4227,7 @@ async fn wait_for_internal_node(
             .await
         {
             if response.status().is_success() || response.status().is_redirection() {
-                info!(
-                    "Internal Node backend is ready at {}",
-                    config.internal_base_url
-                );
+                info!("Internal Node backend is ready at {}", config.internal_base_url);
                 return Ok(());
             }
         }

@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import path from "node:path";
+
 import { expect, test } from "@playwright/test";
 
 const DEV_BYPASS_COOKIE = {
@@ -16,6 +19,14 @@ test.beforeEach(async ({ baseURL, context }) => {
       url: baseURL
     }
   ]);
+});
+
+test("builds a static shell plus private internal API bundle", async () => {
+  const projectRoot = process.cwd();
+  expect(fs.existsSync(path.join(projectRoot, "build", "static", "index.html"))).toBeTruthy();
+  expect(fs.existsSync(path.join(projectRoot, "build", "static", "200.html"))).toBeTruthy();
+  expect(fs.existsSync(path.join(projectRoot, "build", "internal", "index.js"))).toBeTruthy();
+  expect(fs.existsSync(path.join(projectRoot, "build", "node"))).toBeFalsy();
 });
 
 test("serves the static shell under a base path and keeps login state after reload", async ({ baseURL, page }) => {

@@ -43,7 +43,6 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.55.0",
-    "@sveltejs/adapter-node": "^5.2.12",
     "@sveltejs/adapter-static": "^3.0.10",
     "@sveltejs/kit": "^2.48.4",
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
@@ -52,6 +51,7 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "autoprefixer": "^10.5.0",
+    "esbuild": "^0.27.0",
     "hast-util-to-html": "^9.0.5",
     "lowlight": "^3.3.0",
     "lucide-svelte": "^1.0.1",

@@ -6,7 +6,7 @@
 
 1. browser UI
 2. Rust public gateway
-3. internal SvelteKit/Node API service
+3. internal Node API service
 4. `codex app-server`
 
 The browser never talks to Codex directly.
@@ -41,9 +41,9 @@ It is responsible for:
 - enforcing base path and CORS policy
 - appending audit-log entries for privileged login and WebSocket actions
 
-### Internal SvelteKit/Node API service
+### Internal Node API service
 
-The internal service is no longer used as the public page renderer. It exists as an API-only private service behind Rust and contains most Codex-specific application logic:
+The internal service is no longer used as the public page renderer. It exists as an API-only private service behind Rust, is bundled into `build/internal/index.js`, and contains most Codex-specific application logic:
 
 - `codex app-server` client management
 - session hydration and turn shaping

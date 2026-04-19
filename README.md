@@ -87,7 +87,7 @@ Still evolving:
 2. password login and attachment upload use credentialed HTTP requests
 3. session activity, chat, Git, terminals, and runtime state use a reconnect-safe WebSocket RPC channel
 4. a Rust gateway owns auth, cookies, WebSocket fan-out, terminal persistence, runtime install/update actions, and static asset serving
-5. the Rust gateway serves the prebuilt static SPA from `build/static`, rewrites the compile-time base-path placeholder at response time, and starts an internal SvelteKit/Node API service from `build/node` for Codex-specific logic such as session hydration, queue persistence, Git operations, attachment storage, and `config.toml` synchronization
+5. the Rust gateway serves the prebuilt static SPA from `build/static`, rewrites the compile-time base-path placeholder at response time, and starts an internal API-only Node bundle from `build/internal/index.js` for Codex-specific logic such as session hydration, queue persistence, Git operations, attachment storage, and `config.toml` synchronization
 
 More detail is in [docs/architecture.md](./docs/architecture.md).
 
@@ -123,7 +123,7 @@ After setup, running `codex-webui` again starts the background server and prints
 `pnpm build` now produces two runtime artifacts:
 
 - `build/static` for the public SPA assets served by Rust
-- `build/node` for the internal Node API service supervised by Rust
+- `build/internal/index.js` for the private Node API service supervised by Rust
 
 The printed URL may still end in `/login` for compatibility, but that route redirects to the main workspace and the login experience is handled inline by the workspace shell.
 
@@ -282,7 +282,7 @@ See [.env.example](./.env.example) for a concise example set.
 - Restrict `CODEX_WEBUI_ALLOWED_ROOTS` to the smallest practical set.
 - Leave cookies on `SameSite=Strict` unless you explicitly need cross-site browser sessions.
 - Run behind HTTPS in production.
-- Do not expose the internal SvelteKit service directly.
+- Do not expose the internal Node API service directly.
 - Use the viewer password for observation-only access instead of sharing the admin password when multiple humans need browser visibility.
 - Git actions are intentionally gated on explicit repository selection.
 - System shutdown support is disabled by default and must be explicitly enabled.

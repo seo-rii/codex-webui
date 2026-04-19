@@ -13,7 +13,7 @@ That implies the published package must be able to:
 - guide a first-time user through setup
 - start the server in the background
 - resolve a runnable Rust gateway binary for the current platform
-- serve the already-built frontend and internal SvelteKit bundle
+- serve the already-built static frontend and internal API bundle
 
 ## What The Package Needs To Ship
 
@@ -21,7 +21,7 @@ The npm package should include:
 
 - `bin/codex-webui.mjs`
 - the built static frontend under `build/static`
-- the built internal Node API service under `build/node`
+- the built internal Node API bundle at `build/internal/index.js`
 - docs and helper scripts that the CLI depends on
 - Rust gateway binaries under `dist/backend/<target>/`
 
@@ -112,7 +112,7 @@ At runtime the public base path is owned by Rust, not baked permanently into the
 - the static frontend is built with a placeholder base path
 - Rust serves `build/static`
 - Rust rewrites the placeholder in HTML, JS, and CSS responses to the configured `CODEX_WEBUI_BASE_PATH`
-- the internal Node API service runs from `build/node` with no public base-path dependency
+- the internal Node API service runs from `build/internal/index.js` with no public base-path dependency
 
 `CODEX_WEBUI_CODEX_HOME` remains the default-profile convenience value for compatibility, while `CODEX_WEBUI_PROFILES_JSON` is the authoritative multi-profile runtime description.
 

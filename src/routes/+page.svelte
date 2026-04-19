@@ -223,6 +223,7 @@
   let terminals = $state<TerminalSummary[]>([]);
   let activeWorkspaceTabId = $state<WorkspaceTabId>("chat");
   let workspaceMenuOpen = $state(false);
+  let tasksTabOpen = $state(false);
   let gitTabOpen = $state(false);
   let settingsTabOpen = $state(false);
   let gitDiffTabs = $state<GitDiffTab[]>([]);
@@ -1598,11 +1599,13 @@
     const tabs: Array<{ id: WorkspaceTabId; label: string; kind: "chat" | "tasks" | "git" | "settings" | "git-diff" | "code-diff" | "terminal" }> = [
       { id: "chat", label: ui.chat, kind: "chat" }
     ];
-    tabs.push({
-      id: "tasks",
-      label: subagentTasks.length > 0 ? `${ui.tasks} ${subagentTasks.length}` : ui.tasks,
-      kind: "tasks"
-    });
+    if (tasksTabOpen) {
+      tabs.push({
+        id: "tasks",
+        label: subagentTasks.length > 0 ? `${ui.tasks} ${subagentTasks.length}` : ui.tasks,
+        kind: "tasks"
+      });
+    }
     if (gitTabOpen) {
       tabs.push({
         id: "git",
@@ -2130,17 +2133,25 @@
         return;
       }
 
-      if (isMobileLayout) {
-        composerToolbarCompact = true;
-        return;
-      }
-
-      const modelWidthBias = Math.max(0, Math.min(84, (composerSettingsSummary.model.length - 9) * 4));
+      const modelWidthBias = Math.max(
+        0,
+        Math.min(isMobileLayout ? 56 : 84, (composerSettingsSummary.model.length - 9) * (isMobileLayout ? 3 : 4))
+      );
       const threshold =
-        (conversation ? (running ? 560 : 470) : 340) +
+        (conversation
+          ? running
+            ? isMobileLayout
+              ? 430
+              : 560
+            : isMobileLayout
+              ? 338
+              : 470
+          : isMobileLayout
+            ? 220
+            : 340) +
         modelWidthBias +
-        (composerSettingsSummary.speed === "flex" ? 18 : 0) +
-        (draftAttachments.length > 0 ? 12 : 0);
+        (composerSettingsSummary.speed === "flex" ? (isMobileLayout ? 10 : 18) : 0) +
+        (draftAttachments.length > 0 ? (isMobileLayout ? 8 : 12) : 0);
 
       composerToolbarCompact = toolbar.clientWidth < threshold;
     };
@@ -2946,6 +2957,7 @@
     terminals = [];
     activeWorkspaceTabId = "chat";
     workspaceMenuOpen = false;
+    tasksTabOpen = false;
     gitTabOpen = false;
     settingsTabOpen = false;
     gitDiffTabs = [];
@@ -5215,6 +5227,19 @@
   function activateTab(tabId: WorkspaceTabId) {
     activeWorkspaceTabId = tabId;
     workspaceMenuOpen = false;
+  }
+
+  function openTasksTab() {
+    tasksTabOpen = true;
+    activeWorkspaceTabId = "tasks";
+    workspaceMenuOpen = false;
+  }
+
+  function closeTasksTab() {
+    tasksTabOpen = false;
+    if (activeWorkspaceTabId === "tasks") {
+      activeWorkspaceTabId = "chat";
+    }
   }
 
   function openGitTab() {
@@ -7838,7 +7863,7 @@
 
   <!-- Main Content -->
   <main class="flex-1 flex flex-col h-full min-w-0 bg-white relative">
-    <header class="flex items-center justify-between px-6 py-3 border-b border-gray-100 bg-white/80 backdrop-blur-md z-20 sticky top-0">
+    <header class="flex items-center justify-between px-6 py-3 border-b border-gray-100 bg-white/80 backdrop-blur-md z-40 sticky top-0">
       <div class="flex items-center gap-4 min-w-0">
         {#if isMobileLayout}
           <button class="p-2 -ml-2 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors" onclick={openMobileSidebar}>
@@ -7993,7 +8018,7 @@
                 </button>
                 <div class="mx-2 my-1 h-px bg-gray-100"></div>
               {/if}
-              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" onclick={() => { activateTab("tasks"); workspaceMenuOpen = false; }} type="button">
+              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" onclick={openTasksTab} type="button">
                 <History size={16} class="text-gray-400 group-hover:text-amber-600" />
                 <span>{ui.tasks}</span>
               </button>
@@ -8039,7 +8064,8 @@
                 class="ml-1 p-0.5 hover:bg-gray-200 rounded transition-colors"
                 onclick={(event) => {
                   event.stopPropagation();
-                  if (tab.kind === "git") closeGitTab();
+                  if (tab.kind === "tasks") closeTasksTab();
+                  else if (tab.kind === "git") closeGitTab();
                   else if (tab.kind === "settings") closeSettingsTab();
                   else if (tab.kind === "git-diff") closeGitDiffTab(tab.id);
                   else if (tab.kind === "code-diff") closeCodeDiffTab(tab.id);
@@ -8051,7 +8077,8 @@
                   }
                   event.preventDefault();
                   event.stopPropagation();
-                  if (tab.kind === "git") closeGitTab();
+                  if (tab.kind === "tasks") closeTasksTab();
+                  else if (tab.kind === "git") closeGitTab();
                   else if (tab.kind === "settings") closeSettingsTab();
                   else if (tab.kind === "git-diff") closeGitDiffTab(tab.id);
                   else if (tab.kind === "code-diff") closeCodeDiffTab(tab.id);
@@ -8735,22 +8762,22 @@
                 {#if composerSettingsOpen && conversation}
                   <div
                     bind:this={composerSettingsPopoverElement}
-                    class="composer-popover fixed z-[72] w-[19rem] max-w-[calc(100vw-1rem)] rounded-2xl border border-gray-200 bg-white p-3.5 shadow-2xl"
+                    class="composer-popover composer-settings-popover fixed z-[72] w-[19rem] max-w-[calc(100vw-1rem)] rounded-2xl border border-gray-200 bg-white p-3.5 shadow-2xl"
                     style={composerSettingsPopoverStyle || "opacity:0;pointer-events:none;"}
                   >
-                    <div class="mb-2.5 flex items-center justify-between border-b border-gray-100 pb-2.5">
+                    <div class="composer-settings-popover__header mb-2.5 flex items-center justify-between border-b border-gray-100 pb-2.5">
                       <div>
                         <h3 class="text-xs font-bold uppercase tracking-widest text-gray-400">{ui.settings}</h3>
                         <p class="mt-1 text-[11px] font-medium text-gray-500">{composerSettingsTab === "session" ? ui.composerSettings : ui.securitySession}</p>
                       </div>
-                      <button class="text-gray-400 hover:text-gray-600" onclick={() => (composerSettingsOpen = false)} type="button">
+                      <button class="composer-settings-popover__close text-gray-400 hover:text-gray-600" onclick={() => (composerSettingsOpen = false)} type="button">
                         <X size={16} />
                       </button>
                     </div>
-                    <div aria-label={ui.settings} class="mb-3 grid grid-cols-2 gap-1 rounded-2xl border border-gray-200 bg-gray-50 p-1" role="tablist">
+                    <div aria-label={ui.settings} class="composer-settings-tabs mb-3 grid grid-cols-2 gap-1 rounded-2xl border border-gray-200 bg-gray-50 p-1" role="tablist">
                       <button
                         aria-selected={composerSettingsTab === "session"}
-                        class={`ui-animated-button ui-animated-button--soft flex items-center justify-center rounded-xl px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
+                        class={`composer-settings-tab ui-animated-button ui-animated-button--soft flex items-center justify-center rounded-xl px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
                           composerSettingsTab === "session"
                             ? "border border-amber-200 bg-white text-amber-700 shadow-sm"
                             : "border border-transparent text-gray-500 hover:bg-white hover:text-gray-700"
@@ -8766,7 +8793,7 @@
                       </button>
                       <button
                         aria-selected={composerSettingsTab === "security"}
-                        class={`ui-animated-button ui-animated-button--soft flex items-center justify-center rounded-xl px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
+                        class={`composer-settings-tab ui-animated-button ui-animated-button--soft flex items-center justify-center rounded-xl px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
                           composerSettingsTab === "security"
                             ? "border border-sky-200 bg-white text-sky-700 shadow-sm"
                             : "border border-transparent text-gray-500 hover:bg-white hover:text-gray-700"
@@ -8800,27 +8827,29 @@
                             {/each}
                           </select>
                         </div>
-                        <div class="flex items-center justify-between gap-2 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
+                        <div class="composer-settings-card flex items-center justify-between gap-2 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
                           <div class="flex min-w-0 items-center gap-2">
-                            <span class={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border ${
+                            <span class={`composer-settings-card__icon inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border ${
                               conversation.preferences.sendOnEnter
                                 ? "border-amber-200 bg-amber-100 text-amber-700"
                                 : "border-gray-200 bg-white text-gray-500"
-                            }`}>
+                            }`} data-active={conversation.preferences.sendOnEnter}>
                               <Keyboard size={12} />
                             </span>
                             <div class="min-w-0">
-                              <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.sendShortcut}</p>
-                              <p class="truncate text-[11px] text-gray-500">{conversation.preferences.sendOnEnter ? ui.sendShortcutEnter : ui.sendShortcutCtrlEnter}</p>
+                              <p class="composer-settings-card__eyebrow text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.sendShortcut}</p>
+                              <p class="composer-settings-card__value truncate text-[11px] text-gray-500">{conversation.preferences.sendOnEnter ? ui.sendShortcutEnter : ui.sendShortcutCtrlEnter}</p>
                             </div>
                           </div>
-                          <div class="grid shrink-0 grid-cols-2 gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
+                          <div class="composer-settings-segmented grid shrink-0 grid-cols-2 gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
                             <button
-                              class={`ui-animated-button ui-animated-button--soft flex h-8 min-w-[5.2rem] items-center justify-center rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                              class={`composer-settings-segmented__button ui-animated-button ui-animated-button--soft flex h-8 min-w-[5.2rem] items-center justify-center rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
                                 !conversation.preferences.sendOnEnter
                                   ? "border-gray-900 bg-gray-900 text-white shadow-sm"
                                   : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
                               }`}
+                              data-selected={!conversation.preferences.sendOnEnter}
+                              data-tone="default"
                               disabled={readOnlyRole}
                               onclick={() => setPreference("sendOnEnter", false)}
                               type="button"
@@ -8828,11 +8857,13 @@
                               <span>{ui.sendShortcutCtrlEnter}</span>
                             </button>
                             <button
-                              class={`ui-animated-button ui-animated-button--soft flex h-8 min-w-[5.2rem] items-center justify-center rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                              class={`composer-settings-segmented__button ui-animated-button ui-animated-button--soft flex h-8 min-w-[5.2rem] items-center justify-center rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
                                 conversation.preferences.sendOnEnter
                                   ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
                                   : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
                               }`}
+                              data-selected={conversation.preferences.sendOnEnter}
+                              data-tone="fast"
                               disabled={readOnlyRole}
                               onclick={() => setPreference("sendOnEnter", true)}
                               type="button"
@@ -8867,13 +8898,13 @@
                             </button>
                           </div>
                         </div>
-                        <div class="flex items-center justify-between gap-2 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
+                        <div class="composer-settings-card flex items-center justify-between gap-2 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
                           <div class="flex min-w-0 items-center gap-2">
-                            <span class={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border ${
+                            <span class={`composer-settings-card__icon inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border ${
                               isFastSpeedMode(conversation.preferences.speed)
                                 ? "border-amber-200 bg-amber-100 text-amber-700"
                                 : "border-gray-200 bg-white text-gray-500"
-                            }`}>
+                            }`} data-active={isFastSpeedMode(conversation.preferences.speed)}>
                               {#if isFastSpeedMode(conversation.preferences.speed)}
                                 <Zap size={12} />
                               {:else}
@@ -8881,14 +8912,14 @@
                               {/if}
                             </span>
                             <div class="min-w-0">
-                              <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.speed}</p>
-                              <p class="truncate text-[11px] text-gray-500">{getSpeedOptionLabel(conversation.preferences.speed ?? "auto")}</p>
+                              <p class="composer-settings-card__eyebrow text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.speed}</p>
+                              <p class="composer-settings-card__value truncate text-[11px] text-gray-500">{getSpeedOptionLabel(conversation.preferences.speed ?? "auto")}</p>
                             </div>
                           </div>
-                          <div class="grid shrink-0 grid-cols-3 gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
+                          <div class="composer-settings-segmented grid shrink-0 grid-cols-3 gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
                             {#each speedOptions as option (option)}
                               <button
-                                class={`ui-animated-button ui-animated-button--soft flex h-8 min-w-[4.1rem] items-center justify-center gap-1 rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                                class={`composer-settings-segmented__button ui-animated-button ui-animated-button--soft flex h-8 min-w-[4.1rem] items-center justify-center gap-1 rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
                                   (conversation.preferences.speed ?? "auto") === option
                                     ? option === "fast"
                                       ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
@@ -8897,6 +8928,8 @@
                                         : "border-gray-900 bg-gray-900 text-white shadow-sm"
                                     : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
                                 }`}
+                                data-selected={(conversation.preferences.speed ?? "auto") === option}
+                                data-tone={option}
                                 disabled={readOnlyRole}
                                 onclick={() => {
                                   if (!conversation) {
@@ -9484,6 +9517,24 @@
     will-change: transform, opacity;
   }
 
+  .composer-settings-popover,
+  .composer-settings-popover__header,
+  .composer-settings-popover__close,
+  .composer-settings-tabs,
+  .composer-settings-tab,
+  .composer-settings-card,
+  .composer-settings-card__icon,
+  .composer-settings-card__eyebrow,
+  .composer-settings-card__value,
+  .composer-settings-segmented,
+  .composer-settings-segmented__button {
+    transition:
+      background-color 160ms ease,
+      border-color 160ms ease,
+      color 160ms ease,
+      box-shadow 160ms ease;
+  }
+
   @keyframes composer-popover-enter {
     0% {
       opacity: 0;
@@ -9731,6 +9782,129 @@
     background-color: rgba(255, 255, 255, 0.06) !important;
     border-color: rgba(148, 163, 184, 0.22) !important;
     color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-popover {
+    border-color: rgba(71, 85, 105, 0.52) !important;
+    background: linear-gradient(180deg, rgba(17, 24, 39, 0.98), rgba(11, 18, 32, 1)) !important;
+    box-shadow: 0 34px 76px -42px rgba(2, 6, 23, 0.94) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-popover__header {
+    border-color: rgba(71, 85, 105, 0.34) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-popover .text-gray-400 {
+    color: #94a3b8 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-popover .text-gray-500 {
+    color: #a8b3c7 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-popover .text-gray-600,
+  :global(:root[data-theme="dark"]) .composer-settings-popover .text-gray-700,
+  :global(:root[data-theme="dark"]) .composer-settings-popover .text-gray-900 {
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-popover__close:hover {
+    border-radius: 0.75rem;
+    background: rgba(51, 65, 85, 0.74) !important;
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-tabs {
+    border-color: rgba(71, 85, 105, 0.34) !important;
+    background: rgba(15, 23, 42, 0.84) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-tab[aria-selected="false"] {
+    color: #94a3b8 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-tab[aria-selected="false"]:hover {
+    border-color: rgba(148, 163, 184, 0.18) !important;
+    background: rgba(255, 255, 255, 0.06) !important;
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-tab[aria-selected="true"] {
+    background: rgba(30, 41, 59, 0.94) !important;
+    box-shadow: 0 16px 28px -24px rgba(2, 6, 23, 0.72) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-popover select {
+    border-color: rgba(71, 85, 105, 0.42) !important;
+    background: rgba(15, 23, 42, 0.88) !important;
+    color: #f8fafc !important;
+    box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.05);
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-card {
+    border-color: rgba(71, 85, 105, 0.34) !important;
+    background: rgba(15, 23, 42, 0.72) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-card__icon[data-active="false"] {
+    border-color: rgba(71, 85, 105, 0.42) !important;
+    background: rgba(17, 24, 39, 0.92) !important;
+    color: #94a3b8 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-card__icon[data-active="true"] {
+    border-color: rgba(245, 158, 11, 0.34) !important;
+    background: rgba(245, 158, 11, 0.16) !important;
+    color: #fbbf24 !important;
+    box-shadow: inset 0 0 0 1px rgba(251, 191, 36, 0.08);
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-card__eyebrow {
+    color: #94a3b8 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-card__value {
+    color: #e2e8f0 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-segmented {
+    border-color: rgba(71, 85, 105, 0.36) !important;
+    background: rgba(15, 23, 42, 0.92) !important;
+    box-shadow:
+      inset 0 0 0 1px rgba(148, 163, 184, 0.04),
+      0 18px 34px -28px rgba(2, 6, 23, 0.82) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-segmented__button[data-selected="false"] {
+    color: #94a3b8 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-segmented__button[data-selected="false"]:hover {
+    border-color: rgba(148, 163, 184, 0.18) !important;
+    background: rgba(255, 255, 255, 0.06) !important;
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-segmented__button[data-selected="true"][data-tone="default"],
+  :global(:root[data-theme="dark"]) .composer-settings-segmented__button[data-selected="true"][data-tone="auto"] {
+    border-color: rgba(100, 116, 139, 0.46) !important;
+    background: linear-gradient(180deg, rgba(71, 85, 105, 0.96), rgba(51, 65, 85, 1)) !important;
+    color: #f8fafc !important;
+    box-shadow: 0 14px 24px -20px rgba(2, 6, 23, 0.76) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-segmented__button[data-selected="true"][data-tone="fast"] {
+    border-color: rgba(245, 158, 11, 0.34) !important;
+    background: linear-gradient(180deg, rgba(146, 64, 14, 0.3), rgba(120, 53, 15, 0.42)) !important;
+    color: #fcd34d !important;
+    box-shadow: 0 14px 24px -20px rgba(146, 64, 14, 0.62) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .composer-settings-segmented__button[data-selected="true"][data-tone="flex"] {
+    border-color: rgba(56, 189, 248, 0.34) !important;
+    background: linear-gradient(180deg, rgba(12, 74, 110, 0.34), rgba(14, 116, 144, 0.28)) !important;
+    color: #7dd3fc !important;
+    box-shadow: 0 14px 24px -20px rgba(14, 116, 144, 0.52) !important;
   }
 
   :global(:root[data-theme="dark"]) .surface-contrast-button {

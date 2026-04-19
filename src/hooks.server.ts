@@ -1,11 +1,12 @@
 import { base } from "$app/paths";
-import { error, type Handle } from "@sveltejs/kit";
+import { error, type Handle, type HandleServerError } from "@sveltejs/kit";
 
 import { getTextDirection } from "$lib/paraglide/runtime.js";
 import { paraglideMiddleware } from "$lib/paraglide/server.js";
 import { isAuthenticated } from "$lib/server/auth";
 import { getRuntimeConfig, getRuntimeProfile } from "$lib/server/env";
 import { runWithProfile } from "$lib/server/profile-context";
+import { appendRuntimeErrorLog, installRuntimeProcessErrorLogging, serializeErrorForLog } from "$lib/server/runtime-log";
 
 const PUBLIC_API_PATHS = new Set(["/api/auth/login", "/api/auth/logout", "/api/auth/session"]);
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
@@ -13,6 +14,8 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 const CORS_METHODS = "GET,HEAD,POST,PATCH,PUT,DELETE,OPTIONS";
 const PROFILE_COOKIE = "codex_webui_profile";
 const PROFILE_HEADER = "x-codex-webui-profile-id";
+
+installRuntimeProcessErrorLogging();
 
 function normalizeHostname(hostname: string) {
   return hostname.replace(/^\[|\]$/gu, "").replace(/^::ffff:/u, "");
@@ -184,4 +187,23 @@ export const handle: Handle = async ({ event, resolve }) => {
       effectiveRequestUrl: event.url
     }
   );
+};
+
+export const handleError: HandleServerError = ({ error: caughtError, event, status, message }) => {
+  void appendRuntimeErrorLog({
+    source: "sveltekit-request",
+    message,
+    profileId: event.locals.profileId ?? null,
+    details: {
+      status,
+      method: event.request.method,
+      url: event.url.toString(),
+      routeId: event.route.id ?? null,
+      error: serializeErrorForLog(caughtError)
+    }
+  }).catch(() => {});
+
+  return {
+    message
+  };
 };

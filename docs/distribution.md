@@ -20,7 +20,8 @@ That implies the published package must be able to:
 The npm package should include:
 
 - `bin/codex-webui.mjs`
-- the built frontend/internal SvelteKit output under `build`
+- the built static frontend under `build/static`
+- the built internal Node API service under `build/node`
 - docs and helper scripts that the CLI depends on
 - Rust gateway binaries under `dist/backend/<target>/`
 
@@ -58,6 +59,7 @@ On first run, it prompts for:
 - CORS origins
 - optional explicit backend binary path
 - password
+- optional hCaptcha site key and secret key
 
 The password is stored as a scrypt hash in the YAML config.
 
@@ -100,10 +102,27 @@ The CLI starts the Rust gateway as a detached background process and injects the
 - `CODEX_WEBUI_PROFILES_JSON`
 - `CODEX_WEBUI_ALLOWED_ROOTS`
 - `CODEX_WEBUI_PASSWORD_HASH`
+- `CODEX_WEBUI_HCAPTCHA_SITE_KEY`
+- `CODEX_WEBUI_HCAPTCHA_SECRET_KEY`
 - `CODEX_WEBUI_SESSION_SECRET`
 - `CODEX_WEBUI_CORS_ALLOWED_ORIGINS`
 
+At runtime the public base path is owned by Rust, not baked permanently into the shipped SPA:
+
+- the static frontend is built with a placeholder base path
+- Rust serves `build/static`
+- Rust rewrites the placeholder in HTML, JS, and CSS responses to the configured `CODEX_WEBUI_BASE_PATH`
+- the internal Node API service runs from `build/node` with no public base-path dependency
+
 `CODEX_WEBUI_CODEX_HOME` remains the default-profile convenience value for compatibility, while `CODEX_WEBUI_PROFILES_JSON` is the authoritative multi-profile runtime description.
+
+The CLI also accepts transient launch overrides:
+
+- `--hcaptcha-site-key <site-key>`
+- `--hcaptcha-secret-key <secret>`
+- `--disable-hcaptcha`
+
+Prefer the YAML config or environment variables for the secret key in long-lived deployments, because shell history and process inspection can expose command-line secrets.
 
 The CLI currently prints a URL ending in `/login`; that route redirects to the workspace root, so either URL is acceptable for end users.
 
@@ -112,6 +131,13 @@ When system shutdown support is enabled, the actual armed and scheduled state is
 - arming "shutdown after queue completes" happens through the running app
 - the armed flag and any scheduled shutdown timestamp are persisted under `CODEX_WEBUI_DATA_DIR`
 - the backend remains authoritative, so the shutdown can still execute without an attached browser session
+
+The Settings page also exposes a per-user automatic startup toggle:
+
+- Windows uses the current user's Startup folder
+- macOS uses `~/Library/LaunchAgents/`
+- Linux prefers `systemd --user` and falls back to XDG autostart desktop entries when user-systemd is unavailable
+- the generated startup entry launches the packaged `codex-webui` CLI, so normal config resolution and background PID handling stay unchanged
 
 ## Tunnel Behavior
 
@@ -176,9 +202,10 @@ Before publishing, check:
 3. `pnpm build:cross`
 4. `pnpm check`
 5. `cargo check --manifest-path backend/Cargo.toml`
-6. `package.json` includes `bin`, `build`, `dist`, and docs
-7. `node ./bin/codex-webui.mjs` works from a clean checkout
-8. `npx .` or a packed tarball works on a machine that does not rely on local build artifacts by accident
+6. `pnpm exec playwright test e2e/base-path.spec.ts`
+7. `package.json` includes `bin`, `build`, `dist`, and docs
+8. `node ./bin/codex-webui.mjs` works from a clean checkout
+9. `npx .` or a packed tarball works on a machine that does not rely on local build artifacts by accident
 
 ## Recommended Smoke Tests
 

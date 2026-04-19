@@ -24,7 +24,8 @@
     Pin,
     Moon,
     Sun,
-    Power
+    Power,
+    Download
   } from "lucide-svelte";
 
   import { activeLocale, localeOptions, localeSignal, updateLocale } from "$lib/i18n";
@@ -81,6 +82,9 @@
     quotaBusy,
     runtime,
     runtimeBusyAction,
+    showPwaInstall = false,
+    pwaInstalled = false,
+    pwaInstallBusy = false,
     systemShutdownArmed,
     systemShutdownAvailable,
     systemShutdownDelaySeconds,
@@ -92,6 +96,7 @@
     onMarkNotificationsRead,
     onClearNotifications,
     onRefreshRuntime,
+    onInstallApp,
     onSystemShutdownArmedChange,
     onInstallRuntime,
     onUpdateRuntime,
@@ -153,6 +158,9 @@
     quotaBusy: boolean;
     runtime: CodexRuntimeStatus | null;
     runtimeBusyAction: "install" | "update" | "check" | null;
+    showPwaInstall?: boolean;
+    pwaInstalled?: boolean;
+    pwaInstallBusy?: boolean;
     systemShutdownArmed: boolean;
     systemShutdownAvailable: boolean;
     systemShutdownDelaySeconds: number;
@@ -164,6 +172,7 @@
     onMarkNotificationsRead: (ids: string[] | null) => void;
     onClearNotifications: () => void;
     onRefreshRuntime: () => void;
+    onInstallApp: () => void;
     onSystemShutdownArmedChange: (armed: boolean) => void;
     onInstallRuntime: () => void;
     onUpdateRuntime: () => void;
@@ -252,6 +261,9 @@
       check: m.check(),
       update: m.update(),
       install: m.install(),
+      installApp: m.install_app(),
+      installingApp: m.installing_app(),
+      appInstalled: m.app_installed(),
       close: m.close(),
       refreshQuota: m.refresh_quota(),
       switchAccount: m.switch_account(),
@@ -716,7 +728,7 @@
       {#if notificationsOpen}
         <div
           bind:this={notificationPanelElement}
-          class="fixed z-50 grid grid-rows-[auto_auto_minmax(0,1fr)] gap-3 rounded-2xl border border-gray-200 bg-white p-3 opacity-0 pointer-events-none shadow-[0_24px_54px_-28px_rgba(15,23,42,0.35)]"
+          class="sidebar-flyout sidebar-notification-panel fixed z-50 grid grid-rows-[auto_auto_minmax(0,1fr)] gap-3 rounded-2xl border border-gray-200 bg-white p-3 opacity-0 pointer-events-none shadow-[0_24px_54px_-28px_rgba(15,23,42,0.35)]"
           style={notificationPanelStyle}
         >
           <div class="flex items-center justify-between gap-3">
@@ -740,14 +752,14 @@
 
           <div class="min-h-0 overflow-y-auto pr-1 scrollbar-thin">
             {#if notificationsBusy}
-              <div class="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-xs text-gray-500">{ui.loadingMoreThreads}</div>
+              <div class="sidebar-flyout-surface rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-xs text-gray-500">{ui.loadingMoreThreads}</div>
             {:else if notifications.length === 0}
-              <div class="rounded-xl border border-dashed border-gray-200 bg-gray-50/80 px-3 py-4 text-center text-xs text-gray-500">{ui.noNotifications}</div>
+              <div class="sidebar-flyout-surface rounded-xl border border-dashed border-gray-200 bg-gray-50/80 px-3 py-4 text-center text-xs text-gray-500">{ui.noNotifications}</div>
             {:else}
               <div class="grid gap-2">
                 {#each notifications as notification (notification.id)}
                   <button
-                    class={`rounded-xl border px-3 py-2.5 text-left transition-colors ${
+                    class={`sidebar-notification-item rounded-xl border px-3 py-2.5 text-left transition-colors ${
                       notification.readAt === null ? "border-amber-200 bg-amber-50/70" : "border-gray-200 bg-gray-50/70 hover:bg-white"
                     }`}
                     onclick={() => {
@@ -798,15 +810,15 @@
   </div>
 
   <div class="px-4 pb-2 space-y-4">
-    <div class="flex p-1 bg-gray-200/50 rounded-lg text-sm">
+    <div class="sidebar-mode-toggle flex p-1 bg-gray-200/50 rounded-lg text-sm">
       <button
-        class="flex-1 py-1.5 rounded-md transition-all { !showArchived ? 'bg-white shadow-sm text-gray-900 font-medium' : 'text-gray-500 hover:text-gray-700' }"
+        class="sidebar-mode-toggle__button flex-1 py-1.5 rounded-md transition-all { !showArchived ? 'bg-white shadow-sm text-gray-900 font-medium' : 'text-gray-500 hover:text-gray-700' }"
         onclick={() => onArchivedChange(false)}
       >
         {ui.active}
       </button>
       <button
-        class="flex-1 py-1.5 rounded-md transition-all { showArchived ? 'bg-white shadow-sm text-gray-900 font-medium' : 'text-gray-500 hover:text-gray-700' }"
+        class="sidebar-mode-toggle__button flex-1 py-1.5 rounded-md transition-all { showArchived ? 'bg-white shadow-sm text-gray-900 font-medium' : 'text-gray-500 hover:text-gray-700' }"
         onclick={() => onArchivedChange(true)}
       >
         {ui.archived}
@@ -817,7 +829,7 @@
       <button
         bind:this={searchTriggerElement}
         aria-expanded={searchPanelOpen}
-        class={`flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition-all ${
+        class={`sidebar-search-trigger flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition-all ${
           searchPanelOpen
             ? "border-amber-300 bg-white shadow-lg shadow-amber-100/40"
             : searchQuery.trim() ||
@@ -833,7 +845,7 @@
         onclick={toggleSearchPanel}
         type="button"
       >
-        <div class={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${
+        <div class={`sidebar-search-trigger__icon flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${
           searchPanelOpen || searchQuery.trim() || searchScope === "full"
             ? "border-amber-200 bg-amber-50 text-amber-700"
             : "border-gray-200 bg-gray-50 text-gray-400"
@@ -854,7 +866,7 @@
       {#if searchPanelOpen}
         <div
           bind:this={searchPanelElement}
-          class="absolute left-0 right-0 top-[calc(100%+0.55rem)] z-20 overflow-hidden rounded-2xl border border-amber-200/80 bg-white shadow-[0_20px_48px_-28px_rgba(217,119,6,0.45)]"
+          class="sidebar-search-panel absolute left-0 right-0 top-[calc(100%+0.55rem)] z-20 overflow-hidden rounded-2xl border border-amber-200/80 bg-white shadow-[0_20px_48px_-28px_rgba(217,119,6,0.45)]"
         >
           <div class="space-y-3 p-3.5">
             <div class="relative group">
@@ -863,7 +875,7 @@
               </div>
               <input
                 bind:this={searchInputElement}
-                class="w-full rounded-xl border border-gray-200 bg-gray-50/80 py-2.5 pl-10 pr-10 text-sm text-gray-700 placeholder-gray-400 transition-all focus:border-amber-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500/10"
+                class="sidebar-search-input w-full rounded-xl border border-gray-200 bg-gray-50/80 py-2.5 pl-10 pr-10 text-sm text-gray-700 placeholder-gray-400 transition-all focus:border-amber-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-amber-500/10"
                 oninput={(event) => onSearchQueryChange((event.currentTarget as HTMLInputElement).value)}
                 onkeydown={(event) => {
                   if (event.key === "Escape") {
@@ -877,7 +889,7 @@
               />
               {#if searchQuery.trim()}
                 <button
-                  class="absolute inset-y-0 right-2 my-auto flex h-7 w-7 items-center justify-center rounded-lg text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600"
+                  class="sidebar-search-clear absolute inset-y-0 right-2 my-auto flex h-7 w-7 items-center justify-center rounded-lg text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600"
                   onclick={clearSearchQuery}
                   title={ui.close}
                   type="button"
@@ -887,9 +899,9 @@
               {/if}
             </div>
 
-            <div class="flex gap-1 rounded-xl bg-gray-100 p-1">
+            <div class="sidebar-search-scope flex gap-1 rounded-xl bg-gray-100 p-1">
               <button
-                class={`flex-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-all ${
+                class={`sidebar-search-scope__button flex-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-all ${
                   searchScope === "summary" ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"
                 }`}
                 onclick={() => onSearchScopeChange("summary")}
@@ -898,7 +910,7 @@
                 {ui.searchScopeSummary}
               </button>
               <button
-                class={`flex-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-all ${
+                class={`sidebar-search-scope__button flex-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-all ${
                   searchScope === "full" ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"
                 }`}
                 onclick={() => onSearchScopeChange("full")}
@@ -910,7 +922,7 @@
 
             <div class="grid grid-cols-3 gap-2">
               <button
-                class={`rounded-lg border px-2 py-1.5 text-[11px] font-semibold transition-all ${
+                class={`sidebar-search-filter rounded-lg border px-2 py-1.5 text-[11px] font-semibold transition-all ${
                   sessionFilter.pinnedOnly
                     ? "border-amber-200 bg-amber-50 text-amber-700"
                     : "border-gray-200 bg-gray-50 text-gray-500 hover:bg-white hover:text-gray-700"
@@ -921,7 +933,7 @@
                 {ui.pinnedOnly}
               </button>
               <button
-                class={`rounded-lg border px-2 py-1.5 text-[11px] font-semibold transition-all ${
+                class={`sidebar-search-filter rounded-lg border px-2 py-1.5 text-[11px] font-semibold transition-all ${
                   sessionFilter.runningOnly
                     ? "border-amber-200 bg-amber-50 text-amber-700"
                     : "border-gray-200 bg-gray-50 text-gray-500 hover:bg-white hover:text-gray-700"
@@ -932,7 +944,7 @@
                 {ui.runningOnly}
               </button>
               <button
-                class={`rounded-lg border px-2 py-1.5 text-[11px] font-semibold transition-all ${
+                class={`sidebar-search-filter rounded-lg border px-2 py-1.5 text-[11px] font-semibold transition-all ${
                   sessionFilter.queuedOnly
                     ? "border-amber-200 bg-amber-50 text-amber-700"
                     : "border-gray-200 bg-gray-50 text-gray-500 hover:bg-white hover:text-gray-700"
@@ -1267,19 +1279,19 @@
     {#if accountMenuOpen}
       <div
         bind:this={accountPopoverElement}
-        class="fixed z-50 grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] bg-white border border-gray-200 rounded-2xl shadow-2xl overflow-hidden opacity-0 pointer-events-none p-2 w-80"
+        class="sidebar-flyout sidebar-account-popover fixed z-50 grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] bg-white border border-gray-200 rounded-2xl shadow-2xl overflow-hidden opacity-0 pointer-events-none p-2 w-80"
         style={accountPopoverStyle}
       >
-        <div class="p-4 border-b border-gray-100 flex items-center justify-between">
+        <div class="sidebar-flyout-header p-4 border-b border-gray-100 flex items-center justify-between">
           <div>
             <h3 class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-1">{ui.account}</h3>
             <p class="text-sm font-semibold text-gray-900">{accountLabel()}</p>
             <div class="mt-2 flex flex-wrap items-center gap-1.5">
-              <span class="rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-gray-500">
+              <span class="sidebar-flyout-badge rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-gray-500">
                 {webRole === "viewer" ? ui.roleViewer : ui.roleAdmin}
               </span>
               {#if readOnly}
-                <span class="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-700">
+                <span class="sidebar-flyout-badge sidebar-flyout-badge--warning rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-700">
                   {ui.readOnlyMode}
                 </span>
               {/if}
@@ -1300,7 +1312,7 @@
               <div class="space-y-2">
                 {#each profiles as profile (profile.id)}
                   <button
-                    class={`flex w-full items-start justify-between gap-3 rounded-xl border px-3 py-2.5 text-left transition-all ${
+                    class={`sidebar-account-switcher flex w-full items-start justify-between gap-3 rounded-xl border px-3 py-2.5 text-left transition-all ${
                       profile.active
                         ? "border-amber-300 bg-amber-50 text-amber-800 shadow-sm"
                         : "border-gray-200 bg-gray-50 text-gray-600 hover:border-gray-300 hover:bg-white hover:text-gray-800"
@@ -1313,7 +1325,7 @@
                       <p class="mt-1 truncate text-[10px] text-gray-400">{profile.codexHome}</p>
                     </div>
                     {#if profile.active}
-                      <span class="rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-700">
+                      <span class="sidebar-flyout-badge rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-700">
                         {ui.connected}
                       </span>
                     {/if}
@@ -1331,7 +1343,7 @@
             <div class="grid grid-cols-3 gap-2">
               {#each themeOptions as option (option.mode)}
                 <button
-                  class={`flex flex-col items-center gap-1 rounded-xl border px-2.5 py-2 text-[10px] font-bold transition-all ${
+                  class={`sidebar-theme-option flex flex-col items-center gap-1 rounded-xl border px-2.5 py-2 text-[10px] font-bold transition-all ${
                     themeMode === option.mode
                       ? "border-amber-300 bg-amber-50 text-amber-700 shadow-sm"
                       : "border-gray-200 bg-gray-50 text-gray-500 hover:border-gray-300 hover:bg-white hover:text-gray-700"
@@ -1356,7 +1368,7 @@
             <div class="relative">
               <select
                 aria-label={ui.language}
-                class="w-full appearance-none rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5 pr-9 text-sm font-semibold text-gray-700 shadow-sm outline-none transition focus:border-amber-400 focus:bg-white focus:ring-4 focus:ring-amber-100"
+                class="sidebar-flyout-select w-full appearance-none rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5 pr-9 text-sm font-semibold text-gray-700 shadow-sm outline-none transition focus:border-amber-400 focus:bg-white focus:ring-4 focus:ring-amber-100"
                 onchange={(event) =>
                   updateLocale((event.currentTarget as HTMLSelectElement).value as (typeof localeOptions)[number]["value"])}
                 value={$activeLocale}
@@ -1382,7 +1394,7 @@
                   <span class="font-medium text-gray-600">{ui.quota5h}</span>
                   <span class="font-bold text-gray-900">{formatQuotaPercent(quota?.fiveHour?.remainingPercent)}</span>
                 </div>
-                <div class="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
+                <div class="sidebar-flyout-meter h-1.5 w-full rounded-full bg-gray-100 overflow-hidden">
                   <div class="h-full bg-amber-500 rounded-full" style={`width: ${Math.max(0, Math.min(100, quota?.fiveHour?.remainingPercent ?? 0))}%`}></div>
                 </div>
                 <p class="text-[10px] text-gray-400 italic">Reset {formatQuotaReset(quota?.fiveHour?.resetAt)}</p>
@@ -1393,7 +1405,7 @@
                   <span class="font-medium text-gray-600">{ui.quotaWeekly}</span>
                   <span class="font-bold text-gray-900">{formatQuotaPercent(quota?.weekly?.remainingPercent)}</span>
                 </div>
-                <div class="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
+                <div class="sidebar-flyout-meter h-1.5 w-full rounded-full bg-gray-100 overflow-hidden">
                   <div class="h-full bg-amber-500 rounded-full" style={`width: ${Math.max(0, Math.min(100, quota?.weekly?.remainingPercent ?? 0))}%`}></div>
                 </div>
                 <p class="text-[10px] text-gray-400 italic">Reset {formatQuotaReset(quota?.weekly?.resetAt)}</p>
@@ -1405,14 +1417,14 @@
             <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
               <Cpu size={10} /> {ui.runtime}
             </h4>
-            <div class="bg-gray-50 rounded-xl p-3 border border-gray-100 space-y-3">
+            <div class="sidebar-flyout-surface rounded-xl border border-gray-100 bg-gray-50 p-3 space-y-3">
               <div class="flex justify-between text-xs">
                 <span class="text-gray-500">{ui.version}</span>
                 <span class="font-semibold text-gray-700">{runtime?.version ?? ui.missing}</span>
               </div>
               <div class="flex justify-between text-xs">
                 <span class="text-gray-500">{ui.binary}</span>
-                <code class="px-1.5 py-0.5 bg-white border border-gray-200 rounded text-[10px]">{runtime?.configuredBin ?? "codex"}</code>
+                <code class="sidebar-flyout-code rounded border border-gray-200 bg-white px-1.5 py-0.5 text-[10px]">{runtime?.configuredBin ?? "codex"}</code>
               </div>
               <div class="flex gap-2 pt-1">
                 {#if !runtime?.installed}
@@ -1449,9 +1461,9 @@
 
           {#if systemShutdownAvailable}
             <div class="space-y-4">
-              <div class="rounded-2xl border border-gray-200 bg-gray-50/80 p-3 shadow-sm">
+              <div class="sidebar-flyout-surface rounded-2xl border border-gray-200 bg-gray-50/80 p-3 shadow-sm">
                 <div class="flex items-start gap-3">
-                  <div class="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-gray-200 bg-white text-gray-500">
+                  <div class="sidebar-flyout-icon mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-gray-200 bg-white text-gray-500">
                     <Power size={14} />
                   </div>
                   <div class="min-w-0 flex-1">
@@ -1477,7 +1489,7 @@
           {/if}
         </div>
 
-        <div class="p-2 border-t border-gray-100 bg-gray-50/50 space-y-1">
+        <div class="sidebar-flyout-footer p-2 border-t border-gray-100 bg-gray-50/50 space-y-1">
           <button 
             class="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium text-gray-600 hover:bg-white hover:text-amber-600 rounded-lg transition-all"
             disabled={quotaBusy}
@@ -1486,6 +1498,26 @@
             <RefreshCw size={14} class={quotaBusy ? 'animate-spin' : ''} />
             {ui.refreshQuota}
           </button>
+          {#if showPwaInstall}
+            <button
+              class={`w-full flex items-center gap-2 px-3 py-2 text-xs font-medium rounded-lg transition-all ${
+                pwaInstalled
+                  ? "text-emerald-600 hover:bg-emerald-50"
+                  : "text-gray-600 hover:bg-white hover:text-amber-600"
+              }`}
+              disabled={pwaInstallBusy || pwaInstalled}
+              onclick={onInstallApp}
+              type="button"
+            >
+              {#if pwaInstalled}
+                <CheckCircle2 size={14} />
+                {ui.appInstalled}
+              {:else}
+                <Download size={14} />
+                {pwaInstallBusy ? ui.installingApp : ui.installApp}
+              {/if}
+            </button>
+          {/if}
           <button 
             class="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium text-gray-600 hover:bg-white hover:text-amber-600 rounded-lg transition-all disabled:cursor-not-allowed disabled:opacity-50"
             disabled={readOnly}
@@ -1521,5 +1553,185 @@
   }
   :global(.scrollbar-thin:hover::-webkit-scrollbar-thumb) {
     background: var(--scrollbar-thumb-hover);
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-mode-toggle {
+    background: rgba(30, 41, 59, 0.5);
+    box-shadow: inset 0 0 0 1px rgba(71, 85, 105, 0.26);
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-mode-toggle__button {
+    color: #94a3b8;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-mode-toggle__button.bg-white {
+    background: linear-gradient(180deg, rgba(30, 41, 59, 0.96), rgba(15, 23, 42, 0.98)) !important;
+    color: #f8fafc !important;
+    box-shadow:
+      0 14px 28px -24px rgba(2, 6, 23, 0.92),
+      inset 0 0 0 1px rgba(148, 163, 184, 0.14);
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-search-trigger {
+    border-color: rgba(71, 85, 105, 0.48) !important;
+    background: linear-gradient(180deg, rgba(17, 24, 39, 0.9), rgba(15, 23, 42, 0.96)) !important;
+    box-shadow: 0 20px 40px -34px rgba(2, 6, 23, 0.85) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-search-trigger:hover {
+    border-color: rgba(148, 163, 184, 0.32) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-search-trigger__icon {
+    border-color: rgba(71, 85, 105, 0.45) !important;
+    background: rgba(15, 23, 42, 0.78) !important;
+    color: #94a3b8 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-search-panel {
+    border-color: rgba(245, 158, 11, 0.28) !important;
+    background: linear-gradient(180deg, rgba(17, 24, 39, 0.98), rgba(11, 18, 32, 1)) !important;
+    box-shadow: 0 28px 64px -40px rgba(2, 6, 23, 0.94) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-search-input {
+    border-color: rgba(71, 85, 105, 0.42) !important;
+    background: rgba(15, 23, 42, 0.82) !important;
+    color: #e2e8f0 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-search-input::placeholder {
+    color: #64748b !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-search-input:focus {
+    background: rgba(15, 23, 42, 0.94) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-search-clear:hover {
+    background: rgba(51, 65, 85, 0.82) !important;
+    color: #e2e8f0 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-search-scope {
+    background: rgba(15, 23, 42, 0.82) !important;
+    box-shadow: inset 0 0 0 1px rgba(71, 85, 105, 0.22);
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-search-scope__button {
+    color: #94a3b8 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-search-scope__button.bg-white {
+    background: rgba(30, 41, 59, 0.96) !important;
+    color: #f8fafc !important;
+    box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.12);
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-search-filter {
+    border-color: rgba(71, 85, 105, 0.38) !important;
+    background: rgba(15, 23, 42, 0.76) !important;
+    color: #cbd5e1 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-search-filter:hover {
+    background: rgba(30, 41, 59, 0.92) !important;
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-flyout {
+    border-color: rgba(71, 85, 105, 0.44) !important;
+    background: linear-gradient(180deg, rgba(17, 24, 39, 0.97), rgba(11, 18, 32, 0.995)) !important;
+    box-shadow: 0 30px 68px -38px rgba(2, 6, 23, 0.96) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-flyout-header,
+  :global(:root[data-theme="dark"]) .sidebar-flyout-footer {
+    border-color: rgba(71, 85, 105, 0.34) !important;
+    background: rgba(15, 23, 42, 0.78) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-flyout .text-gray-900,
+  :global(:root[data-theme="dark"]) .sidebar-flyout .text-gray-700 {
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-flyout .text-gray-600,
+  :global(:root[data-theme="dark"]) .sidebar-flyout .text-gray-500,
+  :global(:root[data-theme="dark"]) .sidebar-flyout .text-gray-400 {
+    color: #94a3b8 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-flyout-surface {
+    border-color: rgba(71, 85, 105, 0.32) !important;
+    background: rgba(15, 23, 42, 0.78) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-notification-item {
+    color: #e2e8f0 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-notification-item.border-gray-200 {
+    border-color: rgba(71, 85, 105, 0.32) !important;
+    background: rgba(15, 23, 42, 0.72) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-notification-item.border-gray-200:hover {
+    background: rgba(30, 41, 59, 0.94) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-notification-item.border-amber-200 {
+    border-color: rgba(245, 158, 11, 0.3) !important;
+    background: linear-gradient(180deg, rgba(69, 39, 10, 0.28), rgba(15, 23, 42, 0.9)) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-account-switcher.border-gray-200,
+  :global(:root[data-theme="dark"]) .sidebar-theme-option.border-gray-200 {
+    border-color: rgba(71, 85, 105, 0.34) !important;
+    background: rgba(15, 23, 42, 0.74) !important;
+    color: #cbd5e1 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-account-switcher.border-gray-200:hover,
+  :global(:root[data-theme="dark"]) .sidebar-theme-option.border-gray-200:hover {
+    border-color: rgba(148, 163, 184, 0.3) !important;
+    background: rgba(30, 41, 59, 0.94) !important;
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-account-switcher.border-amber-300,
+  :global(:root[data-theme="dark"]) .sidebar-theme-option.border-amber-300 {
+    border-color: rgba(245, 158, 11, 0.38) !important;
+    background: linear-gradient(180deg, rgba(69, 39, 10, 0.32), rgba(15, 23, 42, 0.9)) !important;
+    color: #fde68a !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-flyout-badge {
+    border-color: rgba(71, 85, 105, 0.3) !important;
+    background: rgba(30, 41, 59, 0.92) !important;
+    color: #cbd5e1 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-flyout-badge--warning {
+    border-color: rgba(245, 158, 11, 0.34) !important;
+    background: rgba(69, 39, 10, 0.34) !important;
+    color: #fde68a !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-flyout-select,
+  :global(:root[data-theme="dark"]) .sidebar-flyout-code {
+    border-color: rgba(71, 85, 105, 0.42) !important;
+    background: rgba(15, 23, 42, 0.86) !important;
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-flyout-meter {
+    background: rgba(51, 65, 85, 0.78) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-flyout-icon {
+    border-color: rgba(71, 85, 105, 0.36) !important;
+    background: rgba(15, 23, 42, 0.88) !important;
+    color: #cbd5e1 !important;
   }
 </style>

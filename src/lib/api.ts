@@ -7,6 +7,7 @@ import type {
   AutomationRun,
   AppConfigPayload,
   AuditLogPayload,
+  AuthSessionPayload,
   AttachmentRecord,
   CatalogPayload,
   CodexAccountLoginResponse,
@@ -83,15 +84,15 @@ const ws = new WebSocketRpcClient();
 
 export const api = {
   getAuthSession() {
-    return request<{ authenticated: boolean; role: "admin" | "viewer" | null; activeProfileId: string | null }>(apiPath("/auth/session"), {
+    return request<AuthSessionPayload>(apiPath("/auth/session"), {
       method: "GET"
     });
   },
 
-  login(password: string) {
+  login(password: string, hcaptchaToken: string | null = null) {
     return request<{ ok: true }>(apiPath("/auth/login"), {
       method: "POST",
-      body: JSON.stringify({ password })
+      body: JSON.stringify({ password, hcaptchaToken })
     });
   },
 
@@ -162,6 +163,14 @@ export const api = {
     return ws.request<AppConfigPayload>("config/update", {
       systemShutdown: {
         armed
+      }
+    });
+  },
+
+  saveAutostartEnabled(enabled: boolean) {
+    return ws.request<AppConfigPayload>("config/update", {
+      autostart: {
+        enabled
       }
     });
   },

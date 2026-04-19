@@ -19,6 +19,10 @@ const tunnelPidPath = path.join(stateDir, "tunnel.pid");
 const tunnelLogPath = path.join(stateDir, "tunnel.log");
 const tunnelMetaPath = path.join(stateDir, "tunnel.json");
 
+function runtimeErrorLogPath(config) {
+  return path.join(config.dataDir, "logs", "runtime-errors.jsonl");
+}
+
 function expandHome(input) {
   if (!input) {
     return input;
@@ -103,6 +107,8 @@ function defaultConfigValues() {
     ],
     allowedRoots: [process.cwd()],
     passwordHash: "",
+    hcaptchaSiteKey: "",
+    hcaptchaSecretKey: "",
     sessionSecret: createSessionSecret(),
     corsAllowedOrigins: [],
     backendBinaryPath: "",
@@ -221,6 +227,8 @@ function normalizeConfig(rawConfig = {}) {
     dataDir,
     defaultProfileId,
     profiles,
+    hcaptchaSiteKey: String(rawConfig.hcaptchaSiteKey ?? rawConfig.hcaptcha_site_key ?? defaults.hcaptchaSiteKey).trim(),
+    hcaptchaSecretKey: String(rawConfig.hcaptchaSecretKey ?? rawConfig.hcaptcha_secret_key ?? defaults.hcaptchaSecretKey).trim(),
     allowedRoots:
       Array.isArray(rawConfig.allowedRoots) && rawConfig.allowedRoots.length > 0
         ? rawConfig.allowedRoots.map((entry) => expandHome(String(entry)))
@@ -304,6 +312,12 @@ async function promptConfig(existing = null) {
     const tunnelNameInput = (await rl.question(`Tunnel name (cloudflared only, optional) [${formatOptionalPrompt(defaults.tunnel.name)}]: `)).trim();
     const password = await rl.question("Password (leave blank to keep existing hash): ");
     const passwordHash = password.trim() ? hashPassword(password.trim()) : defaults.passwordHash;
+    const hcaptchaSiteKeyInput = (await rl.question(`hCaptcha site key (optional) [${formatOptionalPrompt(defaults.hcaptchaSiteKey)}]: `)).trim();
+    const hcaptchaSecretKey = (
+      await rl.question(
+        `hCaptcha secret key (optional) [${defaults.hcaptchaSecretKey ? "configured" : "none"}]: `
+      )
+    ).trim() || defaults.hcaptchaSecretKey;
 
     if (!passwordHash) {
       throw new Error("A password is required.");
@@ -328,6 +342,8 @@ async function promptConfig(existing = null) {
           ? corsRaw.split(",").map((entry) => entry.trim()).filter(Boolean)
           : defaults.corsAllowedOrigins,
       passwordHash,
+      hcaptchaSiteKey: hcaptchaSiteKeyInput || defaults.hcaptchaSiteKey,
+      hcaptchaSecretKey,
       sessionSecret: defaults.sessionSecret || createSessionSecret(),
       backendBinaryPath,
       tunnel: {
@@ -848,6 +864,8 @@ async function startServer(config) {
       ),
       CODEX_WEBUI_ALLOWED_ROOTS: config.allowedRoots.join(path.delimiter),
       CODEX_WEBUI_PASSWORD_HASH: String(config.passwordHash),
+      CODEX_WEBUI_HCAPTCHA_SITE_KEY: String(config.hcaptchaSiteKey ?? ""),
+      CODEX_WEBUI_HCAPTCHA_SECRET_KEY: String(config.hcaptchaSecretKey ?? ""),
       CODEX_WEBUI_SESSION_SECRET: String(config.sessionSecret),
       CODEX_WEBUI_CORS_ALLOWED_ORIGINS: config.corsAllowedOrigins.join(",")
     }
@@ -931,7 +949,12 @@ function printUsage(config, pid, alreadyRunning) {
   console.log(`PID: ${pid}`);
   console.log(`Config: ${configPath}`);
   console.log(`Log: ${logPath}`);
+  console.log(`Errors: ${runtimeErrorLogPath(config)}`);
   console.log("");
+  printCommandHelp();
+}
+
+function printCommandHelp() {
   console.log("Commands:");
   console.log("  codex-webui config   Re-run the interactive setup");
   console.log("  codex-webui restart  Restart the background server");
@@ -940,15 +963,118 @@ function printUsage(config, pid, alreadyRunning) {
   console.log("  codex-webui tunnel status  Show the current tunnel state");
   console.log("  codex-webui tunnel stop    Stop the current tunnel");
   console.log("  codex-webui tunnel logs    Print recent tunnel logs");
+  console.log("");
+  console.log("Options:");
+  console.log("  --hcaptcha-site-key <key>      Enable hCaptcha on the login screen with this site key");
+  console.log("  --hcaptcha-secret-key <secret> Enable hCaptcha verification with this secret");
+  console.log("  --disable-hcaptcha             Disable hCaptcha even if it is configured");
+}
+
+function readOptionValue(argv, index, flagName) {
+  const current = argv[index] ?? "";
+  const equalsIndex = current.indexOf("=");
+  if (equalsIndex >= 0) {
+    return {
+      value: current.slice(equalsIndex + 1),
+      nextIndex: index
+    };
+  }
+
+  const next = argv[index + 1];
+  if (next === undefined) {
+    throw new Error(`Missing value for ${flagName}.`);
+  }
+
+  return {
+    value: next,
+    nextIndex: index + 1
+  };
+}
+
+function configInputFromCliOverrides(overrides) {
+  const next = {};
+  if (overrides.disableHcaptcha) {
+    next.hcaptchaSiteKey = "";
+    next.hcaptchaSecretKey = "";
+  }
+  if (overrides.hcaptchaSiteKey !== undefined) {
+    next.hcaptchaSiteKey = String(overrides.hcaptchaSiteKey).trim();
+  }
+  if (overrides.hcaptchaSecretKey !== undefined) {
+    next.hcaptchaSecretKey = String(overrides.hcaptchaSecretKey).trim();
+  }
+  return next;
+}
+
+function applyCliConfigOverrides(config, overrides) {
+  return normalizeConfig({
+    ...(config ?? {}),
+    ...configInputFromCliOverrides(overrides)
+  });
+}
+
+function parseCliInvocation(argv) {
+  const knownCommands = new Set(["config", "restart", "stop", "tunnel"]);
+  let command = "";
+  let restArgs = [...argv];
+  if (knownCommands.has(restArgs[0] ?? "")) {
+    command = restArgs[0];
+    restArgs = restArgs.slice(1);
+  }
+
+  const overrides = {};
+  const remainingArgs = [];
+
+  for (let index = 0; index < restArgs.length; index += 1) {
+    const argument = restArgs[index];
+    if (command !== "tunnel" && (argument === "--help" || argument === "-h")) {
+      return { command, restArgs: [], overrides, help: true };
+    }
+    if (command === "tunnel" && (argument === "--help" || argument === "-h")) {
+      remainingArgs.push(argument);
+      continue;
+    }
+    if (argument === "--disable-hcaptcha") {
+      overrides.disableHcaptcha = true;
+      continue;
+    }
+    if (argument === "--hcaptcha-site-key" || argument.startsWith("--hcaptcha-site-key=")) {
+      const parsed = readOptionValue(restArgs, index, "--hcaptcha-site-key");
+      overrides.hcaptchaSiteKey = parsed.value;
+      index = parsed.nextIndex;
+      continue;
+    }
+    if (argument === "--hcaptcha-secret-key" || argument.startsWith("--hcaptcha-secret-key=")) {
+      const parsed = readOptionValue(restArgs, index, "--hcaptcha-secret-key");
+      overrides.hcaptchaSecretKey = parsed.value;
+      index = parsed.nextIndex;
+      continue;
+    }
+    remainingArgs.push(argument);
+  }
+
+  if (command !== "tunnel" && remainingArgs.length > 0) {
+    throw new Error(`Unknown option: ${remainingArgs[0]}`);
+  }
+
+  return { command, restArgs: remainingArgs, overrides, help: false };
 }
 
 async function main() {
-  const command = process.argv[2] ?? "";
-  const restArgs = process.argv.slice(3);
+  const { command, restArgs, overrides, help } = parseCliInvocation(process.argv.slice(2));
   let config = await readConfig();
 
+  if (help) {
+    printCommandHelp();
+    return;
+  }
+
+  if (config) {
+    config = applyCliConfigOverrides(config, overrides);
+  }
+
   if (!config || command === "config") {
-    config = await promptConfig(config);
+    config = await promptConfig(config ? config : applyCliConfigOverrides(null, overrides));
     console.log(`Saved configuration to ${configPath}`);
     if (command === "config") {
       return;

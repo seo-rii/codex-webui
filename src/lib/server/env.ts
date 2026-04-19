@@ -26,6 +26,8 @@ export type RuntimeProfileConfig = {
 type RuntimeConfig = {
   password: string | null;
   passwordHash: string | null;
+  hcaptchaSiteKey: string | null;
+  hcaptchaSecretKey: string | null;
   sessionSecret: string | null;
   corsAllowedOrigins: string[];
   allowedRoots: string[];
@@ -269,6 +271,8 @@ export function getRuntimeConfig(): RuntimeConfig {
   return {
     password: process.env.CODEX_WEBUI_PASSWORD ?? null,
     passwordHash: process.env.CODEX_WEBUI_PASSWORD_HASH ?? null,
+    hcaptchaSiteKey: process.env.CODEX_WEBUI_HCAPTCHA_SITE_KEY?.trim() || null,
+    hcaptchaSecretKey: process.env.CODEX_WEBUI_HCAPTCHA_SECRET_KEY?.trim() || null,
     sessionSecret: process.env.CODEX_WEBUI_SESSION_SECRET ?? null,
     corsAllowedOrigins: parseCorsAllowedOrigins(),
     allowedRoots,

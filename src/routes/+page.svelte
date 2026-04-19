@@ -44,7 +44,7 @@
   import { fly, slide } from "svelte/transition";
   import { extractAttachmentPaths, stripAttachmentPreamble } from "$lib/attachments";
   import { api } from "$lib/api";
-  import { applyStreamEvent, createConversationState, type ConversationState } from "$lib/chat-state";
+  import { applyStreamEvent, createConversationState, mergeConversationState, type ConversationState } from "$lib/chat-state";
   import ArenaWorkspace from "$lib/components/ArenaWorkspace.svelte";
   import GitWorkspace from "$lib/components/GitWorkspace.svelte";
   import MarkdownMessage from "$lib/components/MarkdownMessage.svelte";
@@ -143,6 +143,13 @@
     value: string;
   };
   type ThemedConfigPayload = AppConfigPayload & { theme?: ThemeSettings };
+  type BeforeInstallPromptEvent = Event & {
+    prompt: () => Promise<void>;
+    userChoice: Promise<{
+      outcome: "accepted" | "dismissed";
+      platform: string;
+    }>;
+  };
 
   let config = $state<AppConfigPayload | null>(null);
   let quota = $state<CodexQuotaStatus | null>(null);
@@ -260,6 +267,10 @@
   let startupAlertModalOpen = $state(false);
   let startupAlertDismissed = $state(false);
   let startupAlertNow = $state(Date.now());
+  let deferredInstallPrompt = $state<BeforeInstallPromptEvent | null>(null);
+  let pwaInstalled = $state(false);
+  let pwaInstallBusy = $state(false);
+  let pwaManualInstallOnly = $state(false);
   const readOnlyRole = $derived(webRole === "viewer");
 
   $effect(() => {
@@ -340,6 +351,14 @@
       loginFailed: m.login_failed(),
       completeHcaptcha: m.complete_hcaptcha(),
       hcaptchaLoadFailed: m.hcaptcha_load_failed(),
+      installApp: m.install_app(),
+      installingApp: m.installing_app(),
+      appInstalled: m.app_installed(),
+      appAlreadyInstalled: m.app_already_installed(),
+      appInstallUnavailable: m.app_install_unavailable(),
+      appInstallIosHint: m.app_install_ios_hint(),
+      appInstalledNotice: m.app_installed_notice(),
+      appInstallPromptDismissed: m.app_install_prompt_dismissed(),
       language: m.language(),
       close: m.close(),
       newThread: m.new_thread(),
@@ -1115,6 +1134,7 @@
   let composerToolbarCompact = $state(true);
   let transcriptDockReservePx = $state(196);
   let transcriptScrollGeneration = 0;
+  let transcriptUserScrollIntentUntil = 0;
   let composerHistory = $state<string[]>([]);
   let composerHistoryIndex = $state(-1);
   let composerHistoryDraft = $state("");
@@ -1503,6 +1523,9 @@
     }
     return null;
   });
+  const showPwaInstallAction = $derived.by(
+    () => authenticated === true && (pwaInstalled || deferredInstallPrompt !== null || pwaManualInstallOnly)
+  );
   const sessionLoadPercent = $derived.by(() => {
     if (sessionsLoadingMore) {
       return Math.max(42, Math.min(96, Math.round(fakeTopLoadPercent || 42)));
@@ -1694,6 +1717,37 @@
         });
       }
     };
+    const syncPwaInstallState = () => {
+      const installed =
+        window.matchMedia("(display-mode: standalone)").matches ||
+        (window.navigator as Navigator & { standalone?: boolean }).standalone === true;
+      pwaInstalled = installed;
+      if (installed) {
+        deferredInstallPrompt = null;
+        pwaManualInstallOnly = false;
+        return;
+      }
+
+      const touchMac = window.navigator.platform === "MacIntel" && window.navigator.maxTouchPoints > 1;
+      const appleMobile = /iphone|ipad|ipod/iu.test(window.navigator.userAgent) || touchMac;
+      pwaManualInstallOnly = appleMobile && deferredInstallPrompt === null;
+    };
+    const handleBeforeInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      deferredInstallPrompt = event as BeforeInstallPromptEvent;
+      pwaManualInstallOnly = false;
+      syncPwaInstallState();
+    };
+    const handleAppInstalled = () => {
+      deferredInstallPrompt = null;
+      pwaInstallBusy = false;
+      syncPwaInstallState();
+      noticeText = ui.appInstalledNotice;
+    };
+    const displayModeQuery = window.matchMedia("(display-mode: standalone)");
+    const handleDisplayModeChange = () => {
+      syncPwaInstallState();
+    };
     let hiddenStartedAt: number | null = document.hidden ? Date.now() : null;
     const handleVisibilityChange = () => {
       if (document.hidden) {
@@ -1750,12 +1804,20 @@
         });
     };
     syncMobileLayout();
+    syncPwaInstallState();
     mobileQuery.addEventListener("change", syncMobileLayout);
+    if (typeof displayModeQuery.addEventListener === "function") {
+      displayModeQuery.addEventListener("change", handleDisplayModeChange);
+    } else {
+      displayModeQuery.addListener(handleDisplayModeChange);
+    }
     window.addEventListener("resize", handleViewportChange);
     window.addEventListener("scroll", handleViewportChange, true);
     window.addEventListener("keydown", handleGlobalKeydown, true);
     window.addEventListener("pointerdown", requestNotificationPermissionFromGesture, true);
     window.addEventListener("keydown", requestNotificationPermissionFromGesture, true);
+    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+    window.addEventListener("appinstalled", handleAppInstalled);
     document.addEventListener("visibilitychange", handleVisibilityChange, true);
     void bootstrap();
 
@@ -1803,11 +1865,18 @@
       releaseThemeListener?.();
       releaseThemeListener = null;
       mobileQuery.removeEventListener("change", syncMobileLayout);
+      if (typeof displayModeQuery.removeEventListener === "function") {
+        displayModeQuery.removeEventListener("change", handleDisplayModeChange);
+      } else {
+        displayModeQuery.removeListener(handleDisplayModeChange);
+      }
       window.removeEventListener("resize", handleViewportChange);
       window.removeEventListener("scroll", handleViewportChange, true);
       window.removeEventListener("keydown", handleGlobalKeydown, true);
       window.removeEventListener("pointerdown", requestNotificationPermissionFromGesture, true);
       window.removeEventListener("keydown", requestNotificationPermissionFromGesture, true);
+      window.removeEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+      window.removeEventListener("appinstalled", handleAppInstalled);
       document.removeEventListener("visibilitychange", handleVisibilityChange, true);
       api.disconnect();
     };
@@ -1971,6 +2040,33 @@
     return () => {
       transcriptResizeObserver?.disconnect();
       transcriptResizeObserver = null;
+    };
+  });
+
+  $effect(() => {
+    const transcript = transcriptElement;
+    if (typeof window === "undefined" || !transcript) {
+      return;
+    }
+
+    const handleWheel = () => {
+      handleTranscriptWheel();
+    };
+    const handleTouchMove = () => {
+      handleTranscriptTouchMove();
+    };
+    const handlePointerMove = (event: Event) => {
+      handleTranscriptPointerMove(event as PointerEvent);
+    };
+
+    transcript.addEventListener("wheel", handleWheel, { passive: true });
+    transcript.addEventListener("touchmove", handleTouchMove, { passive: true });
+    transcript.addEventListener("pointermove", handlePointerMove, { passive: true });
+
+    return () => {
+      transcript.removeEventListener("wheel", handleWheel);
+      transcript.removeEventListener("touchmove", handleTouchMove);
+      transcript.removeEventListener("pointermove", handlePointerMove);
     };
   });
 
@@ -2574,6 +2670,21 @@
 
       transcriptScrollFrame = window.requestAnimationFrame(step);
     });
+  }
+
+  function getTranscriptNow() {
+    if (typeof window !== "undefined" && typeof window.performance !== "undefined") {
+      return window.performance.now();
+    }
+    return Date.now();
+  }
+
+  function noteTranscriptUserScrollIntent(durationMs = 800) {
+    transcriptUserScrollIntentUntil = getTranscriptNow() + durationMs;
+  }
+
+  function hasTranscriptUserScrollIntent() {
+    return getTranscriptNow() <= transcriptUserScrollIntentUntil;
   }
 
   function mergeSessionPage(payload: SessionListPayload, pinnedSession: SessionSummary | null, append = false) {
@@ -3293,7 +3404,10 @@
   }
 
   function applyLoadedSessionDetail(sessionId: string, detail: SessionDetailPayload) {
-    let nextConversation = createConversationState(detail);
+    let nextConversation =
+      conversation && conversation.thread.id === detail.thread.id
+        ? mergeConversationState(conversation, detail)
+        : createConversationState(detail);
     nextConversation = flushPendingSessionEvents(sessionId, nextConversation);
     nextConversation = normalizeConversationExecutionState(nextConversation);
     conversation = nextConversation;
@@ -4948,6 +5062,39 @@
     }
   }
 
+  async function installApp() {
+    if (pwaInstalled) {
+      noticeText = ui.appAlreadyInstalled;
+      return;
+    }
+
+    if (deferredInstallPrompt) {
+      pwaInstallBusy = true;
+      errorText = "";
+
+      try {
+        await deferredInstallPrompt.prompt();
+        const result = await deferredInstallPrompt.userChoice;
+        deferredInstallPrompt = null;
+        if (result.outcome === "dismissed") {
+          noticeText = ui.appInstallPromptDismissed;
+        }
+      } catch (error) {
+        errorText = describeError(error);
+      } finally {
+        pwaInstallBusy = false;
+      }
+      return;
+    }
+
+    if (pwaManualInstallOnly) {
+      noticeText = ui.appInstallIosHint;
+      return;
+    }
+
+    noticeText = ui.appInstallUnavailable;
+  }
+
   async function updateCodex() {
     if (readOnlyRole) {
       errorText = m.error_forbidden_role();
@@ -6287,13 +6434,36 @@
     return entries;
   }
 
+  function handleTranscriptWheel() {
+    noteTranscriptUserScrollIntent();
+  }
+
+  function handleTranscriptTouchMove() {
+    noteTranscriptUserScrollIntent(1200);
+  }
+
+  function handleTranscriptPointerMove(event: PointerEvent) {
+    if (event.buttons > 0) {
+      noteTranscriptUserScrollIntent(1200);
+    }
+  }
+
   function handleTranscriptScroll() {
     if (!transcriptElement) {
       return;
     }
 
     const remaining = transcriptElement.scrollHeight - transcriptElement.scrollTop - transcriptElement.clientHeight;
-    stickTranscriptToBottom = remaining <= scrollBottomThreshold;
+    if (remaining <= scrollBottomThreshold) {
+      stickTranscriptToBottom = true;
+    } else if (forceTranscriptScroll) {
+      stickTranscriptToBottom = true;
+    } else if (hasTranscriptUserScrollIntent()) {
+      stickTranscriptToBottom = false;
+    } else if (stickTranscriptToBottom) {
+      scheduleTranscriptScrollToBottom();
+      return;
+    }
 
     if (
       !forceTranscriptScroll &&
@@ -7208,7 +7378,7 @@
     {#if authenticated === false}
       <div class="ui-scrim ui-scrim--soft absolute inset-0"></div>
       <div class="absolute inset-0 z-10 flex items-center justify-center p-4 sm:p-6">
-        <div class="w-full max-w-xl rounded-[2rem] border border-white/70 bg-white/92 p-6 shadow-[0_32px_90px_rgba(15,23,42,0.24)] backdrop-blur-2xl sm:p-8">
+        <div class="auth-dialog-card w-full max-w-xl rounded-[2rem] border border-white/70 bg-white/92 p-6 shadow-[0_32px_90px_rgba(15,23,42,0.24)] backdrop-blur-2xl sm:p-8">
           <div class="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
             <div class="space-y-3">
               <p class="text-[11px] font-bold uppercase tracking-[0.28em] text-amber-700">{ui.privateGateway}</p>
@@ -7222,7 +7392,7 @@
               <div class="relative">
                 <select
                   aria-label={ui.language}
-                  class="w-full appearance-none rounded-2xl border border-gray-200 bg-white px-3.5 py-2.5 pr-9 text-sm font-semibold text-gray-700 shadow-sm outline-none transition focus:border-amber-400 focus:ring-4 focus:ring-amber-100"
+                  class="auth-dialog-select w-full appearance-none rounded-2xl border border-gray-200 bg-white px-3.5 py-2.5 pr-9 text-sm font-semibold text-gray-700 shadow-sm outline-none transition focus:border-amber-400 focus:ring-4 focus:ring-amber-100"
                   onchange={(event) =>
                     updateLocale((event.currentTarget as HTMLSelectElement).value as (typeof localeOptions)[number]["value"])}
                   value={$activeLocale}
@@ -7247,7 +7417,7 @@
               <input
                 bind:value={loginPassword}
                 autocomplete="current-password"
-                class="w-full rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-900 shadow-sm outline-none transition focus:border-amber-500 focus:ring-4 focus:ring-amber-100"
+                class="auth-dialog-input w-full rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-900 shadow-sm outline-none transition focus:border-amber-500 focus:ring-4 focus:ring-amber-100"
                 data-testid="login-password"
                 placeholder={ui.password}
                 type="password"
@@ -7257,7 +7427,7 @@
             {#if loginHcaptcha.enabled && loginHcaptcha.siteKey}
               <div
                 bind:this={loginHcaptchaContainer}
-                class="min-h-[82px] overflow-hidden rounded-2xl border border-gray-200 bg-white px-3 py-3 shadow-sm"
+                class="auth-dialog-hcaptcha min-h-[82px] overflow-hidden rounded-2xl border border-gray-200 bg-white px-3 py-3 shadow-sm"
               ></div>
             {/if}
 
@@ -7272,13 +7442,13 @@
           </form>
 
           {#if loginMessage}
-            <p class="mt-4 rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">{loginMessage}</p>
+            <p class="auth-dialog-message mt-4 rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">{loginMessage}</p>
           {/if}
         </div>
       </div>
     {:else if errorText}
       <div class="pointer-events-none absolute inset-x-0 bottom-0 z-10 flex justify-center px-4 pb-5 sm:px-6">
-        <p class="pointer-events-auto max-w-xl rounded-2xl border border-red-100 bg-red-50/95 px-4 py-3 text-sm text-red-700 shadow-lg shadow-red-100/70">
+        <p class="auth-dialog-message pointer-events-auto max-w-xl rounded-2xl border border-red-100 bg-red-50/95 px-4 py-3 text-sm text-red-700 shadow-lg shadow-red-100/70">
           {errorText}
         </p>
       </div>
@@ -7293,6 +7463,7 @@
           {#key `${connectionState}:${connectionBannerText}`}
             <div
               transition:fly={{ y: -18, duration: 220 }}
+              data-tone={connectionSnackbarTone}
               class="snackbar-card pointer-events-auto flex w-full items-center gap-3 rounded-2xl border px-4 py-3 shadow-xl backdrop-blur-xl transition-all duration-300 {connectionSnackbarTone === 'error'
                 ? 'border-red-200 bg-red-50/95 text-red-800 shadow-red-100/80'
                 : connectionSnackbarTone === 'warning'
@@ -7314,6 +7485,7 @@
           {#key `${feedbackSnackbar.tone}:${feedbackSnackbar.text}`}
             <div
               transition:fly={{ y: -14, duration: 220 }}
+              data-tone={feedbackSnackbar.tone}
               class="snackbar-card pointer-events-auto flex w-full items-start gap-3 rounded-2xl border px-4 py-3 shadow-xl backdrop-blur-xl transition-all duration-300 {feedbackSnackbar.tone === 'error'
                 ? 'border-red-200 bg-red-50/95 text-red-800 shadow-red-100/80'
                 : feedbackSnackbar.tone === 'warning'
@@ -7369,6 +7541,9 @@
       {quotaBusy}
       {runtime}
       {runtimeBusyAction}
+      showPwaInstall={showPwaInstallAction}
+      {pwaInstalled}
+      {pwaInstallBusy}
       profiles={config?.profiles ?? []}
       systemShutdownArmed={config?.systemShutdown.armed ?? false}
       systemShutdownAvailable={config?.systemShutdown.available ?? false}
@@ -7420,6 +7595,9 @@
       }}
       onRefreshRuntime={() => {
         void refreshRuntimeStatus(true);
+      }}
+      onInstallApp={() => {
+        void installApp();
       }}
       onSystemShutdownArmedChange={(armed) => {
         void saveSystemShutdownAfterQueueCompletes(armed);
@@ -8799,8 +8977,8 @@
     role="dialog"
   >
     <div class="flex min-h-full items-center justify-center p-4 sm:p-8">
-      <div class="w-full max-w-4xl overflow-hidden rounded-[2rem] border border-white/10 bg-white shadow-2xl">
-        <div class="border-b border-gray-200 bg-gradient-to-br from-amber-50 via-white to-white px-6 py-6 sm:px-8">
+      <div class="startup-alert-card w-full max-w-4xl overflow-hidden rounded-[2rem] border border-white/10 bg-white shadow-2xl">
+        <div class="startup-alert-card__hero border-b border-gray-200 bg-gradient-to-br from-amber-50 via-white to-white px-6 py-6 sm:px-8">
           <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div class="space-y-2">
               <div class="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-amber-100 text-amber-700 shadow-sm">
@@ -8828,7 +9006,7 @@
         <div class="grid gap-6 p-6 sm:p-8 {(startupPausedQueues.length > 0 && startupScheduledShutdown) ? 'sm:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]' : ''}">
           {#if startupPausedQueues.length > 0}
             <div class="space-y-4">
-              <div class="rounded-3xl border border-gray-200 bg-gray-50/70 p-5 shadow-sm">
+              <div class="startup-alert-card__section rounded-3xl border border-gray-200 bg-gray-50/70 p-5 shadow-sm">
                 <div class="flex items-start justify-between gap-4">
                   <div>
                     <h3 class="text-sm font-bold text-gray-900">{ui.startupAlertPausedQueues}</h3>
@@ -8843,7 +9021,7 @@
 
                 <div class="mt-5 space-y-3">
                   {#each startupPausedQueues as queueAlert (queueAlert.sessionId)}
-                    <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+                    <div class="startup-alert-card__queue rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
                       <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                         <div class="min-w-0">
                           <div class="truncate text-sm font-semibold text-gray-900">
@@ -8873,7 +9051,7 @@
 
           {#if startupScheduledShutdown}
             <div class="space-y-4">
-              <div class="rounded-3xl border border-amber-200 bg-gradient-to-br from-amber-50 to-white p-5 shadow-sm">
+              <div class="startup-alert-card__section startup-alert-card__section--accent rounded-3xl border border-amber-200 bg-gradient-to-br from-amber-50 to-white p-5 shadow-sm">
                 <div class="flex items-center gap-3">
                   <div class="flex h-10 w-10 items-center justify-center rounded-2xl bg-amber-100 text-amber-700">
                     <Clock size={18} />
@@ -8888,7 +9066,7 @@
                   </div>
                 </div>
                 {#if startupScheduledShutdown.sessionId}
-                  <div class="mt-4 rounded-2xl border border-white/80 bg-white/80 px-4 py-3 text-sm text-gray-600 shadow-sm">
+                  <div class="startup-alert-card__callout mt-4 rounded-2xl border border-white/80 bg-white/80 px-4 py-3 text-sm text-gray-600 shadow-sm">
                     {ui.startupAlertShutdownThread(
                       sessions.find((session) => session.id === startupScheduledShutdown.sessionId)?.name ||
                         (conversation?.thread.id === startupScheduledShutdown.sessionId
@@ -8926,8 +9104,8 @@
       onclick={() => (browserOpen = false)}
       type="button"
     ></button>
-    <div class="relative bg-white rounded-3xl shadow-2xl w-full max-w-2xl max-h-[80vh] overflow-hidden flex flex-col">
-      <header class="px-8 py-6 border-b border-gray-100 flex items-center justify-between"><div><h2 class="text-xl font-bold text-gray-900">Select working folder</h2><p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mt-1">Allowed root paths</p></div><button class="p-2 text-gray-400 hover:text-gray-900 hover:bg-gray-100 rounded-xl transition-all" onclick={() => (browserOpen = false)}><X size={20} /></button></header>
+    <div class="folder-dialog-card relative bg-white rounded-3xl shadow-2xl w-full max-w-2xl max-h-[80vh] overflow-hidden flex flex-col">
+      <header class="folder-dialog-card__header px-8 py-6 border-b border-gray-100 flex items-center justify-between"><div><h2 class="text-xl font-bold text-gray-900">Select working folder</h2><p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mt-1">Allowed root paths</p></div><button class="p-2 text-gray-400 hover:text-gray-900 hover:bg-gray-100 rounded-xl transition-all" onclick={() => (browserOpen = false)}><X size={20} /></button></header>
       <div class="flex-1 overflow-y-auto p-6">
         {#if browserBusy}<div class="py-24 flex flex-col items-center gap-4 text-gray-400"><RefreshCw size={32} class="animate-spin" /><p class="text-sm font-medium">Scanning...</p></div>
         {:else if directoryPayload}
@@ -8937,7 +9115,7 @@
           </div>
         {/if}
       </div>
-      <div class="px-8 py-4 bg-gray-50 border-t border-gray-100 flex items-center justify-end"><button class="px-6 py-2 bg-amber-600 text-white rounded-xl text-xs font-bold hover:bg-amber-700 shadow-md transition-all active:scale-95" onclick={() => (browserOpen = false)}>{ui.selectFolder}</button></div>
+      <div class="folder-dialog-card__footer px-8 py-4 bg-gray-50 border-t border-gray-100 flex items-center justify-end"><button class="px-6 py-2 bg-amber-600 text-white rounded-xl text-xs font-bold hover:bg-amber-700 shadow-md transition-all active:scale-95" onclick={() => (browserOpen = false)}>{ui.selectFolder}</button></div>
     </div>
   </div>
 {/if}
@@ -9183,6 +9361,122 @@
   :global(:root[data-theme="dark"]) .search-popover__close:hover {
     background: rgba(51, 65, 85, 0.78) !important;
     color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .auth-dialog-card {
+    border-color: rgba(71, 85, 105, 0.42) !important;
+    background: linear-gradient(180deg, rgba(17, 24, 39, 0.94), rgba(11, 18, 32, 0.98)) !important;
+    box-shadow: 0 34px 84px -42px rgba(2, 6, 23, 0.95) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .auth-dialog-card h1,
+  :global(:root[data-theme="dark"]) .auth-dialog-card .text-gray-950 {
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .auth-dialog-card .text-gray-500,
+  :global(:root[data-theme="dark"]) .auth-dialog-card .text-gray-700,
+  :global(:root[data-theme="dark"]) .auth-dialog-card .text-gray-400 {
+    color: #94a3b8 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .auth-dialog-select,
+  :global(:root[data-theme="dark"]) .auth-dialog-input,
+  :global(:root[data-theme="dark"]) .auth-dialog-hcaptcha {
+    border-color: rgba(71, 85, 105, 0.44) !important;
+    background: rgba(15, 23, 42, 0.9) !important;
+    color: #f8fafc !important;
+    box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.06);
+  }
+
+  :global(:root[data-theme="dark"]) .auth-dialog-input::placeholder {
+    color: #64748b !important;
+  }
+
+  :global(:root[data-theme="dark"]) .auth-dialog-message {
+    border-color: rgba(248, 113, 113, 0.34) !important;
+    background: rgba(127, 29, 29, 0.34) !important;
+    color: #fecaca !important;
+    box-shadow: 0 18px 42px -30px rgba(127, 29, 29, 0.82) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .snackbar-card {
+    box-shadow: 0 22px 48px -28px rgba(2, 6, 23, 0.94) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .snackbar-card[data-tone="error"] {
+    border-color: rgba(248, 113, 113, 0.38) !important;
+    background: linear-gradient(180deg, rgba(69, 10, 10, 0.95), rgba(39, 11, 11, 0.98)) !important;
+    color: #fee2e2 !important;
+    box-shadow: 0 24px 52px -30px rgba(127, 29, 29, 0.72) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .snackbar-card[data-tone="warning"] {
+    border-color: rgba(245, 158, 11, 0.38) !important;
+    background: linear-gradient(180deg, rgba(69, 39, 10, 0.95), rgba(45, 28, 10, 0.98)) !important;
+    color: #fef3c7 !important;
+    box-shadow: 0 24px 52px -30px rgba(146, 64, 14, 0.72) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .snackbar-card[data-tone="success"],
+  :global(:root[data-theme="dark"]) .snackbar-card[data-tone="info"] {
+    border-color: rgba(52, 211, 153, 0.3) !important;
+    background: linear-gradient(180deg, rgba(7, 47, 38, 0.95), rgba(5, 30, 24, 0.98)) !important;
+    color: #d1fae5 !important;
+    box-shadow: 0 24px 52px -30px rgba(6, 95, 70, 0.7) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .snackbar-card button:hover {
+    background: rgba(255, 255, 255, 0.08) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .startup-alert-card,
+  :global(:root[data-theme="dark"]) .folder-dialog-card {
+    border-color: rgba(71, 85, 105, 0.4) !important;
+    background: linear-gradient(180deg, rgba(17, 24, 39, 0.96), rgba(11, 18, 32, 0.99)) !important;
+    box-shadow: 0 36px 90px -48px rgba(2, 6, 23, 0.98) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .startup-alert-card__hero,
+  :global(:root[data-theme="dark"]) .folder-dialog-card__header {
+    border-color: rgba(71, 85, 105, 0.36) !important;
+    background: linear-gradient(180deg, rgba(30, 41, 59, 0.92), rgba(17, 24, 39, 0.98)) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .folder-dialog-card__footer {
+    border-color: rgba(71, 85, 105, 0.36) !important;
+    background: rgba(15, 23, 42, 0.9) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .startup-alert-card .text-gray-950,
+  :global(:root[data-theme="dark"]) .startup-alert-card .text-gray-900,
+  :global(:root[data-theme="dark"]) .folder-dialog-card .text-gray-900 {
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .startup-alert-card .text-gray-600,
+  :global(:root[data-theme="dark"]) .startup-alert-card .text-gray-500,
+  :global(:root[data-theme="dark"]) .startup-alert-card .text-gray-400,
+  :global(:root[data-theme="dark"]) .folder-dialog-card .text-gray-600,
+  :global(:root[data-theme="dark"]) .folder-dialog-card .text-gray-500,
+  :global(:root[data-theme="dark"]) .folder-dialog-card .text-gray-400 {
+    color: #94a3b8 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .startup-alert-card__section {
+    border-color: rgba(71, 85, 105, 0.34) !important;
+    background: rgba(15, 23, 42, 0.78) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .startup-alert-card__section--accent {
+    border-color: rgba(245, 158, 11, 0.28) !important;
+    background: linear-gradient(180deg, rgba(69, 39, 10, 0.3), rgba(30, 41, 59, 0.82)) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .startup-alert-card__queue,
+  :global(:root[data-theme="dark"]) .startup-alert-card__callout {
+    border-color: rgba(71, 85, 105, 0.34) !important;
+    background: rgba(17, 24, 39, 0.88) !important;
   }
 
   :global(:root[data-theme="dark"]) .queue-resume-banner {

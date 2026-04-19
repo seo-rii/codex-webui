@@ -23,22 +23,26 @@
   ],
   "scripts": {
     "cli": "node ./bin/codex-webui.mjs",
+    "ws:debug": "node ./scripts/ws-debug-client.mjs",
     "paraglide:compile": "paraglide-js compile --project ./project.inlang --outdir ./src/lib/paraglide --strategy cookie globalVariable preferredLanguage baseLocale --is-server 'import.meta.env.SSR' --emit-ts-declarations",
     "dev": "pnpm paraglide:compile && vite dev",
-    "build": "pnpm paraglide:compile && svelte-kit sync && vite build",
+    "build": "pnpm paraglide:compile && svelte-kit sync && node ./scripts/build-app.mjs",
     "build:cross": "node ./scripts/build-cross.mjs",
     "gateway:dev": "cargo run --manifest-path backend/Cargo.toml",
     "gateway:check": "cargo check --manifest-path backend/Cargo.toml",
     "gateway:build": "cargo build --manifest-path backend/Cargo.toml",
     "preview": "vite preview",
     "check": "pnpm paraglide:compile && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "test:e2e": "pnpm build && playwright test",
     "hash-password": "node scripts/hash-password.mjs"
   },
   "dependencies": {
     "@inlang/paraglide-js": "^2.16.0",
+    "ws": "^8.20.0",
     "yaml": "^2.8.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.55.0",
     "@sveltejs/adapter-node": "^5.2.12",
     "@sveltejs/adapter-static": "^3.0.10",
     "@sveltejs/kit": "^2.48.4",

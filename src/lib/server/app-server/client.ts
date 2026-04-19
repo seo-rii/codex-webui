@@ -6,6 +6,7 @@ import type { Readable } from "node:stream";
 import type { RuntimeProfileConfig } from "../env";
 import { getRuntimeConfig } from "../env";
 import { ensureDataDirectories } from "../fs";
+import { appendLogLine, appendRuntimeErrorLog, getProfileLogPath, serializeErrorForLog } from "../runtime-log";
 
 type JsonRpcMessage = {
   id?: string | number;
@@ -53,6 +54,8 @@ export class AppServerClient {
   private readonly events = new EventEmitter();
   private stderrBuffer = "";
   private suppressedInvalidRefreshTokenWarning = false;
+  private stderrLogPath: string | null = null;
+  private expectedChildExit = false;
 
   onNotification(listener: (payload: NotificationPayload) => void) {
     this.events.on("notification", listener);
@@ -85,6 +88,33 @@ export class AppServerClient {
     });
   }
 
+  async close(reason = "codex app-server client closed.") {
+    this.expectedChildExit = true;
+    this.lineReader?.close();
+    this.lineReader = null;
+    this.startPromise = null;
+    this.failPending(new Error(reason));
+
+    const child = this.child;
+    this.child = null;
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      const onExit = () => {
+        clearTimeout(forceKillTimer);
+        resolve();
+      };
+      const forceKillTimer = setTimeout(() => {
+        child.kill("SIGKILL");
+      }, 2_000);
+
+      child.once("exit", onExit);
+      child.kill("SIGTERM");
+    });
+  }
+
   private async ensureStarted() {
     if (this.startPromise) {
       return this.startPromise;
@@ -96,50 +126,93 @@ export class AppServerClient {
   private async start() {
     await ensureDataDirectories(this.profile);
     const { codexBin } = getRuntimeConfig();
+    this.stderrLogPath = getProfileLogPath(this.profile, "codex-app-server.log");
 
-    this.child = spawn(codexBin, ["app-server", "--listen", "stdio://"], {
-      env: {
-        ...process.env,
-        CODEX_HOME: this.profile.codexHome
-      },
-      stdio: ["pipe", "pipe", "pipe"]
-    });
+    try {
+      this.child = spawn(codexBin, ["app-server", "--listen", "stdio://"], {
+        env: {
+          ...process.env,
+          CODEX_HOME: this.profile.codexHome
+        },
+        stdio: ["pipe", "pipe", "pipe"]
+      });
 
-    this.stderrBuffer = "";
-    this.suppressedInvalidRefreshTokenWarning = false;
-    this.child.stderr.on("data", (chunk: Buffer | string) => {
-      this.handleStderrChunk(chunk.toString());
-    });
+      this.stderrBuffer = "";
+      this.suppressedInvalidRefreshTokenWarning = false;
+      this.expectedChildExit = false;
+      this.child.stderr.on("data", (chunk: Buffer | string) => {
+        this.handleStderrChunk(chunk.toString());
+      });
 
-    this.child.once("error", (error: Error) => {
-      this.failPending(error);
-    });
+      this.child.once("error", (error: Error) => {
+        void appendRuntimeErrorLog({
+          source: "codex-app-server",
+          message: "codex app-server process error",
+          profileId: this.profile.id,
+          details: {
+            profileLabel: this.profile.label,
+            logPath: this.stderrLogPath,
+            error: serializeErrorForLog(error)
+          }
+        }).catch(() => {});
+        this.failPending(error);
+      });
 
-    this.child.once("exit", (code: number | null, signal: NodeJS.Signals | null) => {
+      this.child.once("exit", (code: number | null, signal: NodeJS.Signals | null) => {
+        this.flushStderrBuffer();
+        if (!this.expectedChildExit) {
+          void appendRuntimeErrorLog({
+            source: "codex-app-server",
+            message: "codex app-server exited unexpectedly",
+            profileId: this.profile.id,
+            details: {
+              profileLabel: this.profile.label,
+              code,
+              signal,
+              pendingRequestCount: this.pending.size,
+              logPath: this.stderrLogPath
+            }
+          }).catch(() => {});
+        }
+        this.failPending(new Error(`codex app-server exited (${signal ?? code ?? "unknown"})`));
+        this.child = null;
+        this.lineReader = null;
+        this.startPromise = null;
+      });
+
+      this.lineReader = readline.createInterface({
+        input: this.child.stdout as Readable,
+        crlfDelay: Infinity
+      });
+      this.lineReader.on("line", (line: string) => this.handleLine(line));
+
+      await this.requestRaw("initialize", {
+        clientInfo: {
+          name: "codex_webui",
+          title: "Codex Web UI",
+          version: "0.1.0"
+        },
+        capabilities: {
+          experimentalApi: true
+        }
+      });
+      this.writeMessage({ method: "initialized", params: {} });
+    } catch (error) {
       this.flushStderrBuffer();
-      this.failPending(new Error(`codex app-server exited (${signal ?? code ?? "unknown"})`));
-      this.child = null;
-      this.lineReader = null;
-      this.startPromise = null;
-    });
-
-    this.lineReader = readline.createInterface({
-      input: this.child.stdout as Readable,
-      crlfDelay: Infinity
-    });
-    this.lineReader.on("line", (line: string) => this.handleLine(line));
-
-    await this.requestRaw("initialize", {
-      clientInfo: {
-        name: "codex_webui",
-        title: "Codex Web UI",
-        version: "0.1.0"
-      },
-      capabilities: {
-        experimentalApi: true
-      }
-    });
-    this.writeMessage({ method: "initialized", params: {} });
+      this.expectedChildExit = true;
+      this.child?.kill();
+      void appendRuntimeErrorLog({
+        source: "codex-app-server",
+        message: "failed to start codex app-server",
+        profileId: this.profile.id,
+        details: {
+          profileLabel: this.profile.label,
+          logPath: this.stderrLogPath,
+          error: serializeErrorForLog(error)
+        }
+      }).catch(() => {});
+      throw error;
+    }
   }
 
   private requestRaw(method: string, params: Record<string, unknown>) {
@@ -162,7 +235,26 @@ export class AppServerClient {
     if (!line.trim()) {
       return;
     }
-    const message = JSON.parse(line) as JsonRpcMessage;
+    let message: JsonRpcMessage;
+    try {
+      message = JSON.parse(line) as JsonRpcMessage;
+    } catch (error) {
+      void appendRuntimeErrorLog({
+        source: "codex-app-server",
+        message: "received invalid JSON-RPC output from codex app-server",
+        profileId: this.profile.id,
+        details: {
+          profileLabel: this.profile.label,
+          line,
+          logPath: this.stderrLogPath,
+          error: serializeErrorForLog(error)
+        }
+      }).catch(() => {});
+      this.expectedChildExit = true;
+      this.child?.kill();
+      this.failPending(new Error("codex app-server emitted invalid JSON."));
+      return;
+    }
 
     if (message.method && message.id !== undefined) {
       this.events.emit("serverRequest", {
@@ -229,12 +321,25 @@ export class AppServerClient {
     if (!message) {
       return;
     }
+    if (this.stderrLogPath) {
+      void appendLogLine(this.stderrLogPath, message).catch(() => {});
+    }
 
     if (isInvalidRefreshTokenStderr(message)) {
       if (this.suppressedInvalidRefreshTokenWarning) {
         return;
       }
       this.suppressedInvalidRefreshTokenWarning = true;
+      void appendRuntimeErrorLog({
+        source: "codex-app-server",
+        message: "invalid refresh token detected",
+        profileId: this.profile.id,
+        details: {
+          profileLabel: this.profile.label,
+          logPath: this.stderrLogPath,
+          stderr: message
+        }
+      }).catch(() => {});
       console.warn(
         `[codex app-server] ${this.profile.label}: invalid refresh token detected; suppressing repeated refresh-token errors until re-authentication.`
       );

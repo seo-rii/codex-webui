@@ -28,6 +28,7 @@ The goal is not to replace upstream surfaces. The goal is to make Codex usable f
 - Multi-account profile switching backed by separate `CODEX_HOME` directories and profile-scoped `codex app-server` instances
 - Reconnect-safe WebSocket control plane for chat, sessions, Git, terminals, runtime actions, and account flows
 - Request-ID dedupe at the public gateway so reconnect replays do not execute queue or other mutating RPC calls twice
+- Dedicated runtime error logs under `<dataDir>/logs/` for Rust gateway failures, internal Node backend crashes, and per-profile `codex app-server` stderr
 - Session queue, explicit steer flow, persisted queued follow-ups, and resume prompts after restart
 - Composer history recall with keyboard navigation, a quick "reuse last message" chip, and one-click resend/queue for the most recent prompt
 - Session completion and input-required badges are persisted server-side, so they survive reconnects and show up consistently across multiple clients
@@ -40,6 +41,7 @@ The goal is not to replace upstream surfaces. The goal is to make Codex usable f
 - Prompt presets stored server-side, plus composer slash commands for presets, queueing, steering, model changes, and plan-mode toggles
 - Optional admin/viewer role split with server-enforced read-only access and a persisted audit log for privileged actions
 - Structured backend error codes mapped to localized UI messages for common queue, steer, and archive timing failures
+- Cross-platform per-user automatic startup management from the Settings page, with Windows Startup, macOS LaunchAgent, and Linux systemd/XDG support
 - Global "shutdown after queue completes" control that is synchronized across clients and still executes with no browser attached
 - Base-path deployment, configurable CORS, dark/light themes, and Paraglide-based i18n
 
@@ -85,7 +87,7 @@ Still evolving:
 2. password login and attachment upload use credentialed HTTP requests
 3. session activity, chat, Git, terminals, and runtime state use a reconnect-safe WebSocket RPC channel
 4. a Rust gateway owns auth, cookies, WebSocket fan-out, terminal persistence, runtime install/update actions, and static asset serving
-5. the Rust gateway starts an internal SvelteKit/Node service that talks to `codex app-server` and implements Codex-specific logic such as session hydration, queue persistence, Git operations, attachment storage, and `config.toml` synchronization
+5. the Rust gateway serves the prebuilt static SPA from `build/static`, rewrites the compile-time base-path placeholder at response time, and starts an internal SvelteKit/Node API service from `build/node` for Codex-specific logic such as session hydration, queue persistence, Git operations, attachment storage, and `config.toml` synchronization
 
 More detail is in [docs/architecture.md](./docs/architecture.md).
 
@@ -116,6 +118,12 @@ After setup, running `codex-webui` again starts the background server and prints
 - PID
 - config path
 - log path
+- runtime error log path
+
+`pnpm build` now produces two runtime artifacts:
+
+- `build/static` for the public SPA assets served by Rust
+- `build/node` for the internal Node API service supervised by Rust
 
 The printed URL may still end in `/login` for compatibility, but that route redirects to the main workspace and the login experience is handled inline by the workspace shell.
 
@@ -129,7 +137,7 @@ npx codex-webui
 
 On first run the CLI:
 
-1. asks for host, port, base path, Codex binary, the global data directory, one or more profile-specific `CODEX_HOME` paths, allowed roots, optional CORS origins, and password
+1. asks for host, port, base path, Codex binary, the global data directory, one or more profile-specific `CODEX_HOME` paths, allowed roots, optional CORS origins, password, and optional hCaptcha keys
 2. hashes the password with scrypt
 3. writes `~/.codex/codex-webui.yml`
 4. starts the Rust gateway in the background
@@ -145,9 +153,12 @@ codex-webui tunnel
 codex-webui tunnel status
 codex-webui tunnel stop
 codex-webui tunnel logs
+codex-webui --hcaptcha-site-key <site-key> --hcaptcha-secret-key <secret>
 ```
 
 `tunnel` supports provider selection, background or foreground execution, status inspection, and log inspection. It prefers `cloudflared` when available and falls back to `ngrok`.
+
+You can also override login protection at launch time with `--hcaptcha-site-key`, `--hcaptcha-secret-key`, or `--disable-hcaptcha`.
 
 More detail is in [docs/distribution.md](./docs/distribution.md).
 
@@ -242,6 +253,8 @@ The Rust gateway and the internal Node service honor a focused set of `CODEX_WEB
 - `CODEX_WEBUI_VIEWER_PASSWORD_HASH`
 - `CODEX_WEBUI_VIEWER_PASSWORD`
 - `CODEX_WEBUI_SESSION_SECRET`
+- `CODEX_WEBUI_HCAPTCHA_SITE_KEY`
+- `CODEX_WEBUI_HCAPTCHA_SECRET_KEY`
 - `CODEX_WEBUI_CORS_ALLOWED_ORIGINS`
 - `CODEX_WEBUI_ALLOWED_ROOTS`
 - `CODEX_WEBUI_BASE_PATH`
@@ -262,8 +275,10 @@ See [.env.example](./.env.example) for a concise example set.
 ## Security Notes
 
 - Prefer `CODEX_WEBUI_PASSWORD_HASH` over plaintext password variables.
+- Prefer config or environment variables for hCaptcha secrets; command-line flags can leak through shell history and process inspection.
 - If you need read-only browser access, prefer `CODEX_WEBUI_VIEWER_PASSWORD_HASH` over the plaintext viewer password variable.
 - Keep `CODEX_WEBUI_SESSION_SECRET` unique per deployment.
+- Optional hCaptcha login protection is only enabled when both `CODEX_WEBUI_HCAPTCHA_SITE_KEY` and `CODEX_WEBUI_HCAPTCHA_SECRET_KEY` are set.
 - Restrict `CODEX_WEBUI_ALLOWED_ROOTS` to the smallest practical set.
 - Leave cookies on `SameSite=Strict` unless you explicitly need cross-site browser sessions.
 - Run behind HTTPS in production.

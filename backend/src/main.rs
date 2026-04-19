@@ -1,8 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env, fs,
     net::{SocketAddr, TcpListener},
-    path::PathBuf,
+    path::{Component, Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -17,7 +17,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{
-        HeaderMap, Method, StatusCode, Uri,
+        HeaderMap, Method, StatusCode,
         header::{self, HeaderValue},
     },
     response::{IntoResponse, Redirect, Response},
@@ -25,6 +25,7 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
 use reqwest::multipart::{Form, Part};
@@ -62,6 +63,10 @@ const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
 const QUOTA_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const TERMINAL_BUFFER_LIMIT: usize = 500_000;
 const TERMINAL_RELAY_PREFIX: &str = "__terminal__:";
+const STATIC_BASE_PLACEHOLDER: &str = "/__CODEX_WEBUI_BASE__";
+const RUNTIME_ERROR_LOG_NAME: &str = "runtime-errors.jsonl";
+const INTERNAL_NODE_LOG_NAME: &str = "internal-node.log";
+const INTERNAL_NODE_STDERR_TAIL_LIMIT: usize = 120;
 
 tokio::task_local! {
     static ACTIVE_PROFILE_ID: String;
@@ -79,6 +84,86 @@ fn request_cache_key(profile_id: &str, request_id: &str) -> String {
     format!("profile::{profile_id}::request::{request_id}")
 }
 
+fn runtime_logs_dir(config: &Config) -> PathBuf {
+    config.data_dir.join("logs")
+}
+
+fn runtime_error_log_path(config: &Config) -> PathBuf {
+    runtime_logs_dir(config).join(RUNTIME_ERROR_LOG_NAME)
+}
+
+fn internal_node_log_path(config: &Config) -> PathBuf {
+    runtime_logs_dir(config).join(INTERNAL_NODE_LOG_NAME)
+}
+
+fn append_text_log_line(path: &Path, message: &str) {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let line = format!("{} {trimmed}\n", now_millis());
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+    }
+}
+
+fn append_runtime_error_log(config: &Config, source: &str, message: &str, details: Value) {
+    let path = runtime_error_log_path(config);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let entry = json!({
+        "atMs": now_millis(),
+        "pid": std::process::id(),
+        "source": source,
+        "message": message,
+        "details": details
+    });
+
+    if let Ok(line) = serde_json::to_string(&entry) {
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+            let _ = std::io::Write::write_all(&mut file, b"\n");
+        }
+    }
+}
+
+async fn snapshot_stderr_tail(
+    stderr_tail: &Arc<Mutex<VecDeque<String>>>,
+) -> Vec<String> {
+    stderr_tail.lock().await.iter().cloned().collect()
+}
+
+fn install_panic_logger(config: Arc<Config>) {
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let location = panic_info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()));
+        let payload = panic_info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|value| (*value).to_string())
+            .or_else(|| panic_info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic without string payload".to_string());
+        append_runtime_error_log(
+            &config,
+            "rust-gateway",
+            "panic",
+            json!({
+                "payload": payload,
+                "location": location,
+                "backtrace": std::backtrace::Backtrace::force_capture().to_string()
+            }),
+        );
+    }));
+}
+
 #[derive(Clone, Debug)]
 struct Config {
     project_root: PathBuf,
@@ -86,6 +171,7 @@ struct Config {
     profiles: HashMap<String, RuntimeProfile>,
     data_dir: PathBuf,
     base_path: String,
+    static_dir: PathBuf,
     public_host: String,
     public_port: u16,
     internal_port: u16,
@@ -98,10 +184,32 @@ struct Config {
     password_hash: Option<String>,
     viewer_password: Option<String>,
     viewer_password_hash: Option<String>,
+    hcaptcha_site_key: Option<String>,
+    hcaptcha_secret_key: Option<String>,
     session_secret: Option<String>,
     cookie_same_site: SameSiteMode,
     cookie_secure_mode: CookieSecureMode,
     cors_allowed_origins: Vec<String>,
+}
+
+impl Config {
+    fn hcaptcha_site_key(&self) -> Option<&str> {
+        self.hcaptcha_site_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    fn hcaptcha_secret_key(&self) -> Option<&str> {
+        self.hcaptcha_secret_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    fn hcaptcha_enabled(&self) -> bool {
+        self.hcaptcha_site_key().is_some() && self.hcaptcha_secret_key().is_some()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +250,7 @@ struct AppState {
     http: reqwest::Client,
     login_attempts: Arc<Mutex<HashMap<String, Vec<u128>>>>,
     response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>,
+    static_asset_cache: Arc<Mutex<HashMap<String, CachedStaticAsset>>>,
     inflight_requests: Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<ServerEnvelope>>>>>,
     quota_cache: Arc<Mutex<HashMap<String, CachedQuota>>>,
     relays: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
@@ -158,6 +267,13 @@ struct CachedResponse {
 struct CachedQuota {
     created_at: Instant,
     payload: Value,
+}
+
+#[derive(Clone)]
+struct CachedStaticAsset {
+    bytes: Bytes,
+    content_type: &'static str,
+    cache_control: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -274,6 +390,8 @@ enum ServerEnvelope {
 #[derive(Debug, Deserialize)]
 struct LoginPayload {
     password: Option<String>,
+    #[serde(alias = "hcaptchaToken", alias = "hcaptcha_token")]
+    hcaptcha_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,6 +476,9 @@ impl TerminalSession {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let config = Arc::new(Config::from_env()?);
+    install_panic_logger(config.clone());
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -365,44 +486,85 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config = Arc::new(Config::from_env()?);
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("failed to build reqwest client")?;
+    let result = async {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("failed to build reqwest client")?;
 
-    let mut child = spawn_internal_node(&config).await?;
-    wait_for_internal_node(&config, &http).await?;
+        let (mut child, internal_node_stderr_tail) = spawn_internal_node(&config).await?;
+        if let Err(error) = wait_for_internal_node(&config, &http, &internal_node_stderr_tail).await {
+            let _ = child.kill().await;
+            return Err(error);
+        }
 
-    let state = AppState {
-        config: config.clone(),
-        http,
-        login_attempts: Arc::new(Mutex::new(HashMap::new())),
-        response_cache: Arc::new(Mutex::new(HashMap::new())),
-        inflight_requests: Arc::new(Mutex::new(HashMap::new())),
-        quota_cache: Arc::new(Mutex::new(HashMap::new())),
-        relays: Arc::new(Mutex::new(HashMap::new())),
-        terminals: Arc::new(Mutex::new(HashMap::new())),
-    };
+        let state = AppState {
+            config: config.clone(),
+            http,
+            login_attempts: Arc::new(Mutex::new(HashMap::new())),
+            response_cache: Arc::new(Mutex::new(HashMap::new())),
+            static_asset_cache: Arc::new(Mutex::new(HashMap::new())),
+            inflight_requests: Arc::new(Mutex::new(HashMap::new())),
+            quota_cache: Arc::new(Mutex::new(HashMap::new())),
+            relays: Arc::new(Mutex::new(HashMap::new())),
+            terminals: Arc::new(Mutex::new(HashMap::new())),
+        };
 
-    let router = Router::new()
-        .route(&with_base(&config.base_path, "/ws"), get(handle_ws))
-        .route("/", any(handle_http))
-        .route("/{*path}", any(handle_http))
-        .with_state(state.clone());
+        let router = Router::new()
+            .route(&with_base(&config.base_path, "/ws"), get(handle_ws))
+            .route("/", any(handle_http))
+            .route("/{*path}", any(handle_http))
+            .with_state(state.clone());
 
-    let address: SocketAddr = format!("{}:{}", config.public_host, config.public_port)
-        .parse()
-        .context("invalid public listen address")?;
-    info!("Rust gateway listening on http://{address}");
+        let address: SocketAddr = format!("{}:{}", config.public_host, config.public_port)
+            .parse()
+            .context("invalid public listen address")?;
+        info!("Rust gateway listening on http://{address}");
 
-    let listener = tokio::net::TcpListener::bind(address)
-        .await
-        .context("failed to bind public listener")?;
-    let result = axum::serve(listener, router).await;
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .context("failed to bind public listener")?;
 
-    let _ = child.kill().await;
-    result.context("axum server terminated unexpectedly")
+        tokio::select! {
+            server_result = axum::serve(listener, router) => {
+                let _ = child.kill().await;
+                server_result.context("axum server terminated unexpectedly")
+            }
+            child_result = child.wait() => {
+                let details = match child_result {
+                    Ok(status) => json!({
+                        "status": status.to_string(),
+                        "internalBaseUrl": config.internal_base_url,
+                        "internalNodeLogPath": internal_node_log_path(&config).display().to_string(),
+                        "stderrTail": snapshot_stderr_tail(&internal_node_stderr_tail).await
+                    }),
+                    Err(error) => json!({
+                        "error": error.to_string(),
+                        "internalBaseUrl": config.internal_base_url,
+                        "internalNodeLogPath": internal_node_log_path(&config).display().to_string(),
+                        "stderrTail": snapshot_stderr_tail(&internal_node_stderr_tail).await
+                    })
+                };
+                append_runtime_error_log(&config, "rust-gateway", "internal Node backend exited unexpectedly", details);
+                Err(anyhow!("internal Node backend exited unexpectedly"))
+            }
+        }
+    }
+    .await;
+
+    if let Err(error) = &result {
+        append_runtime_error_log(
+            &config,
+            "rust-gateway",
+            "gateway fatal error",
+            json!({
+                "error": format!("{error:#}"),
+                "internalNodeLogPath": internal_node_log_path(&config).display().to_string()
+            }),
+        );
+    }
+
+    result
 }
 
 impl Config {
@@ -411,6 +573,7 @@ impl Config {
         load_dotenv(&cwd);
         let project_root = resolve_project_root(&cwd);
         let base_path = normalize_base_path(env::var("CODEX_WEBUI_BASE_PATH").ok());
+        let static_dir = project_root.join("build/static");
         let public_host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let public_port = parse_port(env::var("PORT").ok(), 4173)?;
         let internal_port = parse_port(
@@ -418,11 +581,17 @@ impl Config {
             choose_free_port()?,
         )?;
         let internal_proxy_token = Uuid::new_v4().to_string();
-        let node_entry = project_root.join("build/index.js");
+        let node_entry = project_root.join("build/node/index.js");
         if !node_entry.exists() {
             return Err(anyhow!(
                 "missing internal SvelteKit build at {}. Run `pnpm build` in codex-webui first.",
                 node_entry.display()
+            ));
+        }
+        if !static_dir.exists() {
+            return Err(anyhow!(
+                "missing static frontend build at {}. Run `pnpm build` in codex-webui first.",
+                static_dir.display()
             ));
         }
 
@@ -437,6 +606,7 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| cwd.join(".data")),
             base_path,
+            static_dir,
             public_host,
             public_port,
             internal_port,
@@ -449,6 +619,8 @@ impl Config {
             password_hash: env::var("CODEX_WEBUI_PASSWORD_HASH").ok(),
             viewer_password: env::var("CODEX_WEBUI_VIEWER_PASSWORD").ok(),
             viewer_password_hash: env::var("CODEX_WEBUI_VIEWER_PASSWORD_HASH").ok(),
+            hcaptcha_site_key: env::var("CODEX_WEBUI_HCAPTCHA_SITE_KEY").ok(),
+            hcaptcha_secret_key: env::var("CODEX_WEBUI_HCAPTCHA_SECRET_KEY").ok(),
             session_secret: env::var("CODEX_WEBUI_SESSION_SECRET").ok(),
             cookie_same_site: parse_same_site(
                 env::var("CODEX_WEBUI_COOKIE_SAMESITE").ok().as_deref(),
@@ -547,6 +719,30 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
         NormalizedPath::Redirect(target) => return Redirect::temporary(&target).into_response(),
         NormalizedPath::OutsideBase => return (StatusCode::NOT_FOUND, "Not found").into_response(),
         NormalizedPath::Route(route_path) => {
+            let origin = extract_origin(&headers);
+            let cors_origin = allowed_cors_origin(&state.config, &origin);
+            let requested_headers = headers
+                .get("access-control-request-headers")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+
+            if route_path.starts_with("/api/")
+                && method == Method::OPTIONS
+                && headers.contains_key("access-control-request-method")
+            {
+                if let Some(origin_value) = cors_origin {
+                    let mut response = Response::new(Body::empty());
+                    *response.status_mut() = StatusCode::NO_CONTENT;
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                    return response;
+                }
+                return (StatusCode::FORBIDDEN, "CORS origin is not allowed.").into_response();
+            }
+
             if route_path.starts_with("/api/auth/") {
                 return handle_auth_http(state, jar, method, route_path, headers, request)
                     .await
@@ -554,14 +750,38 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
             }
 
             if route_path.starts_with("/api/") {
-                return (
-                    StatusCode::NOT_FOUND,
-                    "This backend only exposes auth over HTTP.",
+                if auth_context(&state.config, &jar).is_none() {
+                    let mut response = json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                }
+
+                let mut response = proxy_to_internal(
+                    state,
+                    method,
+                    &route_path,
+                    uri.query(),
+                    headers,
+                    request,
                 )
-                    .into_response();
+                .await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
             }
 
-            return proxy_to_internal(state, method, uri, headers, request).await;
+            return serve_static_asset(state, &route_path).await;
         }
     }
 }
@@ -631,7 +851,11 @@ async fn handle_auth_http(
                     "role": auth.map(|context| match context.role {
                         UserRole::Admin => "admin",
                         UserRole::Viewer => "viewer",
-                    })
+                    }),
+                    "hcaptcha": {
+                        "enabled": state.config.hcaptcha_enabled(),
+                        "siteKey": state.config.hcaptcha_site_key(),
+                    }
                 })),
             )
                 .into_response())
@@ -666,7 +890,10 @@ async fn auth_login(
         .await
         .map_err(|_| "Invalid request body.".to_string())?;
     let payload: LoginPayload =
-        serde_json::from_slice(&body).unwrap_or(LoginPayload { password: None });
+        serde_json::from_slice(&body).unwrap_or(LoginPayload {
+            password: None,
+            hcaptcha_token: None,
+        });
     let password = payload.password.unwrap_or_default();
     let identifier = headers
         .get("x-forwarded-for")
@@ -682,6 +909,86 @@ async fn auth_login(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many login attempts. Try again later.",
         ));
+    }
+
+    if state.config.hcaptcha_enabled() {
+        let Some(hcaptcha_secret_key) = state.config.hcaptcha_secret_key() else {
+            return Ok(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "hCaptcha is not fully configured.",
+            ));
+        };
+        let Some(hcaptcha_token) = payload
+            .hcaptcha_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(json_error(
+                StatusCode::BAD_REQUEST,
+                "Complete the hCaptcha challenge before signing in.",
+            ));
+        };
+
+        let mut verification_payload = vec![
+            ("secret", hcaptcha_secret_key.to_string()),
+            ("response", hcaptcha_token.to_string()),
+        ];
+        if identifier != "unknown" {
+            verification_payload.push(("remoteip", identifier.clone()));
+        }
+
+        let verification_response = state
+            .http
+            .post("https://api.hcaptcha.com/siteverify")
+            .form(&verification_payload)
+            .send()
+            .await
+            .map_err(|error| {
+                tracing::warn!("failed to verify hcaptcha: {error}");
+                "Failed to verify hCaptcha."
+            })?;
+
+        if !verification_response.status().is_success() {
+            tracing::warn!(
+                status = %verification_response.status(),
+                "hcaptcha verification request returned a non-success status"
+            );
+            return Ok(json_error(
+                StatusCode::BAD_GATEWAY,
+                "Failed to verify hCaptcha.",
+            ));
+        }
+
+        let verification_result: Value = verification_response.json().await.map_err(|error| {
+            tracing::warn!("failed to parse hcaptcha verification response: {error}");
+            "Failed to verify hCaptcha."
+        })?;
+        let verification_ok = verification_result
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        if !verification_ok {
+            record_login_failure(&state, &identifier).await;
+            let _ = append_audit_log(
+                &state.config,
+                AuditLogEntry {
+                    id: Uuid::new_v4().to_string(),
+                    at: now_unix_ms(),
+                    role: "anonymous".to_string(),
+                    method: "auth/login".to_string(),
+                    target: None,
+                    ok: false,
+                    error: Some("Failed hCaptcha verification.".to_string()),
+                },
+            )
+            .await;
+            return Ok(json_error(
+                StatusCode::UNAUTHORIZED,
+                "Complete the hCaptcha challenge before signing in.",
+            ));
+        }
     }
 
     let Some(role) =
@@ -753,17 +1060,16 @@ fn auth_logout(jar: CookieJar) -> Response {
 async fn proxy_to_internal(
     state: AppState,
     method: Method,
-    uri: Uri,
+    route_path: &str,
+    query: Option<&str>,
     headers: HeaderMap,
     request: Request,
 ) -> Response {
-    let target = format!(
-        "{}{}",
-        state.config.internal_base_url,
-        uri.path_and_query()
-            .map(|value| value.as_str())
-            .unwrap_or(uri.path())
-    );
+    let mut target = format!("{}{}", state.config.internal_base_url, route_path);
+    if let Some(query) = query.filter(|value| !value.is_empty()) {
+        target.push('?');
+        target.push_str(query);
+    }
 
     let body = match to_bytes(request.into_body(), usize::MAX).await {
         Ok(bytes) => bytes,
@@ -776,6 +1082,166 @@ async fn proxy_to_internal(
             error!("proxy error: {error:#}");
             json_error(StatusCode::BAD_GATEWAY, "Failed to proxy frontend request.")
         }
+    }
+}
+
+async fn serve_static_asset(state: AppState, route_path: &str) -> Response {
+    let Some(relative_path) = sanitize_static_relative_path(route_path) else {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    };
+
+    let cache_key = relative_path.to_string_lossy().into_owned();
+    if let Some(cached) = state.static_asset_cache.lock().await.get(&cache_key).cloned() {
+        return static_asset_response(cached);
+    }
+
+    let asset_path = state.config.static_dir.join(&relative_path);
+    if let Some(asset) = load_static_asset(&state.config, &asset_path, route_path).await {
+        state
+            .static_asset_cache
+            .lock()
+            .await
+            .insert(cache_key, asset.clone());
+        return static_asset_response(asset);
+    }
+
+    if looks_like_static_asset(route_path) {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    }
+
+    let fallback_name = if route_path == "/" { "index.html" } else { "200.html" };
+    let fallback_key = format!("__fallback__::{fallback_name}");
+    if let Some(cached) = state
+        .static_asset_cache
+        .lock()
+        .await
+        .get(&fallback_key)
+        .cloned()
+    {
+        return static_asset_response(cached);
+    }
+
+    let fallback_path = state.config.static_dir.join(fallback_name);
+    if let Some(asset) = load_static_asset(&state.config, &fallback_path, route_path).await {
+        state
+            .static_asset_cache
+            .lock()
+            .await
+            .insert(fallback_key, asset.clone());
+        return static_asset_response(asset);
+    }
+
+    (StatusCode::NOT_FOUND, "Not found").into_response()
+}
+
+fn sanitize_static_relative_path(route_path: &str) -> Option<PathBuf> {
+    let raw = route_path.trim_start_matches('/');
+    if raw.is_empty() {
+        return Some(PathBuf::from("index.html"));
+    }
+
+    let mut sanitized = PathBuf::new();
+    for component in Path::new(raw).components() {
+        match component {
+            Component::Normal(value) => sanitized.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+
+    if sanitized.as_os_str().is_empty() {
+        Some(PathBuf::from("index.html"))
+    } else {
+        Some(sanitized)
+    }
+}
+
+fn looks_like_static_asset(route_path: &str) -> bool {
+    Path::new(route_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.contains('.'))
+}
+
+async fn load_static_asset(
+    config: &Config,
+    asset_path: &Path,
+    route_path: &str,
+) -> Option<CachedStaticAsset> {
+    let metadata = tokio_fs::metadata(asset_path).await.ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+
+    let content_type = static_content_type(asset_path);
+    let cache_control = static_cache_control(route_path, asset_path);
+
+    if static_asset_is_text(asset_path) {
+        let text = tokio_fs::read_to_string(asset_path).await.ok()?;
+        let replaced = text.replace(STATIC_BASE_PLACEHOLDER, &config.base_path);
+        return Some(CachedStaticAsset {
+            bytes: Bytes::from(replaced),
+            content_type,
+            cache_control,
+        });
+    }
+
+    let bytes = tokio_fs::read(asset_path).await.ok()?;
+    Some(CachedStaticAsset {
+        bytes: Bytes::from(bytes),
+        content_type,
+        cache_control,
+    })
+}
+
+fn static_asset_response(asset: CachedStaticAsset) -> Response {
+    let mut response = Response::new(Body::from(asset.bytes));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(asset.content_type),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(asset.cache_control),
+    );
+    response
+}
+
+fn static_asset_is_text(asset_path: &Path) -> bool {
+    matches!(
+        asset_path.extension().and_then(|value| value.to_str()),
+        Some("html" | "js" | "mjs" | "css" | "json" | "map" | "svg" | "txt" | "webmanifest")
+    )
+}
+
+fn static_content_type(asset_path: &Path) -> &'static str {
+    match asset_path.extension().and_then(|value| value.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json" | "map" | "webmanifest") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("ttf") => "font/ttf",
+        Some("wasm") => "application/wasm",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn static_cache_control(route_path: &str, asset_path: &Path) -> &'static str {
+    if route_path == "/" || matches!(asset_path.extension().and_then(|value| value.to_str()), Some("html")) {
+        "no-cache"
+    } else if route_path.starts_with("/_app/immutable/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=3600"
     }
 }
 
@@ -1151,6 +1617,7 @@ async fn execute_ws_method(
         "config/get" => internal_json_request(state, Method::GET, "/api/config", None).await,
         "config/update" => {
             let payload = json!({
+                "autostart": params.get("autostart").cloned().unwrap_or_else(|| json!({})),
                 "systemShutdown": params.get("systemShutdown").cloned().unwrap_or_else(|| json!({})),
                 "theme": params.get("theme").cloned().unwrap_or(Value::Null)
             });
@@ -3677,7 +4144,7 @@ fn load_dotenv(cwd: &PathBuf) {
 }
 
 fn resolve_project_root(cwd: &PathBuf) -> PathBuf {
-    if cwd.join("build/index.js").exists() {
+    if cwd.join("build/node/index.js").exists() || cwd.join("svelte.config.js").exists() {
         return cwd.clone();
     }
 
@@ -3688,7 +4155,7 @@ fn resolve_project_root(cwd: &PathBuf) -> PathBuf {
     {
         if let Some(parent) = cwd.parent() {
             let parent = parent.to_path_buf();
-            if parent.join("build/index.js").exists() {
+            if parent.join("build/node/index.js").exists() || parent.join("svelte.config.js").exists() {
                 return parent;
             }
         }
@@ -3698,15 +4165,10 @@ fn resolve_project_root(cwd: &PathBuf) -> PathBuf {
 }
 
 fn internal_url(config: &Config, path: &str) -> String {
-    let route = if config.base_path.is_empty() {
-        path.to_string()
-    } else {
-        format!("{}{}", config.base_path, path)
-    };
-    format!("{}{}", config.internal_base_url, route)
+    format!("{}{}", config.internal_base_url, path)
 }
 
-async fn spawn_internal_node(config: &Config) -> Result<Child> {
+async fn spawn_internal_node(config: &Config) -> Result<(Child, Arc<Mutex<VecDeque<String>>>)> {
     let mut command = Command::new(&config.node_binary);
     command
         .arg(&config.node_entry)
@@ -3725,25 +4187,37 @@ async fn spawn_internal_node(config: &Config) -> Result<Child> {
     let mut child = command
         .spawn()
         .context("failed to spawn internal Node backend")?;
+    let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
     if let Some(stderr) = child.stderr.take() {
+        let stderr_tail = stderr_tail.clone();
+        let stderr_log_path = internal_node_log_path(config);
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                if !line.trim().is_empty() {
-                    info!("[internal-node] {line}");
+                let message = line.trim();
+                if !message.is_empty() {
+                    append_text_log_line(&stderr_log_path, message);
+                    {
+                        let mut tail = stderr_tail.lock().await;
+                        tail.push_back(message.to_string());
+                        while tail.len() > INTERNAL_NODE_STDERR_TAIL_LIMIT {
+                            tail.pop_front();
+                        }
+                    }
+                    info!("[internal-node] {message}");
                 }
             }
         });
     }
-    Ok(child)
+    Ok((child, stderr_tail))
 }
 
-async fn wait_for_internal_node(config: &Config, http: &reqwest::Client) -> Result<()> {
-    let target = format!(
-        "{}{}",
-        config.internal_base_url,
-        with_base(&config.base_path, "/")
-    );
+async fn wait_for_internal_node(
+    config: &Config,
+    http: &reqwest::Client,
+    stderr_tail: &Arc<Mutex<VecDeque<String>>>,
+) -> Result<()> {
+    let target = format!("{}/", config.internal_base_url);
 
     for _ in 0..100 {
         if let Ok(response) = http
@@ -3763,6 +4237,16 @@ async fn wait_for_internal_node(config: &Config, http: &reqwest::Client) -> Resu
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
+    append_runtime_error_log(
+        config,
+        "rust-gateway",
+        "timed out waiting for internal Node backend",
+        json!({
+            "internalBaseUrl": config.internal_base_url,
+            "internalNodeLogPath": internal_node_log_path(config).display().to_string(),
+            "stderrTail": snapshot_stderr_tail(stderr_tail).await
+        }),
+    );
     Err(anyhow!("timed out waiting for internal Node backend"))
 }
 

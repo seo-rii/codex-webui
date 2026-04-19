@@ -79,6 +79,17 @@ export function clearLoginFailures(identifier: string) {
   attempts.delete(identifier);
 }
 
+export function getLoginHcaptchaConfig() {
+  const config = getRuntimeConfig();
+  const siteKey = config.hcaptchaSiteKey?.trim() || null;
+  const secretKey = config.hcaptchaSecretKey?.trim() || null;
+  return {
+    enabled: Boolean(siteKey && secretKey),
+    siteKey,
+    secretKey
+  };
+}
+
 function resolveCookieSecurity(isSecureRequest: boolean) {
   const { cookieSameSite, cookieSecureMode } = getRuntimeConfig();
 

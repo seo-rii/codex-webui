@@ -9,6 +9,9 @@ export async function GET() {
 
 export async function PATCH({ request }) {
   const body = (await request.json().catch(() => ({}))) as {
+    autostart?: {
+      enabled?: boolean;
+    };
     systemShutdown?: {
       armed?: boolean;
     };
@@ -21,6 +24,10 @@ export async function PATCH({ request }) {
 
   if (typeof body.systemShutdown?.armed === "boolean") {
     return json(await codexGateway.saveSystemShutdownAfterQueueCompletes(body.systemShutdown.armed));
+  }
+
+  if (typeof body.autostart?.enabled === "boolean") {
+    return json(await codexGateway.saveAutostart(body.autostart.enabled));
   }
 
   return json(await codexGateway.getConfig());

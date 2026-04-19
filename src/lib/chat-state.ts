@@ -55,11 +55,307 @@ function resolveConversationRunningTurn(state: ConversationState) {
   return activeTurn ? activeTurn.id : null;
 }
 
+function isLiveThreadStatus(status: string | null | undefined) {
+  return status === "running" || status === "active";
+}
+
+function preferProgressiveString(existing: unknown, incoming: unknown) {
+  if (typeof incoming !== "string") {
+    return typeof existing === "string" ? existing : incoming;
+  }
+  if (typeof existing !== "string") {
+    return incoming;
+  }
+  if (!incoming) {
+    return existing;
+  }
+  if (!existing) {
+    return incoming;
+  }
+  if (incoming.includes(existing)) {
+    return incoming;
+  }
+  if (existing.includes(incoming)) {
+    return existing;
+  }
+  return incoming.length >= existing.length ? incoming : existing;
+}
+
+function mergeStringArray(existing: unknown, incoming: unknown) {
+  const existingEntries = Array.isArray(existing) ? existing.map((entry) => String(entry)) : [];
+  const incomingEntries = Array.isArray(incoming) ? incoming.map((entry) => String(entry)) : [];
+  if (existingEntries.length === 0) {
+    return incomingEntries;
+  }
+  if (incomingEntries.length === 0) {
+    return existingEntries;
+  }
+
+  const merged: string[] = [];
+  const size = Math.max(existingEntries.length, incomingEntries.length);
+  for (let index = 0; index < size; index += 1) {
+    merged[index] = preferProgressiveString(existingEntries[index], incomingEntries[index]) as string;
+  }
+  return merged;
+}
+
+function preferRicherArray<T>(existing: unknown, incoming: unknown): T[] | undefined {
+  const existingEntries = Array.isArray(existing) ? (existing as T[]) : null;
+  const incomingEntries = Array.isArray(incoming) ? (incoming as T[]) : null;
+  if (!existingEntries?.length) {
+    return incomingEntries ?? undefined;
+  }
+  if (!incomingEntries?.length) {
+    return existingEntries;
+  }
+  return incomingEntries.length >= existingEntries.length ? incomingEntries : existingEntries;
+}
+
+function mergeItem(existingItem: CodexItem | undefined, incomingItem: CodexItem): CodexItem {
+  if (!existingItem) {
+    return { ...incomingItem };
+  }
+
+  const merged: CodexItem = {
+    ...existingItem,
+    ...incomingItem
+  };
+
+  if (existingItem.detailState === "loaded" && incomingItem.detailState !== "loaded") {
+    merged.detailState = "loaded";
+  } else if (existingItem.detailState === "inline" && incomingItem.detailState === "deferred") {
+    merged.detailState = "inline";
+  }
+
+  merged.detailPreview =
+    typeof incomingItem.detailPreview === "string" && incomingItem.detailPreview.trim()
+      ? incomingItem.detailPreview
+      : (existingItem.detailPreview ?? null);
+  merged.title =
+    typeof incomingItem.title === "string" && incomingItem.title.trim()
+      ? incomingItem.title
+      : (existingItem.title ?? null);
+
+  if ("text" in existingItem || "text" in incomingItem) {
+    merged.text = preferProgressiveString(existingItem.text, incomingItem.text);
+  }
+  if ("aggregatedOutput" in existingItem || "aggregatedOutput" in incomingItem) {
+    merged.aggregatedOutput = preferProgressiveString(existingItem.aggregatedOutput, incomingItem.aggregatedOutput);
+  }
+  if ("summary" in existingItem || "summary" in incomingItem) {
+    merged.summary = mergeStringArray(existingItem.summary, incomingItem.summary);
+  }
+  if ("changes" in existingItem || "changes" in incomingItem) {
+    merged.changes = preferRicherArray(existingItem.changes, incomingItem.changes);
+  }
+  if ("command" in existingItem || "command" in incomingItem) {
+    merged.command = preferRicherArray(existingItem.command, incomingItem.command);
+  }
+  if ("diff" in existingItem || "diff" in incomingItem) {
+    merged.diff = preferProgressiveString(existingItem.diff, incomingItem.diff);
+  }
+  if ("original" in existingItem || "original" in incomingItem) {
+    merged.original = preferProgressiveString(existingItem.original, incomingItem.original);
+  }
+  if ("modified" in existingItem || "modified" in incomingItem) {
+    merged.modified = preferProgressiveString(existingItem.modified, incomingItem.modified);
+  }
+  if ("query" in existingItem || "query" in incomingItem) {
+    merged.query = preferProgressiveString(existingItem.query, incomingItem.query);
+  }
+  if ("prompt" in existingItem || "prompt" in incomingItem) {
+    merged.prompt = preferProgressiveString(existingItem.prompt, incomingItem.prompt);
+  }
+  if (incomingItem.invocation !== undefined || existingItem.invocation !== undefined) {
+    merged.invocation = incomingItem.invocation ?? existingItem.invocation;
+  }
+  if (incomingItem.result !== undefined || existingItem.result !== undefined) {
+    merged.result = incomingItem.result ?? existingItem.result;
+  }
+  if (incomingItem.action !== undefined || existingItem.action !== undefined) {
+    merged.action = incomingItem.action ?? existingItem.action;
+  }
+  if (incomingItem.tool !== undefined || existingItem.tool !== undefined) {
+    merged.tool = incomingItem.tool ?? existingItem.tool;
+  }
+  if (incomingItem.lifecycleStatus !== undefined || existingItem.lifecycleStatus !== undefined) {
+    const incomingLifecycle = String(incomingItem.lifecycleStatus ?? "");
+    const existingLifecycle = String(existingItem.lifecycleStatus ?? "");
+    merged.lifecycleStatus =
+      existingLifecycle === "completed" && incomingLifecycle === "inProgress"
+        ? existingItem.lifecycleStatus
+        : (incomingItem.lifecycleStatus ?? existingItem.lifecycleStatus);
+  }
+
+  return merged;
+}
+
+function mergeTurnStatus(existingStatus: string | null | undefined, incomingStatus: string | null | undefined) {
+  const existing = String(existingStatus ?? "");
+  const incoming = String(incomingStatus ?? "");
+  if (!existing) {
+    return incoming;
+  }
+  if (!incoming || existing === incoming) {
+    return existing || incoming;
+  }
+  if (existing === "inProgress" && incoming !== "inProgress") {
+    return incoming;
+  }
+  if (incoming === "inProgress" && existing !== "inProgress") {
+    return existing;
+  }
+  return incoming;
+}
+
+function mergeTurnItems(existingItems: CodexItem[], incomingItems: CodexItem[]) {
+  const existingById = new Map(existingItems.map((item) => [item.id, item] as const));
+  const incomingById = new Map(incomingItems.map((item) => [item.id, item] as const));
+  const incomingSubsetOfExisting = incomingItems.every((item) => existingById.has(item.id));
+  const orderedBase = incomingSubsetOfExisting && existingItems.length >= incomingItems.length ? existingItems : incomingItems;
+  const merged = orderedBase.map((baseItem) => mergeItem(existingById.get(baseItem.id), incomingById.get(baseItem.id) ?? baseItem));
+  const seenIds = new Set(merged.map((item) => item.id));
+
+  for (const item of incomingItems) {
+    if (seenIds.has(item.id)) {
+      continue;
+    }
+    merged.push(mergeItem(existingById.get(item.id), item));
+    seenIds.add(item.id);
+  }
+
+  for (const item of existingItems) {
+    if (seenIds.has(item.id)) {
+      continue;
+    }
+    merged.push({ ...item });
+    seenIds.add(item.id);
+  }
+
+  return merged;
+}
+
+function mergeTurn(existingTurn: CodexTurn | undefined, incomingTurn: CodexTurn): CodexTurn {
+  if (!existingTurn) {
+    return cloneTurn(incomingTurn);
+  }
+
+  const status = mergeTurnStatus(existingTurn.status, incomingTurn.status);
+  const completedAt = status === "inProgress" ? null : (incomingTurn.completedAt ?? existingTurn.completedAt);
+  const durationMs = status === "inProgress" ? null : (incomingTurn.durationMs ?? existingTurn.durationMs);
+
+  return {
+    ...existingTurn,
+    ...incomingTurn,
+    items: mergeTurnItems(existingTurn.items, incomingTurn.items),
+    status,
+    error: incomingTurn.error ?? existingTurn.error,
+    startedAt: incomingTurn.startedAt ?? existingTurn.startedAt,
+    completedAt,
+    durationMs,
+    detailState:
+      existingTurn.detailState === "full" && incomingTurn.detailState !== "full"
+        ? "full"
+        : (incomingTurn.detailState ?? existingTurn.detailState),
+    hiddenItemCount:
+      status === "inProgress"
+        ? 0
+        : Math.max(Number(existingTurn.hiddenItemCount ?? 0), Number(incomingTurn.hiddenItemCount ?? 0))
+  };
+}
+
+function mergeTurns(existingTurns: CodexTurn[], incomingTurns: CodexTurn[]) {
+  const existingById = new Map(existingTurns.map((turn) => [turn.id, turn] as const));
+  const merged = incomingTurns.map((turn) => mergeTurn(existingById.get(turn.id), turn));
+  const seenIds = new Set(merged.map((turn) => turn.id));
+
+  for (const turn of existingTurns) {
+    if (seenIds.has(turn.id)) {
+      continue;
+    }
+    merged.push(cloneTurn(turn));
+    seenIds.add(turn.id);
+  }
+
+  return merged;
+}
+
+function mergePendingRequests(
+  existingRequests: SessionDetailPayload["pendingRequests"],
+  incomingRequests: SessionDetailPayload["pendingRequests"]
+) {
+  const merged = new Map(existingRequests.map((request) => [request.id, request] as const));
+  for (const request of incomingRequests) {
+    merged.set(request.id, request);
+  }
+  return [...merged.values()].sort((left, right) => String(left.createdAt ?? "").localeCompare(String(right.createdAt ?? "")));
+}
+
+function mergeQueue(existingQueue: SessionDetailPayload["queue"], incomingQueue: SessionDetailPayload["queue"]) {
+  const existingUpdatedAt = Number(existingQueue.updatedAt ?? 0);
+  const incomingUpdatedAt = Number(incomingQueue.updatedAt ?? 0);
+  return existingUpdatedAt > incomingUpdatedAt ? existingQueue : incomingQueue;
+}
+
+function mergeHydration(
+  existingHydration: SessionDetailPayload["hydration"],
+  incomingHydration: SessionDetailPayload["hydration"],
+  loadedTurns: number
+) {
+  const totalTurns =
+    typeof incomingHydration.totalTurns === "number"
+      ? Math.max(incomingHydration.totalTurns, loadedTurns)
+      : typeof existingHydration.totalTurns === "number"
+        ? Math.max(existingHydration.totalTurns, loadedTurns)
+        : null;
+
+  return {
+    state: incomingHydration.state,
+    loadedTurns: Math.max(incomingHydration.loadedTurns, loadedTurns),
+    totalTurns,
+    remainingTurns:
+      typeof totalTurns === "number"
+        ? Math.max(totalTurns - Math.max(incomingHydration.loadedTurns, loadedTurns), 0)
+        : incomingHydration.remainingTurns,
+    message: incomingHydration.message
+  } satisfies SessionDetailPayload["hydration"];
+}
+
 export function createConversationState(detail: SessionDetailPayload): ConversationState {
   return {
     ...detail,
     livePlans: {},
     liveDiffs: {}
+  };
+}
+
+export function mergeConversationState(current: ConversationState, detail: SessionDetailPayload): ConversationState {
+  const incoming = createConversationState(detail);
+  const mergedTurns = mergeTurns(current.thread.turns, incoming.thread.turns);
+  const hasLiveTurn = mergedTurns.some((turn) => String(turn.status ?? "") === "inProgress");
+  const threadStatus = hasLiveTurn
+    ? (isLiveThreadStatus(incoming.thread.status) ? incoming.thread.status : current.thread.status || "running")
+    : incoming.thread.status;
+
+  return {
+    ...incoming,
+    thread: {
+      ...current.thread,
+      ...incoming.thread,
+      turns: mergedTurns,
+      status: threadStatus,
+      updatedAt: Math.max(Number(current.thread.updatedAt ?? 0), Number(incoming.thread.updatedAt ?? 0))
+    },
+    queue: mergeQueue(current.queue, incoming.queue),
+    pendingRequests: mergePendingRequests(current.pendingRequests, incoming.pendingRequests),
+    tokenUsage: incoming.tokenUsage ?? current.tokenUsage ?? null,
+    hydration: mergeHydration(current.hydration, incoming.hydration, mergedTurns.length),
+    livePlans: {
+      ...current.livePlans
+    },
+    liveDiffs: {
+      ...current.liveDiffs
+    }
   };
 }
 

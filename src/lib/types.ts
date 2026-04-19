@@ -12,6 +12,19 @@ export type AutomationScheduleMode = "manual" | "interval";
 export type AutomationExecutionTarget = "local" | "worktree";
 export type AutomationRunStatus = "running" | "started" | "completed" | "failed";
 export type SessionForkMode = "fork" | "handoff";
+export type AutostartProvider = "windows-startup" | "macos-launch-agent" | "linux-systemd-user" | "linux-xdg-autostart";
+
+export type LoginHcaptchaConfig = {
+  enabled: boolean;
+  siteKey: string | null;
+};
+
+export type AuthSessionPayload = {
+  authenticated: boolean;
+  role: UserRole | null;
+  activeProfileId: string | null;
+  hcaptcha: LoginHcaptchaConfig;
+};
 
 export type SessionPreferences = {
   cwd: string;
@@ -270,6 +283,12 @@ export type AppConfigPayload = {
   };
   git: {
     discoveryDepth: number;
+  };
+  autostart: {
+    available: boolean;
+    enabled: boolean;
+    provider: AutostartProvider | null;
+    location: string | null;
   };
   systemShutdown: {
     available: boolean;

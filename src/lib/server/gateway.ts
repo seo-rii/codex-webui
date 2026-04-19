@@ -55,6 +55,7 @@ import { getCurrentRuntimeProfile, getRuntimeConfig, getRuntimeProfile, type Run
 import { buildSandboxPolicy, listDirectoryPayload, resolveAllowedDirectory, sanitizeFileName } from "./fs";
 import { createGitWorktree, resolveGitRepository } from "./git";
 import { runWithProfile } from "./profile-context";
+import { appendRuntimeErrorLog, serializeErrorForLog } from "./runtime-log";
 import { sessionIndexClient, type IndexedSessionSummary } from "./session-index";
 import { uiStateStore } from "./store";
 import { getStoredThemeSettings, updateStoredThemeSettings } from "./theme-store";
@@ -1821,6 +1822,62 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     }
 
     let draft = stripAttachmentPreamble(selectedMessageText ?? "").trim();
+    const sourceName = getDisplayThreadName(asText(thread.name), asText(thread.preview));
+    const nextName = inferSessionDisplayTitle(selectedMessageText ?? draft) ?? sourceName ?? null;
+
+    if (options.mode === "fork") {
+      const response = asRecord(
+        await this.client.request("thread/fork", {
+          threadId: sourceThreadId,
+          model: preferences.model,
+          cwd: preferences.cwd,
+          approvalPolicy: preferences.approvalPolicy,
+          sandbox: preferences.sandboxMode,
+          serviceTier: preferences.speed === "auto" ? null : preferences.speed,
+          persistExtendedHistory: true
+        })
+      );
+      let forkedThread = normalizeThread(asRecord(response.thread));
+      const forkedThreadId = String(forkedThread.id);
+      const rollbackTurns = anchorIndex >= 0 ? Math.max(0, hydration.turns.length - anchorIndex - 1) : 0;
+
+      if (rollbackTurns > 0) {
+        const rolledBack = asRecord(
+          await this.client.request("thread/rollback", {
+            threadId: forkedThreadId,
+            numTurns: rollbackTurns
+          })
+        );
+        forkedThread = normalizeThread(asRecord(rolledBack.thread));
+      }
+
+      await uiStateStore.set(forkedThreadId, preferences);
+      if (nextName && !isPlaceholderThreadName(nextName)) {
+        await this.renameSession(forkedThreadId, nextName);
+        forkedThread.name = nextName;
+      }
+
+      const summary = applySessionMeta(toSummary(forkedThread, preferences), await uiStateStore.getSessionMeta(forkedThreadId));
+      sessionIndexClient.invalidate();
+      this.loadedThreadIds.add(forkedThreadId);
+      this.loadedThreadIdsLoadedAt = Date.now();
+      this.recentLiveSessions.set(forkedThreadId, summary);
+      this.recentLiveSessionsLoadedAt = Date.now();
+      this.emitGlobal({
+        kind: "notification",
+        method: "codex-webui/sessionSummaryUpdated",
+        params: {
+          session: summary
+        }
+      });
+
+      return {
+        session: summary,
+        draft: "",
+        mode: options.mode
+      };
+    }
+
     if (options.mode === "handoff") {
       const sourceName = getDisplayThreadName(asText(thread.name), asText(thread.preview)) ?? "Source thread";
       const preview = stripAttachmentPreamble(asText(thread.preview) ?? "").trim();
@@ -1867,13 +1924,9 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       throw new Error(options.mode === "handoff" ? "There is no thread context to hand off yet." : "There is no message to fork yet.");
     }
 
-    const sourceName = getDisplayThreadName(asText(thread.name), asText(thread.preview));
-    const nextName =
-      options.mode === "handoff"
-        ? `${sourceName && !isPlaceholderThreadName(sourceName) ? sourceName : inferSessionDisplayTitle(draft) ?? "Thread"} · Handoff`
-        : inferSessionDisplayTitle(selectedMessageText ?? draft) ?? sourceName ?? null;
+    const handoffName = `${sourceName && !isPlaceholderThreadName(sourceName) ? sourceName : inferSessionDisplayTitle(draft) ?? "Thread"} · Handoff`;
 
-    const session = await this.createSession(preferences, nextName);
+    const session = await this.createSession(preferences, handoffName);
     const savedDraft = await this.saveDraft(session.id, draft, "message");
     return {
       session,
@@ -2376,7 +2429,51 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   async renameSession(threadId: string, name: string) {
-    await this.client.request("thread/name/set", { threadId, name });
+    try {
+      await this.client.request("thread/name/set", { threadId, name });
+    } catch (primaryError) {
+      const fallbackClient = new AppServerClient(this.profile);
+      try {
+        await fallbackClient.request("thread/name/set", { threadId, name });
+      } catch (fallbackError) {
+        void appendRuntimeErrorLog({
+          source: "codex-webui",
+          message: "thread rename failed after fallback retry",
+          profileId: this.profile.id,
+          details: {
+            threadId,
+            name,
+            primaryError: serializeErrorForLog(primaryError),
+            fallbackError: serializeErrorForLog(fallbackError)
+          }
+        }).catch(() => {});
+        throw fallbackError;
+      } finally {
+        await fallbackClient.close("thread rename fallback client closed.").catch(() => {});
+      }
+
+      void appendRuntimeErrorLog({
+        source: "codex-webui",
+        message: "thread rename recovered via fallback app-server",
+        profileId: this.profile.id,
+        details: {
+          threadId,
+          name,
+          primaryError: serializeErrorForLog(primaryError)
+        }
+      }).catch(() => {});
+
+      this.emit(threadId, {
+        kind: "notification",
+        method: "thread/name/updated",
+        params: {
+          threadId,
+          threadName: name
+        }
+      });
+      void this.emitSessionSummaryUpdated(threadId);
+    }
+
     sessionIndexClient.invalidate();
   }
 
@@ -3123,6 +3220,18 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
               turnsById.set(activeTurnId, turn);
             }
 
+            if (eventType === "turn_aborted") {
+              turn.status = "stopped";
+              turn.completedAt = timestamp;
+              turn.durationMs =
+                turn.startedAt !== null && turn.completedAt !== null ? Math.max(turn.completedAt - turn.startedAt, 0) : null;
+
+              if (currentTurnId === activeTurnId) {
+                currentTurnId = null;
+              }
+              continue;
+            }
+
             if (record.type === "response_item" && eventType === "reasoning") {
               const summaryEntries = Array.isArray(payload.summary)
                 ? payload.summary
@@ -3156,6 +3265,42 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
               continue;
             }
 
+            if (record.type === "response_item" && eventType === "message") {
+              const role = String(payload.role ?? "");
+              if (role !== "assistant") {
+                continue;
+              }
+              const phase = typeof payload.phase === "string" ? payload.phase : null;
+              const text = extractDraftTextFromItem({
+                id: `${activeTurnId}:response-message:${turn.items.length}`,
+                type: "agentMessage",
+                content: payload.content ?? null,
+                text: payload.text ?? payload.message ?? null,
+                value: payload.content ?? payload.message ?? null
+              } satisfies CodexItem);
+
+              if (!text) {
+                continue;
+              }
+
+              const lastItem = turn.items.at(-1);
+              if (
+                lastItem?.type === "agentMessage" &&
+                String(lastItem.text ?? "") === text &&
+                String(lastItem.phase ?? "") === String(phase ?? "")
+              ) {
+                continue;
+              }
+
+              turn.items.push({
+                id: `${activeTurnId}:agent:${turn.items.length}`,
+                type: "agentMessage",
+                text,
+                phase
+              });
+              continue;
+            }
+
             if (eventType === "agent_reasoning") {
               const summaryEntry = String(payload.text ?? "").trim();
               if (!summaryEntry) {
@@ -3186,21 +3331,38 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
             }
 
             if (eventType === "user_message") {
+              const message = String(payload.message ?? "");
+              const lastItem = turn.items.at(-1);
+              if (lastItem?.type === "userMessage" && String(lastItem.text ?? "") === message) {
+                continue;
+              }
+
               turn.items.push({
                 id: `${activeTurnId}:user:${turn.items.length}`,
                 type: "userMessage",
-                text: String(payload.message ?? ""),
+                text: message,
                 attachments: []
               });
               continue;
             }
 
             if (eventType === "agent_message") {
+              const message = String(payload.message ?? "");
+              const phase = typeof payload.phase === "string" ? payload.phase : null;
+              const lastItem = turn.items.at(-1);
+              if (
+                lastItem?.type === "agentMessage" &&
+                String(lastItem.text ?? "") === message &&
+                String(lastItem.phase ?? "") === String(phase ?? "")
+              ) {
+                continue;
+              }
+
               turn.items.push({
                 id: `${activeTurnId}:agent:${turn.items.length}`,
                 type: "agentMessage",
-                text: String(payload.message ?? ""),
-                phase: typeof payload.phase === "string" ? payload.phase : null
+                text: message,
+                phase
               });
               continue;
             }

@@ -6,7 +6,7 @@
 
 1. browser UI
 2. Rust public gateway
-3. internal SvelteKit/Node service
+3. internal SvelteKit/Node API service
 4. `codex app-server`
 
 The browser never talks to Codex directly.
@@ -30,7 +30,8 @@ It is responsible for:
 
 - password validation and signed cookie issuance
 - admin/viewer role resolution for browser sessions
-- static asset serving
+- static asset serving from the prebuilt SPA bundle
+- runtime base-path placeholder replacement for HTML, JS, and CSS assets
 - public WebSocket upgrade handling and fan-out
 - request-ID response caching and in-flight dedupe for reconnect-safe RPC replay
 - long-lived terminal processes
@@ -40,9 +41,9 @@ It is responsible for:
 - enforcing base path and CORS policy
 - appending audit-log entries for privileged login and WebSocket actions
 
-### Internal SvelteKit/Node service
+### Internal SvelteKit/Node API service
 
-The internal service contains most Codex-specific application logic:
+The internal service is no longer used as the public page renderer. It exists as an API-only private service behind Rust and contains most Codex-specific application logic:
 
 - `codex app-server` client management
 - session hydration and turn shaping
@@ -63,6 +64,14 @@ This service is not meant to be exposed directly.
 `codex app-server` remains the source of truth for live Codex thread execution, thread metadata, and stream notifications.
 
 ## Request And Event Flow
+
+### 0. Public page load
+
+- browser requests the configured base path from Rust
+- Rust serves files from `build/static`
+- HTML, JS, and CSS assets contain a compile-time base-path placeholder
+- Rust rewrites that placeholder to the configured runtime base path before sending text assets
+- unknown non-asset paths fall back to the SPA entry document so the single-page shell can hydrate
 
 ### 1. Authentication
 
@@ -90,7 +99,7 @@ This service is not meant to be exposed directly.
 Uploads are a deliberate exception to the WebSocket-first rule:
 
 - browser sends `multipart/form-data`
-- Rust proxies the upload path to the internal service
+- Rust strips the public base path and proxies the upload path to the internal API service
 - Node stores the upload and associates it with the target session
 
 ## Why Rust + Node

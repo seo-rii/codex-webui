@@ -83,6 +83,93 @@ fn main() {
                     }
                 }));
             }
+            Some("account/read") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "account": {
+                            "type": "chatgpt",
+                            "email": "demo@example.com",
+                            "planType": "plus"
+                        },
+                        "requiresOpenaiAuth": false
+                    }
+                }));
+            }
+            Some("account/login/start") => {
+                let login_type = payload
+                    .get("params")
+                    .and_then(|params| params.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("chatgpt");
+                let result = match login_type {
+                    "apiKey" => json!({
+                        "type": "apiKey"
+                    }),
+                    "chatgptDeviceCode" => json!({
+                        "type": "chatgptDeviceCode",
+                        "loginId": "login-device-1",
+                        "verificationUrl": "https://example.com/device",
+                        "userCode": "ABCD-EFGH"
+                    }),
+                    _ => json!({
+                        "type": "chatgpt",
+                        "loginId": "login-chatgpt-1",
+                        "authUrl": "https://example.com/auth"
+                    }),
+                };
+                print_message(&json!({
+                    "method": "account/login/completed",
+                    "params": {
+                        "loginId": result.get("loginId").cloned().unwrap_or(Value::Null),
+                        "success": true,
+                        "error": Value::Null
+                    }
+                }));
+                print_message(&json!({
+                    "method": "account/updated",
+                    "params": {
+                        "type": if login_type == "apiKey" { "apiKey" } else { "chatgpt" }
+                    }
+                }));
+                print_message(&json!({
+                    "method": "account/rateLimits/updated",
+                    "params": {
+                        "source": "fake"
+                    }
+                }));
+                print_message(&json!({
+                    "id": id,
+                    "result": result
+                }));
+            }
+            Some("account/login/cancel") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "status": "canceled",
+                        "loginId": payload
+                            .get("params")
+                            .and_then(|params| params.get("loginId"))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    }
+                }));
+            }
+            Some("account/logout") => {
+                print_message(&json!({
+                    "method": "account/updated",
+                    "params": {
+                        "type": Value::Null
+                    }
+                }));
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "ok": true
+                    }
+                }));
+            }
             Some("askQuestion") => {
                 server_request_id += 1;
                 print_message(&json!({

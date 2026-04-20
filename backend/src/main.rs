@@ -24,6 +24,10 @@ use axum::{
     routing::{any, get},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use backend::codex_app_server::{
+    AppServerClient, AppServerClientConfig, AppServerManager, AppServerNotification,
+    AppServerProfile,
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
@@ -134,9 +138,7 @@ fn append_runtime_error_log(config: &Config, source: &str, message: &str, detail
     }
 }
 
-async fn snapshot_stderr_tail(
-    stderr_tail: &Arc<Mutex<VecDeque<String>>>,
-) -> Vec<String> {
+async fn snapshot_stderr_tail(stderr_tail: &Arc<Mutex<VecDeque<String>>>) -> Vec<String> {
     stderr_tail.lock().await.iter().cloned().collect()
 }
 
@@ -247,6 +249,7 @@ struct AuthContext {
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
+    app_servers: AppServerManager,
     http: reqwest::Client,
     login_attempts: Arc<Mutex<HashMap<String, Vec<u128>>>>,
     response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>,
@@ -500,6 +503,11 @@ async fn main() -> Result<()> {
 
         let state = AppState {
             config: config.clone(),
+            app_servers: AppServerManager::new(AppServerClientConfig {
+                codex_bin: config.codex_bin.clone(),
+                stderr_log_path: Some(runtime_logs_dir(&config).join("codex-app-server.log")),
+                ..AppServerClientConfig::default()
+            }),
             http,
             login_attempts: Arc::new(Mutex::new(HashMap::new())),
             response_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -528,6 +536,7 @@ async fn main() -> Result<()> {
         tokio::select! {
             server_result = axum::serve(listener, router) => {
                 let _ = child.kill().await;
+                let _ = state.app_servers.close_all().await;
                 server_result.context("axum server terminated unexpectedly")
             }
             child_result = child.wait() => {
@@ -546,6 +555,7 @@ async fn main() -> Result<()> {
                     })
                 };
                 append_runtime_error_log(&config, "rust-gateway", "internal Node backend exited unexpectedly", details);
+                let _ = state.app_servers.close_all().await;
                 Err(anyhow!("internal Node backend exited unexpectedly"))
             }
         }
@@ -657,8 +667,9 @@ fn sanitize_profile_id(input: &str) -> String {
 fn parse_runtime_profiles(
     default_codex_home: &PathBuf,
 ) -> Result<(String, HashMap<String, RuntimeProfile>)> {
-    let default_profile_id =
-        sanitize_profile_id(&env::var("CODEX_WEBUI_DEFAULT_PROFILE_ID").unwrap_or_else(|_| "default".to_string()));
+    let default_profile_id = sanitize_profile_id(
+        &env::var("CODEX_WEBUI_DEFAULT_PROFILE_ID").unwrap_or_else(|_| "default".to_string()),
+    );
     let raw_profiles = env::var("CODEX_WEBUI_PROFILES_JSON").ok();
 
     let Some(raw_profiles) = raw_profiles.filter(|value| !value.trim().is_empty()) else {
@@ -678,13 +689,15 @@ fn parse_runtime_profiles(
 
     for entry in parsed {
         let id = sanitize_profile_id(entry.id.as_deref().unwrap_or("default"));
-        profiles.entry(id.clone()).or_insert_with(|| RuntimeProfile {
-            codex_home: entry
-                .codex_home
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| default_codex_home.clone()),
-        });
+        profiles
+            .entry(id.clone())
+            .or_insert_with(|| RuntimeProfile {
+                codex_home: entry
+                    .codex_home
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| default_codex_home.clone()),
+            });
     }
 
     if profiles.is_empty() {
@@ -751,7 +764,8 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
 
             if route_path.starts_with("/api/") {
                 if auth_context(&state.config, &jar).is_none() {
-                    let mut response = json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
                     if let Some(origin_value) = cors_origin {
                         apply_cors_headers(
                             response.headers_mut(),
@@ -762,15 +776,9 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                     return response;
                 }
 
-                let mut response = proxy_to_internal(
-                    state,
-                    method,
-                    &route_path,
-                    uri.query(),
-                    headers,
-                    request,
-                )
-                .await;
+                let mut response =
+                    proxy_to_internal(state, method, &route_path, uri.query(), headers, request)
+                        .await;
                 if let Some(origin_value) = cors_origin {
                     apply_cors_headers(
                         response.headers_mut(),
@@ -889,11 +897,10 @@ async fn auth_login(
     let body = to_bytes(request.into_body(), usize::MAX)
         .await
         .map_err(|_| "Invalid request body.".to_string())?;
-    let payload: LoginPayload =
-        serde_json::from_slice(&body).unwrap_or(LoginPayload {
-            password: None,
-            hcaptcha_token: None,
-        });
+    let payload: LoginPayload = serde_json::from_slice(&body).unwrap_or(LoginPayload {
+        password: None,
+        hcaptcha_token: None,
+    });
     let password = payload.password.unwrap_or_default();
     let identifier = headers
         .get("x-forwarded-for")
@@ -1091,7 +1098,13 @@ async fn serve_static_asset(state: AppState, route_path: &str) -> Response {
     };
 
     let cache_key = relative_path.to_string_lossy().into_owned();
-    if let Some(cached) = state.static_asset_cache.lock().await.get(&cache_key).cloned() {
+    if let Some(cached) = state
+        .static_asset_cache
+        .lock()
+        .await
+        .get(&cache_key)
+        .cloned()
+    {
         return static_asset_response(cached);
     }
 
@@ -1109,7 +1122,11 @@ async fn serve_static_asset(state: AppState, route_path: &str) -> Response {
         return (StatusCode::NOT_FOUND, "Not found").into_response();
     }
 
-    let fallback_name = if route_path == "/" { "index.html" } else { "200.html" };
+    let fallback_name = if route_path == "/" {
+        "index.html"
+    } else {
+        "200.html"
+    };
     let fallback_key = format!("__fallback__::{fallback_name}");
     if let Some(cached) = state
         .static_asset_cache
@@ -1236,7 +1253,12 @@ fn static_content_type(asset_path: &Path) -> &'static str {
 }
 
 fn static_cache_control(route_path: &str, asset_path: &Path) -> &'static str {
-    if route_path == "/" || matches!(asset_path.extension().and_then(|value| value.to_str()), Some("html")) {
+    if route_path == "/"
+        || matches!(
+            asset_path.extension().and_then(|value| value.to_str()),
+            Some("html")
+        )
+    {
         "no-cache"
     } else if route_path.starts_with("/_app/immutable/") {
         "public, max-age=31536000, immutable"
@@ -1296,7 +1318,8 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
                     ACTIVE_PROFILE_ID
                         .scope(auth.profile_id.clone(), async move {
                             if let Err(error) =
-                                handle_ws_message(&state, &out_tx, &subscriptions, &auth, payload).await
+                                handle_ws_message(&state, &out_tx, &subscriptions, &auth, payload)
+                                    .await
                             {
                                 error!("websocket request failed: {error:#}");
                             }
@@ -1859,8 +1882,7 @@ async fn execute_ws_method(
                 .filter(|value| !value.is_empty())
                 .map(urlencoding::encode);
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
-            let mut path =
-                format!("/api/sessions/{session_id}/search?query={query}&limit={limit}");
+            let mut path = format!("/api/sessions/{session_id}/search?query={query}&limit={limit}");
             if let Some(cursor) = cursor {
                 path.push_str(&format!("&cursor={cursor}"));
             }
@@ -2151,29 +2173,10 @@ async fn execute_ws_method(
             )
             .await
         }
-        "account/get" => internal_json_request(state, Method::GET, "/api/account", None).await,
-        "account/login/start" => {
-            let payload = json!({
-                "type": require_string(&params, "type")?,
-                "apiKey": params.get("apiKey").cloned().unwrap_or(Value::Null)
-            });
-            internal_json_request(state, Method::POST, "/api/account/login", Some(payload)).await
-        }
-        "account/login/cancel" => {
-            let payload = json!({
-                "loginId": require_string(&params, "loginId")?
-            });
-            internal_json_request(
-                state,
-                Method::POST,
-                "/api/account/login/cancel",
-                Some(payload),
-            )
-            .await
-        }
-        "account/logout" => {
-            internal_json_request(state, Method::POST, "/api/account/logout", Some(json!({}))).await
-        }
+        "account/get" => get_account_state(state, &auth.profile_id).await,
+        "account/login/start" => start_account_login(state, &auth.profile_id, &params).await,
+        "account/login/cancel" => cancel_account_login(state, &auth.profile_id, &params).await,
+        "account/logout" => logout_account(state, &auth.profile_id).await,
         "arena/list" => internal_json_request(state, Method::GET, "/api/arena", None).await,
         "arena/start" => {
             let payload = json!({
@@ -2205,10 +2208,7 @@ async fn execute_ws_method(
                 .and_then(Value::as_str)
                 .unwrap_or("open");
             let pr_state = urlencoding::encode(pr_state);
-            let limit = params
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(20);
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
             internal_json_request(
                 state,
                 Method::GET,
@@ -2396,7 +2396,10 @@ async fn execute_ws_method(
             let mut chars = snapshot.chars().peekable();
             while let Some(ch) = chars.next() {
                 if ch == '\u{1b}' {
-                    if matches!(chars.peek(), Some('[' | ']' | '(' | ')' | '#' | 'P' | '_' | '^')) {
+                    if matches!(
+                        chars.peek(),
+                        Some('[' | ']' | '(' | ')' | '#' | 'P' | '_' | '^')
+                    ) {
                         while let Some(next) = chars.next() {
                             if ('@'..='~').contains(&next) {
                                 break;
@@ -2487,7 +2490,8 @@ async fn execute_ws_method(
         "session/unsubscribe" => {
             let session_id = require_string(&params, "sessionId")?;
             let mut current = subscriptions.lock().await;
-            if let Some(handle) = current.remove(&session_relay_key(&auth.profile_id, &session_id)) {
+            if let Some(handle) = current.remove(&session_relay_key(&auth.profile_id, &session_id))
+            {
                 handle.abort();
             }
             Ok(json!({ "subscribed": false, "sessionId": session_id }))
@@ -2684,6 +2688,11 @@ async fn ensure_global_relay(
     let state = state.clone();
     let profile_id = profile_id.to_string();
     let relay_sender = sender.clone();
+    tokio::spawn(bridge_app_server_global_notifications(
+        state.clone(),
+        relay_sender.clone(),
+        profile_id.clone(),
+    ));
     tokio::spawn(async move {
         loop {
             if let Err(error) =
@@ -2696,6 +2705,47 @@ async fn ensure_global_relay(
     });
 
     Ok(sender)
+}
+
+async fn bridge_app_server_global_notifications(
+    state: AppState,
+    sender: broadcast::Sender<Value>,
+    profile_id: String,
+) {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, &profile_id)
+        .0
+        .to_string();
+    let client = match app_server_client(&state, &profile_id).await {
+        Ok(client) => client,
+        Err(error) => {
+            warn!("failed to create app-server bridge for {profile_id}: {error:#}");
+            return;
+        }
+    };
+    let mut notifications = client.subscribe_notifications();
+
+    loop {
+        match notifications.recv().await {
+            Ok(notification) => {
+                if matches!(
+                    notification.method.as_str(),
+                    "account/updated" | "account/rateLimits/updated"
+                ) {
+                    state.quota_cache.lock().await.remove(&resolved_profile_id);
+                }
+
+                if let Some(event) = map_app_server_global_notification(&notification) {
+                    let _ = sender.send(event);
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    "global app-server relay lagged for {profile_id}: skipped {skipped} messages"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 async fn stream_session_events(
@@ -3150,12 +3200,90 @@ async fn codex_quota_status(state: &AppState, refresh: bool, profile_id: &str) -
     };
 
     let mut cache = state.quota_cache.lock().await;
-    cache.insert(profile_id.to_string(), CachedQuota {
-        created_at: Instant::now(),
-        payload: payload.clone(),
-    });
+    cache.insert(
+        profile_id.to_string(),
+        CachedQuota {
+            created_at: Instant::now(),
+            payload: payload.clone(),
+        },
+    );
 
     Ok(payload)
+}
+
+async fn get_account_state(state: &AppState, profile_id: &str) -> Result<Value> {
+    let client = app_server_client(state, profile_id).await?;
+    match client
+        .request("account/read", json!({ "refreshToken": false }))
+        .await
+    {
+        Ok(response) => Ok(json!({
+            "account": response.get("account").cloned().unwrap_or_else(|| json!({})),
+            "requiresOpenaiAuth": response
+                .get("requiresOpenaiAuth")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })),
+        Err(error) if is_invalid_refresh_token_error_message(&error.to_string()) => Ok(json!({
+            "account": {},
+            "requiresOpenaiAuth": true,
+        })),
+        Err(error) => Err(error),
+    }
+}
+
+async fn start_account_login(state: &AppState, profile_id: &str, params: &Value) -> Result<Value> {
+    let login_type = require_string(params, "type")?;
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    match login_type.as_str() {
+        "chatgpt" | "chatgptDeviceCode" => {}
+        "apiKey" => {
+            let api_key = params
+                .get("apiKey")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("API key is required."))?;
+            let client = app_server_client(state, profile_id).await?;
+            state.quota_cache.lock().await.remove(&resolved_profile_id);
+            return client
+                .request(
+                    "account/login/start",
+                    json!({ "type": login_type, "apiKey": api_key }),
+                )
+                .await;
+        }
+        _ => anyhow::bail!("Invalid account login type."),
+    }
+
+    let client = app_server_client(state, profile_id).await?;
+    state.quota_cache.lock().await.remove(&resolved_profile_id);
+    client
+        .request("account/login/start", json!({ "type": login_type }))
+        .await
+}
+
+async fn cancel_account_login(state: &AppState, profile_id: &str, params: &Value) -> Result<Value> {
+    let client = app_server_client(state, profile_id).await?;
+    client
+        .request(
+            "account/login/cancel",
+            json!({
+                "loginId": require_string(params, "loginId")?
+            }),
+        )
+        .await
+}
+
+async fn logout_account(state: &AppState, profile_id: &str) -> Result<Value> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let client = app_server_client(state, profile_id).await?;
+    state.quota_cache.lock().await.remove(&resolved_profile_id);
+    client.request("account/logout", json!({})).await
 }
 
 async fn fetch_codex_quota(state: &AppState, profile_id: &str) -> Result<Value> {
@@ -3255,18 +3383,81 @@ fn normalize_quota_window(window: Option<&UsageWindowShape>) -> Option<Value> {
     }))
 }
 
-fn resolve_runtime_profile<'a>(config: &'a Config, profile_id: &str) -> &'a RuntimeProfile {
+fn is_invalid_refresh_token_error_message(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("tokenrefreshfailed") || lowered.contains("invalid refresh token")
+}
+
+fn map_app_server_global_notification(notification: &AppServerNotification) -> Option<Value> {
+    match notification.method.as_str() {
+        "account/updated" => Some(json!({
+            "kind": "notification",
+            "method": "codex-webui/accountUpdated",
+            "params": notification.params
+        })),
+        "account/login/completed" => Some(json!({
+            "kind": "notification",
+            "method": "codex-webui/accountLoginCompleted",
+            "params": {
+                "loginId": notification
+                    .params
+                    .get("loginId")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "success": notification
+                    .params
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                "error": notification
+                    .params
+                    .get("error")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            }
+        })),
+        "account/rateLimits/updated" => Some(json!({
+            "kind": "notification",
+            "method": "codex-webui/accountRateLimitsUpdated",
+            "params": notification.params
+        })),
+        _ => None,
+    }
+}
+
+async fn app_server_client(state: &AppState, profile_id: &str) -> Result<AppServerClient> {
+    let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
+    Ok(state
+        .app_servers
+        .get_or_create(AppServerProfile {
+            id: resolved_profile_id.to_string(),
+            codex_home: profile.codex_home.clone(),
+        })
+        .await)
+}
+
+fn resolve_runtime_profile_entry<'a>(
+    config: &'a Config,
+    profile_id: &'a str,
+) -> (&'a str, &'a RuntimeProfile) {
+    if let Some(profile) = config.profiles.get(profile_id) {
+        return (profile_id, profile);
+    }
+
+    if let Some(profile) = config.profiles.get(&config.default_profile_id) {
+        return (config.default_profile_id.as_str(), profile);
+    }
+
     config
         .profiles
-        .get(profile_id)
-        .or_else(|| config.profiles.get(&config.default_profile_id))
-        .unwrap_or_else(|| {
-            config
-                .profiles
-                .values()
-                .next()
-                .expect("at least one runtime profile must exist")
-        })
+        .iter()
+        .next()
+        .map(|(resolved_profile_id, profile)| (resolved_profile_id.as_str(), profile))
+        .expect("at least one runtime profile must exist")
+}
+
+fn resolve_runtime_profile<'a>(config: &'a Config, profile_id: &'a str) -> &'a RuntimeProfile {
+    resolve_runtime_profile_entry(config, profile_id).1
 }
 
 async fn read_codex_version(state: &AppState) -> Result<String> {
@@ -4155,7 +4346,9 @@ fn resolve_project_root(cwd: &PathBuf) -> PathBuf {
     {
         if let Some(parent) = cwd.parent() {
             let parent = parent.to_path_buf();
-            if parent.join("build/internal/index.js").exists() || parent.join("svelte.config.js").exists() {
+            if parent.join("build/internal/index.js").exists()
+                || parent.join("svelte.config.js").exists()
+            {
                 return parent;
             }
         }
@@ -4227,7 +4420,10 @@ async fn wait_for_internal_node(
             .await
         {
             if response.status().is_success() || response.status().is_redirection() {
-                info!("Internal Node backend is ready at {}", config.internal_base_url);
+                info!(
+                    "Internal Node backend is ready at {}",
+                    config.internal_base_url
+                );
                 return Ok(());
             }
         }
@@ -4266,4 +4462,48 @@ enum NormalizedPath {
     Redirect(String),
     OutsideBase,
     Route(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AppServerNotification, is_invalid_refresh_token_error_message,
+        map_app_server_global_notification,
+    };
+    use serde_json::{Value, json};
+
+    #[test]
+    fn detects_invalid_refresh_token_errors() {
+        assert!(is_invalid_refresh_token_error_message(
+            "Auth(TokenRefreshFailed(\"Server returned error response: invalid_grant: Invalid refresh token\"))"
+        ));
+        assert!(!is_invalid_refresh_token_error_message(
+            "some other runtime failure"
+        ));
+    }
+
+    #[test]
+    fn maps_account_login_completed_notifications() {
+        let mapped = map_app_server_global_notification(&AppServerNotification {
+            method: "account/login/completed".to_string(),
+            params: json!({
+                "loginId": "login-1",
+                "success": true
+            }),
+        })
+        .expect("notification should map");
+
+        assert_eq!(
+            mapped,
+            json!({
+                "kind": "notification",
+                "method": "codex-webui/accountLoginCompleted",
+                "params": {
+                    "loginId": "login-1",
+                    "success": true,
+                    "error": Value::Null
+                }
+            })
+        );
+    }
 }

@@ -165,3 +165,82 @@ async fn manager_reuses_one_process_per_profile() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_supports_account_requests_and_notifications() -> Result<()> {
+    let codex_home = temp_dir("account-codex-home")?;
+    let client = AppServerClient::new(
+        AppServerProfile {
+            id: "default".to_string(),
+            codex_home,
+        },
+        test_client_config(),
+    );
+    let mut notifications = client.subscribe_notifications();
+
+    let account = client
+        .request("account/read", json!({ "refreshToken": false }))
+        .await?;
+    assert_eq!(
+        account,
+        json!({
+            "account": {
+                "type": "chatgpt",
+                "email": "demo@example.com",
+                "planType": "plus"
+            },
+            "requiresOpenaiAuth": false
+        })
+    );
+
+    let login = client
+        .request("account/login/start", json!({ "type": "chatgpt" }))
+        .await?;
+    assert_eq!(
+        login,
+        json!({
+            "type": "chatgpt",
+            "loginId": "login-chatgpt-1",
+            "authUrl": "https://example.com/auth"
+        })
+    );
+
+    let login_completed = recv_notification(&mut notifications, "account/login/completed").await?;
+    assert_eq!(
+        login_completed.params,
+        json!({
+            "loginId": "login-chatgpt-1",
+            "success": true,
+            "error": Value::Null
+        })
+    );
+
+    let account_updated = recv_notification(&mut notifications, "account/updated").await?;
+    assert_eq!(account_updated.params, json!({ "type": "chatgpt" }));
+
+    let rate_limits = recv_notification(&mut notifications, "account/rateLimits/updated").await?;
+    assert_eq!(rate_limits.params, json!({ "source": "fake" }));
+
+    let canceled = client
+        .request(
+            "account/login/cancel",
+            json!({ "loginId": "login-chatgpt-1" }),
+        )
+        .await?;
+    assert_eq!(
+        canceled,
+        json!({
+            "status": "canceled",
+            "loginId": "login-chatgpt-1"
+        })
+    );
+
+    let logout = client.request("account/logout", json!({})).await?;
+    assert_eq!(logout, json!({ "ok": true }));
+
+    let logout_updated = recv_notification(&mut notifications, "account/updated").await?;
+    assert_eq!(logout_updated.params, json!({ "type": Value::Null }));
+
+    client.close().await?;
+    Ok(())
+}

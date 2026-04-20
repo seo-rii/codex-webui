@@ -64,7 +64,9 @@ const CODEX_USAGE_USER_AGENT: &str = "codex_cli_rs/0.120.0 (Codex Web UI)";
 const NPM_VIEW_TIMEOUT: Duration = Duration::from_millis(2500);
 const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
+const CATALOG_CACHE_TTL: Duration = Duration::from_secs(10);
 const QUOTA_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+const DEFAULT_NOTIFICATION_LIMIT: usize = 80;
 const TERMINAL_BUFFER_LIMIT: usize = 500_000;
 const TERMINAL_RELAY_PREFIX: &str = "__terminal__:";
 const STATIC_BASE_PLACEHOLDER: &str = "/__CODEX_WEBUI_BASE__";
@@ -218,6 +220,7 @@ impl Config {
 #[derive(Clone, Debug)]
 struct RuntimeProfile {
     codex_home: PathBuf,
+    data_dir: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,10 +258,12 @@ struct AppState {
     login_attempts: Arc<Mutex<HashMap<String, Vec<u128>>>>,
     response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>,
     static_asset_cache: Arc<Mutex<HashMap<String, CachedStaticAsset>>>,
+    catalog_cache: Arc<Mutex<HashMap<String, CachedCatalog>>>,
     inflight_requests: Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<ServerEnvelope>>>>>,
     quota_cache: Arc<Mutex<HashMap<String, CachedQuota>>>,
     relays: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
     terminals: Arc<Mutex<HashMap<String, Arc<TerminalSession>>>>,
+    ui_state_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Clone)]
@@ -280,11 +285,19 @@ struct CachedStaticAsset {
     cache_control: &'static str,
 }
 
+#[derive(Clone)]
+struct CachedCatalog {
+    created_at: Instant,
+    payload: Value,
+}
+
 #[derive(Debug, Deserialize)]
 struct RuntimeProfileShape {
     id: Option<String>,
     #[serde(alias = "codex_home", alias = "codexHome")]
     codex_home: Option<String>,
+    #[serde(alias = "data_dir", alias = "dataDir")]
+    data_dir: Option<String>,
 }
 
 struct TerminalSession {
@@ -565,10 +578,12 @@ async fn main() -> Result<()> {
             login_attempts: Arc::new(Mutex::new(HashMap::new())),
             response_cache: Arc::new(Mutex::new(HashMap::new())),
             static_asset_cache: Arc::new(Mutex::new(HashMap::new())),
+            catalog_cache: Arc::new(Mutex::new(HashMap::new())),
             inflight_requests: Arc::new(Mutex::new(HashMap::new())),
             quota_cache: Arc::new(Mutex::new(HashMap::new())),
             relays: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),
+            ui_state_locks: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let router = Router::new()
@@ -638,6 +653,9 @@ impl Config {
         let allowed_roots = parse_allowed_roots(&project_root);
         let base_path = normalize_base_path(env::var("CODEX_WEBUI_BASE_PATH").ok());
         let static_dir = project_root.join("build/static");
+        let data_dir = env::var("CODEX_WEBUI_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| cwd.join(".data"));
         let public_host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let public_port = parse_port(env::var("PORT").ok(), 4173)?;
         let internal_port = parse_port(
@@ -660,16 +678,14 @@ impl Config {
         }
 
         let codex_home = resolve_codex_home()?;
-        let (default_profile_id, profiles) = parse_runtime_profiles(&codex_home)?;
+        let (default_profile_id, profiles) = parse_runtime_profiles(&codex_home, &data_dir)?;
 
         Ok(Self {
             project_root,
             allowed_roots,
             default_profile_id,
             profiles,
-            data_dir: env::var("CODEX_WEBUI_DATA_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| cwd.join(".data")),
+            data_dir,
             base_path,
             static_dir,
             public_host,
@@ -721,6 +737,7 @@ fn sanitize_profile_id(input: &str) -> String {
 
 fn parse_runtime_profiles(
     default_codex_home: &PathBuf,
+    root_data_dir: &PathBuf,
 ) -> Result<(String, HashMap<String, RuntimeProfile>)> {
     let default_profile_id = sanitize_profile_id(
         &env::var("CODEX_WEBUI_DEFAULT_PROFILE_ID").unwrap_or_else(|_| "default".to_string()),
@@ -733,6 +750,7 @@ fn parse_runtime_profiles(
             default_profile_id.clone(),
             RuntimeProfile {
                 codex_home: default_codex_home.clone(),
+                data_dir: root_data_dir.join("profiles").join(&default_profile_id),
             },
         );
         return Ok((default_profile_id, profiles));
@@ -752,6 +770,11 @@ fn parse_runtime_profiles(
                     .as_deref()
                     .map(PathBuf::from)
                     .unwrap_or_else(|| default_codex_home.clone()),
+                data_dir: entry
+                    .data_dir
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| root_data_dir.join("profiles").join(&id)),
             });
     }
 
@@ -760,6 +783,7 @@ fn parse_runtime_profiles(
             default_profile_id.clone(),
             RuntimeProfile {
                 codex_home: default_codex_home.clone(),
+                data_dir: root_data_dir.join("profiles").join(&default_profile_id),
             },
         );
     }
@@ -1069,6 +1093,1033 @@ async fn write_editable_file_payload(
     read_editable_file_payload(state, profile_id, &resolved_path.display().to_string()).await
 }
 
+fn default_notification_settings_value() -> Value {
+    json!({
+        "enabledEventTypes": [
+            "sessionCompleted",
+            "sessionAttention",
+            "queueDispatchFailed",
+            "shutdownScheduled"
+        ],
+        "slackWebhookUrl": Value::Null,
+        "webhookUrl": Value::Null
+    })
+}
+
+fn default_ui_state_value() -> Value {
+    json!({
+        "global": {
+            "shutdownAfterQueueCompletes": false,
+            "scheduledShutdown": Value::Null
+        },
+        "notifications": {
+            "items": [],
+            "settings": default_notification_settings_value()
+        },
+        "sessionMetaByThreadId": {},
+        "savedSessionFilters": [],
+        "promptPresets": [],
+        "automations": [],
+        "automationRuns": [],
+        "preferencesByThreadId": {},
+        "draftsByThreadId": {},
+        "queuesByThreadId": {},
+        "highlightsByThreadId": {}
+    })
+}
+
+fn ensure_ui_state_sections(ui_state: &mut Value) {
+    if !ui_state.is_object() {
+        *ui_state = default_ui_state_value();
+        return;
+    }
+
+    let Some(root) = ui_state.as_object_mut() else {
+        *ui_state = default_ui_state_value();
+        return;
+    };
+
+    if !root.get("global").is_some_and(Value::is_object) {
+        root.insert(
+            "global".to_string(),
+            json!({
+                "shutdownAfterQueueCompletes": false,
+                "scheduledShutdown": Value::Null
+            }),
+        );
+    }
+
+    if !root.get("notifications").is_some_and(Value::is_object) {
+        root.insert(
+            "notifications".to_string(),
+            json!({
+                "items": [],
+                "settings": default_notification_settings_value()
+            }),
+        );
+    }
+
+    if let Some(notifications) = root.get_mut("notifications").and_then(Value::as_object_mut) {
+        if !notifications.get("items").is_some_and(Value::is_array) {
+            notifications.insert("items".to_string(), json!([]));
+        }
+        let normalized_settings =
+            normalize_notification_settings_value(notifications.get("settings"));
+        notifications.insert("settings".to_string(), normalized_settings);
+    }
+
+    for (key, default_value) in [
+        ("sessionMetaByThreadId", json!({})),
+        ("savedSessionFilters", json!([])),
+        ("promptPresets", json!([])),
+        ("automations", json!([])),
+        ("automationRuns", json!([])),
+        ("preferencesByThreadId", json!({})),
+        ("draftsByThreadId", json!({})),
+        ("queuesByThreadId", json!({})),
+        ("highlightsByThreadId", json!({})),
+    ] {
+        let is_valid = if default_value.is_array() {
+            root.get(key).is_some_and(Value::is_array)
+        } else {
+            root.get(key).is_some_and(Value::is_object)
+        };
+        if !is_valid {
+            root.insert(key.to_string(), default_value);
+        }
+    }
+}
+
+fn is_valid_notification_event_type(value: &str) -> bool {
+    matches!(
+        value,
+        "sessionCompleted" | "sessionAttention" | "queueDispatchFailed" | "shutdownScheduled"
+    )
+}
+
+fn normalize_notification_settings_value(value: Option<&Value>) -> Value {
+    let enabled_event_types = value
+        .and_then(Value::as_object)
+        .and_then(|settings| settings.get("enabledEventTypes"))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|entry| is_valid_notification_event_type(entry))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            vec![
+                "sessionCompleted".to_string(),
+                "sessionAttention".to_string(),
+                "queueDispatchFailed".to_string(),
+                "shutdownScheduled".to_string(),
+            ]
+        });
+
+    let normalize_url = |candidate: Option<&Value>| {
+        candidate
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| Value::String(entry.to_string()))
+            .unwrap_or(Value::Null)
+    };
+
+    json!({
+        "enabledEventTypes": enabled_event_types,
+        "slackWebhookUrl": normalize_url(value.and_then(|settings| settings.get("slackWebhookUrl"))),
+        "webhookUrl": normalize_url(value.and_then(|settings| settings.get("webhookUrl")))
+    })
+}
+
+fn profile_ui_state_path(config: &Config, profile_id: &str) -> PathBuf {
+    resolve_runtime_profile(config, profile_id)
+        .data_dir
+        .join("ui-state.json")
+}
+
+async fn ui_state_lock(state: &AppState, profile_id: &str) -> Arc<Mutex<()>> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let mut locks = state.ui_state_locks.lock().await;
+    locks
+        .entry(resolved_profile_id)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+async fn read_profile_ui_state(config: &Config, profile_id: &str) -> Result<Value> {
+    let profile = resolve_runtime_profile(config, profile_id);
+    tokio_fs::create_dir_all(&profile.data_dir)
+        .await
+        .context("failed to create profile data directory")?;
+
+    let path = profile_ui_state_path(config, profile_id);
+    let raw = match tokio_fs::read_to_string(&path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(default_ui_state_value());
+        }
+        Err(error) => return Err(error).context("failed to read ui-state file"),
+    };
+
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(mut parsed) => {
+            ensure_ui_state_sections(&mut parsed);
+            Ok(parsed)
+        }
+        Err(_) => {
+            let backup_path = path.with_extension(format!("json.corrupt-{}", now_millis()));
+            let _ = tokio_fs::rename(&path, &backup_path).await;
+            let fallback = default_ui_state_value();
+            tokio_fs::write(
+                &path,
+                serde_json::to_vec_pretty(&fallback).expect("default ui-state should serialize"),
+            )
+            .await
+            .context("failed to recreate ui-state file after corruption")?;
+            Ok(fallback)
+        }
+    }
+}
+
+async fn write_profile_ui_state(config: &Config, profile_id: &str, ui_state: &Value) -> Result<()> {
+    let path = profile_ui_state_path(config, profile_id);
+    if let Some(parent) = path.parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .context("failed to create profile data directory")?;
+    }
+    let bytes = serde_json::to_vec_pretty(ui_state).context("failed to serialize ui-state")?;
+    tokio_fs::write(&path, bytes)
+        .await
+        .context("failed to write ui-state file")?;
+    Ok(())
+}
+
+async fn with_ui_state_read<R, F>(state: &AppState, profile_id: &str, reader: F) -> ApiResult<R>
+where
+    F: FnOnce(&Value) -> ApiResult<R>,
+{
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let lock = ui_state_lock(state, &resolved_profile_id).await;
+    let _guard = lock.lock().await;
+    let ui_state = read_profile_ui_state(&state.config, &resolved_profile_id)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    reader(&ui_state)
+}
+
+async fn with_ui_state_write<R, F>(state: &AppState, profile_id: &str, writer: F) -> ApiResult<R>
+where
+    F: FnOnce(&mut Value) -> ApiResult<R>,
+{
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let lock = ui_state_lock(state, &resolved_profile_id).await;
+    let _guard = lock.lock().await;
+    let mut ui_state = read_profile_ui_state(&state.config, &resolved_profile_id)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let result = writer(&mut ui_state)?;
+    write_profile_ui_state(&state.config, &resolved_profile_id, &ui_state)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(result)
+}
+
+fn ui_state_notification_items(ui_state: &Value) -> Vec<Value> {
+    ui_state
+        .get("notifications")
+        .and_then(|value| value.get("items"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn unread_notification_count(items: &[Value]) -> usize {
+    items
+        .iter()
+        .filter(|entry| entry.get("readAt").is_none_or(Value::is_null))
+        .count()
+}
+
+fn notifications_payload_from_items(mut items: Vec<Value>, limit: usize) -> Value {
+    items.sort_by(|left, right| {
+        let left_created = left.get("createdAt").and_then(Value::as_i64).unwrap_or(0);
+        let right_created = right.get("createdAt").and_then(Value::as_i64).unwrap_or(0);
+        right_created.cmp(&left_created)
+    });
+    let unread_count = unread_notification_count(&items);
+    let limited = items.into_iter().take(limit.max(1)).collect::<Vec<_>>();
+    json!({
+        "notifications": limited,
+        "unreadCount": unread_count
+    })
+}
+
+fn known_tags_from_ui_state(ui_state: &Value) -> Vec<String> {
+    let mut tags = ui_state
+        .get("sessionMetaByThreadId")
+        .and_then(Value::as_object)
+        .map(|entries| {
+            entries
+                .values()
+                .filter_map(Value::as_object)
+                .filter_map(|entry| entry.get("tags"))
+                .filter_map(Value::as_array)
+                .flat_map(|tags| tags.iter().filter_map(Value::as_str))
+                .filter(|tag| !tag.trim().is_empty())
+                .map(|tag| tag.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+async fn get_notifications_payload(
+    state: &AppState,
+    profile_id: &str,
+    limit: usize,
+) -> ApiResult<Value> {
+    with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(notifications_payload_from_items(
+            ui_state_notification_items(ui_state),
+            limit,
+        ))
+    })
+    .await
+}
+
+async fn mark_notifications_read_payload(
+    state: &AppState,
+    profile_id: &str,
+    ids: Option<Vec<String>>,
+) -> ApiResult<Value> {
+    let target_ids = ids.map(|items| {
+        items
+            .into_iter()
+            .filter_map(|item| {
+                let trimmed = item.trim().to_string();
+                (!trimmed.is_empty()).then_some(trimmed)
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let (payload, changed) = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(items) = ui_state
+            .get_mut("notifications")
+            .and_then(Value::as_object_mut)
+            .and_then(|value| value.get_mut("items"))
+            .and_then(Value::as_array_mut)
+        else {
+            return Ok((json!({ "notifications": [], "unreadCount": 0 }), false));
+        };
+
+        let targets = target_ids.as_ref().map(|entries| {
+            entries
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        });
+        let marked_at = now_unix_ms() as i64;
+        let mut changed = false;
+
+        for entry in items.iter_mut() {
+            let read_at = entry.get("readAt");
+            let entry_id = entry.get("id").and_then(Value::as_str);
+            let should_mark = read_at.is_none_or(Value::is_null)
+                && targets
+                    .as_ref()
+                    .is_none_or(|ids| entry_id.is_some_and(|candidate| ids.contains(candidate)));
+            if should_mark {
+                if let Some(object) = entry.as_object_mut() {
+                    object.insert("readAt".to_string(), json!(marked_at));
+                    changed = true;
+                }
+            }
+        }
+
+        Ok((
+            notifications_payload_from_items(items.clone(), DEFAULT_NOTIFICATION_LIMIT),
+            changed,
+        ))
+    })
+    .await?;
+
+    if changed {
+        emit_profile_global_notification(
+            state,
+            profile_id,
+            json!({
+                "kind": "notification",
+                "method": "codex-webui/notificationStateUpdated",
+                "params": {
+                    "unreadCount": payload.get("unreadCount").cloned().unwrap_or_else(|| json!(0))
+                }
+            }),
+        )
+        .await;
+        emit_profile_config_updated(
+            state,
+            profile_id,
+            json!({
+                "notifications": {
+                    "unreadCount": payload.get("unreadCount").cloned().unwrap_or_else(|| json!(0))
+                }
+            }),
+        )
+        .await;
+    }
+
+    Ok(payload)
+}
+
+async fn clear_notifications_payload(state: &AppState, profile_id: &str) -> ApiResult<Value> {
+    let (payload, changed) = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(items) = ui_state
+            .get_mut("notifications")
+            .and_then(Value::as_object_mut)
+            .and_then(|value| value.get_mut("items"))
+            .and_then(Value::as_array_mut)
+        else {
+            return Ok((json!({ "notifications": [], "unreadCount": 0 }), false));
+        };
+
+        let changed = !items.is_empty();
+        items.clear();
+        Ok((
+            notifications_payload_from_items(Vec::new(), DEFAULT_NOTIFICATION_LIMIT),
+            changed,
+        ))
+    })
+    .await?;
+
+    if changed {
+        emit_profile_global_notification(
+            state,
+            profile_id,
+            json!({
+                "kind": "notification",
+                "method": "codex-webui/notificationStateUpdated",
+                "params": {
+                    "unreadCount": 0
+                }
+            }),
+        )
+        .await;
+        emit_profile_config_updated(
+            state,
+            profile_id,
+            json!({
+                "notifications": {
+                    "unreadCount": 0
+                }
+            }),
+        )
+        .await;
+    }
+
+    Ok(payload)
+}
+
+async fn update_notification_settings_payload(
+    state: &AppState,
+    profile_id: &str,
+    patch: Value,
+) -> ApiResult<Value> {
+    let payload = with_ui_state_write(state, profile_id, |ui_state| {
+        let notifications = ui_state
+            .get_mut("notifications")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "notifications state is missing"))?;
+
+        let current_settings = notifications.get("settings");
+        let merged_settings = normalize_notification_settings_value(Some(&json!({
+            "enabledEventTypes": patch.get("enabledEventTypes").cloned().unwrap_or_else(|| {
+                current_settings
+                    .and_then(|value| value.get("enabledEventTypes"))
+                    .cloned()
+                    .unwrap_or_else(|| default_notification_settings_value()["enabledEventTypes"].clone())
+            }),
+            "slackWebhookUrl": patch.get("slackWebhookUrl").cloned().unwrap_or_else(|| {
+                current_settings
+                    .and_then(|value| value.get("slackWebhookUrl"))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            }),
+            "webhookUrl": patch.get("webhookUrl").cloned().unwrap_or_else(|| {
+                current_settings
+                    .and_then(|value| value.get("webhookUrl"))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            })
+        })));
+
+        notifications.insert("settings".to_string(), merged_settings.clone());
+        let unread_count = notifications
+            .get("items")
+            .and_then(Value::as_array)
+            .map(|items| unread_notification_count(items))
+            .unwrap_or(0);
+
+        Ok(json!({
+            "settings": merged_settings,
+            "unreadCount": unread_count
+        }))
+    })
+    .await?;
+
+    emit_profile_global_notification(
+        state,
+        profile_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/notificationSettingsUpdated",
+            "params": payload.clone()
+        }),
+    )
+    .await;
+    emit_profile_config_updated(
+        state,
+        profile_id,
+        json!({
+            "notifications": payload.clone()
+        }),
+    )
+    .await;
+
+    Ok(payload)
+}
+
+async fn save_session_filter_payload(
+    state: &AppState,
+    profile_id: &str,
+    filter: Value,
+) -> ApiResult<Value> {
+    let name = filter
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Filter name is required."))?;
+    let filter_id = filter
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "filter.id is required."))?;
+
+    let payload = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(saved_filters) = ui_state
+            .get_mut("savedSessionFilters")
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "saved filters state is missing",
+            ));
+        };
+
+        let normalized_tags = filter
+            .get("tags")
+            .and_then(Value::as_array)
+            .map(|tags| {
+                let mut values = tags
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                values.sort();
+                values.dedup();
+                values
+            })
+            .unwrap_or_default();
+
+        let highlight = match filter.get("highlight").and_then(Value::as_str) {
+            Some("attention") => "attention",
+            Some("completed") => "completed",
+            _ => "all",
+        };
+
+        let next_filter = json!({
+            "id": filter_id,
+            "name": name,
+            "pinnedOnly": filter.get("pinnedOnly").and_then(Value::as_bool).unwrap_or(false),
+            "runningOnly": filter.get("runningOnly").and_then(Value::as_bool).unwrap_or(false),
+            "queuedOnly": filter.get("queuedOnly").and_then(Value::as_bool).unwrap_or(false),
+            "highlight": highlight,
+            "tags": normalized_tags
+        });
+
+        let mut next_saved_filters = vec![next_filter];
+        next_saved_filters.extend(
+            saved_filters
+                .iter()
+                .filter(|entry| entry.get("id").and_then(Value::as_str) != Some(filter_id))
+                .cloned(),
+        );
+        next_saved_filters.truncate(40);
+        *saved_filters = next_saved_filters;
+
+        Ok(json!({
+            "savedFilters": saved_filters.clone(),
+            "knownTags": known_tags_from_ui_state(ui_state)
+        }))
+    })
+    .await?;
+
+    emit_profile_config_updated(
+        state,
+        profile_id,
+        json!({
+            "sessionOrganization": {
+                "savedFilters": payload.get("savedFilters").cloned().unwrap_or_else(|| json!([])),
+                "knownTags": payload.get("knownTags").cloned().unwrap_or_else(|| json!([]))
+            }
+        }),
+    )
+    .await;
+
+    Ok(payload)
+}
+
+async fn delete_session_filter_payload(
+    state: &AppState,
+    profile_id: &str,
+    filter_id: &str,
+) -> ApiResult<Value> {
+    let trimmed_filter_id = filter_id.trim();
+    let payload = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(saved_filters) = ui_state
+            .get_mut("savedSessionFilters")
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "saved filters state is missing",
+            ));
+        };
+
+        *saved_filters = saved_filters
+            .iter()
+            .filter(|entry| entry.get("id").and_then(Value::as_str) != Some(trimmed_filter_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "savedFilters": saved_filters.clone(),
+            "knownTags": known_tags_from_ui_state(ui_state)
+        }))
+    })
+    .await?;
+
+    emit_profile_config_updated(
+        state,
+        profile_id,
+        json!({
+            "sessionOrganization": {
+                "savedFilters": payload.get("savedFilters").cloned().unwrap_or_else(|| json!([])),
+                "knownTags": payload.get("knownTags").cloned().unwrap_or_else(|| json!([]))
+            }
+        }),
+    )
+    .await;
+
+    Ok(payload)
+}
+
+async fn save_prompt_preset_payload(
+    state: &AppState,
+    profile_id: &str,
+    preset: Value,
+) -> ApiResult<Value> {
+    let preset_id = preset
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "preset.id is required."))?;
+    let preset_name = preset
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Preset name is required."))?;
+    let preset_prompt = preset
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Preset prompt is required."))?;
+
+    let payload = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(prompt_presets) = ui_state
+            .get_mut("promptPresets")
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "prompt presets state is missing",
+            ));
+        };
+
+        let now = now_unix_ms() as i64;
+        let created_at = prompt_presets
+            .iter()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(preset_id))
+            .and_then(|entry| entry.get("createdAt").and_then(Value::as_i64))
+            .or_else(|| preset.get("createdAt").and_then(Value::as_i64))
+            .unwrap_or(now);
+
+        let next_preset = json!({
+            "id": preset_id,
+            "name": preset_name,
+            "prompt": preset_prompt,
+            "createdAt": created_at,
+            "updatedAt": now
+        });
+
+        let mut next_prompt_presets = vec![next_preset];
+        next_prompt_presets.extend(
+            prompt_presets
+                .iter()
+                .filter(|entry| entry.get("id").and_then(Value::as_str) != Some(preset_id))
+                .cloned(),
+        );
+        next_prompt_presets.truncate(80);
+        next_prompt_presets.sort_by(|left, right| {
+            let left_updated = left.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+            let right_updated = right.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+            right_updated.cmp(&left_updated)
+        });
+        *prompt_presets = next_prompt_presets;
+
+        Ok(json!({
+            "promptPresets": prompt_presets.clone()
+        }))
+    })
+    .await?;
+
+    emit_profile_config_updated(
+        state,
+        profile_id,
+        json!({
+            "promptPresets": payload.get("promptPresets").cloned().unwrap_or_else(|| json!([]))
+        }),
+    )
+    .await;
+
+    Ok(payload)
+}
+
+async fn delete_prompt_preset_payload(
+    state: &AppState,
+    profile_id: &str,
+    preset_id: &str,
+) -> ApiResult<Value> {
+    let trimmed_preset_id = preset_id.trim();
+    let payload = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(prompt_presets) = ui_state
+            .get_mut("promptPresets")
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "prompt presets state is missing",
+            ));
+        };
+
+        *prompt_presets = prompt_presets
+            .iter()
+            .filter(|entry| entry.get("id").and_then(Value::as_str) != Some(trimmed_preset_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        prompt_presets.sort_by(|left, right| {
+            let left_updated = left.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+            let right_updated = right.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+            right_updated.cmp(&left_updated)
+        });
+
+        Ok(json!({
+            "promptPresets": prompt_presets.clone()
+        }))
+    })
+    .await?;
+
+    emit_profile_config_updated(
+        state,
+        profile_id,
+        json!({
+            "promptPresets": payload.get("promptPresets").cloned().unwrap_or_else(|| json!([]))
+        }),
+    )
+    .await;
+
+    Ok(payload)
+}
+
+fn parse_front_matter(raw: &str) -> (Option<String>, Option<String>) {
+    let Some(stripped) = raw.strip_prefix("---\n") else {
+        return (None, None);
+    };
+    let Some((front_matter, _)) = stripped.split_once("\n---") else {
+        return (None, None);
+    };
+
+    let mut name = None;
+    let mut description = None;
+    for line in front_matter.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "name" if !value.is_empty() => name = Some(value.to_string()),
+            "description" if !value.is_empty() => description = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    (name, description)
+}
+
+fn walk_matching_files(root: &Path, matcher: &dyn Fn(&Path) -> bool, results: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_matching_files(&path, matcher, results);
+        } else if path.is_file() && matcher(&path) {
+            results.push(path);
+        }
+    }
+}
+
+fn build_catalog_payload_for_codex_home(codex_home: &Path) -> Value {
+    let skills_root = codex_home.join("skills");
+    let plugins_root = codex_home.join("plugins");
+
+    let mut skill_files = Vec::new();
+    let mut plugin_skill_files = Vec::new();
+    walk_matching_files(
+        &skills_root,
+        &|path| path.file_name().and_then(|value| value.to_str()) == Some("SKILL.md"),
+        &mut skill_files,
+    );
+    walk_matching_files(
+        &plugins_root,
+        &|path| path.file_name().and_then(|value| value.to_str()) == Some("SKILL.md"),
+        &mut plugin_skill_files,
+    );
+
+    let mut skills = skill_files
+        .into_iter()
+        .chain(plugin_skill_files)
+        .map(|path| {
+            let raw = fs::read_to_string(&path).unwrap_or_default();
+            let (name, description) = parse_front_matter(&raw);
+            let (normalized_relative, source, plugin_name) =
+                if let Ok(relative) = path.strip_prefix(&skills_root) {
+                    let relative_string = relative.to_string_lossy().replace('\\', "/");
+                    let source = if relative_string.starts_with(".system/") {
+                        "system"
+                    } else {
+                        "local"
+                    };
+                    (relative_string, source, Value::Null)
+                } else if let Ok(relative) = path.strip_prefix(&plugins_root) {
+                    let relative_string = relative.to_string_lossy().replace('\\', "/");
+                    let plugin_name = relative_string
+                        .split('/')
+                        .next()
+                        .filter(|value| !value.is_empty())
+                        .map(|value| Value::String(value.to_string()))
+                        .unwrap_or(Value::Null);
+                    let source = if relative_string.starts_with(".system/") {
+                        "system"
+                    } else {
+                        "plugin"
+                    };
+                    (relative_string, source, plugin_name)
+                } else {
+                    (
+                        path.file_name()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or("SKILL.md")
+                            .to_string(),
+                        "local",
+                        Value::Null,
+                    )
+                };
+
+            let skill_name = name
+                .or_else(|| {
+                    path.parent()
+                        .and_then(|parent| parent.file_name())
+                        .and_then(|value| value.to_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "Skill".to_string());
+
+            json!({
+                "id": normalized_relative.trim_end_matches("/SKILL.md"),
+                "name": skill_name,
+                "description": description.unwrap_or_default(),
+                "path": path.display().to_string(),
+                "source": source,
+                "pluginName": plugin_name
+            })
+        })
+        .collect::<Vec<_>>();
+
+    skills.sort_by(|left, right| {
+        left.get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                right
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+    });
+
+    let mut plugin_files = Vec::new();
+    walk_matching_files(
+        &plugins_root,
+        &|path| path.ends_with(Path::new(".codex-plugin").join("plugin.json")),
+        &mut plugin_files,
+    );
+
+    let mut plugins = plugin_files
+        .into_iter()
+        .map(|path| {
+            let raw = fs::read_to_string(&path).unwrap_or_else(|_| "{}".to_string());
+            let parsed: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+            let plugin_base = path
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| path.clone());
+            let interface = parsed.get("interface").cloned().unwrap_or_else(|| json!({}));
+            let skills_dir = parsed
+                .get("skills")
+                .and_then(Value::as_str)
+                .map(|value| plugin_base.join(value));
+            let mut plugin_skill_entries = Vec::new();
+            if let Some(skills_dir) = skills_dir {
+                walk_matching_files(
+                    &skills_dir,
+                    &|candidate| {
+                        candidate.file_name().and_then(|value| value.to_str()) == Some("SKILL.md")
+                    },
+                    &mut plugin_skill_entries,
+                );
+            }
+            plugin_skill_entries.sort();
+
+            let name = parsed
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    plugin_base
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "plugin".to_string());
+            let display_name = interface
+                .get("displayName")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| name.clone());
+
+            json!({
+                "name": name,
+                "displayName": display_name,
+                "description": parsed.get("description").and_then(Value::as_str).unwrap_or_default(),
+                "version": parsed.get("version").cloned().unwrap_or(Value::Null),
+                "developerName": interface.get("developerName").cloned().unwrap_or(Value::Null),
+                "category": interface.get("category").cloned().unwrap_or(Value::Null),
+                "path": plugin_base.display().to_string(),
+                "skills": plugin_skill_entries
+                    .iter()
+                    .filter_map(|skill_path| {
+                        skill_path
+                            .parent()
+                            .and_then(Path::file_name)
+                            .and_then(|value| value.to_str())
+                            .map(str::to_string)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    plugins.sort_by(|left, right| {
+        left.get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                right
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+    });
+
+    json!({
+        "plugins": plugins,
+        "skills": skills
+    })
+}
+
+async fn get_catalog_payload(state: &AppState, profile_id: &str) -> ApiResult<Value> {
+    let codex_home = resolve_runtime_profile(&state.config, profile_id)
+        .codex_home
+        .display()
+        .to_string();
+
+    if let Some(cached) = state.catalog_cache.lock().await.get(&codex_home).cloned() {
+        if cached.created_at.elapsed() < CATALOG_CACHE_TTL {
+            return Ok(cached.payload);
+        }
+    }
+
+    let codex_home_path = resolve_runtime_profile(&state.config, profile_id)
+        .codex_home
+        .clone();
+    let payload =
+        tokio::task::spawn_blocking(move || build_catalog_payload_for_codex_home(&codex_home_path))
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    state.catalog_cache.lock().await.insert(
+        codex_home,
+        CachedCatalog {
+            created_at: Instant::now(),
+            payload: payload.clone(),
+        },
+    );
+
+    Ok(payload)
+}
+
 async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Request) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
@@ -1135,7 +2186,16 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                 return response;
             }
 
-            if route_path == "/api/directories" || route_path == "/api/editor" {
+            if matches!(
+                route_path.as_str(),
+                "/api/directories"
+                    | "/api/editor"
+                    | "/api/catalog"
+                    | "/api/notifications"
+                    | "/api/notifications/settings"
+                    | "/api/session-filters"
+                    | "/api/prompt-presets"
+            ) {
                 let Some(auth) = auth_context(&state.config, &jar) else {
                     let mut response =
                         json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
@@ -1152,6 +2212,19 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                 let mut response = match route_path.as_str() {
                     "/api/directories" => handle_directories_api_http(state, request).await,
                     "/api/editor" => handle_editor_api_http(state, request, auth).await,
+                    "/api/catalog" => handle_catalog_api_http(state, request, auth).await,
+                    "/api/notifications" => {
+                        handle_notifications_api_http(state, request, auth).await
+                    }
+                    "/api/notifications/settings" => {
+                        handle_notification_settings_api_http(state, request, auth).await
+                    }
+                    "/api/session-filters" => {
+                        handle_session_filters_api_http(state, request, auth).await
+                    }
+                    "/api/prompt-presets" => {
+                        handle_prompt_presets_api_http(state, request, auth).await
+                    }
                     _ => unreachable!(),
                 };
                 if let Some(origin_value) = cors_origin {
@@ -1299,6 +2372,193 @@ async fn handle_editor_api_http(state: AppState, request: Request, auth: AuthCon
                     "Failed to read editor request body.",
                 )),
             }
+        }
+        _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_catalog_api_http(state: AppState, request: Request, auth: AuthContext) -> Response {
+    if request.method() != Method::GET {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+
+    match get_catalog_payload(&state, &auth.profile_id).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_notifications_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+) -> Response {
+    let result = match request.method() {
+        &Method::GET => {
+            let limit = query_param_value(request.uri().query(), "limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .map(|value| value.clamp(1, 200))
+                .unwrap_or(DEFAULT_NOTIFICATION_LIMIT);
+            get_notifications_payload(&state, &auth.profile_id, limit).await
+        }
+        &Method::PATCH => {
+            if auth.role != UserRole::Admin {
+                return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+            }
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .context("failed to read notifications request body");
+            match body {
+                Ok(body) => {
+                    let payload: Value =
+                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    let ids = payload.get("ids").and_then(Value::as_array).map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    });
+                    mark_notifications_read_payload(&state, &auth.profile_id, ids).await
+                }
+                Err(_) => Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Failed to read notifications request body.",
+                )),
+            }
+        }
+        &Method::DELETE => {
+            if auth.role != UserRole::Admin {
+                return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+            }
+            clear_notifications_payload(&state, &auth.profile_id).await
+        }
+        _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_notification_settings_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+) -> Response {
+    if request.method() != Method::PATCH {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+    if auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    let body = to_bytes(request.into_body(), usize::MAX)
+        .await
+        .context("failed to read notification settings request body");
+    let result = match body {
+        Ok(body) => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            update_notification_settings_payload(&state, &auth.profile_id, payload).await
+        }
+        Err(_) => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Failed to read notification settings request body.",
+        )),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_filters_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+) -> Response {
+    if auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    let result = match request.method() {
+        &Method::POST => {
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .context("failed to read session filters request body");
+            match body {
+                Ok(body) => {
+                    let payload: Value =
+                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    save_session_filter_payload(
+                        &state,
+                        &auth.profile_id,
+                        payload.get("filter").cloned().unwrap_or_else(|| json!({})),
+                    )
+                    .await
+                }
+                Err(_) => Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Failed to read session filters request body.",
+                )),
+            }
+        }
+        &Method::DELETE => {
+            let filter_id =
+                query_param_value(request.uri().query(), "filterId").unwrap_or_default();
+            delete_session_filter_payload(&state, &auth.profile_id, &filter_id).await
+        }
+        _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_prompt_presets_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+) -> Response {
+    if auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    let result = match request.method() {
+        &Method::POST => {
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .context("failed to read prompt presets request body");
+            match body {
+                Ok(body) => {
+                    let payload: Value =
+                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    save_prompt_preset_payload(
+                        &state,
+                        &auth.profile_id,
+                        payload.get("preset").cloned().unwrap_or_else(|| json!({})),
+                    )
+                    .await
+                }
+                Err(_) => Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Failed to read prompt presets request body.",
+                )),
+            }
+        }
+        &Method::DELETE => {
+            let preset_id =
+                query_param_value(request.uri().query(), "presetId").unwrap_or_default();
+            delete_prompt_preset_payload(&state, &auth.profile_id, &preset_id).await
         }
         _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
     };
@@ -2162,41 +3422,43 @@ async fn execute_ws_method(
             internal_json_request(state, Method::PATCH, "/api/config", Some(payload)).await
         }
         "notifications/list" => {
-            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(80);
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!("/api/notifications?limit={limit}"),
-                None,
-            )
-            .await
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|value| value.clamp(1, 200) as usize)
+                .unwrap_or(DEFAULT_NOTIFICATION_LIMIT);
+            get_notifications_payload(state, &auth.profile_id, limit)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "audit/list" => {
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(120) as usize;
             list_audit_log(&state.config, limit).await
         }
         "notifications/markRead" => {
-            let payload = json!({
-                "ids": params.get("ids").cloned().unwrap_or(Value::Null)
+            let ids = params.get("ids").and_then(Value::as_array).map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
             });
-            internal_json_request(state, Method::PATCH, "/api/notifications", Some(payload)).await
+            mark_notifications_read_payload(state, &auth.profile_id, ids)
+                .await
+                .map_err(anyhow::Error::from)
         }
-        "notifications/clear" => {
-            internal_json_request(state, Method::DELETE, "/api/notifications", None).await
-        }
+        "notifications/clear" => clear_notifications_payload(state, &auth.profile_id)
+            .await
+            .map_err(anyhow::Error::from),
         "notifications/settings/update" => {
             let payload = json!({
                 "enabledEventTypes": params.get("enabledEventTypes").cloned().unwrap_or(Value::Null),
                 "slackWebhookUrl": params.get("slackWebhookUrl").cloned().unwrap_or(Value::Null),
                 "webhookUrl": params.get("webhookUrl").cloned().unwrap_or(Value::Null)
             });
-            internal_json_request(
-                state,
-                Method::PATCH,
-                "/api/notifications/settings",
-                Some(payload),
-            )
-            .await
+            update_notification_settings_payload(state, &auth.profile_id, payload)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "automations/save" => {
             let payload = json!({
@@ -2240,7 +3502,9 @@ async fn execute_ws_method(
             )
             .await
         }
-        "catalog/get" => internal_json_request(state, Method::GET, "/api/catalog", None).await,
+        "catalog/get" => get_catalog_payload(state, &auth.profile_id)
+            .await
+            .map_err(anyhow::Error::from),
         "editor/file/get" => {
             let file_path = require_string(&params, "filePath")?;
             read_editable_file_payload(state, &auth.profile_id, &file_path)
@@ -2326,39 +3590,31 @@ async fn execute_ws_method(
             )
             .await
         }
-        "sessionFilters/save" => {
-            let payload = json!({
-                "filter": params.get("filter").cloned().unwrap_or(Value::Null)
-            });
-            internal_json_request(state, Method::POST, "/api/session-filters", Some(payload)).await
-        }
+        "sessionFilters/save" => save_session_filter_payload(
+            state,
+            &auth.profile_id,
+            params.get("filter").cloned().unwrap_or(Value::Null),
+        )
+        .await
+        .map_err(anyhow::Error::from),
         "sessionFilters/delete" => {
             let filter_id = require_string(&params, "filterId")?;
-            let filter_id = urlencoding::encode(&filter_id);
-            internal_json_request(
-                state,
-                Method::DELETE,
-                &format!("/api/session-filters?filterId={filter_id}"),
-                None,
-            )
-            .await
+            delete_session_filter_payload(state, &auth.profile_id, &filter_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
-        "promptPresets/save" => {
-            let payload = json!({
-                "preset": params.get("preset").cloned().unwrap_or(Value::Null)
-            });
-            internal_json_request(state, Method::POST, "/api/prompt-presets", Some(payload)).await
-        }
+        "promptPresets/save" => save_prompt_preset_payload(
+            state,
+            &auth.profile_id,
+            params.get("preset").cloned().unwrap_or(Value::Null),
+        )
+        .await
+        .map_err(anyhow::Error::from),
         "promptPresets/delete" => {
             let preset_id = require_string(&params, "presetId")?;
-            let preset_id = urlencoding::encode(&preset_id);
-            internal_json_request(
-                state,
-                Method::DELETE,
-                &format!("/api/prompt-presets?presetId={preset_id}"),
-                None,
-            )
-            .await
+            delete_prompt_preset_payload(state, &auth.profile_id, &preset_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "session/get" => {
             let session_id = require_string(&params, "sessionId")?;
@@ -3356,14 +4612,43 @@ async fn list_terminal_summaries(state: &AppState) -> Vec<TerminalSummaryState> 
 }
 
 async fn emit_global_notification(state: &AppState, event: Value) {
+    let relays = {
+        let relays = state.relays.lock().await;
+        relays
+            .iter()
+            .filter(|(key, _)| key.contains(GLOBAL_RELAY_KEY))
+            .map(|(_, relay)| relay.clone())
+            .collect::<Vec<_>>()
+    };
+
+    for relay in relays {
+        let _ = relay.send(event.clone());
+    }
+}
+
+async fn emit_profile_global_notification(state: &AppState, profile_id: &str, event: Value) {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
     let relay = {
         let relays = state.relays.lock().await;
-        relays.get(GLOBAL_RELAY_KEY).cloned()
+        relays.get(&global_relay_key(resolved_profile_id)).cloned()
     };
 
     if let Some(relay) = relay {
         let _ = relay.send(event);
     }
+}
+
+async fn emit_profile_config_updated(state: &AppState, profile_id: &str, params: Value) {
+    emit_profile_global_notification(
+        state,
+        profile_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/configUpdated",
+            "params": params
+        }),
+    )
+    .await;
 }
 
 async fn emit_terminals_updated(state: &AppState) {
@@ -4976,8 +6261,18 @@ mod tests {
         codex_home: PathBuf,
     ) -> AppState {
         let profile_id = "default".to_string();
+        let profile_data_dir = project_root
+            .join(".data")
+            .join("profiles")
+            .join(&profile_id);
         let mut profiles = HashMap::new();
-        profiles.insert(profile_id.clone(), RuntimeProfile { codex_home });
+        profiles.insert(
+            profile_id.clone(),
+            RuntimeProfile {
+                codex_home,
+                data_dir: profile_data_dir,
+            },
+        );
 
         AppState {
             config: Arc::new(Config {
@@ -5012,10 +6307,12 @@ mod tests {
             login_attempts: Arc::new(Mutex::new(HashMap::new())),
             response_cache: Arc::new(Mutex::new(HashMap::new())),
             static_asset_cache: Arc::new(Mutex::new(HashMap::new())),
+            catalog_cache: Arc::new(Mutex::new(HashMap::new())),
             inflight_requests: Arc::new(Mutex::new(HashMap::new())),
             quota_cache: Arc::new(Mutex::new(HashMap::new())),
             relays: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),
+            ui_state_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -5139,6 +6436,349 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::FORBIDDEN);
         assert_eq!(error.message, "This file is outside editable roots.");
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test]
+    async fn notification_helpers_update_ui_state_and_counts() {
+        let sandbox = unique_test_dir("notifications");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state = test_state(workspace.clone(), vec![workspace], codex_home);
+        let ui_state_path = profile_ui_state_path(&state.config, "default");
+        fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+        fs::write(
+            &ui_state_path,
+            serde_json::to_vec_pretty(&json!({
+                "global": {
+                    "shutdownAfterQueueCompletes": false,
+                    "scheduledShutdown": Value::Null
+                },
+                "notifications": {
+                    "items": [
+                        {
+                            "id": "n1",
+                            "type": "sessionCompleted",
+                            "createdAt": 20,
+                            "readAt": Value::Null,
+                            "sessionId": "s1",
+                            "sessionName": "One",
+                            "payload": {}
+                        },
+                        {
+                            "id": "n2",
+                            "type": "sessionAttention",
+                            "createdAt": 10,
+                            "readAt": Value::Null,
+                            "sessionId": "s2",
+                            "sessionName": "Two",
+                            "payload": {}
+                        }
+                    ],
+                    "settings": {
+                        "enabledEventTypes": ["sessionCompleted"],
+                        "slackWebhookUrl": "",
+                        "webhookUrl": Value::Null
+                    }
+                },
+                "sessionMetaByThreadId": {},
+                "savedSessionFilters": [],
+                "promptPresets": [],
+                "automations": [],
+                "automationRuns": [],
+                "preferencesByThreadId": {},
+                "draftsByThreadId": {},
+                "queuesByThreadId": {},
+                "highlightsByThreadId": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let listed = get_notifications_payload(&state, "default", 80)
+            .await
+            .unwrap();
+        assert_eq!(listed.get("unreadCount").and_then(Value::as_u64), Some(2));
+
+        let marked =
+            mark_notifications_read_payload(&state, "default", Some(vec!["n1".to_string()]))
+                .await
+                .unwrap();
+        assert_eq!(marked.get("unreadCount").and_then(Value::as_u64), Some(1));
+
+        let settings = update_notification_settings_payload(
+            &state,
+            "default",
+            json!({
+                "enabledEventTypes": ["sessionAttention", "invalid"],
+                "slackWebhookUrl": " https://hooks.slack.test/one ",
+                "webhookUrl": ""
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            settings
+                .get("settings")
+                .and_then(|value| value.get("enabledEventTypes"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            vec![json!("sessionAttention")]
+        );
+        assert_eq!(
+            settings
+                .get("settings")
+                .and_then(|value| value.get("slackWebhookUrl"))
+                .and_then(Value::as_str),
+            Some("https://hooks.slack.test/one")
+        );
+        assert!(
+            settings
+                .get("settings")
+                .and_then(|value| value.get("webhookUrl"))
+                .is_some_and(Value::is_null)
+        );
+
+        let cleared = clear_notifications_payload(&state, "default")
+            .await
+            .unwrap();
+        assert_eq!(cleared.get("unreadCount").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            cleared
+                .get("notifications")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test]
+    async fn saves_filters_and_prompt_presets_with_normalization() {
+        let sandbox = unique_test_dir("ui-state-saves");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state = test_state(workspace.clone(), vec![workspace], codex_home);
+        let ui_state_path = profile_ui_state_path(&state.config, "default");
+        fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+        fs::write(
+            &ui_state_path,
+            serde_json::to_vec_pretty(&json!({
+                "global": {
+                    "shutdownAfterQueueCompletes": false,
+                    "scheduledShutdown": Value::Null
+                },
+                "notifications": {
+                    "items": [],
+                    "settings": default_notification_settings_value()
+                },
+                "sessionMetaByThreadId": {
+                    "thread-1": {
+                        "pinned": true,
+                        "tags": ["alpha", "beta"]
+                    }
+                },
+                "savedSessionFilters": [],
+                "promptPresets": [],
+                "automations": [],
+                "automationRuns": [],
+                "preferencesByThreadId": {},
+                "draftsByThreadId": {},
+                "queuesByThreadId": {},
+                "highlightsByThreadId": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let filters = save_session_filter_payload(
+            &state,
+            "default",
+            json!({
+                "id": "filter-1",
+                "name": "  Important  ",
+                "pinnedOnly": true,
+                "runningOnly": false,
+                "queuedOnly": true,
+                "highlight": "completed",
+                "tags": ["beta", "alpha", "beta", ""]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            filters
+                .get("savedFilters")
+                .and_then(Value::as_array)
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry.get("name"))
+                .and_then(Value::as_str),
+            Some("Important")
+        );
+        assert_eq!(
+            filters
+                .get("savedFilters")
+                .and_then(Value::as_array)
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry.get("tags"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            vec![json!("alpha"), json!("beta")]
+        );
+        assert_eq!(
+            filters
+                .get("knownTags")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            vec![json!("alpha"), json!("beta")]
+        );
+
+        let presets = save_prompt_preset_payload(
+            &state,
+            "default",
+            json!({
+                "id": "preset-1",
+                "name": "  Draft reply  ",
+                "prompt": "Use the existing repo style.",
+                "createdAt": 5
+            }),
+        )
+        .await
+        .unwrap();
+        let first_preset = presets
+            .get("promptPresets")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.first())
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            first_preset.get("name").and_then(Value::as_str),
+            Some("Draft reply")
+        );
+        assert_eq!(
+            first_preset.get("createdAt").and_then(Value::as_i64),
+            Some(5)
+        );
+        assert!(
+            first_preset
+                .get("updatedAt")
+                .and_then(Value::as_i64)
+                .is_some_and(|value| value >= 5)
+        );
+
+        let deleted_filters = delete_session_filter_payload(&state, "default", "filter-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted_filters
+                .get("savedFilters")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+
+        let deleted_presets = delete_prompt_preset_payload(&state, "default", "preset-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted_presets
+                .get("promptPresets")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[test]
+    fn catalog_builder_discovers_plugins_and_skills() {
+        let sandbox = unique_test_dir("catalog");
+        let codex_home = sandbox.join(".codex");
+        let local_skill_dir = codex_home.join("skills").join("my-skill");
+        let system_skill_dir = codex_home.join("skills").join(".system").join("sys-skill");
+        let plugin_base = codex_home.join("plugins").join("sample-plugin");
+        let plugin_skill_dir = plugin_base.join("skills").join("plugin-skill");
+
+        fs::create_dir_all(&local_skill_dir).unwrap();
+        fs::create_dir_all(&system_skill_dir).unwrap();
+        fs::create_dir_all(plugin_base.join(".codex-plugin")).unwrap();
+        fs::create_dir_all(&plugin_skill_dir).unwrap();
+
+        fs::write(
+            local_skill_dir.join("SKILL.md"),
+            "---\nname: Local Skill\ndescription: Local description\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            system_skill_dir.join("SKILL.md"),
+            "---\nname: System Skill\ndescription: System description\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_skill_dir.join("SKILL.md"),
+            "---\nname: Plugin Skill\ndescription: Plugin description\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_base.join(".codex-plugin").join("plugin.json"),
+            serde_json::to_vec_pretty(&json!({
+                "name": "sample-plugin",
+                "description": "Plugin description",
+                "version": "1.2.3",
+                "skills": "skills",
+                "interface": {
+                    "displayName": "Sample Plugin",
+                    "developerName": "Codex Web UI",
+                    "category": "tools"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let payload = build_catalog_payload_for_codex_home(&codex_home);
+        let skills = payload
+            .get("skills")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap();
+        let plugins = payload
+            .get("plugins")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap();
+
+        assert!(skills.iter().any(|entry| {
+            entry.get("name").and_then(Value::as_str) == Some("Local Skill")
+                && entry.get("source").and_then(Value::as_str) == Some("local")
+        }));
+        assert!(skills.iter().any(|entry| {
+            entry.get("name").and_then(Value::as_str) == Some("System Skill")
+                && entry.get("source").and_then(Value::as_str) == Some("system")
+        }));
+        assert!(skills.iter().any(|entry| {
+            entry.get("name").and_then(Value::as_str) == Some("Plugin Skill")
+                && entry.get("pluginName").and_then(Value::as_str) == Some("sample-plugin")
+        }));
+        assert!(plugins.iter().any(|entry| {
+            entry.get("displayName").and_then(Value::as_str) == Some("Sample Plugin")
+                && entry
+                    .get("skills")
+                    .and_then(Value::as_array)
+                    .is_some_and(|skills| skills.contains(&json!("plugin-skill")))
+        }));
 
         let _ = fs::remove_dir_all(sandbox);
     }

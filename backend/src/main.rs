@@ -169,6 +169,7 @@ fn install_panic_logger(config: Arc<Config>) {
 #[derive(Clone, Debug)]
 struct Config {
     project_root: PathBuf,
+    allowed_roots: Vec<PathBuf>,
     default_profile_id: String,
     profiles: HashMap<String, RuntimeProfile>,
     data_dir: PathBuf,
@@ -415,6 +416,58 @@ struct AuditLogEntry {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct DirectoryEntryPayload {
+    name: String,
+    path: String,
+    #[serde(rename = "isDirectory")]
+    is_directory: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DirectoryPayload {
+    #[serde(rename = "allowedRoots")]
+    allowed_roots: Vec<DirectoryEntryPayload>,
+    #[serde(rename = "currentPath")]
+    current_path: Option<String>,
+    #[serde(rename = "parentPath")]
+    parent_path: Option<String>,
+    entries: Vec<DirectoryEntryPayload>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct EditableFilePayload {
+    path: String,
+    #[serde(rename = "displayName")]
+    display_name: String,
+    content: String,
+    language: String,
+    writable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+type ApiResult<T> = std::result::Result<T, ApiError>;
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
+    ApiError {
+        status,
+        message: message.into(),
+    }
+}
+
 impl TerminalSession {
     async fn summary(&self) -> TerminalSummaryState {
         self.summary.lock().await.clone()
@@ -582,6 +635,7 @@ impl Config {
         let cwd = env::current_dir().context("failed to read current directory")?;
         load_dotenv(&cwd);
         let project_root = resolve_project_root(&cwd);
+        let allowed_roots = parse_allowed_roots(&project_root);
         let base_path = normalize_base_path(env::var("CODEX_WEBUI_BASE_PATH").ok());
         let static_dir = project_root.join("build/static");
         let public_host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -610,6 +664,7 @@ impl Config {
 
         Ok(Self {
             project_root,
+            allowed_roots,
             default_profile_id,
             profiles,
             data_dir: env::var("CODEX_WEBUI_DATA_DIR")
@@ -722,6 +777,298 @@ fn parse_runtime_profiles(
     Ok((resolved_default_profile_id, profiles))
 }
 
+fn parse_allowed_roots(project_root: &Path) -> Vec<PathBuf> {
+    let mut roots = env::var_os("CODEX_WEBUI_ALLOWED_ROOTS")
+        .map(|value| {
+            env::split_paths(&value)
+                .map(|entry| {
+                    normalize_path(if entry.is_absolute() {
+                        entry
+                    } else {
+                        project_root.join(entry)
+                    })
+                })
+                .filter(|entry| !entry.as_os_str().is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            let fallback = project_root
+                .parent()
+                .filter(|parent| *parent != project_root)
+                .unwrap_or(project_root);
+            vec![fallback.to_path_buf()]
+        });
+
+    roots.dedup();
+    roots
+}
+
+fn normalize_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(value) => normalized.push(value.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    normalized
+}
+
+fn resolve_input_path(project_root: &Path, input: &str) -> PathBuf {
+    let candidate = PathBuf::from(input);
+    normalize_path(if candidate.is_absolute() {
+        candidate
+    } else {
+        project_root.join(candidate)
+    })
+}
+
+async fn real_path_safe(target: &Path) -> PathBuf {
+    tokio_fs::canonicalize(target)
+        .await
+        .unwrap_or_else(|_| target.to_path_buf())
+}
+
+async fn resolved_allowed_roots(config: &Config) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(config.allowed_roots.len());
+    for root in &config.allowed_roots {
+        roots.push(real_path_safe(root).await);
+    }
+    roots
+}
+
+fn path_is_within(root: &Path, candidate: &Path) -> bool {
+    candidate == root || candidate.starts_with(root)
+}
+
+fn directory_entry_payload(path: &Path) -> DirectoryEntryPayload {
+    DirectoryEntryPayload {
+        name: path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| path.display().to_string()),
+        path: path.display().to_string(),
+        is_directory: true,
+    }
+}
+
+fn infer_editor_language(file_path: &Path) -> String {
+    match file_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("ts" | "tsx") => "typescript",
+        Some("js" | "mjs" | "cjs" | "jsx") => "javascript",
+        Some("json") => "json",
+        Some("toml") => "ini",
+        Some("md") => "markdown",
+        Some("yml" | "yaml") => "yaml",
+        Some("svelte") => "html",
+        Some("rs") => "rust",
+        Some("py") => "python",
+        Some("css") => "css",
+        Some("sh") => "shell",
+        _ => "plaintext",
+    }
+    .to_string()
+}
+
+fn query_param_value(query: Option<&str>, key: &str) -> Option<String> {
+    query?.split('&').find_map(|entry| {
+        let (raw_key, raw_value) = entry.split_once('=').unwrap_or((entry, ""));
+        if raw_key != key {
+            return None;
+        }
+        let decoded = raw_value.replace('+', "%20");
+        urlencoding::decode(&decoded)
+            .ok()
+            .map(|value| value.into_owned())
+    })
+}
+
+async fn list_directories_payload(
+    state: &AppState,
+    current_path: Option<&str>,
+) -> ApiResult<Value> {
+    let resolved_roots = resolved_allowed_roots(&state.config).await;
+    let root_entries = resolved_roots
+        .iter()
+        .map(|root| directory_entry_payload(root))
+        .collect::<Vec<_>>();
+
+    let Some(current_path) = current_path.filter(|value| !value.trim().is_empty()) else {
+        return Ok(serde_json::to_value(DirectoryPayload {
+            allowed_roots: root_entries.clone(),
+            current_path: None,
+            parent_path: None,
+            entries: root_entries,
+        })
+        .expect("directory payload should serialize"));
+    };
+
+    let candidate = resolve_input_path(&state.config.project_root, current_path);
+    let resolved = real_path_safe(&candidate).await;
+    if !resolved_roots
+        .iter()
+        .any(|root| path_is_within(root, &resolved))
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "The selected path is outside the allowed roots.",
+        ));
+    }
+
+    let metadata = tokio_fs::metadata(&resolved).await.map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "The selected path is not a directory.",
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "The selected path is not a directory.",
+        ));
+    }
+
+    let mut reader = tokio_fs::read_dir(&resolved).await.map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to read directory.",
+        )
+    })?;
+    let mut entries = Vec::new();
+    while let Some(entry) = reader.next_entry().await.map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to read directory.",
+        )
+    })? {
+        let file_type = entry.file_type().await.map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to inspect directory entry.",
+            )
+        })?;
+        if file_type.is_dir() {
+            entries.push(directory_entry_payload(&entry.path()));
+        }
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let parent_path = if resolved_roots.iter().any(|root| root == &resolved) {
+        None
+    } else {
+        resolved.parent().map(|parent| parent.display().to_string())
+    };
+
+    Ok(serde_json::to_value(DirectoryPayload {
+        allowed_roots: root_entries,
+        current_path: Some(resolved.display().to_string()),
+        parent_path,
+        entries,
+    })
+    .expect("directory payload should serialize"))
+}
+
+async fn resolve_editable_file_path(
+    state: &AppState,
+    profile_id: &str,
+    file_path: &str,
+) -> ApiResult<PathBuf> {
+    if file_path.trim().is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "filePath is required."));
+    }
+
+    let candidate = resolve_input_path(&state.config.project_root, file_path);
+    let existing = tokio_fs::canonicalize(&candidate).await.ok();
+    let path_to_check = existing.unwrap_or_else(|| candidate.clone());
+
+    let mut roots = resolved_allowed_roots(&state.config).await;
+    let profile_root =
+        real_path_safe(&resolve_runtime_profile(&state.config, profile_id).codex_home).await;
+    roots.push(profile_root);
+
+    if !roots
+        .iter()
+        .any(|root| path_is_within(root, &path_to_check))
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "This file is outside editable roots.",
+        ));
+    }
+
+    Ok(candidate)
+}
+
+async fn read_editable_file_payload(
+    state: &AppState,
+    profile_id: &str,
+    file_path: &str,
+) -> ApiResult<Value> {
+    let resolved_path = resolve_editable_file_path(state, profile_id, file_path).await?;
+    let content = match tokio_fs::read_to_string(&resolved_path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to read the selected file.",
+            ));
+        }
+    };
+
+    Ok(serde_json::to_value(EditableFilePayload {
+        path: resolved_path.display().to_string(),
+        display_name: resolved_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| resolved_path.display().to_string()),
+        content,
+        language: infer_editor_language(&resolved_path),
+        writable: true,
+    })
+    .expect("editable file payload should serialize"))
+}
+
+async fn write_editable_file_payload(
+    state: &AppState,
+    profile_id: &str,
+    file_path: &str,
+    content: &str,
+) -> ApiResult<Value> {
+    let resolved_path = resolve_editable_file_path(state, profile_id, file_path).await?;
+    if let Some(parent) = resolved_path.parent() {
+        tokio_fs::create_dir_all(parent).await.map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to create parent directories for the file.",
+            )
+        })?;
+    }
+    tokio_fs::write(&resolved_path, content)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to write the selected file.",
+            )
+        })?;
+    read_editable_file_payload(state, profile_id, &resolved_path.display().to_string()).await
+}
+
 async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Request) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
@@ -778,6 +1125,35 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
 
                 let mut response =
                     handle_account_api_http(state, method, route_path, request, auth).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path == "/api/directories" || route_path == "/api/editor" {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+
+                let mut response = match route_path.as_str() {
+                    "/api/directories" => handle_directories_api_http(state, request).await,
+                    "/api/editor" => handle_editor_api_http(state, request, auth).await,
+                    _ => unreachable!(),
+                };
                 if let Some(origin_value) = cors_origin {
                     apply_cors_headers(
                         response.headers_mut(),
@@ -873,6 +1249,63 @@ async fn handle_account_api_http(
             };
             json_error(status, &message)
         }
+    }
+}
+
+async fn handle_directories_api_http(state: AppState, request: Request) -> Response {
+    if request.method() != Method::GET {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+
+    let current_path = query_param_value(request.uri().query(), "path");
+    match list_directories_payload(&state, current_path.as_deref()).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_editor_api_http(state: AppState, request: Request, auth: AuthContext) -> Response {
+    let method = request.method().clone();
+    let result = match method {
+        Method::GET => {
+            let file_path =
+                query_param_value(request.uri().query(), "filePath").unwrap_or_default();
+            read_editable_file_payload(&state, &auth.profile_id, &file_path).await
+        }
+        Method::PUT => {
+            if auth.role != UserRole::Admin {
+                return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+            }
+
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .context("failed to read editor request body");
+            match body {
+                Ok(body) => {
+                    let payload: Value =
+                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    let file_path = payload
+                        .get("filePath")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let content = payload
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    write_editable_file_payload(&state, &auth.profile_id, file_path, content).await
+                }
+                Err(_) => Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Failed to read editor request body.",
+                )),
+            }
+        }
+        _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
     }
 }
 
@@ -1809,22 +2242,21 @@ async fn execute_ws_method(
         }
         "catalog/get" => internal_json_request(state, Method::GET, "/api/catalog", None).await,
         "editor/file/get" => {
-            let file_path_raw = require_string(&params, "filePath")?;
-            let file_path = urlencoding::encode(&file_path_raw);
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!("/api/editor?filePath={file_path}"),
-                None,
-            )
-            .await
+            let file_path = require_string(&params, "filePath")?;
+            read_editable_file_payload(state, &auth.profile_id, &file_path)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "editor/file/save" => {
-            let payload = json!({
-                "filePath": require_string(&params, "filePath")?,
-                "content": params.get("content").cloned().unwrap_or_else(|| Value::String(String::new()))
-            });
-            internal_json_request(state, Method::PUT, "/api/editor", Some(payload)).await
+            let file_path = require_string(&params, "filePath")?;
+            let content = params
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            write_editable_file_payload(state, &auth.profile_id, &file_path, &content)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "runtime/install" => install_or_update_codex(state, true).await,
         "runtime/update" => install_or_update_codex(state, false).await,
@@ -2227,13 +2659,10 @@ async fn execute_ws_method(
             .await
         }
         "directories/browse" => {
-            let path_value = params
-                .get("currentPath")
-                .and_then(Value::as_str)
-                .map(urlencoding::encode)
-                .map(|encoded| format!("/api/directories?path={encoded}"))
-                .unwrap_or_else(|| "/api/directories".to_string());
-            internal_json_request(state, Method::GET, &path_value, None).await
+            let current_path = params.get("currentPath").and_then(Value::as_str);
+            list_directories_payload(state, current_path)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "attachments/upload" => {
             let session_id = require_string(&params, "sessionId")?;
@@ -2977,25 +3406,10 @@ async fn validate_terminal_cwd(state: &AppState, requested_cwd: Option<String>) 
         anyhow::bail!("terminal working directory must be a directory.");
     }
 
-    let config = internal_json_request(state, Method::GET, "/api/config", None).await?;
-    let allowed_roots = config
-        .get("allowedRoots")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|entry| {
-            entry
-                .get("path")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect::<Vec<_>>();
-
-    let allowed = allowed_roots.iter().any(|root| {
-        let root_path = PathBuf::from(root);
-        resolved == root_path || resolved.starts_with(&root_path)
-    });
+    let allowed_roots = resolved_allowed_roots(&state.config).await;
+    let allowed = allowed_roots
+        .iter()
+        .any(|root| path_is_within(root, &resolved));
 
     if !allowed {
         anyhow::bail!("terminal working directory must stay within allowed roots.");
@@ -4548,11 +4962,62 @@ enum NormalizedPath {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AppServerNotification, is_invalid_refresh_token_error_message,
-        map_app_server_global_notification,
-    };
+    use super::*;
     use serde_json::{Value, json};
+    use std::{collections::HashMap, sync::Arc};
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("codex-webui-{label}-{}", Uuid::new_v4()))
+    }
+
+    fn test_state(
+        project_root: PathBuf,
+        allowed_roots: Vec<PathBuf>,
+        codex_home: PathBuf,
+    ) -> AppState {
+        let profile_id = "default".to_string();
+        let mut profiles = HashMap::new();
+        profiles.insert(profile_id.clone(), RuntimeProfile { codex_home });
+
+        AppState {
+            config: Arc::new(Config {
+                project_root: project_root.clone(),
+                allowed_roots,
+                default_profile_id: profile_id,
+                profiles,
+                data_dir: project_root.join(".data"),
+                base_path: String::new(),
+                static_dir: project_root.join("static"),
+                public_host: "127.0.0.1".to_string(),
+                public_port: 4173,
+                internal_port: 4174,
+                internal_proxy_token: "test-token".to_string(),
+                internal_base_url: "http://127.0.0.1:4174".to_string(),
+                node_entry: project_root.join("node-entry.js"),
+                node_binary: "node".to_string(),
+                codex_bin: "codex".to_string(),
+                password: None,
+                password_hash: None,
+                viewer_password: None,
+                viewer_password_hash: None,
+                hcaptcha_site_key: None,
+                hcaptcha_secret_key: None,
+                session_secret: None,
+                cookie_same_site: SameSiteMode::Strict,
+                cookie_secure_mode: CookieSecureMode::Auto,
+                cors_allowed_origins: Vec::new(),
+            }),
+            app_servers: AppServerManager::new(AppServerClientConfig::default()),
+            http: reqwest::Client::new(),
+            login_attempts: Arc::new(Mutex::new(HashMap::new())),
+            response_cache: Arc::new(Mutex::new(HashMap::new())),
+            static_asset_cache: Arc::new(Mutex::new(HashMap::new())),
+            inflight_requests: Arc::new(Mutex::new(HashMap::new())),
+            quota_cache: Arc::new(Mutex::new(HashMap::new())),
+            relays: Arc::new(Mutex::new(HashMap::new())),
+            terminals: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 
     #[test]
     fn detects_invalid_refresh_token_errors() {
@@ -4587,5 +5052,94 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[tokio::test]
+    async fn lists_only_directories_within_allowed_root() {
+        let sandbox = unique_test_dir("directories");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(workspace.join("alpha")).unwrap();
+        fs::create_dir_all(workspace.join("beta")).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(workspace.join("notes.txt"), "ignore").unwrap();
+
+        let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+        let payload: DirectoryPayload = serde_json::from_value(
+            list_directories_payload(&state, Some(workspace.to_str().unwrap()))
+                .await
+                .expect("directory payload should load"),
+        )
+        .expect("payload should deserialize");
+
+        assert_eq!(payload.allowed_roots.len(), 1);
+        assert_eq!(payload.current_path, Some(workspace.display().to_string()));
+        assert_eq!(payload.parent_path, None);
+        assert_eq!(
+            payload
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test]
+    async fn writes_and_reads_editable_files_inside_profile_home() {
+        let sandbox = unique_test_dir("editor");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state = test_state(workspace.clone(), vec![workspace], codex_home.clone());
+        let config_path = codex_home.join("config.toml");
+        let saved: EditableFilePayload = serde_json::from_value(
+            write_editable_file_payload(
+                &state,
+                "default",
+                config_path.to_str().unwrap(),
+                "model = 'gpt-5.4'\n",
+            )
+            .await
+            .expect("save should succeed"),
+        )
+        .expect("payload should deserialize");
+        let loaded: EditableFilePayload = serde_json::from_value(
+            read_editable_file_payload(&state, "default", config_path.to_str().unwrap())
+                .await
+                .expect("read should succeed"),
+        )
+        .expect("payload should deserialize");
+
+        assert_eq!(saved.path, config_path.display().to_string());
+        assert_eq!(saved.language, "ini");
+        assert_eq!(loaded.content, "model = 'gpt-5.4'\n");
+        assert!(loaded.writable);
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test]
+    async fn rejects_editable_files_outside_allowed_roots() {
+        let sandbox = unique_test_dir("editor-outside");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        let outside = sandbox.join("outside").join("secret.txt");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state = test_state(workspace.clone(), vec![workspace], codex_home);
+        let error = resolve_editable_file_path(&state, "default", outside.to_str().unwrap())
+            .await
+            .expect_err("outside paths must be rejected");
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.message, "This file is outside editable roots.");
+
+        let _ = fs::remove_dir_all(sandbox);
     }
 }

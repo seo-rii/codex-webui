@@ -8,7 +8,9 @@ export type AppErrorCode =
   | "PENDING_REQUEST_NOT_FOUND"
   | "SESSION_ALREADY_ARCHIVED"
   | "SESSION_NOT_ARCHIVED"
-  | "SESSION_NOT_FOUND";
+  | "SESSION_NOT_FOUND"
+  | "SESSION_ROLLOUT_NOT_FOUND"
+  | "SESSION_ROLLOUT_NOT_RECOVERABLE";
 
 export type AppErrorPayload = {
   code: AppErrorCode | string;

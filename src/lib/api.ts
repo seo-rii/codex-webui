@@ -35,6 +35,7 @@ import type {
   SessionForkPayload,
   SessionListPayload,
   SessionPreferences,
+  SessionRolloutRecoveryPayload,
   SessionSearchScope,
   SessionSummaryFilter,
   SessionSummary,
@@ -273,6 +274,13 @@ export const api = {
 
   getSession(sessionId: string, limit = 20) {
     return ws.request<SessionDetailPayload>("session/get", { sessionId, limit });
+  },
+
+  recoverSessionRollout(sessionId: string) {
+    return request<SessionRolloutRecoveryPayload>(apiPath(`/sessions/${sessionId}/recovery`), {
+      method: "POST",
+      body: JSON.stringify({})
+    });
   },
 
   forkSession(

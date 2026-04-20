@@ -26,6 +26,10 @@ export function describeUiError(value: unknown) {
         return m.error_session_not_archived();
       case "SESSION_NOT_FOUND":
         return m.error_session_not_found();
+      case "SESSION_ROLLOUT_NOT_FOUND":
+        return m.error_session_rollout_not_found();
+      case "SESSION_ROLLOUT_NOT_RECOVERABLE":
+        return m.error_session_rollout_not_recoverable();
       default:
         if (parsed.message?.trim()) {
           return parsed.message.trim();

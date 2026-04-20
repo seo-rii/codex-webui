@@ -87,6 +87,7 @@
     SessionDetailPayload,
     SessionPreferences,
     SessionQueueItem,
+    SessionRolloutRecoveryPayload,
     SessionSearchScope,
     SessionSummaryFilter,
     SessionSummary,
@@ -134,6 +135,15 @@
     createdAt: number;
     baselineTurnId: string | null;
     baselineTurnCount: number;
+  };
+  type SessionRecoveryPromptState = {
+    sessionId: string;
+    message: string;
+    issue: string | null;
+    totalLines: number | null;
+    recoverableLines: number | null;
+    skippedLines: number | null;
+    busy: boolean;
   };
   type SlashSuggestion = {
     key: string;
@@ -268,6 +278,8 @@
   } | null>(null);
   let startupAlertModalOpen = $state(false);
   let startupAlertDismissed = $state(false);
+  let sessionRecoveryPrompt = $state<SessionRecoveryPromptState | null>(null);
+  let dismissedSessionRecoveryPromptForSessionId = $state<string | null>(null);
   let startupAlertNow = $state(Date.now());
   let deferredInstallPrompt = $state<BeforeInstallPromptEvent | null>(null);
   let pwaInstalled = $state(false);
@@ -771,7 +783,14 @@
         loadedTurns: 0,
         totalTurns: 0,
         remainingTurns: 0,
-        message: null
+        message: null,
+        recovery: {
+          available: false,
+          issue: null,
+          totalLines: null,
+          recoverableLines: null,
+          skippedLines: null
+        }
       },
       livePlans: {},
       liveDiffs: {}
@@ -2976,6 +2995,8 @@
     editingQueuePrompt = "";
     startupAlertModalOpen = false;
     startupAlertDismissed = false;
+    sessionRecoveryPrompt = null;
+    dismissedSessionRecoveryPromptForSessionId = null;
     syncSelectedSessionInUrl(null);
   }
 
@@ -3261,6 +3282,8 @@
     pendingSteerResume = null;
     optimisticMessage = null;
     sendIntent = null;
+    sessionRecoveryPrompt = null;
+    dismissedSessionRecoveryPromptForSessionId = null;
     clearStaleSessionCatchup();
     mobileSidebarOpen = false;
     composerSettingsOpen = false;
@@ -3477,7 +3500,87 @@
     });
     clearHydrationRefresh();
     clearStaleSessionCatchup();
+    updateSessionRecoveryPrompt(sessionId, nextConversation);
     return nextConversation;
+  }
+
+  function updateSessionRecoveryPrompt(sessionId: string, nextConversation: ConversationState) {
+    const recovery = nextConversation.hydration.recovery;
+    if (
+      nextConversation.hydration.state !== "error" ||
+      !recovery.available ||
+      dismissedSessionRecoveryPromptForSessionId === sessionId
+    ) {
+      if (sessionRecoveryPrompt?.sessionId === sessionId && !sessionRecoveryPrompt.busy) {
+        sessionRecoveryPrompt = null;
+      }
+      return;
+    }
+
+    sessionRecoveryPrompt = {
+      sessionId,
+      message: nextConversation.hydration.message ?? "",
+      issue: recovery.issue,
+      totalLines: recovery.totalLines,
+      recoverableLines: recovery.recoverableLines,
+      skippedLines: recovery.skippedLines,
+      busy: sessionRecoveryPrompt?.sessionId === sessionId ? sessionRecoveryPrompt.busy : false
+    };
+  }
+
+  function dismissSessionRecoveryPrompt() {
+    if (sessionRecoveryPrompt?.sessionId) {
+      dismissedSessionRecoveryPromptForSessionId = sessionRecoveryPrompt.sessionId;
+    }
+    sessionRecoveryPrompt = null;
+  }
+
+  function getSessionRecoveryIssueLabel(issue: string | null) {
+    if (issue === "invalidUtf8") {
+      return m.session_history_recovery_issue_invalid_utf8();
+    }
+    if (issue === "invalidJson") {
+      return m.session_history_recovery_issue_invalid_json();
+    }
+    return m.session_history_recovery_issue_generic();
+  }
+
+  async function recoverSessionHistoryPrompt() {
+    const prompt = sessionRecoveryPrompt;
+    if (!prompt || prompt.busy) {
+      return;
+    }
+
+    sessionRecoveryPrompt = {
+      ...prompt,
+      busy: true
+    };
+
+    try {
+      const payload: SessionRolloutRecoveryPayload = await api.recoverSessionRollout(prompt.sessionId);
+      noticeText = m.session_history_recovery_success({
+        recovered: String(payload.recoveredLines),
+        skipped: String(payload.skippedLines)
+      });
+      dismissedSessionRecoveryPromptForSessionId = null;
+      sessionRecoveryPrompt = null;
+
+      if (selectedSessionId === prompt.sessionId) {
+        await refreshSelectedSessionState(
+          prompt.sessionId,
+          Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize),
+          true
+        );
+      }
+    } catch (error) {
+      errorText = describeError(error);
+      if (sessionRecoveryPrompt?.sessionId === prompt.sessionId) {
+        sessionRecoveryPrompt = {
+          ...sessionRecoveryPrompt,
+          busy: false
+        };
+      }
+    }
   }
 
   async function refreshSelectedSessionState(sessionId: string, turnLimit: number, loadDraft = false) {
@@ -9205,6 +9308,92 @@
           </div>
         {/if}
       {/if}
+    </div>
+  </div>
+{/if}
+
+{#if sessionRecoveryPrompt}
+  <div
+    aria-labelledby="session-recovery-title"
+    aria-modal="true"
+    class="ui-scrim ui-scrim--modal fixed inset-0 z-[116] overflow-y-auto"
+    role="dialog"
+  >
+    <div class="flex min-h-full items-center justify-center p-4 sm:p-8">
+      <div class="auth-dialog-card w-full max-w-2xl rounded-[2rem] border border-white/70 bg-white/92 p-6 shadow-[0_32px_90px_rgba(15,23,42,0.24)] backdrop-blur-2xl sm:p-8">
+        <div class="flex items-start justify-between gap-4">
+          <div class="space-y-3">
+            <div class="inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-amber-100 text-amber-700 shadow-sm">
+              <AlertCircle size={18} />
+            </div>
+            <div>
+              <h2 id="session-recovery-title" class="text-xl font-bold tracking-tight text-gray-950">
+                {m.session_history_recovery_title()}
+              </h2>
+              <p class="mt-2 text-sm leading-relaxed text-gray-600">
+                {m.session_history_recovery_description()}
+              </p>
+            </div>
+          </div>
+          <button
+            aria-label={m.close()}
+            class="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-gray-200 text-gray-500 transition-colors hover:bg-gray-50 hover:text-gray-900"
+            onclick={dismissSessionRecoveryPrompt}
+            type="button"
+          >
+            <X size={18} />
+          </button>
+        </div>
+
+        <div class="mt-6 rounded-3xl border border-amber-200 bg-amber-50/80 p-4">
+          <p class="text-sm font-semibold text-amber-900">
+            {getSessionRecoveryIssueLabel(sessionRecoveryPrompt.issue)}
+          </p>
+          <p class="mt-2 text-sm leading-relaxed text-amber-800/90">
+            {sessionRecoveryPrompt.message || m.session_history_recovery_generic_message()}
+          </p>
+        </div>
+
+        <div class="mt-4 grid gap-3 sm:grid-cols-3">
+          <div class="rounded-2xl border border-gray-200 bg-gray-50/80 px-4 py-3">
+            <div class="text-[11px] font-bold uppercase tracking-[0.18em] text-gray-400">{m.session_history_recovery_total_lines()}</div>
+            <div class="mt-1 text-lg font-semibold text-gray-900">{sessionRecoveryPrompt.totalLines ?? "—"}</div>
+          </div>
+          <div class="rounded-2xl border border-gray-200 bg-gray-50/80 px-4 py-3">
+            <div class="text-[11px] font-bold uppercase tracking-[0.18em] text-gray-400">{m.session_history_recovery_recoverable_lines()}</div>
+            <div class="mt-1 text-lg font-semibold text-gray-900">{sessionRecoveryPrompt.recoverableLines ?? "—"}</div>
+          </div>
+          <div class="rounded-2xl border border-gray-200 bg-gray-50/80 px-4 py-3">
+            <div class="text-[11px] font-bold uppercase tracking-[0.18em] text-gray-400">{m.session_history_recovery_skipped_lines()}</div>
+            <div class="mt-1 text-lg font-semibold text-gray-900">{sessionRecoveryPrompt.skippedLines ?? "—"}</div>
+          </div>
+        </div>
+
+        <p class="mt-4 text-sm leading-relaxed text-gray-600">
+          {m.session_history_recovery_backup_notice()}
+        </p>
+
+        <div class="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+          <button
+            class="ui-animated-button ui-animated-button--soft inline-flex items-center justify-center rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-sm font-semibold text-gray-700 shadow-sm transition-colors hover:bg-gray-50"
+            onclick={dismissSessionRecoveryPrompt}
+            type="button"
+          >
+            {m.not_now()}
+          </button>
+          <button
+            class="ui-animated-button inline-flex items-center justify-center gap-2 rounded-2xl bg-amber-600 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-amber-500/20 transition-colors hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={sessionRecoveryPrompt.busy}
+            onclick={() => void recoverSessionHistoryPrompt()}
+            type="button"
+          >
+            {#if sessionRecoveryPrompt.busy}
+              <RefreshCw size={15} class="animate-spin" />
+            {/if}
+            <span>{m.session_history_recovery_action()}</span>
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 {/if}

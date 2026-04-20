@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { createReadStream } from "node:fs";
-import { access, readdir } from "node:fs/promises";
+import { access, copyFile, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import { promisify } from "node:util";
@@ -80,6 +80,11 @@ type SystemShutdownCapability = {
 
 type SessionHydrationState = SessionDetailPayload["hydration"] & {
   turns: SessionDetailPayload["thread"]["turns"];
+};
+
+type RolloutRecoveryPlan = {
+  info: SessionDetailPayload["hydration"]["recovery"];
+  recoveredContent: string;
 };
 
 const SESSION_WINDOW_SIZE = 20;
@@ -220,6 +225,89 @@ function isUnmaterializedThreadError(error: unknown) {
 function isInvalidRefreshTokenError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error ?? "");
   return INVALID_REFRESH_TOKEN_PATTERN.test(message);
+}
+
+function emptyHydrationRecoveryInfo(): SessionDetailPayload["hydration"]["recovery"] {
+  return {
+    available: false,
+    issue: null,
+    totalLines: null,
+    recoverableLines: null,
+    skippedLines: null
+  };
+}
+
+function normalizeRolloutLine(rawLine: string) {
+  const trimmed = rawLine.replace(/^\uFEFF/u, "").replace(/\u0000/gu, "").trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const candidates = [trimmed];
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace > 0 || lastBrace >= 0) {
+    const sliced = trimmed.slice(firstBrace >= 0 ? firstBrace : 0, lastBrace >= 0 ? lastBrace + 1 : trimmed.length).trim();
+    if (sliced && sliced !== trimmed) {
+      candidates.push(sliced);
+    }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.stringify(JSON.parse(candidate));
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+function inspectRolloutRecoveryContent(buffer: Buffer): RolloutRecoveryPlan {
+  let issue: string | null = null;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+  } catch {
+    issue = "invalidUtf8";
+  }
+
+  const decoded = new TextDecoder("utf-8").decode(buffer);
+  let totalLines = 0;
+  let recoverableLines = 0;
+  let skippedLines = 0;
+  const recoveredLines: string[] = [];
+
+  for (const rawLine of decoded.split(/\r?\n/u)) {
+    if (!rawLine.trim()) {
+      continue;
+    }
+
+    totalLines += 1;
+    const normalized = normalizeRolloutLine(rawLine);
+    if (!normalized) {
+      skippedLines += 1;
+      continue;
+    }
+
+    recoverableLines += 1;
+    recoveredLines.push(normalized);
+  }
+
+  if (!issue && skippedLines > 0) {
+    issue = "invalidJson";
+  }
+
+  return {
+    info: {
+      available: recoverableLines > 0 && (issue === "invalidUtf8" || skippedLines > 0),
+      issue,
+      totalLines,
+      recoverableLines,
+      skippedLines
+    },
+    recoveredContent: recoveredLines.length > 0 ? `${recoveredLines.join("\n")}\n` : ""
+  };
 }
 
 function coercePreferences(preferences: Partial<SessionPreferences> | null | undefined) {
@@ -1973,8 +2061,53 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         loadedTurns: visibleTurns.length,
         totalTurns,
         remainingTurns: Math.max(totalTurns - visibleTurns.length, 0),
-        message: hydration.message
+        message: hydration.message,
+        recovery: hydration.recovery
       }
+    };
+  }
+
+  async recoverSessionHistory(threadId: string) {
+    const thread = await this.readThread(threadId, false);
+    const rolloutPath = await this.resolveRolloutPath(threadId, thread);
+    if (!rolloutPath) {
+      throw createAppError("SESSION_ROLLOUT_NOT_FOUND", "No persisted rollout file was found for this session.");
+    }
+
+    const plan = inspectRolloutRecoveryContent(await readFile(rolloutPath));
+    if (!plan.info.available || !plan.info.recoverableLines || !plan.recoveredContent.trim()) {
+      throw createAppError("SESSION_ROLLOUT_NOT_RECOVERABLE", "This session history could not be recovered automatically.");
+    }
+
+    const backupPath = `${rolloutPath}.bak-${new Date().toISOString().replace(/[:.]/gu, "-")}`;
+    await copyFile(rolloutPath, backupPath);
+    await writeFile(rolloutPath, plan.recoveredContent, "utf8");
+
+    this.rolloutPaths.set(threadId, rolloutPath);
+    this.sessionHydrations.delete(threadId);
+    this.itemDetailsByThread.delete(threadId);
+    this.fullTurnsByThread.delete(threadId);
+
+    await appendRuntimeErrorLog({
+      source: "node-backend",
+      message: "recovered corrupted rollout",
+      profileId: this.profile.id,
+      details: {
+        threadId,
+        rolloutPath,
+        backupPath,
+        recovery: plan.info
+      }
+    });
+
+    return {
+      ok: true,
+      sessionId: threadId,
+      backupPath,
+      recoveredAt: Date.now(),
+      totalLines: plan.info.totalLines ?? 0,
+      recoveredLines: plan.info.recoverableLines ?? 0,
+      skippedLines: plan.info.skippedLines ?? 0
     };
   }
 
@@ -2874,6 +3007,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       totalTurns: null,
       remainingTurns: 0,
       message: null,
+      recovery: emptyHydrationRecoveryInfo(),
       turns: []
     } satisfies SessionHydrationState;
     this.sessionHydrations.set(threadId, fresh);
@@ -2889,6 +3023,60 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       }
       this.sessionHydrations.delete(oldest[0]);
     }
+  }
+
+  private async resolveRolloutPath(threadId: string, threadSummary?: Record<string, unknown>) {
+    let rolloutPath = this.rolloutPaths.get(threadId) ?? null;
+    if (rolloutPath !== null || this.rolloutPaths.has(threadId)) {
+      return rolloutPath;
+    }
+
+    const codexHome = this.profile.codexHome;
+    const createdAt = Number(threadSummary?.createdAt ?? 0);
+    const candidateDates =
+      createdAt > 0
+        ? [0, -1, 1].map((offset) => {
+            const value = new Date(createdAt * 1000);
+            value.setDate(value.getDate() + offset);
+            return value;
+          })
+        : [];
+
+    for (const date of candidateDates) {
+      const dayDirectory = path.join(
+        codexHome,
+        "sessions",
+        String(date.getFullYear()),
+        String(date.getMonth() + 1).padStart(2, "0"),
+        String(date.getDate()).padStart(2, "0")
+      );
+
+      try {
+        const names = await readdir(dayDirectory);
+        const match = names.find((name) => name.endsWith(`${threadId}.jsonl`));
+        if (match) {
+          rolloutPath = path.join(dayDirectory, match);
+          break;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    if (!rolloutPath) {
+      try {
+        const archived = await readdir(path.join(codexHome, "archived_sessions"));
+        const match = archived.find((name) => name.endsWith(`${threadId}.jsonl`));
+        if (match) {
+          rolloutPath = path.join(codexHome, "archived_sessions", match);
+        }
+      } catch {
+        rolloutPath = null;
+      }
+    }
+
+    this.rolloutPaths.set(threadId, rolloutPath);
+    return rolloutPath;
   }
 
   private getItemDetailMap(threadId: string) {
@@ -3088,58 +3276,12 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       initial.totalTurns = null;
       initial.remainingTurns = 0;
       initial.message = null;
+      initial.recovery = emptyHydrationRecoveryInfo();
       initial.turns = [];
 
       try {
-        const codexHome = this.profile.codexHome;
         const liveThread = String(threadSummary?.status ?? "") === "active" || String(threadSummary?.status ?? "") === "running" || this.activeTurns.has(threadId);
-        let rolloutPath = this.rolloutPaths.get(threadId) ?? null;
-        if (rolloutPath === null && !this.rolloutPaths.has(threadId)) {
-          const createdAt = Number(threadSummary?.createdAt ?? 0);
-          const candidateDates =
-            createdAt > 0
-              ? [0, -1, 1].map((offset) => {
-                  const value = new Date(createdAt * 1000);
-                  value.setDate(value.getDate() + offset);
-                  return value;
-                })
-              : [];
-
-          for (const date of candidateDates) {
-            const dayDirectory = path.join(
-              codexHome,
-              "sessions",
-              String(date.getFullYear()),
-              String(date.getMonth() + 1).padStart(2, "0"),
-              String(date.getDate()).padStart(2, "0")
-            );
-
-            try {
-              const names = await readdir(dayDirectory);
-              const match = names.find((name) => name.endsWith(`${threadId}.jsonl`));
-              if (match) {
-                rolloutPath = path.join(dayDirectory, match);
-                break;
-              }
-            } catch {
-              continue;
-            }
-          }
-
-          if (!rolloutPath) {
-            try {
-              const archived = await readdir(path.join(codexHome, "archived_sessions"));
-              const match = archived.find((name) => name.endsWith(`${threadId}.jsonl`));
-              if (match) {
-                rolloutPath = path.join(codexHome, "archived_sessions", match);
-              }
-            } catch {
-              rolloutPath = null;
-            }
-          }
-
-          this.rolloutPaths.set(threadId, rolloutPath);
-        }
+        const rolloutPath = await this.resolveRolloutPath(threadId, threadSummary);
 
         if (rolloutPath) {
           const turnsById = new Map<string, SessionDetailPayload["thread"]["turns"][number]>();
@@ -3519,6 +3661,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
           initial.loadedTurns = initial.turns.length;
           initial.remainingTurns = 0;
           initial.message = null;
+          initial.recovery = emptyHydrationRecoveryInfo();
           const activeTurnId = findActiveTurnId({ turns: initial.turns });
           if (activeTurnId) {
             this.activeTurns.set(threadId, activeTurnId);
@@ -3539,6 +3682,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
         initial.loadedTurns = initial.turns.length;
         initial.remainingTurns = 0;
         initial.message = null;
+        initial.recovery = emptyHydrationRecoveryInfo();
         const activeTurnId = findActiveTurnId(thread);
         if (activeTurnId) {
           this.activeTurns.set(threadId, activeTurnId);
@@ -3549,6 +3693,29 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       } catch (error) {
         initial.state = "error";
         initial.message = error instanceof Error ? error.message : "Failed to load session history.";
+        initial.recovery = emptyHydrationRecoveryInfo();
+        if (
+          error instanceof Error &&
+          /valid utf-8/iu.test(error.message)
+        ) {
+          const rolloutPath = await this.resolveRolloutPath(threadId, threadSummary);
+          if (rolloutPath) {
+            try {
+              initial.recovery = inspectRolloutRecoveryContent(await readFile(rolloutPath)).info;
+            } catch (inspectionError) {
+              void appendRuntimeErrorLog({
+                source: "node-backend",
+                message: "failed to inspect corrupted rollout",
+                profileId: this.profile.id,
+                details: {
+                  threadId,
+                  rolloutPath,
+                  error: serializeErrorForLog(inspectionError)
+                }
+              }).catch(() => {});
+            }
+          }
+        }
       } finally {
         this.hydrationJobs.delete(threadId);
       }

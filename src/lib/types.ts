@@ -381,7 +381,24 @@ export type SessionDetailPayload = {
     totalTurns: number | null;
     remainingTurns: number;
     message: string | null;
+    recovery: {
+      available: boolean;
+      issue: string | null;
+      totalLines: number | null;
+      recoverableLines: number | null;
+      skippedLines: number | null;
+    };
   };
+};
+
+export type SessionRolloutRecoveryPayload = {
+  ok: true;
+  sessionId: string;
+  backupPath: string;
+  recoveredAt: number;
+  totalLines: number;
+  recoveredLines: number;
+  skippedLines: number;
 };
 
 export type SessionTurnsPagePayload = {

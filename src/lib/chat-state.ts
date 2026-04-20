@@ -317,7 +317,8 @@ function mergeHydration(
       typeof totalTurns === "number"
         ? Math.max(totalTurns - Math.max(incomingHydration.loadedTurns, loadedTurns), 0)
         : incomingHydration.remainingTurns,
-    message: incomingHydration.message
+    message: incomingHydration.message,
+    recovery: incomingHydration.recovery
   } satisfies SessionDetailPayload["hydration"];
 }
 
@@ -430,7 +431,14 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
       loadedTurns: Number(params.loadedTurns ?? 0),
       totalTurns: typeof params.totalTurns === "number" ? Number(params.totalTurns) : null,
       remainingTurns: typeof params.remainingTurns === "number" ? Number(params.remainingTurns) : next.hydration.remainingTurns,
-      message: null
+      message: null,
+      recovery: {
+        available: false,
+        issue: null,
+        totalLines: null,
+        recoverableLines: null,
+        skippedLines: null
+      }
     };
     return next;
   }
@@ -447,7 +455,14 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
       loadedTurns: Number(params.loadedTurns ?? next.thread.turns.length),
       totalTurns: typeof params.totalTurns === "number" ? Number(params.totalTurns) : next.hydration.totalTurns,
       remainingTurns: typeof params.remainingTurns === "number" ? Number(params.remainingTurns) : next.hydration.remainingTurns,
-      message: null
+      message: null,
+      recovery: {
+        available: false,
+        issue: null,
+        totalLines: null,
+        recoverableLines: null,
+        skippedLines: null
+      }
     };
     return next;
   }
@@ -458,7 +473,14 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
       loadedTurns: Number(params.loadedTurns ?? next.thread.turns.length),
       totalTurns: typeof params.totalTurns === "number" ? Number(params.totalTurns) : next.thread.turns.length,
       remainingTurns: typeof params.remainingTurns === "number" ? Number(params.remainingTurns) : 0,
-      message: null
+      message: null,
+      recovery: {
+        available: false,
+        issue: null,
+        totalLines: null,
+        recoverableLines: null,
+        skippedLines: null
+      }
     };
     if (typeof params.activeTurnId === "string" || params.activeTurnId === null) {
       next.activeTurnId = (params.activeTurnId as string | null) ?? null;
@@ -475,7 +497,29 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
       loadedTurns: next.hydration.loadedTurns,
       totalTurns: next.hydration.totalTurns,
       remainingTurns: next.hydration.remainingTurns,
-      message: typeof params.message === "string" ? params.message : "Failed to load session history."
+      message: typeof params.message === "string" ? params.message : "Failed to load session history.",
+      recovery:
+        params.recovery && typeof params.recovery === "object"
+          ? {
+              available: Boolean((params.recovery as Record<string, unknown>).available),
+              issue:
+                typeof (params.recovery as Record<string, unknown>).issue === "string"
+                  ? String((params.recovery as Record<string, unknown>).issue)
+                  : null,
+              totalLines:
+                typeof (params.recovery as Record<string, unknown>).totalLines === "number"
+                  ? Number((params.recovery as Record<string, unknown>).totalLines)
+                  : null,
+              recoverableLines:
+                typeof (params.recovery as Record<string, unknown>).recoverableLines === "number"
+                  ? Number((params.recovery as Record<string, unknown>).recoverableLines)
+                  : null,
+              skippedLines:
+                typeof (params.recovery as Record<string, unknown>).skippedLines === "number"
+                  ? Number((params.recovery as Record<string, unknown>).skippedLines)
+                  : null
+            }
+          : next.hydration.recovery
     };
     return next;
   }

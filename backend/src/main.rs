@@ -762,6 +762,32 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                     .into_response();
             }
 
+            if route_path == "/api/account" || route_path.starts_with("/api/account/") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+
+                let mut response =
+                    handle_account_api_http(state, method, route_path, request, auth).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
             if route_path.starts_with("/api/") {
                 if auth_context(&state.config, &jar).is_none() {
                     let mut response =
@@ -790,6 +816,62 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
             }
 
             return serve_static_asset(state, &route_path).await;
+        }
+    }
+}
+
+async fn handle_account_api_http(
+    state: AppState,
+    method: Method,
+    route_path: String,
+    request: Request,
+    auth: AuthContext,
+) -> Response {
+    let result = match (method, route_path.as_str()) {
+        (Method::GET, "/api/account") => get_account_state(&state, &auth.profile_id).await,
+        (Method::POST, "/api/account/login") => {
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .context("failed to read account login request body");
+            match body {
+                Ok(body) => {
+                    let payload: Value =
+                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    start_account_login(&state, &auth.profile_id, &payload).await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        (Method::POST, "/api/account/login/cancel") => {
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .context("failed to read account login cancel request body");
+            match body {
+                Ok(body) => {
+                    let payload: Value =
+                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    cancel_account_login(&state, &auth.profile_id, &payload).await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        (Method::POST, "/api/account/logout") => logout_account(&state, &auth.profile_id).await,
+        _ => return json_error(StatusCode::NOT_FOUND, "Not found."),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => {
+            let message = error.to_string();
+            let status = if message.contains("required")
+                || message.contains("Invalid account login type")
+                || message.contains("API key is required")
+            {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            json_error(status, &message)
         }
     }
 }

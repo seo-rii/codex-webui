@@ -3,14 +3,33 @@ import path from "node:path";
 import process from "node:process";
 
 const projectRoot = process.cwd();
-const frontendApiPath = path.join(projectRoot, "src", "lib", "api.ts");
+const frontendSourceRoot = path.join(projectRoot, "src");
 const debugClientPath = path.join(projectRoot, "scripts", "ws-debug-client.mjs");
-const wsClientPath = path.join(projectRoot, "src", "lib", "ws-client.ts");
 const backendMainPath = path.join(projectRoot, "backend", "src", "main.rs");
 const INTERPOLATION_TOKEN = "__SEGMENT__";
+const SOURCE_FILE_EXTENSIONS = new Set([".ts", ".js", ".mjs", ".svelte"]);
 
 function extractAll(pattern, content) {
   return [...content.matchAll(pattern)].map((match) => match[1]);
+}
+
+async function collectSourceFiles(rootPath) {
+  const entries = await fs.readdir(rootPath, { withFileTypes: true });
+  const files = [];
+
+  for (const entry of entries) {
+    const entryPath = path.join(rootPath, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await collectSourceFiles(entryPath)));
+      continue;
+    }
+
+    if (entry.isFile() && SOURCE_FILE_EXTENSIONS.has(path.extname(entry.name))) {
+      files.push(entryPath);
+    }
+  }
+
+  return files;
 }
 
 function normalizeTemplatePath(value) {
@@ -40,30 +59,32 @@ function backendSupportsTemplate(content, template) {
 }
 
 async function main() {
-  const [frontendApi, debugClient, wsClient, backendMain] = await Promise.all([
-    fs.readFile(frontendApiPath, "utf8"),
-    fs.readFile(debugClientPath, "utf8"),
-    fs.readFile(wsClientPath, "utf8"),
-    fs.readFile(backendMainPath, "utf8")
-  ]);
+  const frontendFiles = await collectSourceFiles(frontendSourceRoot);
+  const frontendSources = await Promise.all(frontendFiles.map((filePath) => fs.readFile(filePath, "utf8")));
+  const debugClient = await fs.readFile(debugClientPath, "utf8");
+  const backendMain = await fs.readFile(backendMainPath, "utf8");
+  const allFrontendContent = frontendSources.join("\n");
+  const allSourceContent = `${allFrontendContent}\n${debugClient}`;
 
   const wsMethods = new Set([
-    ...extractAll(/ws\.request(?:<[^>]+>)?\("([^"]+)"/gu, frontendApi)
+    ...extractAll(/ws\.request(?:<[^>]+>)?\(\s*["']([^"']+)["']/gu, allSourceContent),
+    ...extractAll(/ws\.request(?:<[^>]+>)?\(\s*`([^`]+)`/gu, allSourceContent)
   ]);
 
-  const httpRoutes = new Set(
-    [
-    ...extractAll(/apiPath\("([^"]+)"/gu, frontendApi).map((pathname) => `/api${pathname}`),
-      ...extractAll(/apiPath\(`([^`]+)`/gu, frontendApi).map((pathname) => `/api${normalizeTemplatePath(pathname)}`),
-      ...extractAll(/buildUrl\("([^"]+)"/gu, debugClient).filter((pathname) => pathname.startsWith("/api/")),
-      ...extractAll(/buildUrl\(`([^`]+)`/gu, debugClient)
-        .map(normalizeTemplatePath)
-        .filter((pathname) => pathname.startsWith("/api/"))
-    ].sort()
-  );
+  const httpRoutes = new Set([
+    ...extractAll(/apiPath\(\s*["']([^"']+)["']/gu, allSourceContent).map((pathname) => `/api${pathname}`),
+    ...extractAll(/apiPath\(\s*`([^`]+)`/gu, allSourceContent).map((pathname) => `/api${normalizeTemplatePath(pathname)}`),
+    ...extractAll(/buildUrl\(\s*["']([^"']+)["']/gu, allSourceContent).filter((pathname) => pathname.startsWith("/api/")),
+    ...extractAll(/buildUrl\(\s*`([^`]+)`/gu, allSourceContent)
+      .map(normalizeTemplatePath)
+      .filter((pathname) => pathname.startsWith("/api/"))
+  ]);
 
   const websocketRoutes = new Set([
-    ...extractAll(/appPath\("([^"]+)"/gu, wsClient).filter((pathname) => pathname === "/ws")
+    ...extractAll(/appPath\(\s*["']([^"']+)["']/gu, allSourceContent).filter((pathname) => pathname === "/ws"),
+    ...extractAll(/appPath\(\s*`([^`]+)`/gu, allSourceContent)
+      .map(normalizeTemplatePath)
+      .filter((pathname) => pathname === "/ws")
   ]);
 
   const missingWsMethods = [...wsMethods].filter((method) => !backendMain.includes(`"${method}"`)).sort();

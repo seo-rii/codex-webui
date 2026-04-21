@@ -5024,6 +5024,377 @@ async fn resolve_git_file_from_absolute_path_payload(
     }))
 }
 
+fn parse_github_remote_payload(remote_name: &str, remote_url: &str) -> Option<Value> {
+    let trimmed = remote_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (host, owner, raw_name) = if let Some(rest) = trimmed.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        let mut parts = path.split('/');
+        let owner = parts.next()?;
+        let raw_name = parts.collect::<Vec<_>>().join("/");
+        (host.to_string(), owner.to_string(), raw_name)
+    } else {
+        let (_, rest) = trimmed.split_once("://")?;
+        let rest = rest.strip_prefix("git@").unwrap_or(rest);
+        let mut parts = rest.splitn(3, '/');
+        let host = parts.next()?.to_string();
+        let owner = parts.next()?.to_string();
+        let raw_name = parts.next()?.to_string();
+        (host, owner, raw_name)
+    };
+
+    let name = raw_name
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_string();
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "host": host,
+        "owner": owner,
+        "name": name,
+        "remoteName": remote_name,
+        "url": format!("https://{host}/{owner}/{name}")
+    }))
+}
+
+async fn run_gh_text_payload(repo_path: &str, args: Vec<String>) -> ApiResult<String> {
+    let mut command = Command::new("gh");
+    command
+        .args(args)
+        .current_dir(repo_path)
+        .envs(env::vars())
+        .env("GH_PAGER", "cat")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("PAGER", "cat")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "GitHub CLI (gh) is not installed on the server.",
+            )
+        } else {
+            api_error(StatusCode::BAD_REQUEST, error.to_string())
+        }
+    })?;
+
+    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        .await
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "`gh` timed out"))?
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.contains("executable file not found") || stderr.contains("not found") {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "GitHub CLI (gh) is not installed on the server.",
+            ));
+        }
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            if stderr.is_empty() {
+                "gh command failed.".to_string()
+            } else {
+                stderr
+            },
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn resolve_github_repository_payload(state: &AppState, repo_path: &str) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let remote_names = run_git_text_payload(state, &repo_root, vec!["remote".to_string()])
+        .await?
+        .lines()
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    let mut ordered_remote_names = vec!["origin".to_string()];
+    ordered_remote_names.extend(
+        remote_names
+            .into_iter()
+            .filter(|entry| entry != "origin")
+            .collect::<Vec<_>>(),
+    );
+
+    for remote_name in ordered_remote_names {
+        let remote_url = run_git_text_payload(
+            state,
+            &repo_root,
+            vec![
+                "config".to_string(),
+                "--get".to_string(),
+                format!("remote.{remote_name}.url"),
+            ],
+        )
+        .await
+        .unwrap_or_default();
+        if let Some(parsed) = parse_github_remote_payload(&remote_name, &remote_url) {
+            return Ok(parsed);
+        }
+    }
+
+    Err(api_error(
+        StatusCode::BAD_REQUEST,
+        "No GitHub remote was found for the selected repository.",
+    ))
+}
+
+fn map_github_pull_request_summary_payload(pull_request: &Value) -> Value {
+    let merged_at = pull_request.get("merged_at").and_then(Value::as_str);
+    let labels = pull_request
+        .get("labels")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+                .map(|label| Value::String(label.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    json!({
+        "number": pull_request.get("number").and_then(Value::as_u64).unwrap_or(0),
+        "title": pull_request.get("title").and_then(Value::as_str).unwrap_or("Untitled PR"),
+        "state": if merged_at.is_some() {
+            "merged"
+        } else if pull_request.get("state").and_then(Value::as_str) == Some("closed") {
+            "closed"
+        } else {
+            "open"
+        },
+        "isDraft": pull_request.get("draft").and_then(Value::as_bool).unwrap_or(false),
+        "url": pull_request.get("html_url").and_then(Value::as_str).unwrap_or_default(),
+        "author": pull_request
+            .get("user")
+            .and_then(|value| value.get("login"))
+            .and_then(Value::as_str)
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+        "authorUrl": pull_request
+            .get("user")
+            .and_then(|value| value.get("html_url"))
+            .and_then(Value::as_str)
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+        "baseRefName": pull_request
+            .get("base")
+            .and_then(|value| value.get("ref"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "headRefName": pull_request
+            .get("head")
+            .and_then(|value| value.get("ref"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "updatedAt": pull_request
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+        "additions": pull_request.get("additions").and_then(Value::as_i64).unwrap_or(0),
+        "deletions": pull_request.get("deletions").and_then(Value::as_i64).unwrap_or(0),
+        "changedFiles": pull_request.get("changed_files").and_then(Value::as_i64).unwrap_or(0),
+        "labels": labels
+    })
+}
+
+fn map_github_pull_request_file_payload(file: &Value) -> Value {
+    json!({
+        "path": file.get("filename").and_then(Value::as_str).unwrap_or_default(),
+        "previousPath": file
+            .get("previous_filename")
+            .and_then(Value::as_str)
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+        "status": file.get("status").and_then(Value::as_str).unwrap_or("modified"),
+        "additions": file.get("additions").and_then(Value::as_i64).unwrap_or(0),
+        "deletions": file.get("deletions").and_then(Value::as_i64).unwrap_or(0),
+        "patch": file
+            .get("patch")
+            .and_then(Value::as_str)
+            .map(Value::from)
+            .unwrap_or(Value::Null)
+    })
+}
+
+async fn list_github_pull_requests_payload(
+    state: &AppState,
+    repo_path: &str,
+    pr_state: &str,
+    limit: u64,
+) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let repository = resolve_github_repository_payload(state, &repo_root).await?;
+    let owner = repository
+        .get("owner")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let name = repository
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let normalized_state = match pr_state {
+        "closed" | "all" => pr_state,
+        _ => "open",
+    };
+    let normalized_limit = limit.clamp(1, 50);
+    let raw = run_gh_text_payload(
+        &repo_root,
+        vec![
+            "api".to_string(),
+            format!(
+                "repos/{owner}/{name}/pulls?state={}&per_page={normalized_limit}",
+                urlencoding::encode(normalized_state)
+            ),
+        ],
+    )
+    .await?;
+    let pull_requests = serde_json::from_str::<Value>(&raw)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let summaries = pull_requests
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| map_github_pull_request_summary_payload(&entry))
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "repository": repository,
+        "pullRequests": summaries
+    }))
+}
+
+async fn get_github_pull_request_payload(
+    state: &AppState,
+    repo_path: &str,
+    number: u64,
+) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let repository = resolve_github_repository_payload(state, &repo_root).await?;
+    let owner = repository
+        .get("owner")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let name = repository
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let pull_request_number = number.max(1);
+    let pull_request_raw = run_gh_text_payload(
+        &repo_root,
+        vec![
+            "api".to_string(),
+            format!("repos/{owner}/{name}/pulls/{pull_request_number}"),
+        ],
+    )
+    .await?;
+    let files_raw = run_gh_text_payload(
+        &repo_root,
+        vec![
+            "api".to_string(),
+            format!("repos/{owner}/{name}/pulls/{pull_request_number}/files?per_page=100"),
+        ],
+    )
+    .await?;
+    let pull_request = serde_json::from_str::<Value>(&pull_request_raw)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let files = serde_json::from_str::<Value>(&files_raw)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    let mut detail = map_github_pull_request_summary_payload(&pull_request)
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    detail.insert(
+        "body".to_string(),
+        pull_request
+            .get("body")
+            .and_then(Value::as_str)
+            .map(Value::from)
+            .unwrap_or_else(|| Value::String(String::new())),
+    );
+    detail.insert(
+        "reviewDecision".to_string(),
+        pull_request
+            .get("review_decision")
+            .and_then(Value::as_str)
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+    detail.insert(
+        "mergeStateStatus".to_string(),
+        pull_request
+            .get("mergeable_state")
+            .and_then(Value::as_str)
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+    detail.insert(
+        "commits".to_string(),
+        Value::from(
+            pull_request
+                .get("commits")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        ),
+    );
+    detail.insert(
+        "files".to_string(),
+        Value::Array(
+            files
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| map_github_pull_request_file_payload(&entry))
+                .collect(),
+        ),
+    );
+
+    Ok(json!({
+        "repository": repository,
+        "pullRequest": Value::Object(detail)
+    }))
+}
+
+async fn checkout_github_pull_request_payload(
+    state: &AppState,
+    repo_path: &str,
+    number: u64,
+) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let pull_request_number = number.max(1);
+    run_gh_text_payload(
+        &repo_root,
+        vec![
+            "pr".to_string(),
+            "checkout".to_string(),
+            pull_request_number.to_string(),
+        ],
+    )
+    .await?;
+    invalidate_git_repository_cache(state).await;
+    get_git_status_payload(state, &repo_root).await
+}
+
 async fn normalize_session_preferences_payload(
     state: &AppState,
     profile_id: &str,
@@ -8963,6 +9334,31 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                 return response;
             }
 
+            if route_path == "/api/git/repositories" || route_path.starts_with("/api/git/") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+
+                let mut response = handle_git_api_http(state, request, auth, &route_path).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
             if route_path == "/api/automations" || route_path.starts_with("/api/automations/") {
                 let Some(auth) = auth_context(&state.config, &jar) else {
                     let mut response =
@@ -10194,6 +10590,314 @@ async fn handle_config_api_http(state: AppState, request: Request, auth: AuthCon
             *response.status_mut() = StatusCode::CREATED;
             response
         }
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_git_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    route_path: &str,
+) -> Response {
+    let method = request.method().clone();
+    if method != Method::GET && auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    let query = request.uri().query().map(str::to_string);
+    let body = if matches!(
+        method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        match to_bytes(request.into_body(), usize::MAX)
+            .await
+            .context("failed to read git request body")
+        {
+            Ok(body) => Some(body),
+            Err(_) => {
+                return json_error(StatusCode::BAD_REQUEST, "Failed to read git request body.");
+            }
+        }
+    } else {
+        None
+    };
+    let payload = body
+        .as_ref()
+        .map(|body| serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({})))
+        .unwrap_or_else(|| json!({}));
+
+    let result = if route_path == "/api/git/repositories" {
+        if method != Method::GET {
+            return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+        }
+        list_git_repositories_payload(&state, true).await
+    } else if route_path == "/api/git/status" {
+        if method != Method::GET {
+            return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+        }
+        let Some(repo_path) = query_param_value(query.as_deref(), "repoPath") else {
+            return json_error(StatusCode::BAD_REQUEST, "repoPath is required.");
+        };
+        get_git_status_payload(&state, &repo_path).await
+    } else if route_path == "/api/git/file/resolve" {
+        if method != Method::GET {
+            return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+        }
+        let Some(file_path) = query_param_value(query.as_deref(), "filePath") else {
+            return json_error(StatusCode::BAD_REQUEST, "filePath is required.");
+        };
+        resolve_git_file_from_absolute_path_payload(&state, &file_path).await
+    } else if route_path == "/api/git/file" {
+        match method {
+            Method::GET => {
+                let Some(repo_path) = query_param_value(query.as_deref(), "repoPath") else {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "repoPath and filePath are required.",
+                    );
+                };
+                let Some(file_path) = query_param_value(query.as_deref(), "filePath") else {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "repoPath and filePath are required.",
+                    );
+                };
+                get_git_file_payload(&state, &repo_path, &file_path).await
+            }
+            Method::PUT => {
+                let Some(repo_path) = payload.get("repoPath").and_then(Value::as_str) else {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "repoPath, filePath, and content are required.",
+                    );
+                };
+                let Some(file_path) = payload.get("filePath").and_then(Value::as_str) else {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "repoPath, filePath, and content are required.",
+                    );
+                };
+                let Some(content) = payload.get("content").and_then(Value::as_str) else {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "repoPath, filePath, and content are required.",
+                    );
+                };
+                save_git_file_payload(&state, repo_path, file_path, content).await
+            }
+            _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
+        }
+    } else if route_path == "/api/git/stage" {
+        if method != Method::POST {
+            return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+        }
+        let Some(repo_path) = payload.get("repoPath").and_then(Value::as_str) else {
+            return json_error(StatusCode::BAD_REQUEST, "repoPath is required.");
+        };
+        stage_git_changes_payload(
+            &state,
+            repo_path,
+            payload.get("filePath").and_then(Value::as_str),
+        )
+        .await
+    } else if route_path == "/api/git/unstage" {
+        if method != Method::POST {
+            return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+        }
+        let Some(repo_path) = payload.get("repoPath").and_then(Value::as_str) else {
+            return json_error(StatusCode::BAD_REQUEST, "repoPath is required.");
+        };
+        unstage_git_changes_payload(
+            &state,
+            repo_path,
+            payload.get("filePath").and_then(Value::as_str),
+        )
+        .await
+    } else if route_path == "/api/git/fetch" {
+        if method != Method::POST {
+            return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+        }
+        let Some(repo_path) = payload.get("repoPath").and_then(Value::as_str) else {
+            return json_error(StatusCode::BAD_REQUEST, "repoPath is required.");
+        };
+        fetch_git_repository_payload(&state, repo_path).await
+    } else if route_path == "/api/git/pull" {
+        if method != Method::POST {
+            return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+        }
+        let Some(repo_path) = payload.get("repoPath").and_then(Value::as_str) else {
+            return json_error(StatusCode::BAD_REQUEST, "repoPath is required.");
+        };
+        pull_git_repository_payload(&state, repo_path).await
+    } else if route_path == "/api/git/commit" {
+        if method != Method::POST {
+            return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+        }
+        let Some(repo_path) = payload.get("repoPath").and_then(Value::as_str) else {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "repoPath and message are required.",
+            );
+        };
+        let Some(message) = payload.get("message").and_then(Value::as_str) else {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "repoPath and message are required.",
+            );
+        };
+        commit_git_changes_payload(&state, repo_path, message).await
+    } else if route_path == "/api/git/checkout" {
+        if method != Method::POST {
+            return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+        }
+        let Some(repo_path) = payload.get("repoPath").and_then(Value::as_str) else {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "repoPath and branchName are required.",
+            );
+        };
+        let Some(branch_name) = payload.get("branchName").and_then(Value::as_str) else {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "repoPath and branchName are required.",
+            );
+        };
+        checkout_git_branch_payload(
+            &state,
+            repo_path,
+            branch_name,
+            payload
+                .get("create")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        )
+        .await
+    } else if route_path == "/api/git/worktrees" {
+        match method {
+            Method::GET => {
+                let repo_path = query_param_value(query.as_deref(), "repoPath").unwrap_or_default();
+                list_git_worktrees_payload(&state, &repo_path).await
+            }
+            Method::POST => {
+                let repo_path = payload
+                    .get("repoPath")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let worktree_path = payload
+                    .get("worktreePath")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                create_git_worktree_payload(
+                    &state,
+                    repo_path,
+                    worktree_path,
+                    payload.get("branchName").and_then(Value::as_str),
+                    payload
+                        .get("createBranch")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    payload
+                        .get("detach")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
+                .await
+            }
+            Method::DELETE => {
+                let repo_path = payload
+                    .get("repoPath")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let worktree_path = payload
+                    .get("worktreePath")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                remove_git_worktree_payload(
+                    &state,
+                    repo_path,
+                    worktree_path,
+                    payload
+                        .get("force")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
+                .await
+            }
+            _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
+        }
+    } else if route_path == "/api/git/commit/diff" {
+        if method != Method::GET {
+            return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+        }
+        let Some(repo_path) = query_param_value(query.as_deref(), "repoPath") else {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "repoPath and commitHash are required.",
+            );
+        };
+        let Some(commit_hash) = query_param_value(query.as_deref(), "commitHash") else {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "repoPath and commitHash are required.",
+            );
+        };
+        get_git_commit_diff_payload(&state, &repo_path, &commit_hash).await
+    } else if route_path == "/api/git/github/pulls" {
+        if method != Method::GET {
+            return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+        }
+        let Some(repo_path) = query_param_value(query.as_deref(), "repoPath") else {
+            return json_error(StatusCode::BAD_REQUEST, "repoPath is required.");
+        };
+        let pr_state =
+            query_param_value(query.as_deref(), "state").unwrap_or_else(|| "open".to_string());
+        let limit = query_param_value(query.as_deref(), "limit")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(20);
+        list_github_pull_requests_payload(&state, &repo_path, &pr_state, limit).await
+    } else if let Some(suffix) = route_path.strip_prefix("/api/git/github/pulls/") {
+        if let Some(number_text) = suffix.strip_suffix("/checkout") {
+            if method != Method::POST {
+                return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+            }
+            let Ok(number) = number_text.parse::<u64>() else {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "repoPath and pull request number are required.",
+                );
+            };
+            let Some(repo_path) = payload.get("repoPath").and_then(Value::as_str) else {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "repoPath and pull request number are required.",
+                );
+            };
+            checkout_github_pull_request_payload(&state, repo_path, number).await
+        } else {
+            if method != Method::GET {
+                return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+            }
+            let Ok(number) = suffix.parse::<u64>() else {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "repoPath and pull request number are required.",
+                );
+            };
+            let Some(repo_path) = query_param_value(query.as_deref(), "repoPath") else {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "repoPath and pull request number are required.",
+                );
+            };
+            get_github_pull_request_payload(&state, &repo_path, number).await
+        }
+    } else {
+        return json_error(StatusCode::NOT_FOUND, "Not found.");
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
         Err(error) => json_error(error.status, &error.message),
     }
 }
@@ -12696,55 +13400,38 @@ async fn execute_ws_method(
         "git/status" => get_git_status_payload(state, &require_string(&params, "repoPath")?)
             .await
             .map_err(anyhow::Error::from),
-        "git/github/pulls" => {
-            let repo_path_raw = require_string(&params, "repoPath")?;
-            let repo_path = urlencoding::encode(&repo_path_raw);
-            let pr_state = params
+        "git/github/pulls" => list_github_pull_requests_payload(
+            state,
+            &require_string(&params, "repoPath")?,
+            params
                 .get("state")
                 .and_then(Value::as_str)
-                .unwrap_or("open");
-            let pr_state = urlencoding::encode(pr_state);
-            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!(
-                    "/api/git/github/pulls?repoPath={repo_path}&state={pr_state}&limit={limit}"
-                ),
-                None,
-            )
-            .await
-        }
+                .unwrap_or("open"),
+            params.get("limit").and_then(Value::as_u64).unwrap_or(20),
+        )
+        .await
+        .map_err(anyhow::Error::from),
         "git/github/pull" => {
-            let repo_path_raw = require_string(&params, "repoPath")?;
-            let repo_path = urlencoding::encode(&repo_path_raw);
             let number = params
                 .get("number")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| anyhow!("number is required"))?;
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!("/api/git/github/pulls/{number}?repoPath={repo_path}"),
-                None,
-            )
-            .await
+            get_github_pull_request_payload(state, &require_string(&params, "repoPath")?, number)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "git/github/pull/checkout" => {
-            let payload = json!({
-                "repoPath": require_string(&params, "repoPath")?
-            });
             let number = params
                 .get("number")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| anyhow!("number is required"))?;
-            internal_json_request(
+            checkout_github_pull_request_payload(
                 state,
-                Method::POST,
-                &format!("/api/git/github/pulls/{number}/checkout"),
-                Some(payload),
+                &require_string(&params, "repoPath")?,
+                number,
             )
             .await
+            .map_err(anyhow::Error::from)
         }
         "git/worktrees/list" => {
             list_git_worktrees_payload(state, &require_string(&params, "repoPath")?)
@@ -15593,58 +16280,6 @@ async fn upload_attachments(
     }))
 }
 
-async fn internal_json_request(
-    state: &AppState,
-    method: Method,
-    path: &str,
-    body: Option<Value>,
-) -> Result<Value> {
-    let profile_id = ACTIVE_PROFILE_ID
-        .try_with(|profile_id| profile_id.clone())
-        .ok();
-    internal_json_request_for_profile(state, profile_id.as_deref(), method, path, body).await
-}
-
-async fn internal_json_request_for_profile(
-    state: &AppState,
-    profile_id: Option<&str>,
-    method: Method,
-    path: &str,
-    body: Option<Value>,
-) -> Result<Value> {
-    let target = internal_url(&state.config, path);
-    let mut request = state
-        .http
-        .request(
-            reqwest::Method::from_bytes(method.as_str().as_bytes())?,
-            target,
-        )
-        .header(INTERNAL_HEADER, &state.config.internal_proxy_token);
-
-    if let Some(profile_id) = profile_id.filter(|value| !value.trim().is_empty()) {
-        request = request.header(PROFILE_HEADER, profile_id);
-    }
-
-    if let Some(body) = body {
-        request = request.json(&body);
-    }
-
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("failed internal request for {path}"))?;
-    parse_json_response(response).await
-}
-
-async fn parse_json_response(response: reqwest::Response) -> Result<Value> {
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(anyhow!(text));
-    }
-    serde_json::from_str(&text).context("invalid json from internal backend")
-}
-
 async fn forward_request(
     state: &AppState,
     method: Method,
@@ -16254,10 +16889,6 @@ fn resolve_project_root(cwd: &PathBuf) -> PathBuf {
     }
 
     cwd.clone()
-}
-
-fn internal_url(config: &Config, path: &str) -> String {
-    format!("{}{}", config.internal_base_url, path)
 }
 
 async fn spawn_internal_node(config: &Config) -> Result<(Child, Arc<Mutex<VecDeque<String>>>)> {
@@ -17198,6 +17829,85 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn git_http_handlers_use_rust_routes() {
+        let sandbox = unique_test_dir("git-http");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        let repo = workspace.join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+        init_test_git_repo(&repo);
+
+        let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+        let auth = AuthContext {
+            role: UserRole::Admin,
+            profile_id: "default".to_string(),
+        };
+
+        let repositories_request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/git/repositories")
+            .body(Body::empty())
+            .unwrap();
+        let repositories_response = handle_git_api_http(
+            state.clone(),
+            repositories_request,
+            auth.clone(),
+            "/api/git/repositories",
+        )
+        .await;
+        assert_eq!(repositories_response.status(), StatusCode::OK);
+        let repositories_body = to_bytes(repositories_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let repositories_payload: Value = serde_json::from_slice(&repositories_body).unwrap();
+        assert_eq!(
+            repositories_payload
+                .get("repositories")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src").join("queue.rs"), "pub fn run() {}\n").unwrap();
+        let stage_request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/git/stage")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "repoPath": repo.display().to_string(),
+                    "filePath": "src/queue.rs"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let stage_response =
+            handle_git_api_http(state.clone(), stage_request, auth, "/api/git/stage").await;
+        assert_eq!(stage_response.status(), StatusCode::OK);
+        let stage_body = to_bytes(stage_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stage_payload: Value = serde_json::from_slice(&stage_body).unwrap();
+        assert_eq!(
+            stage_payload
+                .get("files")
+                .and_then(Value::as_array)
+                .map(|files| files.iter().any(|entry| {
+                    entry.get("path").and_then(Value::as_str) == Some("src/queue.rs")
+                        && entry
+                            .get("hasStagedChanges")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                })),
+            Some(true)
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn git_fetch_and_pull_payloads_use_rust_helpers() {
         let sandbox = unique_test_dir("git-fetch-pull");
         let workspace = sandbox.join("workspace");
@@ -17312,6 +18022,66 @@ for raw_line in sys.stdin:
         assert_eq!(
             fs::read_to_string(local.join("README.md")).unwrap(),
             "remote update\n"
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[test]
+    fn parses_github_remote_urls() {
+        let ssh =
+            parse_github_remote_payload("origin", "git@github.com:openai/codex-webui.git").unwrap();
+        assert_eq!(ssh.get("host").and_then(Value::as_str), Some("github.com"));
+        assert_eq!(ssh.get("owner").and_then(Value::as_str), Some("openai"));
+        assert_eq!(ssh.get("name").and_then(Value::as_str), Some("codex-webui"));
+
+        let https =
+            parse_github_remote_payload("upstream", "https://github.com/openai/codex-webui.git")
+                .unwrap();
+        assert_eq!(
+            https.get("remoteName").and_then(Value::as_str),
+            Some("upstream")
+        );
+        assert_eq!(
+            https.get("url").and_then(Value::as_str),
+            Some("https://github.com/openai/codex-webui")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolves_github_repository_payload_from_git_remote() {
+        let sandbox = unique_test_dir("github-remote");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        let repo = workspace.join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+        init_test_git_repo(&repo);
+
+        let remote = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:openai/codex-webui.git",
+            ])
+            .output()
+            .unwrap();
+        assert!(remote.status.success(), "git remote add failed");
+
+        let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+        let repository = resolve_github_repository_payload(&state, repo.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.get("owner").and_then(Value::as_str),
+            Some("openai")
+        );
+        assert_eq!(
+            repository.get("name").and_then(Value::as_str),
+            Some("codex-webui")
         );
 
         let _ = fs::remove_dir_all(sandbox);

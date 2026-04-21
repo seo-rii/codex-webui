@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     env, fs,
     future::Future,
-    net::{SocketAddr, TcpListener},
+    net::SocketAddr,
     path::{Component, Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -43,7 +43,7 @@ use subtle::ConstantTimeEq;
 use time::Duration as CookieDuration;
 use tokio::{
     fs as tokio_fs,
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     sync::{Mutex, broadcast, mpsc},
 };
@@ -55,7 +55,6 @@ const AUTH_COOKIE: &str = "codex_webui_auth";
 const PROFILE_COOKIE: &str = "codex_webui_profile";
 const LOGIN_WINDOW_MS: u128 = 10 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS: usize = 8;
-const INTERNAL_HEADER: &str = "x-codex-webui-internal-token";
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const GLOBAL_RELAY_KEY: &str = "__global__";
 const CODEX_NPM_PACKAGE: &str = "@openai/codex";
@@ -73,9 +72,6 @@ const TERMINAL_BUFFER_LIMIT: usize = 500_000;
 const TERMINAL_RELAY_PREFIX: &str = "__terminal__:";
 const STATIC_BASE_PLACEHOLDER: &str = "/__CODEX_WEBUI_BASE__";
 const RUNTIME_ERROR_LOG_NAME: &str = "runtime-errors.jsonl";
-const INTERNAL_NODE_LOG_NAME: &str = "internal-node.log";
-const INTERNAL_NODE_STDERR_TAIL_LIMIT: usize = 120;
-const INTERNAL_NODE_DISABLE_QUEUE_LIFECYCLE_ENV: &str = "CODEX_WEBUI_RUST_OWNS_QUEUE_LIFECYCLE";
 const AUTOSTART_LABEL: &str = "dev.seorii.codex-webui";
 const WINDOWS_STARTUP_SCRIPT: &str = "codex-webui.vbs";
 const MACOS_LAUNCH_AGENT: &str = "dev.seorii.codex-webui.plist";
@@ -112,26 +108,6 @@ fn runtime_error_log_path(config: &Config) -> PathBuf {
     runtime_logs_dir(config).join(RUNTIME_ERROR_LOG_NAME)
 }
 
-fn internal_node_log_path(config: &Config) -> PathBuf {
-    runtime_logs_dir(config).join(INTERNAL_NODE_LOG_NAME)
-}
-
-fn append_text_log_line(path: &Path, message: &str) {
-    let trimmed = message.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    let line = format!("{} {trimmed}\n", now_millis());
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
-    }
-}
-
 fn append_runtime_error_log(config: &Config, source: &str, message: &str, details: Value) {
     let path = runtime_error_log_path(config);
     if let Some(parent) = path.parent() {
@@ -152,10 +128,6 @@ fn append_runtime_error_log(config: &Config, source: &str, message: &str, detail
             let _ = std::io::Write::write_all(&mut file, b"\n");
         }
     }
-}
-
-async fn snapshot_stderr_tail(stderr_tail: &Arc<Mutex<VecDeque<String>>>) -> Vec<String> {
-    stderr_tail.lock().await.iter().cloned().collect()
 }
 
 fn install_panic_logger(config: Arc<Config>) {
@@ -193,11 +165,6 @@ struct Config {
     static_dir: PathBuf,
     public_host: String,
     public_port: u16,
-    internal_port: u16,
-    internal_proxy_token: String,
-    internal_base_url: String,
-    node_entry: PathBuf,
-    node_binary: String,
     codex_bin: String,
     max_upload_bytes: u64,
     git_discovery_depth: u64,
@@ -657,12 +624,6 @@ async fn main() -> Result<()> {
             .build()
             .context("failed to build reqwest client")?;
 
-        let (mut child, internal_node_stderr_tail) = spawn_internal_node(&config).await?;
-        if let Err(error) = wait_for_internal_node(&config, &http, &internal_node_stderr_tail).await {
-            let _ = child.kill().await;
-            return Err(error);
-        }
-
         let state = AppState {
             config: config.clone(),
             app_servers: AppServerManager::new(AppServerClientConfig {
@@ -709,32 +670,11 @@ async fn main() -> Result<()> {
             .await
             .context("failed to bind public listener")?;
 
-        tokio::select! {
-            server_result = axum::serve(listener, router) => {
-                let _ = child.kill().await;
-                let _ = state.app_servers.close_all().await;
-                server_result.context("axum server terminated unexpectedly")
-            }
-            child_result = child.wait() => {
-                let details = match child_result {
-                    Ok(status) => json!({
-                        "status": status.to_string(),
-                        "internalBaseUrl": config.internal_base_url,
-                        "internalNodeLogPath": internal_node_log_path(&config).display().to_string(),
-                        "stderrTail": snapshot_stderr_tail(&internal_node_stderr_tail).await
-                    }),
-                    Err(error) => json!({
-                        "error": error.to_string(),
-                        "internalBaseUrl": config.internal_base_url,
-                        "internalNodeLogPath": internal_node_log_path(&config).display().to_string(),
-                        "stderrTail": snapshot_stderr_tail(&internal_node_stderr_tail).await
-                    })
-                };
-                append_runtime_error_log(&config, "rust-gateway", "internal Node backend exited unexpectedly", details);
-                let _ = state.app_servers.close_all().await;
-                Err(anyhow!("internal Node backend exited unexpectedly"))
-            }
-        }
+        let server_result = axum::serve(listener, router)
+            .await
+            .context("axum server terminated unexpectedly");
+        let _ = state.app_servers.close_all().await;
+        server_result
     }
     .await;
 
@@ -743,10 +683,7 @@ async fn main() -> Result<()> {
             &config,
             "rust-gateway",
             "gateway fatal error",
-            json!({
-                "error": format!("{error:#}"),
-                "internalNodeLogPath": internal_node_log_path(&config).display().to_string()
-            }),
+            json!({ "error": format!("{error:#}") }),
         );
     }
 
@@ -766,10 +703,6 @@ impl Config {
             .unwrap_or_else(|_| cwd.join(".data"));
         let public_host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let public_port = parse_port(env::var("PORT").ok(), 4173)?;
-        let internal_port = parse_port(
-            env::var("CODEX_WEBUI_INTERNAL_PORT").ok(),
-            choose_free_port()?,
-        )?;
         let max_upload_bytes = env::var("CODEX_WEBUI_MAX_UPLOAD_MB")
             .ok()
             .and_then(|value| value.parse::<f64>().ok())
@@ -785,14 +718,6 @@ impl Config {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(30);
-        let internal_proxy_token = Uuid::new_v4().to_string();
-        let node_entry = project_root.join("build/internal/index.js");
-        if !node_entry.exists() {
-            return Err(anyhow!(
-                "missing internal API build at {}. Run `pnpm build` in codex-webui first.",
-                node_entry.display()
-            ));
-        }
         if !static_dir.exists() {
             return Err(anyhow!(
                 "missing static frontend build at {}. Run `pnpm build` in codex-webui first.",
@@ -813,11 +738,6 @@ impl Config {
             static_dir,
             public_host,
             public_port,
-            internal_port,
-            internal_proxy_token,
-            internal_base_url: format!("http://127.0.0.1:{internal_port}"),
-            node_entry,
-            node_binary: env::var("NODE_BINARY").unwrap_or_else(|_| "node".to_string()),
             codex_bin: env::var("CODEX_WEBUI_CODEX_BIN").unwrap_or_else(|_| "codex".to_string()),
             max_upload_bytes,
             git_discovery_depth,
@@ -17168,11 +17088,6 @@ fn parse_cors_origins(value: Option<String>) -> Result<Vec<String>> {
         .collect()
 }
 
-fn choose_free_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("failed to allocate internal port")?;
-    Ok(listener.local_addr()?.port())
-}
-
 fn resolve_codex_home() -> Result<PathBuf> {
     if let Some(value) = env::var_os("CODEX_WEBUI_CODEX_HOME").or_else(|| env::var_os("CODEX_HOME"))
     {
@@ -17217,89 +17132,6 @@ fn resolve_project_root(cwd: &PathBuf) -> PathBuf {
     }
 
     cwd.clone()
-}
-
-async fn spawn_internal_node(config: &Config) -> Result<(Child, Arc<Mutex<VecDeque<String>>>)> {
-    let mut command = Command::new(&config.node_binary);
-    command
-        .arg(&config.node_entry)
-        .current_dir(&config.project_root)
-        .envs(env::vars())
-        .env("HOST", "127.0.0.1")
-        .env("PORT", config.internal_port.to_string())
-        .env(
-            "CODEX_WEBUI_INTERNAL_PROXY_TOKEN",
-            &config.internal_proxy_token,
-        )
-        .env(INTERNAL_NODE_DISABLE_QUEUE_LIFECYCLE_ENV, "true")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-
-    let mut child = command
-        .spawn()
-        .context("failed to spawn internal Node backend")?;
-    let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
-    if let Some(stderr) = child.stderr.take() {
-        let stderr_tail = stderr_tail.clone();
-        let stderr_log_path = internal_node_log_path(config);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                let message = line.trim();
-                if !message.is_empty() {
-                    append_text_log_line(&stderr_log_path, message);
-                    {
-                        let mut tail = stderr_tail.lock().await;
-                        tail.push_back(message.to_string());
-                        while tail.len() > INTERNAL_NODE_STDERR_TAIL_LIMIT {
-                            tail.pop_front();
-                        }
-                    }
-                    info!("[internal-node] {message}");
-                }
-            }
-        });
-    }
-    Ok((child, stderr_tail))
-}
-
-async fn wait_for_internal_node(
-    config: &Config,
-    http: &reqwest::Client,
-    stderr_tail: &Arc<Mutex<VecDeque<String>>>,
-) -> Result<()> {
-    let target = format!("{}/health", config.internal_base_url);
-
-    for _ in 0..100 {
-        if let Ok(response) = http
-            .get(&target)
-            .header(INTERNAL_HEADER, &config.internal_proxy_token)
-            .send()
-            .await
-        {
-            if response.status().is_success() || response.status().is_redirection() {
-                info!(
-                    "Internal Node backend is ready at {}",
-                    config.internal_base_url
-                );
-                return Ok(());
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    append_runtime_error_log(
-        config,
-        "rust-gateway",
-        "timed out waiting for internal Node backend",
-        json!({
-            "internalBaseUrl": config.internal_base_url,
-            "internalNodeLogPath": internal_node_log_path(config).display().to_string(),
-            "stderrTail": snapshot_stderr_tail(stderr_tail).await
-        }),
-    );
-    Err(anyhow!("timed out waiting for internal Node backend"))
 }
 
 fn now_millis() -> u128 {
@@ -17404,11 +17236,6 @@ mod tests {
                 static_dir: project_root.join("static"),
                 public_host: "127.0.0.1".to_string(),
                 public_port: 4173,
-                internal_port: 4174,
-                internal_proxy_token: "test-token".to_string(),
-                internal_base_url: "http://127.0.0.1:4174".to_string(),
-                node_entry: project_root.join("node-entry.js"),
-                node_binary: "node".to_string(),
                 codex_bin: "codex".to_string(),
                 max_upload_bytes: 20 * 1024 * 1024,
                 git_discovery_depth: 1,

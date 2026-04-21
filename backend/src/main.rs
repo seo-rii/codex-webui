@@ -4609,18 +4609,7 @@ async fn get_git_file_payload(
         .cloned()
         .unwrap_or(Value::Null);
 
-    let repo_root_path = PathBuf::from(&repo_root);
-    let candidate_path = normalize_path(repo_root_path.join(file_path));
-    let existing_path = tokio_fs::canonicalize(&candidate_path)
-        .await
-        .unwrap_or_else(|_| candidate_path.clone());
-    if !path_is_within(&repo_root_path, &existing_path) {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "The selected file is outside the repository root.",
-        ));
-    }
-
+    let candidate_path = resolve_git_repository_file_path(&repo_root, file_path).await?;
     let modified_bytes = tokio_fs::read(&candidate_path).await.unwrap_or_default();
     let modified_is_binary = modified_bytes.contains(&0);
     let modified_content = if modified_is_binary {
@@ -4698,6 +4687,161 @@ async fn get_git_file_payload(
         "isBinary": original_is_binary || modified_is_binary,
         "status": status
     }))
+}
+
+async fn resolve_git_repository_file_path(repo_root: &str, file_path: &str) -> ApiResult<PathBuf> {
+    let repo_root_path = PathBuf::from(repo_root);
+    let candidate_path = normalize_path(repo_root_path.join(file_path));
+    let existing_path = tokio_fs::canonicalize(&candidate_path)
+        .await
+        .unwrap_or_else(|_| candidate_path.clone());
+    if !path_is_within(&repo_root_path, &existing_path) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "The selected file is outside the repository root.",
+        ));
+    }
+    Ok(candidate_path)
+}
+
+async fn save_git_file_payload(
+    state: &AppState,
+    repo_path: &str,
+    file_path: &str,
+    content: &str,
+) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let target_path = resolve_git_repository_file_path(&repo_root, file_path).await?;
+    if let Some(parent) = target_path.parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    }
+    tokio_fs::write(&target_path, content)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    get_git_file_payload(state, &repo_root, file_path).await
+}
+
+async fn stage_git_changes_payload(
+    state: &AppState,
+    repo_path: &str,
+    file_path: Option<&str>,
+) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let args = if let Some(file_path) = file_path.filter(|value| !value.trim().is_empty()) {
+        vec!["add".to_string(), "--".to_string(), file_path.to_string()]
+    } else {
+        vec!["add".to_string(), "-A".to_string()]
+    };
+    run_git_text_payload(state, &repo_root, args).await?;
+    get_git_status_payload(state, &repo_root).await
+}
+
+async fn unstage_git_changes_payload(
+    state: &AppState,
+    repo_path: &str,
+    file_path: Option<&str>,
+) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let args = if let Some(file_path) = file_path.filter(|value| !value.trim().is_empty()) {
+        vec![
+            "restore".to_string(),
+            "--staged".to_string(),
+            "--".to_string(),
+            file_path.to_string(),
+        ]
+    } else {
+        vec![
+            "restore".to_string(),
+            "--staged".to_string(),
+            ".".to_string(),
+        ]
+    };
+    run_git_text_payload(state, &repo_root, args).await?;
+    get_git_status_payload(state, &repo_root).await
+}
+
+async fn fetch_git_repository_payload(state: &AppState, repo_path: &str) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    run_git_text_payload(
+        state,
+        &repo_root,
+        vec![
+            "fetch".to_string(),
+            "--all".to_string(),
+            "--prune".to_string(),
+        ],
+    )
+    .await?;
+    invalidate_git_repository_cache(state).await;
+    get_git_status_payload(state, &repo_root).await
+}
+
+async fn pull_git_repository_payload(state: &AppState, repo_path: &str) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    run_git_text_payload(
+        state,
+        &repo_root,
+        vec!["pull".to_string(), "--ff-only".to_string()],
+    )
+    .await?;
+    invalidate_git_repository_cache(state).await;
+    get_git_status_payload(state, &repo_root).await
+}
+
+async fn commit_git_changes_payload(
+    state: &AppState,
+    repo_path: &str,
+    message: &str,
+) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let trimmed_message = message.trim();
+    if trimmed_message.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Commit message is required.",
+        ));
+    }
+    run_git_text_payload(
+        state,
+        &repo_root,
+        vec![
+            "commit".to_string(),
+            "-m".to_string(),
+            trimmed_message.to_string(),
+        ],
+    )
+    .await?;
+    get_git_status_payload(state, &repo_root).await
+}
+
+async fn checkout_git_branch_payload(
+    state: &AppState,
+    repo_path: &str,
+    branch_name: &str,
+    create: bool,
+) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let trimmed_branch_name = branch_name.trim();
+    if trimmed_branch_name.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "branchName is required.",
+        ));
+    }
+    let args = if create {
+        vec![
+            "switch".to_string(),
+            "-c".to_string(),
+            trimmed_branch_name.to_string(),
+        ]
+    } else {
+        vec!["switch".to_string(), trimmed_branch_name.to_string()]
+    };
+    run_git_text_payload(state, &repo_root, args).await?;
+    invalidate_git_repository_cache(state).await;
+    get_git_status_payload(state, &repo_root).await
 }
 
 async fn get_git_commit_diff_payload(
@@ -12647,47 +12791,44 @@ async fn execute_ws_method(
         )
         .await
         .map_err(anyhow::Error::from),
-        "git/file/save" => {
-            let payload = json!({
-                "repoPath": require_string(&params, "repoPath")?,
-                "filePath": require_string(&params, "filePath")?,
-                "content": params.get("content").cloned().unwrap_or_else(|| Value::String(String::new()))
-            });
-            internal_json_request(state, Method::PUT, "/api/git/file", Some(payload)).await
-        }
-        "git/stage" => {
-            let payload = json!({
-                "repoPath": require_string(&params, "repoPath")?,
-                "filePath": params.get("filePath").cloned().unwrap_or(Value::Null)
-            });
-            internal_json_request(state, Method::POST, "/api/git/stage", Some(payload)).await
-        }
-        "git/unstage" => {
-            let payload = json!({
-                "repoPath": require_string(&params, "repoPath")?,
-                "filePath": params.get("filePath").cloned().unwrap_or(Value::Null)
-            });
-            internal_json_request(state, Method::POST, "/api/git/unstage", Some(payload)).await
-        }
-        "git/fetch" => {
-            let payload = json!({
-                "repoPath": require_string(&params, "repoPath")?
-            });
-            internal_json_request(state, Method::POST, "/api/git/fetch", Some(payload)).await
-        }
-        "git/pull" => {
-            let payload = json!({
-                "repoPath": require_string(&params, "repoPath")?
-            });
-            internal_json_request(state, Method::POST, "/api/git/pull", Some(payload)).await
-        }
-        "git/commit" => {
-            let payload = json!({
-                "repoPath": require_string(&params, "repoPath")?,
-                "message": require_string(&params, "message")?
-            });
-            internal_json_request(state, Method::POST, "/api/git/commit", Some(payload)).await
-        }
+        "git/file/save" => save_git_file_payload(
+            state,
+            &require_string(&params, "repoPath")?,
+            &require_string(&params, "filePath")?,
+            params
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )
+        .await
+        .map_err(anyhow::Error::from),
+        "git/stage" => stage_git_changes_payload(
+            state,
+            &require_string(&params, "repoPath")?,
+            params.get("filePath").and_then(Value::as_str),
+        )
+        .await
+        .map_err(anyhow::Error::from),
+        "git/unstage" => unstage_git_changes_payload(
+            state,
+            &require_string(&params, "repoPath")?,
+            params.get("filePath").and_then(Value::as_str),
+        )
+        .await
+        .map_err(anyhow::Error::from),
+        "git/fetch" => fetch_git_repository_payload(state, &require_string(&params, "repoPath")?)
+            .await
+            .map_err(anyhow::Error::from),
+        "git/pull" => pull_git_repository_payload(state, &require_string(&params, "repoPath")?)
+            .await
+            .map_err(anyhow::Error::from),
+        "git/commit" => commit_git_changes_payload(
+            state,
+            &require_string(&params, "repoPath")?,
+            &require_string(&params, "message")?,
+        )
+        .await
+        .map_err(anyhow::Error::from),
         "git/commit/diff" => get_git_commit_diff_payload(
             state,
             &require_string(&params, "repoPath")?,
@@ -12695,14 +12836,17 @@ async fn execute_ws_method(
         )
         .await
         .map_err(anyhow::Error::from),
-        "git/checkout" => {
-            let payload = json!({
-                "repoPath": require_string(&params, "repoPath")?,
-                "branchName": require_string(&params, "branchName")?,
-                "create": params.get("create").cloned().unwrap_or_else(|| Value::Bool(false))
-            });
-            internal_json_request(state, Method::POST, "/api/git/checkout", Some(payload)).await
-        }
+        "git/checkout" => checkout_git_branch_payload(
+            state,
+            &require_string(&params, "repoPath")?,
+            &require_string(&params, "branchName")?,
+            params
+                .get("create")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        )
+        .await
+        .map_err(anyhow::Error::from),
         "terminal/list" => list_terminals(state).await,
         "terminal/create" => {
             let cwd = params
@@ -16973,6 +17117,201 @@ for raw_line in sys.stdin:
         assert_eq!(
             resolved.get("filePath").and_then(Value::as_str),
             Some("README.md")
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn git_write_payloads_use_rust_helpers() {
+        let sandbox = unique_test_dir("git-write");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        let repo = workspace.join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+        init_test_git_repo(&repo);
+
+        let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+
+        let saved = save_git_file_payload(&state, repo.to_str().unwrap(), "src/new.txt", "hello\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            saved.get("modifiedContent").and_then(Value::as_str),
+            Some("hello\n")
+        );
+
+        let staged = stage_git_changes_payload(&state, repo.to_str().unwrap(), Some("src/new.txt"))
+            .await
+            .unwrap();
+        assert!(
+            staged
+                .get("files")
+                .and_then(Value::as_array)
+                .is_some_and(|files| files.iter().any(|entry| {
+                    entry.get("path").and_then(Value::as_str) == Some("src/new.txt")
+                        && entry.get("hasStagedChanges").and_then(Value::as_bool) == Some(true)
+                }))
+        );
+
+        let unstaged =
+            unstage_git_changes_payload(&state, repo.to_str().unwrap(), Some("src/new.txt"))
+                .await
+                .unwrap();
+        assert!(
+            unstaged
+                .get("files")
+                .and_then(Value::as_array)
+                .is_some_and(|files| files.iter().any(|entry| {
+                    entry.get("isUntracked").and_then(Value::as_bool) == Some(true)
+                }))
+        );
+
+        stage_git_changes_payload(&state, repo.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let committed = commit_git_changes_payload(&state, repo.to_str().unwrap(), "add new file")
+            .await
+            .unwrap();
+        assert_eq!(committed.get("clean").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            committed
+                .get("commits")
+                .and_then(Value::as_array)
+                .and_then(|commits| commits.first())
+                .and_then(|commit| commit.get("subject"))
+                .and_then(Value::as_str),
+            Some("add new file")
+        );
+
+        let switched =
+            checkout_git_branch_payload(&state, repo.to_str().unwrap(), "feature/test", true)
+                .await
+                .unwrap();
+        assert_eq!(
+            switched.get("branch").and_then(Value::as_str),
+            Some("feature/test")
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn git_fetch_and_pull_payloads_use_rust_helpers() {
+        let sandbox = unique_test_dir("git-fetch-pull");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        let seed = workspace.join("seed");
+        let remote = workspace.join("remote.git");
+        let local = workspace.join("local");
+        let updater = workspace.join("updater");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+        init_test_git_repo(&seed);
+
+        let current_branch = {
+            let output = std::process::Command::new("git")
+                .args(["-C", seed.to_str().unwrap(), "branch", "--show-current"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        let clone_bare = std::process::Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                seed.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(clone_bare.status.success(), "git clone --bare failed");
+
+        let clone_local = std::process::Command::new("git")
+            .args(["clone", remote.to_str().unwrap(), local.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(clone_local.status.success(), "git clone local failed");
+
+        let clone_updater = std::process::Command::new("git")
+            .args(["clone", remote.to_str().unwrap(), updater.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(clone_updater.status.success(), "git clone updater failed");
+        for args in [
+            vec![
+                "-C",
+                updater.to_str().unwrap(),
+                "config",
+                "user.name",
+                "Codex WebUI",
+            ],
+            vec![
+                "-C",
+                updater.to_str().unwrap(),
+                "config",
+                "user.email",
+                "codex-webui@example.com",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git updater config failed");
+        }
+
+        fs::write(updater.join("README.md"), "remote update\n").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["-C", updater.to_str().unwrap(), "add", "README.md"])
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "git add updater failed");
+        let commit = std::process::Command::new("git")
+            .args([
+                "-C",
+                updater.to_str().unwrap(),
+                "commit",
+                "-m",
+                "remote update",
+            ])
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "git commit updater failed");
+        let push = std::process::Command::new("git")
+            .args([
+                "-C",
+                updater.to_str().unwrap(),
+                "push",
+                "origin",
+                &current_branch,
+            ])
+            .output()
+            .unwrap();
+        assert!(push.status.success(), "git push updater failed");
+
+        let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+
+        let fetched = fetch_git_repository_payload(&state, local.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            fetched
+                .get("behind")
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value >= 1)
+        );
+
+        let pulled = pull_git_repository_payload(&state, local.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(pulled.get("clean").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            fs::read_to_string(local.join("README.md")).unwrap(),
+            "remote update\n"
         );
 
         let _ = fs::remove_dir_all(sandbox);

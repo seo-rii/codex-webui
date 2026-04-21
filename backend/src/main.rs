@@ -3946,6 +3946,239 @@ async fn normalize_git_repo_path(state: &AppState, git_repo_path: &Value) -> Api
     Ok(Value::String(resolved.display().to_string()))
 }
 
+async fn resolve_git_repo_root(state: &AppState, repo_path: &str) -> ApiResult<String> {
+    let normalized = normalize_git_repo_path(state, &Value::String(repo_path.to_string())).await?;
+    let resolved_repo_path = normalized
+        .as_str()
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "The selected repository path is invalid.",
+            )
+        })?
+        .to_string();
+
+    let output = run_command_with_timeout(
+        "git",
+        vec![
+            "-C".to_string(),
+            resolved_repo_path.clone(),
+            "rev-parse".to_string(),
+            "--show-toplevel".to_string(),
+        ],
+        Duration::from_secs(10),
+    )
+    .await
+    .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            if stderr.is_empty() {
+                "The selected path is not inside a Git repository.".to_string()
+            } else {
+                stderr
+            },
+        ));
+    }
+
+    let repo_root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if repo_root.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "The selected repository path is not inside a Git repository.",
+        ));
+    }
+    Ok(repo_root)
+}
+
+async fn resolve_git_worktree_path(state: &AppState, worktree_path: &str) -> ApiResult<String> {
+    if worktree_path.trim().is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "worktreePath is required.",
+        ));
+    }
+
+    let candidate = resolve_input_path(&state.config.project_root, worktree_path);
+    let existing = tokio_fs::canonicalize(&candidate).await.ok();
+    let path_to_check = existing.unwrap_or_else(|| candidate.clone());
+    let allowed_roots = resolved_allowed_roots(&state.config).await;
+    if !allowed_roots
+        .iter()
+        .any(|root| path_is_within(root, &path_to_check))
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "The selected worktree path is outside the allowed roots.",
+        ));
+    }
+
+    Ok(candidate.display().to_string())
+}
+
+async fn run_git_text_payload(
+    _state: &AppState,
+    repo_path: &str,
+    args: Vec<String>,
+) -> ApiResult<String> {
+    let mut command_args = vec!["-C".to_string(), repo_path.to_string()];
+    command_args.extend(args.clone());
+    let output = run_command_with_timeout("git", command_args, Duration::from_secs(20))
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            if stderr.is_empty() {
+                format!(
+                    "git {} failed.",
+                    args.first().map(String::as_str).unwrap_or("command")
+                )
+            } else {
+                stderr
+            },
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn parse_git_worktrees_payload(repo_path: &str, output: &str) -> Vec<Value> {
+    let mut worktrees = Vec::new();
+    let mut current: Option<serde_json::Map<String, Value>> = None;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() {
+            if let Some(entry) = current.take() {
+                worktrees.push(Value::Object(entry));
+            }
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(entry) = current.take() {
+                worktrees.push(Value::Object(entry));
+            }
+            let mut entry = serde_json::Map::new();
+            entry.insert("path".to_string(), Value::String(path.to_string()));
+            entry.insert("branch".to_string(), Value::Null);
+            entry.insert("head".to_string(), Value::Null);
+            entry.insert("bare".to_string(), Value::Bool(false));
+            entry.insert("detached".to_string(), Value::Bool(false));
+            entry.insert("locked".to_string(), Value::Bool(false));
+            entry.insert("prunable".to_string(), Value::Bool(false));
+            entry.insert("current".to_string(), Value::Bool(path == repo_path));
+            current = Some(entry);
+            continue;
+        }
+
+        let Some(entry) = current.as_mut() else {
+            continue;
+        };
+        if let Some(head) = line.strip_prefix("HEAD ") {
+            entry.insert("head".to_string(), Value::String(head.to_string()));
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            entry.insert("branch".to_string(), Value::String(branch.to_string()));
+        } else if line == "bare" {
+            entry.insert("bare".to_string(), Value::Bool(true));
+        } else if line == "detached" {
+            entry.insert("detached".to_string(), Value::Bool(true));
+        } else if line.starts_with("locked") {
+            entry.insert("locked".to_string(), Value::Bool(true));
+        } else if line.starts_with("prunable") {
+            entry.insert("prunable".to_string(), Value::Bool(true));
+        }
+    }
+
+    if let Some(entry) = current.take() {
+        worktrees.push(Value::Object(entry));
+    }
+
+    worktrees
+}
+
+async fn list_git_worktrees_payload(state: &AppState, repo_path: &str) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let output = run_git_text_payload(
+        state,
+        &repo_root,
+        vec![
+            "worktree".to_string(),
+            "list".to_string(),
+            "--porcelain".to_string(),
+        ],
+    )
+    .await?;
+    Ok(json!({
+        "repoPath": repo_root,
+        "worktrees": parse_git_worktrees_payload(&repo_root, &output)
+    }))
+}
+
+async fn create_git_worktree_payload(
+    state: &AppState,
+    repo_path: &str,
+    worktree_path: &str,
+    branch_name: Option<&str>,
+    create_branch: bool,
+    detach: bool,
+) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let resolved_worktree_path = resolve_git_worktree_path(state, worktree_path).await?;
+    let trimmed_branch_name = branch_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if !detach && trimmed_branch_name.is_none() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Provide a branch name or create a detached worktree.",
+        ));
+    }
+
+    let mut args = vec!["worktree".to_string(), "add".to_string()];
+    if detach {
+        args.push("--detach".to_string());
+    } else if create_branch {
+        let Some(branch_name) = trimmed_branch_name.clone() else {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "Provide a branch name or create a detached worktree.",
+            ));
+        };
+        args.push("-b".to_string());
+        args.push(branch_name);
+    }
+    args.push(resolved_worktree_path);
+    if !detach && !create_branch {
+        if let Some(branch_name) = trimmed_branch_name {
+            args.push(branch_name);
+        }
+    }
+
+    run_git_text_payload(state, &repo_root, args).await?;
+    list_git_worktrees_payload(state, &repo_root).await
+}
+
+async fn remove_git_worktree_payload(
+    state: &AppState,
+    repo_path: &str,
+    worktree_path: &str,
+    force: bool,
+) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let resolved_worktree_path = resolve_git_worktree_path(state, worktree_path).await?;
+    let mut args = vec!["worktree".to_string(), "remove".to_string()];
+    if force {
+        args.push("--force".to_string());
+    }
+    args.push(resolved_worktree_path);
+    run_git_text_payload(state, &repo_root, args).await?;
+    list_git_worktrees_payload(state, &repo_root).await
+}
+
 async fn normalize_session_preferences_payload(
     state: &AppState,
     profile_id: &str,
@@ -6745,24 +6978,22 @@ async fn run_automation_payload(
                 .join(&time_suffix);
             let branch_name = format!("automation/{worktree_name}-{time_suffix}");
 
-            internal_json_request_for_profile(
+            create_git_worktree_payload(
                 state,
-                Some(profile_id),
-                Method::POST,
-                "/api/git/worktrees",
-                Some(json!({
-                    "repoPath": repo_root,
-                    "worktreePath": worktree.display().to_string(),
-                    "branchName": branch_name,
-                    "createBranch": true,
-                    "detach": false
-                })),
+                &repo_root,
+                &worktree.display().to_string(),
+                Some(&branch_name),
+                true,
+                false,
             )
             .await
             .map_err(|error| {
                 api_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("Failed to create the automation worktree: {error}"),
+                    error.status,
+                    format!(
+                        "Failed to create the automation worktree: {}",
+                        error.message
+                    ),
                 )
             })?;
 
@@ -11679,34 +11910,37 @@ async fn execute_ws_method(
             .await
         }
         "git/worktrees/list" => {
-            let repo_path_raw = require_string(&params, "repoPath")?;
-            let repo_path = urlencoding::encode(&repo_path_raw);
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!("/api/git/worktrees?repoPath={repo_path}"),
-                None,
-            )
-            .await
+            list_git_worktrees_payload(state, &require_string(&params, "repoPath")?)
+                .await
+                .map_err(anyhow::Error::from)
         }
-        "git/worktrees/create" => {
-            let payload = json!({
-                "repoPath": require_string(&params, "repoPath")?,
-                "worktreePath": require_string(&params, "worktreePath")?,
-                "branchName": params.get("branchName").cloned().unwrap_or(Value::Null),
-                "createBranch": params.get("createBranch").cloned().unwrap_or_else(|| Value::Bool(false)),
-                "detach": params.get("detach").cloned().unwrap_or_else(|| Value::Bool(false))
-            });
-            internal_json_request(state, Method::POST, "/api/git/worktrees", Some(payload)).await
-        }
-        "git/worktrees/remove" => {
-            let payload = json!({
-                "repoPath": require_string(&params, "repoPath")?,
-                "worktreePath": require_string(&params, "worktreePath")?,
-                "force": params.get("force").cloned().unwrap_or_else(|| Value::Bool(false))
-            });
-            internal_json_request(state, Method::DELETE, "/api/git/worktrees", Some(payload)).await
-        }
+        "git/worktrees/create" => create_git_worktree_payload(
+            state,
+            &require_string(&params, "repoPath")?,
+            &require_string(&params, "worktreePath")?,
+            params.get("branchName").and_then(Value::as_str),
+            params
+                .get("createBranch")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            params
+                .get("detach")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        )
+        .await
+        .map_err(anyhow::Error::from),
+        "git/worktrees/remove" => remove_git_worktree_payload(
+            state,
+            &require_string(&params, "repoPath")?,
+            &require_string(&params, "worktreePath")?,
+            params
+                .get("force")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        )
+        .await
+        .map_err(anyhow::Error::from),
         "git/file/get" => {
             let repo_path_raw = require_string(&params, "repoPath")?;
             let file_path_raw = require_string(&params, "filePath")?;
@@ -15320,6 +15554,46 @@ mod tests {
         std::env::temp_dir().join(format!("codex-webui-{label}-{}", Uuid::new_v4()))
     }
 
+    fn init_test_git_repo(repo_path: &Path) {
+        fs::create_dir_all(repo_path).unwrap();
+        let commands = [
+            vec!["init".to_string(), repo_path.display().to_string()],
+            vec![
+                "-C".to_string(),
+                repo_path.display().to_string(),
+                "config".to_string(),
+                "user.name".to_string(),
+                "Codex WebUI".to_string(),
+            ],
+            vec![
+                "-C".to_string(),
+                repo_path.display().to_string(),
+                "config".to_string(),
+                "user.email".to_string(),
+                "codex-webui@example.com".to_string(),
+            ],
+        ];
+        for command in commands {
+            let output = std::process::Command::new("git")
+                .args(command)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git setup command failed");
+        }
+
+        fs::write(repo_path.join("README.md"), "init\n").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["-C", repo_path.to_str().unwrap(), "add", "README.md"])
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "git add failed");
+        let commit = std::process::Command::new("git")
+            .args(["-C", repo_path.to_str().unwrap(), "commit", "-m", "init"])
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "git commit failed");
+    }
+
     fn test_state(
         project_root: PathBuf,
         allowed_roots: Vec<PathBuf>,
@@ -15845,6 +16119,79 @@ for raw_line in sys.stdin:
                 .map(|entry| entry.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["alpha", "beta"]
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn git_worktree_payloads_use_rust_git_helpers() {
+        let sandbox = unique_test_dir("git-worktrees");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        let repo = workspace.join("repo");
+        let worktree = workspace.join(".codex-webui-worktrees").join("feature");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+        init_test_git_repo(&repo);
+
+        let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+
+        let created = create_git_worktree_payload(
+            &state,
+            repo.to_str().unwrap(),
+            worktree.to_str().unwrap(),
+            Some("feature/test"),
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            created.get("repoPath").and_then(Value::as_str),
+            Some(repo.to_str().unwrap())
+        );
+        assert!(
+            created
+                .get("worktrees")
+                .and_then(Value::as_array)
+                .is_some_and(|worktrees| {
+                    worktrees.iter().any(|entry| {
+                        entry.get("path").and_then(Value::as_str)
+                            == Some(worktree.to_str().unwrap())
+                            && entry.get("branch").and_then(Value::as_str) == Some("feature/test")
+                    })
+                })
+        );
+
+        let listed = list_git_worktrees_payload(&state, repo.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .get("worktrees")
+                .and_then(Value::as_array)
+                .is_some_and(|worktrees| worktrees.len() >= 2)
+        );
+
+        let removed = remove_git_worktree_payload(
+            &state,
+            repo.to_str().unwrap(),
+            worktree.to_str().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            removed
+                .get("worktrees")
+                .and_then(Value::as_array)
+                .is_some_and(|worktrees| {
+                    !worktrees.iter().any(|entry| {
+                        entry.get("path").and_then(Value::as_str)
+                            == Some(worktree.to_str().unwrap())
+                    })
+                })
         );
 
         let _ = fs::remove_dir_all(sandbox);

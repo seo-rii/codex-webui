@@ -31,7 +31,7 @@ use backend::codex_app_server::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use futures_util::{FutureExt, SinkExt, StreamExt, TryStreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use reqwest::multipart::Form;
 use scrypt::{Params as ScryptParams, scrypt};
@@ -46,7 +46,6 @@ use tokio::{
     process::{Child, Command},
     sync::{Mutex, broadcast, mpsc},
 };
-use tokio_util::io::StreamReader;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -12104,16 +12103,6 @@ async fn ensure_global_relay(
         relay_sender.clone(),
         profile_id.clone(),
     ));
-    tokio::spawn(async move {
-        loop {
-            if let Err(error) =
-                stream_global_events(state.clone(), relay_sender.clone(), profile_id.clone()).await
-            {
-                warn!("global stream relay failed: {error:#}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    });
 
     Ok(sender)
 }
@@ -12157,50 +12146,6 @@ async fn bridge_app_server_global_notifications(
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
-}
-
-async fn stream_global_events(
-    state: AppState,
-    sender: broadcast::Sender<Value>,
-    profile_id: String,
-) -> Result<()> {
-    let target = internal_url(&state.config, "/api/events/stream");
-    let response = state
-        .http
-        .get(target)
-        .header(INTERNAL_HEADER, &state.config.internal_proxy_token)
-        .header(PROFILE_HEADER, &profile_id)
-        .send()
-        .await
-        .context("failed to connect to internal global SSE stream")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "internal global SSE request failed with {status}: {body}"
-        ));
-    }
-
-    let stream = response
-        .bytes_stream()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error));
-    let reader = StreamReader::new(stream);
-    let mut lines = BufReader::new(reader).lines();
-
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .context("failed to read global SSE line")?
-    {
-        if let Some(data) = line.strip_prefix("data: ") {
-            let payload: Value =
-                serde_json::from_str(data).context("invalid global SSE json payload")?;
-            let _ = sender.send(payload);
-        }
-    }
-
-    Err(anyhow!("internal global SSE stream ended"))
 }
 
 async fn list_terminal_summaries(state: &AppState) -> Vec<TerminalSummaryState> {
@@ -13306,6 +13251,7 @@ async fn handle_profile_runtime_notification(
                 state.active_turns.lock().await.insert(runtime_key, turn_id);
             }
             cancel_scheduled_shutdown_for_activity(state, profile_id).await;
+            set_session_highlight(state, profile_id, &session_id, None).await;
         }
         "turn/completed" => {
             let turn_id = notification_turn_id(&notification.params);
@@ -13319,6 +13265,39 @@ async fn handle_profile_runtime_notification(
             drop(active_turns);
             maybe_drain_queue(state, profile_id, &session_id).await;
             maybe_schedule_global_shutdown(state, profile_id, turn_id.as_deref()).await;
+            emit_profile_global_notification(
+                state,
+                profile_id,
+                json!({
+                    "kind": "notification",
+                    "method": "codex-webui/sessionAttention",
+                    "params": {
+                        "sessionId": session_id,
+                        "reason": "completed"
+                    }
+                }),
+            )
+            .await;
+            enqueue_profile_notification(
+                state,
+                profile_id,
+                "sessionCompleted",
+                Some(&session_id),
+                json!({
+                    "turnId": turn_id.clone().map(Value::String).unwrap_or(Value::Null)
+                }),
+            )
+            .await;
+            set_session_highlight(
+                state,
+                profile_id,
+                &session_id,
+                Some(json!({
+                    "kind": "completed",
+                    "at": now_unix_ms()
+                })),
+            )
+            .await;
         }
         "thread/status/changed" => {
             let status = normalized_thread_status(notification.params.get("status"))
@@ -13330,6 +13309,21 @@ async fn handle_profile_runtime_notification(
                 maybe_drain_queue(state, profile_id, &session_id).await;
                 maybe_schedule_global_shutdown(state, profile_id, None).await;
             }
+        }
+        "thread/archived" | "thread/unarchived" => {
+            emit_profile_global_notification(
+                state,
+                profile_id,
+                json!({
+                    "kind": "notification",
+                    "method": "codex-webui/sessionListsInvalidated",
+                    "params": {
+                        "threadId": session_id,
+                        "archived": notification.method == "thread/archived"
+                    }
+                }),
+            )
+            .await;
         }
         _ => {}
     }
@@ -17850,6 +17844,88 @@ for raw_line in sys.stdin:
                 .and_then(Value::as_u64),
             Some(15)
         );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_notifications_emit_global_events_without_internal_sse() {
+        let sandbox = unique_test_dir("global-stream-rust");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+        let relay = ensure_global_relay(&state, "default")
+            .await
+            .expect("global relay should initialize");
+        let mut receiver = relay.subscribe();
+
+        handle_profile_runtime_notification(
+            &state,
+            "default",
+            &AppServerNotification {
+                method: "turn/completed".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "turn": {
+                        "id": "turn-1",
+                        "status": "completed",
+                        "items": []
+                    }
+                }),
+            },
+        )
+        .await;
+
+        let mut saw_completion_attention = false;
+        for _ in 0..6 {
+            let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("completion event should arrive")
+                .expect("completion event should be readable");
+            if event.get("method").and_then(Value::as_str) == Some("codex-webui/sessionAttention")
+                && event
+                    .get("params")
+                    .and_then(|value| value.get("reason"))
+                    .and_then(Value::as_str)
+                    == Some("completed")
+            {
+                saw_completion_attention = true;
+                break;
+            }
+        }
+        assert!(saw_completion_attention);
+
+        handle_profile_runtime_notification(
+            &state,
+            "default",
+            &AppServerNotification {
+                method: "thread/archived".to_string(),
+                params: json!({
+                    "threadId": "thread-1"
+                }),
+            },
+        )
+        .await;
+
+        let mut saw_invalidation = false;
+        for _ in 0..6 {
+            let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("invalidation event should arrive")
+                .expect("invalidation event should be readable");
+            if event.get("method").and_then(Value::as_str)
+                == Some("codex-webui/sessionListsInvalidated")
+            {
+                saw_invalidation = true;
+                break;
+            }
+        }
+        assert!(saw_invalidation);
 
         let _ = fs::remove_dir_all(sandbox);
     }

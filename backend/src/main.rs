@@ -35,7 +35,6 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
-use reqwest::multipart::Form;
 use scrypt::{Params as ScryptParams, scrypt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -54,7 +53,6 @@ use uuid::Uuid;
 
 const AUTH_COOKIE: &str = "codex_webui_auth";
 const PROFILE_COOKIE: &str = "codex_webui_profile";
-const PROFILE_HEADER: &str = "x-codex-webui-profile-id";
 const LOGIN_WINDOW_MS: u128 = 10 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS: usize = 8;
 const INTERNAL_HEADER: &str = "x-codex-webui-internal-token";
@@ -10293,9 +10291,7 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                     return response;
                 }
 
-                let mut response =
-                    proxy_to_internal(state, method, &route_path, uri.query(), headers, request)
-                        .await;
+                let mut response = json_error(StatusCode::NOT_FOUND, "Not found.");
                 if let Some(origin_value) = cors_origin {
                     apply_cors_headers(
                         response.headers_mut(),
@@ -12794,34 +12790,6 @@ async fn handle_session_stream_api_http(
     match ensure_stream_relay(&state, &auth.profile_id, session_id).await {
         Ok(relay) => sse_response(relay.subscribe(), json!({ "threadId": session_id })),
         Err(error) => json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
-    }
-}
-
-async fn proxy_to_internal(
-    state: AppState,
-    method: Method,
-    route_path: &str,
-    query: Option<&str>,
-    headers: HeaderMap,
-    request: Request,
-) -> Response {
-    let mut target = format!("{}{}", state.config.internal_base_url, route_path);
-    if let Some(query) = query.filter(|value| !value.is_empty()) {
-        target.push('?');
-        target.push_str(query);
-    }
-
-    let body = match to_bytes(request.into_body(), usize::MAX).await {
-        Ok(bytes) => bytes,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Failed to read request body.").into_response(),
-    };
-
-    match forward_request(&state, method, &target, headers, body.to_vec(), None, None).await {
-        Ok(response) => response,
-        Err(error) => {
-            error!("proxy error: {error:#}");
-            json_error(StatusCode::BAD_GATEWAY, "Failed to proxy frontend request.")
-        }
     }
 }
 
@@ -16698,66 +16666,6 @@ async fn upload_attachments(
             .map(attachment_payload_from_record)
             .collect::<Vec<_>>()
     }))
-}
-
-async fn forward_request(
-    state: &AppState,
-    method: Method,
-    target: &str,
-    headers: HeaderMap,
-    body: Vec<u8>,
-    json_body: Option<Value>,
-    form: Option<Form>,
-) -> Result<Response> {
-    let mut request = state
-        .http
-        .request(
-            reqwest::Method::from_bytes(method.as_str().as_bytes())?,
-            target.to_string(),
-        )
-        .header(INTERNAL_HEADER, &state.config.internal_proxy_token);
-
-    if let Ok(profile_id) = ACTIVE_PROFILE_ID.try_with(|profile_id| profile_id.clone()) {
-        request = request.header(PROFILE_HEADER, profile_id);
-    }
-
-    for (name, value) in headers.iter() {
-        if name == header::HOST
-            || name == header::CONTENT_LENGTH
-            || name.as_str() == INTERNAL_HEADER
-            || name.as_str() == PROFILE_HEADER
-        {
-            continue;
-        }
-        request = request.header(name, value);
-    }
-
-    if let Some(json_body) = json_body {
-        request = request.json(&json_body);
-    } else if let Some(form) = form {
-        request = request.multipart(form);
-    } else if !body.is_empty() {
-        request = request.body(body);
-    }
-
-    let upstream = request.send().await.context("failed to forward request")?;
-    let status =
-        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let upstream_headers = upstream.headers().clone();
-    let bytes = upstream
-        .bytes()
-        .await
-        .context("failed to read upstream response")?;
-
-    let mut response = Response::new(Body::from(bytes));
-    *response.status_mut() = status;
-    for (name, value) in upstream_headers.iter() {
-        if name == header::TRANSFER_ENCODING || name == header::CONNECTION {
-            continue;
-        }
-        response.headers_mut().insert(name, value.clone());
-    }
-    Ok(response)
 }
 
 async fn cached_response(state: &AppState, request_id: &str) -> Option<ServerEnvelope> {

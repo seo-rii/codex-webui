@@ -282,6 +282,8 @@ struct AppState {
     automation_timers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     queue_dispatching: Arc<Mutex<HashSet<String>>>,
     active_turns: Arc<Mutex<HashMap<String, String>>>,
+    pending_server_requests:
+        Arc<Mutex<HashMap<String, HashMap<String, PendingServerRequestEntry>>>>,
     shutdown_timers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
 }
 
@@ -308,6 +310,15 @@ struct CachedStaticAsset {
 struct CachedCatalog {
     created_at: Instant,
     payload: Value,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct PendingServerRequestEntry {
+    raw_id: Value,
+    method: String,
+    params: Value,
+    created_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -644,6 +655,7 @@ async fn main() -> Result<()> {
             automation_timers: Arc::new(Mutex::new(HashMap::new())),
             queue_dispatching: Arc::new(Mutex::new(HashSet::new())),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
+            pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
             shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -6534,6 +6546,68 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                 return response;
             }
 
+            if route_path.starts_with("/api/sessions/") && route_path.ends_with("/abort") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/abort"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_abort_api_http(state, request, auth, &session_id).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path.starts_with("/api/sessions/") && route_path.ends_with("/approval") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/approval"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_approval_api_http(state, request, auth, &session_id).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
             if route_path.starts_with("/api/") {
                 if auth_context(&state.config, &jar).is_none() {
                     let mut response =
@@ -7562,6 +7636,70 @@ async fn handle_session_queue_api_http(
                 )),
             }
         }
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_abort_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    session_id: &str,
+) -> Response {
+    if request.method() != Method::POST {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+    if auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    match abort_turn_payload(&state, &auth.profile_id, session_id).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_approval_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    session_id: &str,
+) -> Response {
+    if request.method() != Method::POST {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+    if auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    let result = match to_bytes(request.into_body(), usize::MAX)
+        .await
+        .context("failed to read approval request body")
+    {
+        Ok(body) => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            let request_id = payload
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            resolve_server_request_payload(
+                &state,
+                &auth.profile_id,
+                session_id,
+                &request_id,
+                payload.get("result").cloned().unwrap_or(Value::Null),
+            )
+            .await
+        }
+        Err(_) => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Failed to read approval request body.",
+        )),
     };
 
     match result {
@@ -8983,27 +9121,22 @@ async fn execute_ws_method(
         }
         "turn/abort" => {
             let session_id = require_string(&params, "sessionId")?;
-            internal_json_request(
-                state,
-                Method::POST,
-                &format!("/api/sessions/{session_id}/abort"),
-                Some(json!({})),
-            )
-            .await
+            abort_turn_payload(state, &auth.profile_id, &session_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "approval/resolve" => {
             let session_id = require_string(&params, "sessionId")?;
-            let payload = json!({
-                "requestId": require_string(&params, "requestId")?,
-                "result": params.get("result").cloned().unwrap_or(Value::Null)
-            });
-            internal_json_request(
+            let request_id = require_string(&params, "requestId")?;
+            resolve_server_request_payload(
                 state,
-                Method::POST,
-                &format!("/api/sessions/{session_id}/approval"),
-                Some(payload),
+                &auth.profile_id,
+                &session_id,
+                &request_id,
+                params.get("result").cloned().unwrap_or(Value::Null),
             )
             .await
+            .map_err(anyhow::Error::from)
         }
         "directories/browse" => {
             let current_path = params.get("currentPath").and_then(Value::as_str);
@@ -10510,6 +10643,354 @@ fn notification_turn_id(params: &Value) -> Option<String> {
         })
 }
 
+fn pending_request_id(raw_id: &Value) -> String {
+    raw_id
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| raw_id.to_string())
+}
+
+async fn set_session_highlight(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    highlight: Option<Value>,
+) {
+    let result = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(highlights_by_thread_id) = ui_state
+            .get_mut("highlightsByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "highlight state is missing",
+            ));
+        };
+
+        if let Some(highlight) = highlight {
+            highlights_by_thread_id.insert(session_id.to_string(), highlight);
+        } else {
+            highlights_by_thread_id.remove(session_id);
+        }
+
+        Ok(())
+    })
+    .await;
+
+    if result.is_ok() {
+        emit_session_summary_updated(state, profile_id, session_id, None).await;
+    }
+}
+
+async fn handle_profile_server_request(
+    state: &AppState,
+    profile_id: &str,
+    request: &backend::codex_app_server::AppServerRequest,
+) {
+    let Some(session_id) = request
+        .params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+
+    let preferences = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("preferencesByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get(&session_id))
+            .cloned()
+            .unwrap_or(Value::Null))
+    })
+    .await
+    .unwrap_or(Value::Null);
+    let auto_approve_mode = preferences
+        .get("autoApproveMode")
+        .and_then(Value::as_str)
+        .unwrap_or("manual");
+
+    let auto_approve_result = match request.method.as_str() {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+            if auto_approve_mode == "turn" || auto_approve_mode == "session" =>
+        {
+            Some(json!({
+                "decision": if auto_approve_mode == "session" { "acceptForSession" } else { "accept" }
+            }))
+        }
+        "item/permissions/requestApproval"
+            if auto_approve_mode == "turn" || auto_approve_mode == "session" =>
+        {
+            Some(json!({
+                "scope": auto_approve_mode,
+                "permissions": request.params.get("permissions").cloned().unwrap_or_else(|| json!({}))
+            }))
+        }
+        _ => None,
+    };
+
+    if let Some(result) = auto_approve_result {
+        if let Ok(client) = app_server_client(state, profile_id).await {
+            if client.respond(request.id.clone(), result).await.is_ok() {
+                emit_session_notification(
+                    state,
+                    profile_id,
+                    &session_id,
+                    json!({
+                        "kind": "notification",
+                        "method": "codex-webui/autoApproved",
+                        "params": {
+                            "requestId": pending_request_id(&request.id),
+                            "requestMethod": request.method,
+                            "autoApproveMode": auto_approve_mode
+                        }
+                    }),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    let request_id = pending_request_id(&request.id);
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        &session_id,
+    );
+    state
+        .pending_server_requests
+        .lock()
+        .await
+        .entry(runtime_key)
+        .or_default()
+        .insert(
+            request_id.clone(),
+            PendingServerRequestEntry {
+                raw_id: request.id.clone(),
+                method: request.method.clone(),
+                params: request.params.clone(),
+                created_at: now_rfc3339(),
+            },
+        );
+
+    emit_session_notification(
+        state,
+        profile_id,
+        &session_id,
+        json!({
+            "kind": "serverRequest",
+            "id": request_id.clone(),
+            "method": request.method,
+            "params": request.params
+        }),
+    )
+    .await;
+    emit_profile_global_notification(
+        state,
+        profile_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/sessionAttention",
+            "params": {
+                "sessionId": session_id,
+                "reason": "approval"
+            }
+        }),
+    )
+    .await;
+    enqueue_profile_notification(
+        state,
+        profile_id,
+        "sessionAttention",
+        Some(&session_id),
+        json!({
+            "reason": "approval",
+            "requestId": request_id,
+            "requestMethod": request.method
+        }),
+    )
+    .await;
+    set_session_highlight(
+        state,
+        profile_id,
+        &session_id,
+        Some(json!({
+            "kind": "attention",
+            "at": now_unix_ms()
+        })),
+    )
+    .await;
+}
+
+async fn abort_turn_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Value> {
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        session_id,
+    );
+    let active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
+    let Some(turn_id) = active_turn_id else {
+        return internal_json_request_for_profile(
+            state,
+            Some(profile_id),
+            Method::POST,
+            &format!("/api/sessions/{session_id}/abort"),
+            Some(json!({})),
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to abort the session: {error}"),
+            )
+        });
+    };
+
+    match app_server_client(state, profile_id).await {
+        Ok(client) => {
+            if client
+                .request(
+                    "turn/interrupt",
+                    json!({
+                        "threadId": session_id,
+                        "turnId": turn_id
+                    }),
+                )
+                .await
+                .is_ok()
+            {
+                Ok(json!({ "interrupted": true }))
+            } else {
+                internal_json_request_for_profile(
+                    state,
+                    Some(profile_id),
+                    Method::POST,
+                    &format!("/api/sessions/{session_id}/abort"),
+                    Some(json!({})),
+                )
+                .await
+                .map_err(|error| {
+                    api_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to abort the session: {error}"),
+                    )
+                })
+            }
+        }
+        Err(_) => internal_json_request_for_profile(
+            state,
+            Some(profile_id),
+            Method::POST,
+            &format!("/api/sessions/{session_id}/abort"),
+            Some(json!({})),
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to abort the session: {error}"),
+            )
+        }),
+    }
+}
+
+async fn resolve_server_request_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    request_id: &str,
+    result: Value,
+) -> ApiResult<Value> {
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        session_id,
+    );
+    let pending = state
+        .pending_server_requests
+        .lock()
+        .await
+        .get(&runtime_key)
+        .and_then(|entries| entries.get(request_id))
+        .cloned();
+
+    let Some(pending) = pending else {
+        return internal_json_request_for_profile(
+            state,
+            Some(profile_id),
+            Method::POST,
+            &format!("/api/sessions/{session_id}/approval"),
+            Some(json!({
+                "requestId": request_id,
+                "result": result
+            })),
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to resolve the server request: {error}"),
+            )
+        });
+    };
+
+    let client = app_server_client(state, profile_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to codex app-server: {error}"),
+            )
+        })?;
+    client
+        .respond(pending.raw_id.clone(), result)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to resolve the server request: {error}"),
+            )
+        })?;
+
+    let remaining = {
+        let mut pending_requests = state.pending_server_requests.lock().await;
+        let remaining = pending_requests
+            .get_mut(&runtime_key)
+            .map(|entries| {
+                entries.remove(request_id);
+                entries.len()
+            })
+            .unwrap_or(0);
+        if remaining == 0 {
+            pending_requests.remove(&runtime_key);
+        }
+        remaining
+    };
+
+    emit_session_notification(
+        state,
+        profile_id,
+        session_id,
+        json!({
+            "kind": "notification",
+            "method": "serverRequest/resolved",
+            "params": {
+                "threadId": session_id,
+                "requestId": request_id
+            }
+        }),
+    )
+    .await;
+    if remaining == 0 {
+        set_session_highlight(state, profile_id, session_id, None).await;
+    }
+
+    Ok(json!({ "ok": true }))
+}
+
 async fn handle_profile_runtime_notification(
     state: &AppState,
     profile_id: &str,
@@ -10629,18 +11110,32 @@ async fn restore_runtime_profile_state(state: AppState, profile_id: String) {
             .request("model/list", json!({ "includeHidden": false }))
             .await;
         let mut notifications = client.subscribe_notifications();
+        let mut requests = client.subscribe_requests();
 
         loop {
-            match notifications.recv().await {
-                Ok(notification) => {
-                    handle_profile_runtime_notification(&state, &profile_id, &notification).await;
+            tokio::select! {
+                notification = notifications.recv() => match notification {
+                    Ok(notification) => {
+                        handle_profile_runtime_notification(&state, &profile_id, &notification).await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(
+                            "runtime app-server relay lagged for {profile_id}: skipped {skipped} messages"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                request = requests.recv() => match request {
+                    Ok(request) => {
+                        handle_profile_server_request(&state, &profile_id, &request).await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(
+                            "runtime app-server request relay lagged for {profile_id}: skipped {skipped} messages"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(
-                        "runtime app-server relay lagged for {profile_id}: skipped {skipped} messages"
-                    );
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
 
@@ -12330,6 +12825,7 @@ mod tests {
             automation_timers: Arc::new(Mutex::new(HashMap::new())),
             queue_dispatching: Arc::new(Mutex::new(HashSet::new())),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
+            pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
             shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -12454,6 +12950,13 @@ for raw_line in sys.stdin:
             "result": {
                 "data": data[start:end] if start < len(data) else [],
                 "nextCursor": next_cursor
+            }
+        })
+    elif method == "turn/interrupt":
+        write({
+            "id": request_id,
+            "result": {
+                "interrupted": True
             }
         })
     else:
@@ -13350,6 +13853,114 @@ for raw_line in sys.stdin:
                 .and_then(Value::as_str),
             Some("Build Docs")
         );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_turn_payload_uses_known_active_turn() {
+        let sandbox = unique_test_dir("abort-turn-rust");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+        state.active_turns.lock().await.insert(
+            runtime_session_key("default", "thread-1"),
+            "turn-123".to_string(),
+        );
+
+        let payload = abort_turn_payload(&state, "default", "thread-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            payload.get("interrupted").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_server_request_payload_uses_pending_request_store() {
+        let sandbox = unique_test_dir("approval-rust");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+        handle_profile_server_request(
+            &state,
+            "default",
+            &backend::codex_app_server::AppServerRequest {
+                id: json!("srv-1"),
+                method: "input/request".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "question": "Continue?"
+                }),
+            },
+        )
+        .await;
+
+        let pending_before = state
+            .pending_server_requests
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-1"))
+            .and_then(|entries| entries.get("srv-1"))
+            .cloned();
+        assert!(pending_before.is_some());
+
+        let highlighted = with_ui_state_read(&state, "default", |ui_state| {
+            Ok(ui_state
+                .get("highlightsByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get("thread-1"))
+                .cloned()
+                .unwrap_or(Value::Null))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            highlighted.get("kind").and_then(Value::as_str),
+            Some("attention")
+        );
+
+        let payload = resolve_server_request_payload(
+            &state,
+            "default",
+            "thread-1",
+            "srv-1",
+            json!({ "answer": "yes" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+
+        let pending_after = state
+            .pending_server_requests
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-1"))
+            .cloned();
+        assert!(pending_after.is_none());
+
+        let highlight_after = with_ui_state_read(&state, "default", |ui_state| {
+            Ok(ui_state
+                .get("highlightsByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get("thread-1"))
+                .cloned()
+                .unwrap_or(Value::Null))
+        })
+        .await
+        .unwrap();
+        assert!(highlight_after.is_null());
 
         let _ = fs::remove_dir_all(sandbox);
     }

@@ -226,6 +226,14 @@ fn main() {
                     }
                 }));
             }
+            Some("turn/interrupt") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "interrupted": true
+                    }
+                }));
+            }
             Some("account/read") => {
                 print_message(&json!({
                     "id": id,

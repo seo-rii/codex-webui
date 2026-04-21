@@ -17272,6 +17272,21 @@ mod tests {
         }
     }
 
+    fn test_state_with_static_dir_and_base_path(
+        project_root: PathBuf,
+        allowed_roots: Vec<PathBuf>,
+        codex_home: PathBuf,
+        static_dir: PathBuf,
+        base_path: &str,
+    ) -> AppState {
+        let mut state = test_state(project_root, allowed_roots, codex_home);
+        let mut config = (*state.config).clone();
+        config.static_dir = static_dir;
+        config.base_path = base_path.to_string();
+        state.config = Arc::new(config);
+        state
+    }
+
     fn test_state_with_fake_app_server(
         project_root: PathBuf,
         allowed_roots: Vec<PathBuf>,
@@ -18056,6 +18071,106 @@ for raw_line in sys.stdin:
                 })),
             Some(true)
         );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn static_asset_handler_rewrites_base_path_and_uses_spa_fallbacks() {
+        let sandbox = unique_test_dir("static-assets");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        let static_dir = workspace.join("static");
+        fs::create_dir_all(static_dir.join("_app").join("immutable")).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            static_dir.join("index.html"),
+            "<html><body>/__CODEX_WEBUI_BASE__/index</body></html>",
+        )
+        .unwrap();
+        fs::write(
+            static_dir.join("200.html"),
+            "<html><body>/__CODEX_WEBUI_BASE__/fallback</body></html>",
+        )
+        .unwrap();
+        fs::write(
+            static_dir.join("_app").join("immutable").join("app.js"),
+            "window.__BASE__ = '/__CODEX_WEBUI_BASE__';",
+        )
+        .unwrap();
+
+        let state = test_state_with_static_dir_and_base_path(
+            workspace.clone(),
+            vec![workspace.clone()],
+            codex_home,
+            static_dir,
+            "/absproxy/4173",
+        );
+
+        let root_response = serve_static_asset(state.clone(), "/").await;
+        assert_eq!(root_response.status(), StatusCode::OK);
+        assert_eq!(
+            root_response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-cache"))
+        );
+        let root_body = to_bytes(root_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let root_text = String::from_utf8(root_body.to_vec()).unwrap();
+        assert!(root_text.contains("/absproxy/4173/index"));
+        assert!(!root_text.contains(STATIC_BASE_PLACEHOLDER));
+
+        let session_response = serve_static_asset(state.clone(), "/sessions/thread-1").await;
+        assert_eq!(session_response.status(), StatusCode::OK);
+        let session_body = to_bytes(session_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let session_text = String::from_utf8(session_body.to_vec()).unwrap();
+        assert!(session_text.contains("/absproxy/4173/fallback"));
+        assert!(!session_text.contains(STATIC_BASE_PLACEHOLDER));
+
+        let asset_response = serve_static_asset(state, "/_app/immutable/app.js").await;
+        assert_eq!(asset_response.status(), StatusCode::OK);
+        assert_eq!(
+            asset_response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static(
+                "public, max-age=31536000, immutable"
+            ))
+        );
+        let asset_body = to_bytes(asset_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let asset_text = String::from_utf8(asset_body.to_vec()).unwrap();
+        assert!(asset_text.contains("/absproxy/4173"));
+        assert!(!asset_text.contains(STATIC_BASE_PLACEHOLDER));
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn static_asset_handler_rejects_invalid_and_missing_paths() {
+        let sandbox = unique_test_dir("static-assets-404");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        let static_dir = workspace.join("static");
+        fs::create_dir_all(&static_dir).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(static_dir.join("index.html"), "<html>ok</html>").unwrap();
+        fs::write(static_dir.join("200.html"), "<html>fallback</html>").unwrap();
+
+        let state = test_state_with_static_dir_and_base_path(
+            workspace.clone(),
+            vec![workspace.clone()],
+            codex_home,
+            static_dir,
+            "",
+        );
+
+        let invalid_response = serve_static_asset(state.clone(), "/../../secret.txt").await;
+        assert_eq!(invalid_response.status(), StatusCode::NOT_FOUND);
+
+        let missing_asset_response = serve_static_asset(state, "/missing.css").await;
+        assert_eq!(missing_asset_response.status(), StatusCode::NOT_FOUND);
 
         let _ = fs::remove_dir_all(sandbox);
     }

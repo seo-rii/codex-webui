@@ -5445,6 +5445,359 @@ async fn steer_turn_payload(
     }))
 }
 
+async fn fork_session_payload(
+    state: &AppState,
+    profile_id: &str,
+    source_session_id: &str,
+    mode: &str,
+    turn_id: Option<&str>,
+    message_text: Option<&str>,
+) -> ApiResult<Value> {
+    let source_thread = read_thread_payload(state, profile_id, source_session_id, true).await?;
+    let source_preferences = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("preferencesByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get(source_session_id))
+            .cloned()
+            .unwrap_or_else(|| {
+                json!({
+                    "cwd": source_thread.get("cwd").cloned().unwrap_or(Value::Null)
+                })
+            }))
+    })
+    .await?;
+    let preferences =
+        normalize_session_preferences_payload(state, profile_id, source_preferences).await?;
+    let turns = source_thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let anchor_index = turn_id
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|turn_id| {
+            turns
+                .iter()
+                .position(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id))
+        })
+        .or_else(|| (!turns.is_empty()).then_some(turns.len() - 1));
+    let visible_turns = anchor_index
+        .map(|index| turns[..=index].to_vec())
+        .unwrap_or_else(|| turns.clone());
+
+    let strip_attachment_preamble = |value: &str| {
+        let trimmed = value.trim();
+        let Some(rest) = trimmed.strip_prefix(&format!("{ATTACHMENT_PREAMBLE_START}\n")) else {
+            return trimmed.to_string();
+        };
+        let Some((_, tail)) = rest.split_once(&format!("\n{ATTACHMENT_PREAMBLE_END}")) else {
+            return trimmed.to_string();
+        };
+        tail.trim_start_matches('\n').trim().to_string()
+    };
+
+    let mut selected_message_text = message_text
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if selected_message_text.is_none() {
+        for turn in visible_turns.iter().rev() {
+            let Some(items) = turn.get("items").and_then(Value::as_array) else {
+                continue;
+            };
+            for item in items.iter().rev() {
+                if item.get("type").and_then(Value::as_str) != Some("userMessage") {
+                    continue;
+                }
+                let text = strip_attachment_preamble(
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("message").and_then(Value::as_str))
+                        .unwrap_or_default(),
+                );
+                if !text.is_empty() {
+                    selected_message_text = Some(text);
+                    break;
+                }
+            }
+            if selected_message_text.is_some() {
+                break;
+            }
+        }
+    }
+    if selected_message_text.is_none() {
+        let preview = strip_attachment_preamble(
+            source_thread
+                .get("preview")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        if !preview.is_empty() {
+            selected_message_text = Some(preview);
+        }
+    }
+
+    let mut draft = selected_message_text
+        .as_deref()
+        .map(strip_attachment_preamble)
+        .unwrap_or_default();
+    let source_name = display_thread_name(
+        source_thread.get("name").and_then(Value::as_str),
+        source_thread.get("preview").and_then(Value::as_str),
+    );
+    let next_name =
+        infer_session_display_title(selected_message_text.as_deref().unwrap_or(draft.as_str()))
+            .or_else(|| source_name.clone());
+
+    if mode == "fork" {
+        if draft.trim().is_empty() {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "There is no message to fork yet.",
+            ));
+        }
+
+        let client = app_server_client(state, profile_id)
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to connect to codex app-server: {error}"),
+                )
+            })?;
+        let response = client
+            .request(
+                "thread/fork",
+                json!({
+                    "threadId": source_session_id,
+                    "model": preferences.get("model").cloned().unwrap_or(Value::Null),
+                    "cwd": preferences.get("cwd").cloned().unwrap_or(Value::Null),
+                    "approvalPolicy": preferences.get("approvalPolicy").cloned().unwrap_or_else(|| json!("on-request")),
+                    "sandbox": preferences.get("sandboxMode").cloned().unwrap_or_else(|| json!("workspace-write")),
+                    "serviceTier": match preferences.get("speed").and_then(Value::as_str) {
+                        Some("fast") => Value::String("fast".to_string()),
+                        Some("flex") => Value::String("flex".to_string()),
+                        _ => Value::Null
+                    },
+                    "persistExtendedHistory": true
+                }),
+            )
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to fork the session: {error}"),
+                )
+            })?;
+        let mut forked_thread = response.get("thread").cloned().ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "Codex app-server returned an invalid fork payload.",
+            )
+        })?;
+        let forked_session_id = forked_thread
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "Codex app-server returned a forked session without an id.",
+                )
+            })?
+            .to_string();
+        let rollback_turns = anchor_index
+            .map(|index| turns.len().saturating_sub(index + 1))
+            .unwrap_or(0);
+        if rollback_turns > 0 {
+            let rolled_back = client
+                .request(
+                    "thread/rollback",
+                    json!({
+                        "threadId": forked_session_id,
+                        "numTurns": rollback_turns
+                    }),
+                )
+                .await
+                .map_err(|error| {
+                    api_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to roll back the forked session: {error}"),
+                    )
+                })?;
+            if let Some(thread) = rolled_back.get("thread").cloned() {
+                forked_thread = thread;
+            }
+        }
+
+        with_ui_state_write(state, profile_id, |ui_state| {
+            let Some(preferences_by_thread_id) = ui_state
+                .get_mut("preferencesByThreadId")
+                .and_then(Value::as_object_mut)
+            else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "preferences state is missing",
+                ));
+            };
+            preferences_by_thread_id.insert(forked_session_id.clone(), preferences.clone());
+            Ok(())
+        })
+        .await?;
+
+        if let Some(name) = next_name
+            .as_deref()
+            .filter(|value| !is_placeholder_thread_name(Some(value)))
+        {
+            rename_session_payload(state, profile_id, &forked_session_id, name).await?;
+            if let Some(thread_object) = forked_thread.as_object_mut() {
+                thread_object.insert("name".to_string(), Value::String(name.to_string()));
+            }
+        }
+
+        let snapshot = read_session_summary_ui_snapshot(state, profile_id).await?;
+        let summary = build_session_summary_from_thread_payload(
+            &forked_thread,
+            &snapshot,
+            Some(preferences.clone()),
+        )?;
+        emit_session_summary_updated(
+            state,
+            profile_id,
+            &forked_session_id,
+            Some(preferences.clone()),
+        )
+        .await;
+        return Ok(json!({
+            "session": summary,
+            "draft": "",
+            "mode": "fork"
+        }));
+    }
+
+    if mode != "handoff" {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Unsupported fork mode."));
+    }
+
+    let source_name_for_handoff = source_name
+        .clone()
+        .unwrap_or_else(|| "Source thread".to_string());
+    let preview = strip_attachment_preamble(
+        source_thread
+            .get("preview")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    let mut entries = Vec::new();
+    for turn in &visible_turns {
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+            if item_type != "userMessage" && item_type != "agentMessage" {
+                continue;
+            }
+            let text = strip_attachment_preamble(
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("message").and_then(Value::as_str))
+                    .unwrap_or_default(),
+            );
+            if !text.is_empty() {
+                entries.push((item_type == "userMessage", text));
+            }
+        }
+    }
+
+    let mut sections = vec![format!(
+        "Continue this task in a fresh thread.\n\nSource thread: {source_name_for_handoff}\nWorking directory: {}",
+        source_thread
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    )];
+    if !preview.is_empty() {
+        sections.push(format!("Current goal:\n{preview}"));
+    }
+    if let Some(selected_message_text) = selected_message_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        sections.push(format!("Focus request:\n{selected_message_text}"));
+    }
+    if !entries.is_empty() {
+        sections.push(format!(
+            "Recent context:\n{}",
+            entries
+                .iter()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|(is_user, text)| format!(
+                    "- {}: {}",
+                    if *is_user { "User" } else { "Assistant" },
+                    text.split_whitespace().collect::<Vec<_>>().join(" ")
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    sections.push(
+        "Continue from this handoff, preserve any existing constraints, and begin with the most sensible next step."
+            .to_string(),
+    );
+    draft = sections
+        .into_iter()
+        .map(|section| section.trim().to_string())
+        .filter(|section| !section.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if draft.trim().is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "There is no thread context to hand off yet.",
+        ));
+    }
+
+    let handoff_name = format!(
+        "{} · Handoff",
+        if source_name_for_handoff.trim().is_empty()
+            || is_placeholder_thread_name(Some(source_name_for_handoff.as_str()))
+        {
+            infer_session_display_title(&draft).unwrap_or_else(|| "Thread".to_string())
+        } else {
+            source_name_for_handoff
+        }
+    );
+    let session =
+        create_session_payload(state, profile_id, preferences, Some(&handoff_name)).await?;
+    let handoff_session_id = session
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "Forked session summary was invalid.",
+            )
+        })?
+        .to_string();
+    let saved_draft =
+        save_session_draft_payload(state, profile_id, &handoff_session_id, &draft, "message")
+            .await?;
+    Ok(json!({
+        "session": session,
+        "draft": saved_draft
+            .get("draft")
+            .cloned()
+            .unwrap_or_else(|| Value::String(draft)),
+        "mode": "handoff"
+    }))
+}
+
 async fn invalidate_session_lists(state: &AppState, profile_id: &str) {
     emit_profile_global_notification(
         state,
@@ -7384,6 +7737,37 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                 return response;
             }
 
+            if route_path.starts_with("/api/sessions/") && route_path.ends_with("/fork") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/fork"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_fork_api_http(state, &session_id, request, auth).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
             if let Some(session_id) = route_path
                 .strip_prefix("/api/sessions/")
                 .filter(|value| !value.is_empty() && !value.contains('/'))
@@ -8073,7 +8457,11 @@ async fn handle_config_api_http(state: AppState, request: Request, auth: AuthCon
     };
 
     match result {
-        Ok(payload) => Json(payload).into_response(),
+        Ok(payload) => {
+            let mut response = Json(payload).into_response();
+            *response.status_mut() = StatusCode::CREATED;
+            response
+        }
         Err(error) => json_error(error.status, &error.message),
     }
 }
@@ -8221,6 +8609,50 @@ async fn handle_session_api_http(
             }
         }
         _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_fork_api_http(
+    state: AppState,
+    session_id: &str,
+    request: Request,
+    auth: AuthContext,
+) -> Response {
+    if request.method() != Method::POST {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+    if auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    let result = match to_bytes(request.into_body(), usize::MAX)
+        .await
+        .context("failed to read session fork body")
+    {
+        Ok(body) => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            fork_session_payload(
+                &state,
+                &auth.profile_id,
+                session_id,
+                payload
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("fork"),
+                payload.get("turnId").and_then(Value::as_str),
+                payload.get("messageText").and_then(Value::as_str),
+            )
+            .await
+        }
+        Err(_) => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Failed to read session fork body.",
+        )),
     };
 
     match result {
@@ -10196,18 +10628,16 @@ async fn execute_ws_method(
         }
         "session/fork" => {
             let session_id = require_string(&params, "sessionId")?;
-            let payload = json!({
-                "mode": params.get("mode").cloned().unwrap_or_else(|| Value::String("fork".to_string())),
-                "turnId": params.get("turnId").cloned().unwrap_or(Value::Null),
-                "messageText": params.get("messageText").cloned().unwrap_or(Value::Null)
-            });
-            internal_json_request(
+            fork_session_payload(
                 state,
-                Method::POST,
-                &format!("/api/sessions/{session_id}/fork"),
-                Some(payload),
+                &auth.profile_id,
+                &session_id,
+                params.get("mode").and_then(Value::as_str).unwrap_or("fork"),
+                params.get("turnId").and_then(Value::as_str),
+                params.get("messageText").and_then(Value::as_str),
             )
             .await
+            .map_err(anyhow::Error::from)
         }
         "session/search" => {
             let session_id = require_string(&params, "sessionId")?;
@@ -14223,6 +14653,58 @@ for raw_line in sys.stdin:
                 "ok": True
             }
         })
+    elif method == "thread/fork":
+        source_thread_id = params.get("threadId", "")
+        source_thread = threads.get(source_thread_id)
+        if not isinstance(source_thread, dict):
+            write({
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "thread not found"
+                }
+            })
+            continue
+        thread_counter += 1
+        timestamp_counter += 1
+        forked_thread = json.loads(json.dumps(source_thread))
+        forked_thread["id"] = f"fork-{thread_counter}"
+        forked_thread["createdAt"] = timestamp_counter
+        forked_thread["updatedAt"] = timestamp_counter
+        forked_thread["forkedFrom"] = source_thread_id
+        threads[forked_thread["id"]] = forked_thread
+        write({
+            "id": request_id,
+            "result": {
+                "thread": forked_thread
+            }
+        })
+    elif method == "thread/rollback":
+        thread_id = params.get("threadId", "")
+        num_turns = max(0, int(params.get("numTurns", 0) or 0))
+        thread = threads.get(thread_id)
+        if not isinstance(thread, dict):
+            write({
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "thread not found"
+                }
+            })
+            continue
+        turns = list(thread.get("turns") or [])
+        if num_turns > 0:
+            turns = turns[:-num_turns] if num_turns < len(turns) else []
+        thread["turns"] = turns
+        thread["rollbackCount"] = int(thread.get("rollbackCount", 0) or 0) + num_turns
+        thread["updatedAt"] = timestamp_counter
+        threads[thread_id] = thread
+        write({
+            "id": request_id,
+            "result": {
+                "thread": thread
+            }
+        })
     elif method == "turn/start":
         thread_id = params.get("threadId", "")
         turn_counter += 1
@@ -15674,6 +16156,147 @@ for raw_line in sys.stdin:
             .await
             .unwrap();
         assert_eq!(draft.get("draft").and_then(Value::as_str), Some(""));
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fork_session_payload_uses_app_server_fork_and_rollback() {
+        let sandbox = unique_test_dir("session-fork-rust");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+        app_server_client(&state, "default")
+            .await
+            .unwrap()
+            .request(
+                "thread/seed",
+                json!({
+                    "thread": {
+                        "id": "thread-1",
+                        "name": "New thread",
+                        "preview": "Fix duplicate queue dispatches in websocket transport",
+                        "cwd": workspace.display().to_string(),
+                        "archived": false,
+                        "createdAt": 1,
+                        "updatedAt": 2,
+                        "status": "idle",
+                        "isSubagent": false,
+                        "agentNickname": Value::Null,
+                        "agentRole": Value::Null,
+                        "turns": [
+                            {
+                                "id": "turn-1",
+                                "status": "completed",
+                                "error": Value::Null,
+                                "startedAt": 10,
+                                "completedAt": 20,
+                                "durationMs": 10,
+                                "items": [
+                                    {
+                                        "id": "item-1",
+                                        "type": "userMessage",
+                                        "text": "Fix duplicate queue dispatches in websocket transport"
+                                    }
+                                ]
+                            },
+                            {
+                                "id": "turn-2",
+                                "status": "completed",
+                                "error": Value::Null,
+                                "startedAt": 30,
+                                "completedAt": 40,
+                                "durationMs": 10,
+                                "items": [
+                                    {
+                                        "id": "item-2",
+                                        "type": "userMessage",
+                                        "text": "Also capture the race with a regression test"
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        save_session_preferences_payload(
+            &state,
+            "default",
+            "thread-1",
+            json!({
+                "cwd": workspace.display().to_string(),
+                "model": "gpt-5",
+                "approvalPolicy": "on-request",
+                "sandboxMode": "workspace-write",
+                "speed": "fast",
+                "effort": "high",
+                "networkAccess": true
+            }),
+        )
+        .await
+        .unwrap();
+
+        let payload =
+            fork_session_payload(&state, "default", "thread-1", "fork", Some("turn-1"), None)
+                .await
+                .unwrap();
+
+        assert_eq!(payload.get("mode").and_then(Value::as_str), Some("fork"));
+        assert_eq!(
+            payload
+                .get("session")
+                .and_then(|value| value.get("id"))
+                .and_then(Value::as_str),
+            Some("fork-1")
+        );
+        assert_eq!(
+            payload
+                .get("session")
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str),
+            Some("Fix duplicate queue dispatches in websocket transport")
+        );
+
+        let forked_thread = read_thread_payload(&state, "default", "fork-1", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            forked_thread.get("forkedFrom").and_then(Value::as_str),
+            Some("thread-1")
+        );
+        assert_eq!(
+            forked_thread.get("rollbackCount").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            forked_thread
+                .get("turns")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let stored_preferences = with_ui_state_read(&state, "default", |ui_state| {
+            Ok(ui_state
+                .get("preferencesByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get("fork-1"))
+                .cloned()
+                .unwrap_or(Value::Null))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            stored_preferences.get("model").and_then(Value::as_str),
+            Some("gpt-5")
+        );
 
         let _ = fs::remove_dir_all(sandbox);
     }

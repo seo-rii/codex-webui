@@ -266,6 +266,87 @@ fn main() {
                     }
                 }));
             }
+            Some("thread/fork") => {
+                let source_thread_id = payload
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let Some(source_thread) = threads.get(&source_thread_id).cloned() else {
+                    print_message(&json!({
+                        "id": id,
+                        "error": {
+                            "code": -32000,
+                            "message": "thread not found"
+                        }
+                    }));
+                    continue;
+                };
+
+                thread_counter += 1;
+                timestamp_counter += 1;
+                let forked_thread_id = format!("fork-{thread_counter}");
+                let mut forked_thread = source_thread;
+                if let Some(thread_object) = forked_thread.as_object_mut() {
+                    thread_object.insert("id".to_string(), Value::String(forked_thread_id.clone()));
+                    thread_object.insert("createdAt".to_string(), Value::from(timestamp_counter));
+                    thread_object.insert("updatedAt".to_string(), Value::from(timestamp_counter));
+                    thread_object.insert(
+                        "forkedFrom".to_string(),
+                        Value::String(source_thread_id.clone()),
+                    );
+                }
+                threads.insert(forked_thread_id.clone(), forked_thread.clone());
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "thread": forked_thread
+                    }
+                }));
+            }
+            Some("thread/rollback") => {
+                let thread_id = payload
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let num_turns = payload
+                    .get("params")
+                    .and_then(|params| params.get("numTurns"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let Some(thread_object) =
+                    threads.get_mut(&thread_id).and_then(Value::as_object_mut)
+                else {
+                    print_message(&json!({
+                        "id": id,
+                        "error": {
+                            "code": -32000,
+                            "message": "thread not found"
+                        }
+                    }));
+                    continue;
+                };
+                if let Some(turns) = thread_object.get_mut("turns").and_then(Value::as_array_mut) {
+                    let remaining = turns.len().saturating_sub(num_turns);
+                    turns.truncate(remaining);
+                }
+                let rollback_count = thread_object
+                    .get("rollbackCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    + num_turns as u64;
+                thread_object.insert("rollbackCount".to_string(), Value::from(rollback_count));
+                thread_object.insert("updatedAt".to_string(), Value::from(timestamp_counter));
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "thread": Value::Object(thread_object.clone())
+                    }
+                }));
+            }
             Some("turn/start") => {
                 let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
                 let thread_id = params

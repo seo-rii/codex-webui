@@ -19,7 +19,7 @@ export default defineConfig({
     trace: "retain-on-failure"
   },
   webServer: {
-    command: "cargo run --manifest-path backend/Cargo.toml",
+    command: "cargo run --manifest-path backend/Cargo.toml --bin backend",
     cwd: ".",
     timeout: 180_000,
     reuseExistingServer: false,

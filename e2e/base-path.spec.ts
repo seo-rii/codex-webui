@@ -21,12 +21,19 @@ test.beforeEach(async ({ baseURL, context }) => {
   ]);
 });
 
-test("builds a static shell plus private internal API bundle", async () => {
+test("builds only the static shell artifacts used by the rust gateway", async () => {
   const projectRoot = process.cwd();
-  expect(fs.existsSync(path.join(projectRoot, "build", "static", "index.html"))).toBeTruthy();
-  expect(fs.existsSync(path.join(projectRoot, "build", "static", "200.html"))).toBeTruthy();
-  expect(fs.existsSync(path.join(projectRoot, "build", "internal", "index.js"))).toBeTruthy();
-  expect(fs.existsSync(path.join(projectRoot, "build", "node"))).toBeFalsy();
+  const staticDir = path.join(projectRoot, "build", "static");
+
+  for (const htmlName of ["index.html", "200.html", "login.html"]) {
+    const htmlPath = path.join(staticDir, htmlName);
+    expect(fs.existsSync(htmlPath)).toBeTruthy();
+    expect(fs.readFileSync(htmlPath, "utf8")).not.toContain("%lang%");
+    expect(fs.readFileSync(htmlPath, "utf8")).not.toContain("%dir%");
+  }
+
+  expect(fs.existsSync(path.join(projectRoot, "build", "internal", "index.js"))).toBeFalsy();
+  expect(fs.existsSync(path.join(projectRoot, ".svelte-kit", "output", "server", "entries", "endpoints"))).toBeFalsy();
 });
 
 test("serves the static shell under a base path and keeps login state after reload", async ({ baseURL, page }) => {

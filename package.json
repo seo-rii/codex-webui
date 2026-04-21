@@ -35,7 +35,7 @@
     "gateway:build": "cargo build --manifest-path backend/Cargo.toml",
     "preview": "vite preview",
     "check": "pnpm paraglide:compile && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "test:e2e": "pnpm build && playwright test",
+    "test:e2e": "pnpm build && pnpm verify:static-build && pnpm verify:api-parity && playwright test",
     "hash-password": "node scripts/hash-password.mjs"
   },
   "dependencies": {

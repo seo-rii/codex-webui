@@ -1,9 +1,11 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    convert::Infallible,
     env, fs,
     future::Future,
     net::{SocketAddr, TcpListener},
     path::{Component, Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -5476,6 +5478,97 @@ fn display_thread_name(name: Option<&str>, preview: Option<&str>) -> Option<Stri
     }
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct RolloutRecoveryInfoPayload {
+    available: bool,
+    issue: Option<String>,
+    total_lines: usize,
+    recoverable_lines: usize,
+    skipped_lines: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RolloutRecoveryPlanPayload {
+    info: RolloutRecoveryInfoPayload,
+    recovered_content: String,
+}
+
+fn normalize_rollout_line(raw_line: &str) -> Option<String> {
+    let trimmed = raw_line
+        .trim_start_matches('\u{feff}')
+        .replace('\0', "")
+        .trim()
+        .to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut candidates = vec![trimmed.clone()];
+    if let (Some(first_brace), Some(last_brace)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        let sliced = trimmed[first_brace..=last_brace].trim().to_string();
+        if !sliced.is_empty() && sliced != trimmed {
+            candidates.push(sliced);
+        }
+    }
+
+    for candidate in candidates {
+        if let Ok(parsed) = serde_json::from_str::<Value>(&candidate) {
+            if let Ok(normalized) = serde_json::to_string(&parsed) {
+                return Some(normalized);
+            }
+        }
+    }
+
+    None
+}
+
+fn inspect_rollout_recovery_content(buffer: &[u8]) -> RolloutRecoveryPlanPayload {
+    let mut issue = std::str::from_utf8(buffer)
+        .err()
+        .map(|_| "invalidUtf8".to_string());
+    let decoded = String::from_utf8_lossy(buffer);
+    let mut total_lines = 0_usize;
+    let mut recoverable_lines = 0_usize;
+    let mut skipped_lines = 0_usize;
+    let mut recovered_lines = Vec::new();
+
+    for raw_line in decoded.lines() {
+        if raw_line.trim().is_empty() {
+            continue;
+        }
+
+        total_lines += 1;
+        let Some(normalized) = normalize_rollout_line(raw_line) else {
+            skipped_lines += 1;
+            continue;
+        };
+
+        recoverable_lines += 1;
+        recovered_lines.push(normalized);
+    }
+
+    if issue.is_none() && skipped_lines > 0 {
+        issue = Some("invalidJson".to_string());
+    }
+
+    RolloutRecoveryPlanPayload {
+        info: RolloutRecoveryInfoPayload {
+            available: recoverable_lines > 0
+                && (issue.as_deref() == Some("invalidUtf8") || skipped_lines > 0),
+            issue,
+            total_lines,
+            recoverable_lines,
+            skipped_lines,
+        },
+        recovered_content: if recovered_lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", recovered_lines.join("\n"))
+        },
+    }
+}
+
 #[derive(Clone, Default)]
 struct SessionFilterCriteria {
     pinned_only: bool,
@@ -6382,6 +6475,67 @@ async fn read_thread_payload(
         )
     })?;
     Ok(normalize_thread_payload(&thread))
+}
+
+fn resolve_rollout_path(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    thread: &Value,
+) -> Option<PathBuf> {
+    let profile = resolve_runtime_profile(&state.config, profile_id);
+    let created_at = thread
+        .get("createdAt")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let created_at_seconds = if created_at > 10_000_000_000 {
+        created_at / 1000
+    } else {
+        created_at
+    };
+
+    if created_at_seconds > 0 {
+        if let Ok(base) = time::OffsetDateTime::from_unix_timestamp(created_at_seconds) {
+            for offset in [0_i64, -1, 1] {
+                let Some(candidate) = base.checked_add(time::Duration::days(offset)) else {
+                    continue;
+                };
+                let date = candidate.date();
+                let day_directory = profile
+                    .codex_home
+                    .join("sessions")
+                    .join(date.year().to_string())
+                    .join(format!("{:02}", u8::from(date.month())))
+                    .join(format!("{:02}", date.day()));
+                if let Ok(entries) = fs::read_dir(&day_directory) {
+                    for entry in entries.flatten() {
+                        if entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.ends_with(&format!("{session_id}.jsonl")))
+                        {
+                            return Some(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let archived_directory = profile.codex_home.join("archived_sessions");
+    if let Ok(entries) = fs::read_dir(archived_directory) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(&format!("{session_id}.jsonl")))
+            {
+                return Some(entry.path());
+            }
+        }
+    }
+
+    None
 }
 
 async fn session_detail_payload(
@@ -10039,6 +10193,92 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                 return response;
             }
 
+            if route_path.starts_with("/api/sessions/") && route_path.ends_with("/recovery") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/recovery"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_recovery_api_http(state, request, auth, &session_id).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path.starts_with("/api/sessions/") && route_path.ends_with("/stream") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/stream"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_stream_api_http(state, request, auth, &session_id).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path == "/api/events/stream" {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let mut response = handle_events_stream_http(state, request, auth).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
             if route_path.starts_with("/api/") {
                 if auth_context(&state.config, &jar).is_none() {
                     let mut response =
@@ -11987,6 +12227,99 @@ async fn handle_session_approval_api_http(
     }
 }
 
+async fn handle_session_recovery_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    session_id: &str,
+) -> Response {
+    let app_error_response = |status: StatusCode, code: &str, message: &str| {
+        let mut response = Json(json!({
+            "code": code,
+            "message": message,
+            "status": status.as_u16()
+        }))
+        .into_response();
+        *response.status_mut() = status;
+        response
+    };
+
+    if request.method() != Method::POST {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+    if auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    let thread = match read_thread_payload(&state, &auth.profile_id, session_id, false).await {
+        Ok(thread) => thread,
+        Err(error) => return json_error(error.status, &error.message),
+    };
+    let Some(rollout_path) = resolve_rollout_path(&state, &auth.profile_id, session_id, &thread)
+    else {
+        return app_error_response(
+            StatusCode::NOT_FOUND,
+            "SESSION_ROLLOUT_NOT_FOUND",
+            "No persisted rollout file was found for this session.",
+        );
+    };
+    let rollout_buffer = match tokio_fs::read(&rollout_path).await {
+        Ok(buffer) => buffer,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return app_error_response(
+                StatusCode::NOT_FOUND,
+                "SESSION_ROLLOUT_NOT_FOUND",
+                "No persisted rollout file was found for this session.",
+            );
+        }
+        Err(error) => {
+            return json_error(StatusCode::BAD_GATEWAY, &error.to_string());
+        }
+    };
+    let plan = inspect_rollout_recovery_content(&rollout_buffer);
+    if !plan.info.available
+        || plan.info.recoverable_lines == 0
+        || plan.recovered_content.trim().is_empty()
+    {
+        return app_error_response(
+            StatusCode::CONFLICT,
+            "SESSION_ROLLOUT_NOT_RECOVERABLE",
+            "This session history could not be recovered automatically.",
+        );
+    }
+
+    let backup_path = PathBuf::from(format!("{}.bak-{}", rollout_path.display(), now_unix_ms()));
+    if let Err(error) = tokio_fs::copy(&rollout_path, &backup_path).await {
+        return json_error(StatusCode::BAD_GATEWAY, &error.to_string());
+    }
+    if let Err(error) = tokio_fs::write(&rollout_path, plan.recovered_content.as_bytes()).await {
+        return json_error(StatusCode::BAD_GATEWAY, &error.to_string());
+    }
+
+    append_runtime_error_log(
+        &state.config,
+        "rust-gateway",
+        "recovered corrupted rollout",
+        json!({
+            "threadId": session_id,
+            "rolloutPath": rollout_path.display().to_string(),
+            "backupPath": backup_path.display().to_string(),
+            "recovery": plan.info
+        }),
+    );
+
+    Json(json!({
+        "ok": true,
+        "sessionId": session_id,
+        "backupPath": backup_path.display().to_string(),
+        "recoveredAt": now_unix_ms(),
+        "totalLines": plan.info.total_lines,
+        "recoveredLines": plan.info.recoverable_lines,
+        "skippedLines": plan.info.skipped_lines
+    }))
+    .into_response()
+}
+
 async fn handle_automations_api_http(
     state: AppState,
     request: Request,
@@ -12375,6 +12708,93 @@ fn auth_logout(jar: CookieJar) -> Response {
         Json(json!({ "ok": true })),
     )
         .into_response()
+}
+
+fn encode_sse_event(event: &str, payload: &Value) -> Bytes {
+    let body = serde_json::to_string(payload).unwrap_or_else(|_| "null".to_string());
+    Bytes::from(format!("event: {event}\ndata: {body}\n\n"))
+}
+
+fn sse_response(receiver: broadcast::Receiver<Value>, ready_payload: Value) -> Response {
+    struct SseState {
+        ready: Option<Bytes>,
+        receiver: broadcast::Receiver<Value>,
+        keepalive: Pin<Box<tokio::time::Sleep>>,
+    }
+
+    let stream = futures_util::stream::unfold(
+        SseState {
+            ready: Some(encode_sse_event("ready", &ready_payload)),
+            receiver,
+            keepalive: Box::pin(tokio::time::sleep(Duration::from_secs(15))),
+        },
+        |mut state| async move {
+            if let Some(ready) = state.ready.take() {
+                return Some((Ok::<Bytes, Infallible>(ready), state));
+            }
+
+            loop {
+                tokio::select! {
+                    _ = &mut state.keepalive => {
+                        state.keepalive.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(15));
+                        return Some((Ok(Bytes::from_static(b": ping\n\n")), state));
+                    }
+                    result = state.receiver.recv() => {
+                        match result {
+                            Ok(event) => {
+                                state.keepalive.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(15));
+                                return Some((Ok(encode_sse_event("message", &event)), state));
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!("sse relay lagged: skipped {skipped} messages");
+                            }
+                            Err(broadcast::error::RecvError::Closed) => return None,
+                        }
+                    }
+                }
+            }
+        },
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CACHE_CONTROL, "no-cache, no-transform")
+        .header(header::CONNECTION, "keep-alive")
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))
+}
+
+async fn handle_events_stream_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+) -> Response {
+    if request.method() != Method::GET {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+
+    match ensure_global_relay(&state, &auth.profile_id).await {
+        Ok(relay) => sse_response(relay.subscribe(), json!({ "scope": "global" })),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
+    }
+}
+
+async fn handle_session_stream_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    session_id: &str,
+) -> Response {
+    if request.method() != Method::GET {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+
+    match ensure_stream_relay(&state, &auth.profile_id, session_id).await {
+        Ok(relay) => sse_response(relay.subscribe(), json!({ "threadId": session_id })),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error.to_string()),
+    }
 }
 
 async fn proxy_to_internal(
@@ -19750,6 +20170,97 @@ for raw_line in sys.stdin:
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(1)
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_recovery_http_handler_recovers_rollout_file() {
+        let sandbox = unique_test_dir("session-recovery-http");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state = test_state_with_fake_app_server(
+            workspace.clone(),
+            vec![workspace.clone()],
+            codex_home.clone(),
+        );
+        let created_at = time::OffsetDateTime::now_utc().unix_timestamp();
+        let created_date = time::OffsetDateTime::from_unix_timestamp(created_at)
+            .unwrap()
+            .date();
+        let rollout_dir = codex_home
+            .join("sessions")
+            .join(created_date.year().to_string())
+            .join(format!("{:02}", u8::from(created_date.month())))
+            .join(format!("{:02}", created_date.day()));
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout_path = rollout_dir.join("2026-04-21-thread-1.jsonl");
+        fs::write(&rollout_path, b"{\"step\":1}\n\xff\n{\"step\":2}\n").unwrap();
+
+        app_server_client(&state, "default")
+            .await
+            .unwrap()
+            .request(
+                "thread/seed",
+                json!({
+                    "thread": {
+                        "id": "thread-1",
+                        "name": "Recover rollout",
+                        "preview": "Recover rollout",
+                        "cwd": workspace.display().to_string(),
+                        "archived": false,
+                        "createdAt": created_at,
+                        "updatedAt": created_at,
+                        "status": "idle",
+                        "isSubagent": false,
+                        "agentNickname": Value::Null,
+                        "agentRole": Value::Null,
+                        "turns": []
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .body(Body::empty())
+            .unwrap();
+        let response = handle_session_recovery_api_http(
+            state.clone(),
+            request,
+            AuthContext {
+                role: UserRole::Admin,
+                profile_id: "default".to_string(),
+            },
+            "thread-1",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            payload.get("recoveredLines").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(payload.get("skippedLines").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            fs::read_to_string(&rollout_path).unwrap(),
+            "{\"step\":1}\n{\"step\":2}\n"
+        );
+        assert!(
+            Path::new(
+                payload
+                    .get("backupPath")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            )
+            .exists()
         );
 
         let _ = fs::remove_dir_all(sandbox);

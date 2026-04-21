@@ -5088,6 +5088,105 @@ async fn rename_session_payload(
     }))
 }
 
+async fn resolve_selected_attachment_records(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    attachment_ids: Option<&Value>,
+) -> ApiResult<Vec<StoredAttachmentRecord>> {
+    let requested_attachment_ids = string_array_from_value(attachment_ids);
+    let requested_attachment_set = requested_attachment_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let attachments = list_session_attachment_records(state, profile_id, session_id)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    if requested_attachment_set.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    Ok(attachments
+        .into_iter()
+        .filter(|attachment| requested_attachment_set.contains(attachment.id.as_str()))
+        .collect())
+}
+
+fn build_turn_input_payload(
+    prompt: &str,
+    attachments: &[StoredAttachmentRecord],
+) -> (Vec<Value>, Vec<String>) {
+    let mut additional_readable_roots = Vec::new();
+    let mut readable_roots_seen = HashSet::new();
+    let mut text_attachment_paths = Vec::new();
+    let mut image_attachment_paths = Vec::new();
+
+    for attachment in attachments {
+        if let Some(path) = attachment.path.as_deref() {
+            let readable_root = Path::new(path)
+                .parent()
+                .unwrap_or_else(|| Path::new(path))
+                .display()
+                .to_string();
+            if readable_roots_seen.insert(readable_root.clone()) {
+                additional_readable_roots.push(readable_root);
+            }
+            if attachment.kind.as_deref() == Some("image") {
+                image_attachment_paths.push(path.to_string());
+            } else {
+                text_attachment_paths.push(path.to_string());
+            }
+        }
+    }
+
+    let mut input = vec![json!({
+        "type": "text",
+        "text": if text_attachment_paths.is_empty() {
+            prompt.to_string()
+        } else {
+            format!(
+                "{ATTACHMENT_PREAMBLE_START}\n{}\n{ATTACHMENT_PREAMBLE_END}\n\n{prompt}",
+                text_attachment_paths.join("\n")
+            )
+        },
+        "text_elements": []
+    })];
+    for image_path in image_attachment_paths {
+        input.push(json!({
+            "type": "localImage",
+            "path": image_path
+        }));
+    }
+
+    (input, additional_readable_roots)
+}
+
+async fn resolve_active_turn_id_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Option<String>> {
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        session_id,
+    );
+    if let Some(turn_id) = state.active_turns.lock().await.get(&runtime_key).cloned() {
+        return Ok(Some(turn_id));
+    }
+
+    let thread = read_thread_payload(state, profile_id, session_id, true).await?;
+    let active_turn_id = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .and_then(active_turn_id_from_turns);
+    if let Some(turn_id) = active_turn_id.clone() {
+        state.active_turns.lock().await.insert(runtime_key, turn_id);
+    }
+    Ok(active_turn_id)
+}
+
 async fn send_turn_payload(
     state: &AppState,
     profile_id: &str,
@@ -5097,17 +5196,8 @@ async fn send_turn_payload(
     preferences: Value,
 ) -> ApiResult<Value> {
     let trimmed_prompt = prompt.trim();
-    let requested_attachment_ids = string_array_from_value(attachment_ids);
-    let requested_attachment_set = requested_attachment_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let attachments = list_session_attachment_records(state, profile_id, session_id)
-        .await
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .into_iter()
-        .filter(|attachment| requested_attachment_set.contains(attachment.id.as_str()))
-        .collect::<Vec<_>>();
+    let attachments =
+        resolve_selected_attachment_records(state, profile_id, session_id, attachment_ids).await?;
 
     if trimmed_prompt.is_empty() && attachments.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
@@ -5181,46 +5271,12 @@ async fn send_turn_payload(
             })?;
     }
 
+    let (input, attachment_readable_roots) = build_turn_input_payload(trimmed_prompt, &attachments);
     let mut readable_roots = vec![cwd.clone()];
-    let mut readable_roots_seen = readable_roots.iter().cloned().collect::<HashSet<_>>();
-    let mut text_attachment_paths = Vec::new();
-    let mut image_attachment_paths = Vec::new();
-    for attachment in &attachments {
-        if let Some(path) = attachment.path.as_deref() {
-            let readable_root = Path::new(path)
-                .parent()
-                .unwrap_or_else(|| Path::new(path))
-                .display()
-                .to_string();
-            if readable_roots_seen.insert(readable_root.clone()) {
-                readable_roots.push(readable_root);
-            }
-            if attachment.kind.as_deref() == Some("image") {
-                image_attachment_paths.push(path.to_string());
-            } else {
-                text_attachment_paths.push(path.to_string());
-            }
+    for readable_root in attachment_readable_roots {
+        if !readable_roots.contains(&readable_root) {
+            readable_roots.push(readable_root);
         }
-    }
-
-    let mut input = Vec::new();
-    input.push(json!({
-        "type": "text",
-        "text": if text_attachment_paths.is_empty() {
-            trimmed_prompt.to_string()
-        } else {
-            format!(
-                "{ATTACHMENT_PREAMBLE_START}\n{}\n{ATTACHMENT_PREAMBLE_END}\n\n{trimmed_prompt}",
-                text_attachment_paths.join("\n")
-            )
-        },
-        "text_elements": []
-    }));
-    for image_path in image_attachment_paths {
-        input.push(json!({
-            "type": "localImage",
-            "path": image_path
-        }));
     }
 
     let sandbox_mode = next_preferences
@@ -5334,6 +5390,58 @@ async fn send_turn_payload(
             .and_then(|value| value.get("id"))
             .cloned()
             .unwrap_or(Value::Null)
+    }))
+}
+
+async fn steer_turn_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    prompt: &str,
+    attachment_ids: Option<&Value>,
+) -> ApiResult<Value> {
+    let trimmed_prompt = prompt.trim();
+    if trimmed_prompt.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
+    }
+
+    let active_turn_id = resolve_active_turn_id_payload(state, profile_id, session_id).await?;
+    let Some(active_turn_id) = active_turn_id else {
+        return Err(api_error(StatusCode::CONFLICT, "NO_ACTIVE_TURN"));
+    };
+
+    let attachments =
+        resolve_selected_attachment_records(state, profile_id, session_id, attachment_ids).await?;
+    let (input, _) = build_turn_input_payload(trimmed_prompt, &attachments);
+    let client = app_server_client(state, profile_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to codex app-server: {error}"),
+            )
+        })?;
+    client
+        .request(
+            "turn/steer",
+            json!({
+                "threadId": session_id,
+                "expectedTurnId": active_turn_id,
+                "input": input
+            }),
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to steer the active turn: {error}"),
+            )
+        })?;
+
+    clear_session_draft_payload(state, profile_id, session_id).await?;
+    Ok(json!({
+        "ok": true,
+        "turnId": active_turn_id
     }))
 }
 
@@ -7366,6 +7474,37 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                 return response;
             }
 
+            if route_path.starts_with("/api/sessions/") && route_path.ends_with("/steer") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/steer"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_steer_api_http(state, request, auth, &session_id).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
             if route_path.starts_with("/api/sessions/") && route_path.contains("/queue") {
                 let Some(auth) = auth_context(&state.config, &jar) else {
                     let mut response =
@@ -8516,6 +8655,49 @@ async fn handle_session_messages_api_http(
         Err(_) => Err(api_error(
             StatusCode::BAD_REQUEST,
             "Failed to read session message body.",
+        )),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_steer_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    session_id: &str,
+) -> Response {
+    if request.method() != Method::POST {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+    if auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    let result = match to_bytes(request.into_body(), usize::MAX)
+        .await
+        .context("failed to read session steer body")
+    {
+        Ok(body) => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            steer_turn_payload(
+                &state,
+                &auth.profile_id,
+                session_id,
+                payload
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                payload.get("attachmentIds"),
+            )
+            .await
+        }
+        Err(_) => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Failed to read session steer body.",
         )),
     };
 
@@ -10231,17 +10413,16 @@ async fn execute_ws_method(
         }
         "turn/steer" => {
             let session_id = require_string(&params, "sessionId")?;
-            let payload = json!({
-                "prompt": require_string(&params, "prompt")?,
-                "attachmentIds": params.get("attachmentIds").cloned().unwrap_or_else(|| json!([]))
-            });
-            internal_json_request(
+            let prompt = require_string(&params, "prompt")?;
+            steer_turn_payload(
                 state,
-                Method::POST,
-                &format!("/api/sessions/{session_id}/steer"),
-                Some(payload),
+                &auth.profile_id,
+                &session_id,
+                &prompt,
+                params.get("attachmentIds"),
             )
             .await
+            .map_err(anyhow::Error::from)
         }
         "turn/abort" => {
             let session_id = require_string(&params, "sessionId")?;
@@ -11265,24 +11446,9 @@ async fn dispatch_queue_item(
         .unwrap_or_else(|| json!([]));
 
     if mode == "steer" {
-        internal_json_request_for_profile(
-            state,
-            Some(profile_id),
-            Method::POST,
-            &format!("/api/sessions/{session_id}/steer"),
-            Some(json!({
-                "prompt": prompt,
-                "attachmentIds": attachment_ids
-            })),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|error| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to dispatch queued message: {error}"),
-            )
-        })
+        steer_turn_payload(state, profile_id, session_id, prompt, Some(&attachment_ids))
+            .await
+            .map(|_| ())
     } else {
         send_turn_payload(
             state,
@@ -11949,65 +12115,25 @@ async fn abort_turn_payload(
     profile_id: &str,
     session_id: &str,
 ) -> ApiResult<Value> {
-    let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, profile_id).0,
-        session_id,
-    );
-    let active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
+    let active_turn_id = resolve_active_turn_id_payload(state, profile_id, session_id).await?;
     let Some(turn_id) = active_turn_id else {
-        return internal_json_request_for_profile(
-            state,
-            Some(profile_id),
-            Method::POST,
-            &format!("/api/sessions/{session_id}/abort"),
-            Some(json!({})),
-        )
-        .await
-        .map_err(|error| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to abort the session: {error}"),
-            )
-        });
+        return Ok(json!({ "interrupted": false }));
     };
 
-    match app_server_client(state, profile_id).await {
-        Ok(client) => {
-            if client
-                .request(
-                    "turn/interrupt",
-                    json!({
-                        "threadId": session_id,
-                        "turnId": turn_id
-                    }),
-                )
-                .await
-                .is_ok()
-            {
-                Ok(json!({ "interrupted": true }))
-            } else {
-                internal_json_request_for_profile(
-                    state,
-                    Some(profile_id),
-                    Method::POST,
-                    &format!("/api/sessions/{session_id}/abort"),
-                    Some(json!({})),
-                )
-                .await
-                .map_err(|error| {
-                    api_error(
-                        StatusCode::BAD_GATEWAY,
-                        format!("Failed to abort the session: {error}"),
-                    )
-                })
-            }
-        }
-        Err(_) => internal_json_request_for_profile(
-            state,
-            Some(profile_id),
-            Method::POST,
-            &format!("/api/sessions/{session_id}/abort"),
-            Some(json!({})),
+    app_server_client(state, profile_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to codex app-server: {error}"),
+            )
+        })?
+        .request(
+            "turn/interrupt",
+            json!({
+                "threadId": session_id,
+                "turnId": turn_id
+            }),
         )
         .await
         .map_err(|error| {
@@ -12015,8 +12141,9 @@ async fn abort_turn_payload(
                 StatusCode::BAD_GATEWAY,
                 format!("Failed to abort the session: {error}"),
             )
-        }),
-    }
+        })?;
+
+    Ok(json!({ "interrupted": true }))
 }
 
 async fn resolve_server_request_payload(
@@ -14155,6 +14282,17 @@ for raw_line in sys.stdin:
                 }
             }
         })
+    elif method == "turn/steer":
+        thread_id = params.get("threadId", "")
+        expected_turn_id = params.get("expectedTurnId", "")
+        if thread_id in threads:
+            threads[thread_id]["lastTurnSteer"] = params
+        write({
+            "id": request_id,
+            "result": {
+                "turnId": expected_turn_id
+            }
+        })
     elif method == "turn/interrupt":
         write({
             "id": request_id,
@@ -15402,6 +15540,140 @@ for raw_line in sys.stdin:
             state.active_turns.lock().await.get(&runtime_key).cloned(),
             Some("turn-1".to_string())
         );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steer_turn_payload_uses_active_turn_from_thread_reads() {
+        let sandbox = unique_test_dir("turn-steer-rust");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+        let runtime_profile = resolve_runtime_profile(&state.config, "default");
+        let uploads_dir = runtime_profile.data_dir.join("uploads").join("thread-1");
+        fs::create_dir_all(&uploads_dir).unwrap();
+
+        let text_attachment_path = workspace.join("handoff.md");
+        fs::write(&text_attachment_path, "handoff").unwrap();
+        fs::write(
+            uploads_dir.join("att-file.json"),
+            serde_json::to_vec(&json!({
+                "id": "att-file",
+                "originalName": "handoff.md",
+                "path": text_attachment_path.display().to_string(),
+                "mimeType": "text/markdown",
+                "size": 7,
+                "kind": "file",
+                "createdAt": "2026-04-20T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        app_server_client(&state, "default")
+            .await
+            .unwrap()
+            .request(
+                "thread/seed",
+                json!({
+                    "thread": {
+                        "id": "thread-1",
+                        "name": "Investigate queue",
+                        "preview": "Investigate queue",
+                        "cwd": workspace.display().to_string(),
+                        "archived": false,
+                        "createdAt": 1,
+                        "updatedAt": 2,
+                        "status": "running",
+                        "isSubagent": false,
+                        "agentNickname": Value::Null,
+                        "agentRole": Value::Null,
+                        "turns": [
+                            {
+                                "id": "turn-1",
+                                "status": "completed",
+                                "error": Value::Null,
+                                "startedAt": 10,
+                                "completedAt": 20,
+                                "durationMs": 10,
+                                "items": []
+                            },
+                            {
+                                "id": "turn-2",
+                                "status": "inProgress",
+                                "error": Value::Null,
+                                "startedAt": 30,
+                                "completedAt": Value::Null,
+                                "durationMs": Value::Null,
+                                "items": []
+                            }
+                        ]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        save_session_draft_payload(&state, "default", "thread-1", "Steer draft", "steer")
+            .await
+            .unwrap();
+
+        let payload = steer_turn_payload(
+            &state,
+            "default",
+            "thread-1",
+            "Focus on the queue deduplication race first.",
+            Some(&json!(["att-file"])),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            payload.get("turnId").and_then(Value::as_str),
+            Some("turn-2")
+        );
+
+        let thread = read_thread_payload(&state, "default", "thread-1", true)
+            .await
+            .unwrap();
+        let last_turn_steer = thread.get("lastTurnSteer").cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            last_turn_steer
+                .get("expectedTurnId")
+                .and_then(Value::as_str),
+            Some("turn-2")
+        );
+        let first_text = last_turn_steer
+            .get("input")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert!(first_text.contains(ATTACHMENT_PREAMBLE_START));
+        assert!(first_text.contains(text_attachment_path.to_str().unwrap()));
+        assert!(first_text.contains("Focus on the queue deduplication race first."));
+
+        let runtime_key = runtime_session_key(
+            resolve_runtime_profile_entry(&state.config, "default").0,
+            "thread-1",
+        );
+        assert_eq!(
+            state.active_turns.lock().await.get(&runtime_key).cloned(),
+            Some("turn-2".to_string())
+        );
+
+        let draft = get_session_draft_payload(&state, "default", "thread-1")
+            .await
+            .unwrap();
+        assert_eq!(draft.get("draft").and_then(Value::as_str), Some(""));
 
         let _ = fs::remove_dir_all(sandbox);
     }

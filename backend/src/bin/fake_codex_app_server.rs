@@ -347,6 +347,25 @@ fn main() {
                     }
                 }));
             }
+            Some("turn/steer") => {
+                let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
+                let thread_id = params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(thread_object) =
+                    threads.get_mut(&thread_id).and_then(Value::as_object_mut)
+                {
+                    thread_object.insert("lastTurnSteer".to_string(), params.clone());
+                }
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "turnId": params.get("expectedTurnId").cloned().unwrap_or(Value::Null)
+                    }
+                }));
+            }
             Some("turn/interrupt") => {
                 print_message(&json!({
                     "id": id,

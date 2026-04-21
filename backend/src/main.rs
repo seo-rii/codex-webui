@@ -3493,6 +3493,7 @@ struct CodexTomlDefaults {
     model: Option<String>,
     model_reasoning_effort: Option<String>,
     plan_mode_reasoning_effort: Option<String>,
+    personality: Option<String>,
     approval_policy: Option<String>,
     sandbox_mode: Option<String>,
     service_tier: String,
@@ -3611,6 +3612,8 @@ fn read_codex_toml_defaults(codex_home: &Path) -> CodexTomlDefaults {
             None,
             "plan_mode_reasoning_effort",
         )),
+        personality: parse_toml_string_value(get_toml_value(&raw, None, "personality"))
+            .filter(|value| matches!(value.as_str(), "none" | "friendly" | "pragmatic")),
         approval_policy: parse_toml_string_value(get_toml_value(&raw, None, "approval_policy")),
         sandbox_mode: parse_toml_string_value(get_toml_value(&raw, None, "sandbox_mode")),
         service_tier,
@@ -3736,6 +3739,16 @@ async fn sync_codex_toml_with_preferences(codex_home: &Path, preferences: &Value
             .get("model")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
+            .map(stringify_toml_string),
+    );
+    raw = upsert_toml_value(
+        &raw,
+        None,
+        "personality",
+        preferences
+            .get("personality")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "none" | "friendly" | "pragmatic"))
             .map(stringify_toml_string),
     );
     raw = upsert_toml_value(
@@ -5347,6 +5360,17 @@ async fn normalize_session_preferences_payload(
     )
     .await?;
     next_preferences.insert("gitRepoPath".to_string(), normalized_git_repo_path);
+    next_preferences.insert(
+        "personality".to_string(),
+        Value::String(
+            next_preferences
+                .get("personality")
+                .and_then(Value::as_str)
+                .filter(|value| matches!(*value, "none" | "friendly" | "pragmatic"))
+                .unwrap_or("pragmatic")
+                .to_string(),
+        ),
+    );
 
     Ok(Value::Object(next_preferences))
 }
@@ -5984,6 +6008,7 @@ async fn create_session_payload(
                 "cwd": cwd,
                 "approvalPolicy": session_preferences.get("approvalPolicy").cloned().unwrap_or_else(|| json!("on-request")),
                 "sandbox": session_preferences.get("sandboxMode").cloned().unwrap_or_else(|| json!("workspace-write")),
+                "personality": session_preferences.get("personality").cloned().unwrap_or(Value::Null),
                 "serviceTier": match session_preferences.get("speed").and_then(Value::as_str) {
                     Some("fast") => Value::String("fast".to_string()),
                     Some("flex") => Value::String("flex".to_string()),
@@ -7207,6 +7232,7 @@ async fn send_turn_payload(
                 "approvalPolicy": next_preferences.get("approvalPolicy").cloned().unwrap_or_else(|| json!("on-request")),
                 "sandboxPolicy": sandbox_policy,
                 "model": model.clone(),
+                "personality": next_preferences.get("personality").cloned().unwrap_or(Value::Null),
                 "serviceTier": match next_preferences.get("speed").and_then(Value::as_str) {
                     Some("fast") => Value::String("fast".to_string()),
                     Some("flex") => Value::String("flex".to_string()),
@@ -8859,6 +8885,7 @@ async fn start_arena_run_payload(
                     "cwd": cwd,
                     "approvalPolicy": session_preferences.get("approvalPolicy").cloned().unwrap_or_else(|| json!("on-request")),
                     "sandbox": session_preferences.get("sandboxMode").cloned().unwrap_or_else(|| json!("workspace-write")),
+                    "personality": session_preferences.get("personality").cloned().unwrap_or(Value::Null),
                     "serviceTier": match session_preferences.get("speed").and_then(Value::as_str) {
                         Some("fast") => Value::String("fast".to_string()),
                         Some("flex") => Value::String("flex".to_string()),
@@ -10350,6 +10377,12 @@ async fn session_preferences_defaults_payload(state: &AppState, profile_id: &str
         }
     })
     .unwrap_or_else(|| "medium".to_string());
+    let personality = env_choice(
+        "CODEX_WEBUI_DEFAULT_PERSONALITY",
+        &["none", "friendly", "pragmatic"],
+    )
+    .or_else(|| codex_defaults.personality.clone())
+    .unwrap_or_else(|| "pragmatic".to_string());
 
     json!({
         "cwd": default_cwd,
@@ -10360,6 +10393,7 @@ async fn session_preferences_defaults_payload(state: &AppState, profile_id: &str
             .unwrap_or(Value::Null),
         "effort": effort,
         "speed": speed,
+        "personality": personality,
         "mode": mode,
         "sendOnEnter": env_bool("CODEX_WEBUI_DEFAULT_SEND_ON_ENTER").unwrap_or(false),
         "sandboxMode": sandbox_mode,
@@ -10448,6 +10482,10 @@ async fn config_models_payload(state: &AppState, profile_id: &str) -> ApiResult<
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default(),
+                "supportsPersonality": model
+                    .get("supportsPersonality")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
                 "isDefault": model.get("isDefault").and_then(Value::as_bool).unwrap_or(false)
             })
         })

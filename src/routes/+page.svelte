@@ -563,12 +563,19 @@
       askCodex: m.ask_codex(),
       queueFollowUpPlaceholder: m.queue_follow_up_placeholder(),
       model: m.model(),
+      personality: m.personality(),
+      personalityFriendly: m.personality_friendly(),
+      personalityPragmatic: m.personality_pragmatic(),
+      personalityNone: m.personality_none(),
       speed: m.speed(),
       planMode: m.plan_mode(),
       autoDefault: m.auto_default(),
       speedAuto: m.speed_auto(),
       speedFast: m.speed_fast(),
       speedFlex: m.speed_flex(),
+      slashPersonalityDescription: m.slash_personality_description(),
+      slashPersonalityUpdated: (personality: string) => m.slash_personality_updated({ personality }),
+      slashPersonalityInvalid: m.slash_personality_invalid(),
       approvalMode: m.approval_mode(),
       manual: m.manual(),
       autoOnce: m.auto_once(),
@@ -1374,6 +1381,9 @@
     const available = ["auto", ...(selectedModel?.additionalSpeedTiers ?? [])];
     return [...new Set(available.filter((value) => value === "auto" || value === "fast" || value === "flex"))];
   });
+  const personalityOptions = $derived.by(
+    () => ["pragmatic", "friendly", "none"] as Array<SessionPreferences["personality"]>
+  );
   const slashSuggestions = $derived.by(() => {
     const value = draft.trimStart();
     if (!value.startsWith("/")) {
@@ -1382,6 +1392,20 @@
 
     const body = value.slice(1);
     const lower = body.toLowerCase();
+    if (lower.startsWith("personality ")) {
+      const personalityNeedle = body.slice("personality ".length).trim().toLowerCase();
+      return personalityOptions
+        .filter((personality) => !personalityNeedle || personality.includes(personalityNeedle))
+        .slice(0, 6)
+        .map((personality) => ({
+          key: `personality:${personality}`,
+          command: "personality",
+          title: `/personality ${personality}`,
+          description: getPersonalityOptionLabel(personality),
+          value: `/personality ${personality}`
+        }));
+    }
+
     if (lower.startsWith("preset ")) {
       const presetNeedle = body.slice("preset ".length).trim().toLowerCase();
       return (config?.promptPresets ?? [])
@@ -1424,6 +1448,13 @@
         title: "/model",
         description: m.slash_model_description(),
         value: "/model "
+      },
+      {
+        key: "personality",
+        command: "personality",
+        title: "/personality",
+        description: ui.slashPersonalityDescription,
+        value: "/personality "
       },
       {
         key: "plan",
@@ -4255,6 +4286,27 @@
       draft = "";
       scheduleComposerTextareaResize();
       noticeText = m.slash_model_updated({ model: args });
+      return true;
+    }
+
+    if (command === "personality") {
+      if (readOnlyRole) {
+        errorText = m.error_forbidden_role();
+        return true;
+      }
+      if (!args) {
+        errorText = m.slash_argument_required({ command: "/personality" });
+        return true;
+      }
+      const normalized = args.toLowerCase();
+      if (normalized !== "friendly" && normalized !== "pragmatic" && normalized !== "none") {
+        errorText = ui.slashPersonalityInvalid;
+        return true;
+      }
+      setPreference("personality", normalized as SessionPreferences["personality"]);
+      draft = "";
+      scheduleComposerTextareaResize();
+      noticeText = ui.slashPersonalityUpdated(getPersonalityOptionLabel(normalized as SessionPreferences["personality"]));
       return true;
     }
 
@@ -7548,6 +7600,15 @@
       }
     ];
 
+    if ((conversation.preferences.personality ?? "pragmatic") !== "pragmatic") {
+      indicators.push({
+        key: "personality",
+        icon: conversation.preferences.personality === "friendly" ? "mood" : "horizontal_rule",
+        label: getPersonalityOptionLabel(conversation.preferences.personality),
+        text: null
+      });
+    }
+
     if ((conversation.preferences.mode ?? "default") === "plan") {
       indicators.push({
         key: "plan",
@@ -7586,6 +7647,16 @@
       return ui.speedFlex;
     }
     return ui.speedAuto;
+  }
+
+  function getPersonalityOptionLabel(option: SessionPreferences["personality"] | null | undefined) {
+    if (option === "friendly") {
+      return ui.personalityFriendly;
+    }
+    if (option === "none") {
+      return ui.personalityNone;
+    }
+    return ui.personalityPragmatic;
   }
 
   function isFastSpeedMode(speed: SessionPreferences["speed"] | null | undefined) {
@@ -8930,6 +9001,23 @@
                             {/each}
                           </select>
                         </div>
+                        {#if selectedModel?.supportsPersonality ?? true}
+                          <div class="space-y-1">
+                            <label class="px-1 text-[10px] font-bold uppercase tracking-widest text-gray-400" for="composer-personality-select">{ui.personality}</label>
+                            <select
+                              class="w-full rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm transition-all focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/10 disabled:cursor-not-allowed disabled:opacity-60"
+                              disabled={readOnlyRole}
+                              id="composer-personality-select"
+                              onchange={(event) =>
+                                setPreference("personality", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["personality"])}
+                              value={conversation.preferences.personality ?? "pragmatic"}
+                            >
+                              {#each personalityOptions as option (option)}
+                                <option value={option}>{getPersonalityOptionLabel(option)}</option>
+                              {/each}
+                            </select>
+                          </div>
+                        {/if}
                         <div class="composer-settings-card flex items-center justify-between gap-2 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
                           <div class="flex min-w-0 items-center gap-2">
                             <span class={`composer-settings-card__icon inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border ${

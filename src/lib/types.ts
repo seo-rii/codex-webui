@@ -3,6 +3,7 @@ export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access"
 export type CollaborationMode = "default" | "plan";
 export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 export type ServiceSpeed = "auto" | "fast" | "flex";
+export type Personality = "none" | "friendly" | "pragmatic";
 export type AttachmentKind = "image" | "file";
 export type AutoApproveMode = "manual" | "turn" | "session";
 export type ItemDetailState = "inline" | "deferred" | "loaded";
@@ -31,6 +32,7 @@ export type SessionPreferences = {
   model: string | null;
   effort: ReasoningEffort | null;
   speed: ServiceSpeed;
+  personality: Personality;
   mode: CollaborationMode;
   sendOnEnter: boolean;
   sandboxMode: SandboxMode;
@@ -214,6 +216,7 @@ export type ModelOption = {
   supportedReasoningEfforts: string[];
   additionalSpeedTiers: string[];
   inputModalities: string[];
+  supportsPersonality: boolean;
   isDefault: boolean;
 };
 

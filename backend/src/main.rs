@@ -65,6 +65,7 @@ const NPM_VIEW_TIMEOUT: Duration = Duration::from_millis(2500);
 const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(10);
+const GIT_REPOSITORY_CACHE_TTL: Duration = Duration::from_secs(5);
 const QUOTA_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const DEFAULT_NOTIFICATION_LIMIT: usize = 80;
 const DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT: usize = 40;
@@ -278,6 +279,8 @@ struct AppState {
     response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>,
     static_asset_cache: Arc<Mutex<HashMap<String, CachedStaticAsset>>>,
     catalog_cache: Arc<Mutex<HashMap<String, CachedCatalog>>>,
+    git_repository_cache: Arc<Mutex<Option<CachedGitRepositories>>>,
+    pinned_git_repositories: Arc<Mutex<HashMap<String, Value>>>,
     inflight_requests: Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<ServerEnvelope>>>>>,
     quota_cache: Arc<Mutex<HashMap<String, CachedQuota>>>,
     relays: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
@@ -314,6 +317,12 @@ struct CachedStaticAsset {
 struct CachedCatalog {
     created_at: Instant,
     payload: Value,
+}
+
+#[derive(Clone)]
+struct CachedGitRepositories {
+    created_at: Instant,
+    repositories: Vec<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -666,6 +675,8 @@ async fn main() -> Result<()> {
             response_cache: Arc::new(Mutex::new(HashMap::new())),
             static_asset_cache: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(Mutex::new(HashMap::new())),
+            git_repository_cache: Arc::new(Mutex::new(None)),
+            pinned_git_repositories: Arc::new(Mutex::new(HashMap::new())),
             inflight_requests: Arc::new(Mutex::new(HashMap::new())),
             quota_cache: Arc::new(Mutex::new(HashMap::new())),
             relays: Arc::new(Mutex::new(HashMap::new())),
@@ -4022,9 +4033,18 @@ async fn run_git_text_payload(
     repo_path: &str,
     args: Vec<String>,
 ) -> ApiResult<String> {
+    let output = run_git_output_payload(repo_path, args.clone(), Duration::from_secs(20)).await?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn run_git_output_payload(
+    repo_path: &str,
+    args: Vec<String>,
+    timeout: Duration,
+) -> ApiResult<std::process::Output> {
     let mut command_args = vec!["-C".to_string(), repo_path.to_string()];
     command_args.extend(args.clone());
-    let output = run_command_with_timeout("git", command_args, Duration::from_secs(20))
+    let output = run_command_with_timeout("git", command_args, timeout)
         .await
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
     if !output.status.success() {
@@ -4041,7 +4061,107 @@ async fn run_git_text_payload(
             },
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(output)
+}
+
+fn git_skip_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | "node_modules" | ".svelte-kit" | "build" | "dist" | ".next" | "coverage"
+    )
+}
+
+async fn has_git_marker(path: &Path) -> bool {
+    tokio_fs::metadata(path.join(".git"))
+        .await
+        .map(|metadata| metadata.is_dir() || metadata.is_file())
+        .unwrap_or(false)
+}
+
+async fn list_git_child_directories(path: &Path) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    let Ok(mut entries) = tokio_fs::read_dir(path).await else {
+        return directories;
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if git_skip_dir(name) {
+            continue;
+        }
+        if entry
+            .file_type()
+            .await
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false)
+        {
+            directories.push(entry.path());
+        }
+    }
+
+    directories
+}
+
+async fn build_git_repository_payload(
+    _state: &AppState,
+    repo_path: &Path,
+    allowed_roots: &[PathBuf],
+) -> ApiResult<Value> {
+    let normalized_repo_path = real_path_safe(repo_path).await;
+    let Some(root_path) = allowed_roots
+        .iter()
+        .find(|candidate| path_is_within(candidate, &normalized_repo_path))
+    else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "The selected repository was not found within allowed roots.",
+        ));
+    };
+
+    let current_branch = run_command_with_timeout(
+        "git",
+        vec![
+            "-C".to_string(),
+            normalized_repo_path.display().to_string(),
+            "branch".to_string(),
+            "--show-current".to_string(),
+        ],
+        Duration::from_secs(5),
+    )
+    .await
+    .ok()
+    .filter(|output| output.status.success())
+    .and_then(|output| {
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!branch.is_empty()).then_some(branch)
+    });
+    let relative_path = normalized_repo_path
+        .strip_prefix(root_path)
+        .ok()
+        .and_then(|value| {
+            let text = value.display().to_string();
+            (!text.is_empty()).then_some(text)
+        })
+        .unwrap_or_else(|| ".".to_string());
+
+    Ok(json!({
+        "path": normalized_repo_path.display().to_string(),
+        "name": normalized_repo_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| normalized_repo_path.as_os_str().to_str().unwrap_or(".")),
+        "rootPath": root_path.display().to_string(),
+        "relativePath": relative_path,
+        "currentBranch": current_branch
+    }))
+}
+
+async fn invalidate_git_repository_cache(state: &AppState) {
+    *state.git_repository_cache.lock().await = None;
 }
 
 fn parse_git_worktrees_payload(repo_path: &str, output: &str) -> Vec<Value> {
@@ -4151,7 +4271,7 @@ async fn create_git_worktree_payload(
         args.push("-b".to_string());
         args.push(branch_name);
     }
-    args.push(resolved_worktree_path);
+    args.push(resolved_worktree_path.clone());
     if !detach && !create_branch {
         if let Some(branch_name) = trimmed_branch_name {
             args.push(branch_name);
@@ -4159,6 +4279,18 @@ async fn create_git_worktree_payload(
     }
 
     run_git_text_payload(state, &repo_root, args).await?;
+    invalidate_git_repository_cache(state).await;
+    let allowed_roots = resolved_allowed_roots(&state.config).await;
+    if let Ok(repository) =
+        build_git_repository_payload(state, Path::new(&resolved_worktree_path), &allowed_roots)
+            .await
+    {
+        state
+            .pinned_git_repositories
+            .lock()
+            .await
+            .insert(resolved_worktree_path.clone(), repository);
+    }
     list_git_worktrees_payload(state, &repo_root).await
 }
 
@@ -4174,9 +4306,578 @@ async fn remove_git_worktree_payload(
     if force {
         args.push("--force".to_string());
     }
-    args.push(resolved_worktree_path);
+    args.push(resolved_worktree_path.clone());
     run_git_text_payload(state, &repo_root, args).await?;
+    invalidate_git_repository_cache(state).await;
+    state
+        .pinned_git_repositories
+        .lock()
+        .await
+        .remove(&resolved_worktree_path);
     list_git_worktrees_payload(state, &repo_root).await
+}
+
+async fn list_git_repositories_payload(state: &AppState, force_refresh: bool) -> ApiResult<Value> {
+    if !force_refresh {
+        if let Some(cached) = state
+            .git_repository_cache
+            .lock()
+            .await
+            .clone()
+            .filter(|cached| cached.created_at.elapsed() < GIT_REPOSITORY_CACHE_TTL)
+        {
+            let pinned = state
+                .pinned_git_repositories
+                .lock()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut repositories_by_path = HashMap::new();
+            for repository in cached.repositories.into_iter().chain(pinned.into_iter()) {
+                if let Some(path) = repository.get("path").and_then(Value::as_str) {
+                    repositories_by_path.insert(path.to_string(), repository);
+                }
+            }
+            let mut repositories = repositories_by_path.into_values().collect::<Vec<_>>();
+            repositories.sort_by(|left, right| {
+                left.get("relativePath")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(
+                        right
+                            .get("relativePath")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+                    .then_with(|| {
+                        left.get("path")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .cmp(
+                                right
+                                    .get("path")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                            )
+                    })
+            });
+            return Ok(json!({ "repositories": repositories }));
+        }
+    }
+
+    let allowed_roots = resolved_allowed_roots(&state.config).await;
+    let mut repositories = Vec::new();
+    for root in &allowed_roots {
+        let mut queue = VecDeque::from([(root.clone(), 0_u64)]);
+        while let Some((current_path, depth)) = queue.pop_front() {
+            if has_git_marker(&current_path).await {
+                if let Ok(repository) =
+                    build_git_repository_payload(state, &current_path, &allowed_roots).await
+                {
+                    repositories.push(repository);
+                }
+            }
+            if depth >= state.config.git_discovery_depth {
+                continue;
+            }
+            for child in list_git_child_directories(&current_path).await {
+                queue.push_back((child, depth + 1));
+            }
+        }
+    }
+
+    let pinned = state
+        .pinned_git_repositories
+        .lock()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut repositories_by_path = HashMap::new();
+    for repository in repositories.into_iter().chain(pinned.into_iter()) {
+        if let Some(path) = repository.get("path").and_then(Value::as_str) {
+            repositories_by_path.insert(path.to_string(), repository);
+        }
+    }
+    let mut repositories = repositories_by_path.into_values().collect::<Vec<_>>();
+    repositories.sort_by(|left, right| {
+        left.get("relativePath")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                right
+                    .get("relativePath")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+            .then_with(|| {
+                left.get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(
+                        right
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+            })
+    });
+    *state.git_repository_cache.lock().await = Some(CachedGitRepositories {
+        created_at: Instant::now(),
+        repositories: repositories.clone(),
+    });
+    Ok(json!({ "repositories": repositories }))
+}
+
+async fn get_git_status_payload(state: &AppState, repo_path: &str) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let allowed_roots = resolved_allowed_roots(&state.config).await;
+    let repository =
+        build_git_repository_payload(state, Path::new(&repo_root), &allowed_roots).await?;
+    let output = run_git_text_payload(
+        state,
+        &repo_root,
+        vec![
+            "status".to_string(),
+            "--porcelain=v1".to_string(),
+            "--branch".to_string(),
+        ],
+    )
+    .await?;
+    let lines = output
+        .lines()
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let header = lines
+        .iter()
+        .find(|line| line.starts_with("## "))
+        .cloned()
+        .unwrap_or_else(|| "## HEAD".to_string());
+    let summary = header.trim_start_matches("## ").to_string();
+    let (branch_part, tracking_part) = summary
+        .split_once("...")
+        .map(|(left, right)| (left.trim().to_string(), right.to_string()))
+        .unwrap_or_else(|| (summary.trim().to_string(), String::new()));
+    let branch = if branch_part == "HEAD (no branch)" {
+        None
+    } else {
+        let trimmed = branch_part.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    let extract_count = |needle: &str| -> u64 {
+        tracking_part
+            .split(needle)
+            .nth(1)
+            .map(str::trim_start)
+            .and_then(|value| {
+                value
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_digit())
+                    .collect::<String>()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .unwrap_or(0)
+    };
+    let ahead = extract_count("ahead ");
+    let behind = extract_count("behind ");
+
+    let files = lines
+        .iter()
+        .filter(|line| !line.starts_with("## "))
+        .map(|line| {
+            let staged_code = line.chars().next().unwrap_or(' ');
+            let unstaged_code = line.chars().nth(1).unwrap_or(' ');
+            let raw_path = line.get(3..).unwrap_or_default();
+            let (original_path, file_path) = raw_path
+                .split_once(" -> ")
+                .map(|(left, right)| (Some(left.to_string()), right.to_string()))
+                .unwrap_or_else(|| (None, raw_path.to_string()));
+            let map_code = |code: char| match code {
+                'M' => "modified",
+                'A' => "added",
+                'D' => "deleted",
+                'R' => "renamed",
+                'C' => "copied",
+                'U' => "unmerged",
+                '?' => "untracked",
+                '!' => "ignored",
+                _ => "clean",
+            };
+            json!({
+                "path": file_path,
+                "originalPath": original_path,
+                "stagedCode": staged_code.to_string(),
+                "unstagedCode": unstaged_code.to_string(),
+                "stagedLabel": map_code(staged_code),
+                "unstagedLabel": map_code(unstaged_code),
+                "hasStagedChanges": staged_code != ' ' && staged_code != '?',
+                "hasUnstagedChanges": unstaged_code != ' ' && unstaged_code != '?',
+                "isUntracked": staged_code == '?' && unstaged_code == '?'
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let branches_output = run_git_text_payload(
+        state,
+        &repo_root,
+        vec![
+            "for-each-ref".to_string(),
+            "refs/heads".to_string(),
+            "--format=%(refname:short)\t%(HEAD)\t%(upstream:short)".to_string(),
+        ],
+    )
+    .await?;
+    let branches = branches_output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut parts = line.split('\t');
+            let name = parts.next().unwrap_or_default();
+            let current = parts.next().unwrap_or_default();
+            let upstream = parts.next().unwrap_or_default();
+            json!({
+                "name": name,
+                "current": current == "*",
+                "upstream": if upstream.trim().is_empty() { Value::Null } else { Value::String(upstream.to_string()) }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let commits_output = run_git_text_payload(
+        state,
+        &repo_root,
+        vec![
+            "log".to_string(),
+            "--max-count=12".to_string(),
+            "--pretty=format:%H%x09%h%x09%an%x09%aI%x09%s".to_string(),
+        ],
+    )
+    .await?;
+    let commits = commits_output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut parts = line.split('\t');
+            json!({
+                "hash": parts.next().unwrap_or_default(),
+                "shortHash": parts.next().unwrap_or_default(),
+                "author": parts.next().unwrap_or_default(),
+                "authoredAt": parts.next().unwrap_or_default(),
+                "subject": parts.next().unwrap_or_default()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "repo": {
+            "path": repository.get("path").cloned().unwrap_or(Value::String(repo_root.clone())),
+            "name": repository.get("name").cloned().unwrap_or(Value::Null),
+            "rootPath": repository.get("rootPath").cloned().unwrap_or(Value::Null),
+            "relativePath": repository.get("relativePath").cloned().unwrap_or(Value::Null),
+            "currentBranch": branch.clone()
+        },
+        "branch": branch,
+        "ahead": ahead,
+        "behind": behind,
+        "clean": files.is_empty(),
+        "files": files,
+        "branches": branches,
+        "commits": commits
+    }))
+}
+
+async fn get_git_file_payload(
+    state: &AppState,
+    repo_path: &str,
+    file_path: &str,
+) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let status_payload = get_git_status_payload(state, &repo_root).await?;
+    let status = status_payload
+        .get("files")
+        .and_then(Value::as_array)
+        .and_then(|files| {
+            files
+                .iter()
+                .find(|entry| entry.get("path").and_then(Value::as_str) == Some(file_path))
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    let repo_root_path = PathBuf::from(&repo_root);
+    let candidate_path = normalize_path(repo_root_path.join(file_path));
+    let existing_path = tokio_fs::canonicalize(&candidate_path)
+        .await
+        .unwrap_or_else(|_| candidate_path.clone());
+    if !path_is_within(&repo_root_path, &existing_path) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "The selected file is outside the repository root.",
+        ));
+    }
+
+    let modified_bytes = tokio_fs::read(&candidate_path).await.unwrap_or_default();
+    let modified_is_binary = modified_bytes.contains(&0);
+    let modified_content = if modified_is_binary {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&modified_bytes).to_string()
+    };
+
+    let head_path = status
+        .get("originalPath")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(file_path);
+    let head_output = run_command_with_timeout(
+        "git",
+        vec![
+            "-C".to_string(),
+            repo_root.clone(),
+            "show".to_string(),
+            format!("HEAD:{}", head_path.replace('\\', "/")),
+        ],
+        Duration::from_secs(20),
+    )
+    .await
+    .ok();
+    let (original_content, original_is_binary) = if let Some(output) = head_output {
+        if output.status.success() {
+            let is_binary = output.stdout.contains(&0);
+            (
+                if is_binary {
+                    String::new()
+                } else {
+                    String::from_utf8_lossy(&output.stdout).to_string()
+                },
+                is_binary,
+            )
+        } else {
+            (String::new(), false)
+        }
+    } else {
+        (String::new(), false)
+    };
+
+    let language = match Path::new(file_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("ts" | "tsx") => "typescript",
+        Some("js" | "mjs" | "cjs" | "jsx") => "javascript",
+        Some("svelte" | "html") => "html",
+        Some("json") => "json",
+        Some("css") => "css",
+        Some("scss") => "scss",
+        Some("md") => "markdown",
+        Some("yml" | "yaml") => "yaml",
+        Some("sh") => "shell",
+        Some("rs") => "rust",
+        Some("py") => "python",
+        Some("go") => "go",
+        Some("java") => "java",
+        Some("kt") => "kotlin",
+        Some("swift") => "swift",
+        _ => "plaintext",
+    };
+
+    Ok(json!({
+        "repoPath": repo_root,
+        "filePath": file_path,
+        "originalPath": status.get("originalPath").cloned().unwrap_or(Value::Null),
+        "originalContent": original_content,
+        "modifiedContent": modified_content,
+        "language": language,
+        "isBinary": original_is_binary || modified_is_binary,
+        "status": status
+    }))
+}
+
+async fn get_git_commit_diff_payload(
+    state: &AppState,
+    repo_path: &str,
+    commit_hash: &str,
+) -> ApiResult<Value> {
+    let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let normalized_commit_hash = commit_hash.trim();
+    if normalized_commit_hash.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "commitHash is required.",
+        ));
+    }
+    let diff = run_git_text_payload(
+        state,
+        &repo_root,
+        vec![
+            "show".to_string(),
+            "--format=".to_string(),
+            "--find-renames".to_string(),
+            "--find-copies".to_string(),
+            "--no-ext-diff".to_string(),
+            normalized_commit_hash.to_string(),
+        ],
+    )
+    .await?;
+    Ok(json!({
+        "repoPath": repo_root,
+        "commitHash": normalized_commit_hash,
+        "diff": diff
+    }))
+}
+
+async fn resolve_git_file_from_absolute_path_payload(
+    state: &AppState,
+    file_path: &str,
+) -> ApiResult<Value> {
+    if file_path.trim().is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "filePath is required."));
+    }
+
+    let normalized = real_path_safe(Path::new(file_path)).await;
+    let target_metadata = tokio_fs::metadata(&normalized).await.ok();
+    let repositories = list_git_repositories_payload(state, false)
+        .await?
+        .get("repositories")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut repositories = repositories;
+    repositories.sort_by(|left, right| {
+        right
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .len()
+            .cmp(
+                &left
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .len(),
+            )
+    });
+    let allowed_roots = resolved_allowed_roots(&state.config).await;
+
+    let mut resolved_repository = repositories.into_iter().find(|repository| {
+        repository
+            .get("path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .is_some_and(|candidate| path_is_within(&candidate, &normalized))
+    });
+
+    if resolved_repository.is_none() {
+        let mut current_path = if target_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_dir())
+        {
+            normalized.clone()
+        } else {
+            normalized
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| normalized.clone())
+        };
+
+        while allowed_roots
+            .iter()
+            .any(|root| path_is_within(root, &current_path))
+        {
+            if has_git_marker(&current_path).await {
+                if let Ok(repository) =
+                    build_git_repository_payload(state, &current_path, &allowed_roots).await
+                {
+                    resolved_repository = Some(repository);
+                    break;
+                }
+            }
+            let parent = current_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| current_path.clone());
+            if parent == current_path {
+                break;
+            }
+            current_path = parent;
+        }
+    }
+
+    if resolved_repository.is_none() {
+        let stats = tokio_fs::metadata(&normalized).await.ok();
+        if stats.as_ref().is_some_and(|metadata| metadata.is_dir()) {
+            let max_depth = state.config.git_discovery_depth.saturating_add(2).max(3);
+            let mut queue = VecDeque::from([(normalized.clone(), 0_u64)]);
+            while let Some((current_path, depth)) = queue.pop_front() {
+                if depth > 0 && has_git_marker(&current_path).await {
+                    if let Ok(repository) =
+                        build_git_repository_payload(state, &current_path, &allowed_roots).await
+                    {
+                        resolved_repository = Some(repository);
+                        break;
+                    }
+                }
+                if depth >= max_depth {
+                    continue;
+                }
+                for child in list_git_child_directories(&current_path).await {
+                    queue.push_back((child, depth + 1));
+                }
+            }
+        }
+    }
+
+    let Some(repository) = resolved_repository else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "The selected path could not be mapped to a Git repository within allowed roots.",
+        ));
+    };
+
+    let repo_path = repository
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "The selected repository path is invalid.",
+            )
+        })?
+        .to_string();
+    let repo_root = PathBuf::from(&repo_path);
+    let relative_path = if target_metadata
+        .as_ref()
+        .is_some_and(|metadata| !metadata.is_dir())
+    {
+        normalized
+            .strip_prefix(&repo_root)
+            .ok()
+            .and_then(|relative| {
+                let text = relative
+                    .components()
+                    .filter_map(|component| match component {
+                        Component::Normal(value) => value.to_str().map(str::to_string),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                (!text.is_empty()).then_some(text)
+            })
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "repoPath": repo_path,
+        "filePath": relative_path
+    }))
 }
 
 async fn normalize_session_preferences_payload(
@@ -11845,20 +12546,12 @@ async fn execute_ws_method(
         )
         .await
         .map_err(anyhow::Error::from),
-        "git/repositories/list" => {
-            internal_json_request(state, Method::GET, "/api/git/repositories", None).await
-        }
-        "git/status" => {
-            let repo_path_raw = require_string(&params, "repoPath")?;
-            let repo_path = urlencoding::encode(&repo_path_raw);
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!("/api/git/status?repoPath={repo_path}"),
-                None,
-            )
+        "git/repositories/list" => list_git_repositories_payload(state, false)
             .await
-        }
+            .map_err(anyhow::Error::from),
+        "git/status" => get_git_status_payload(state, &require_string(&params, "repoPath")?)
+            .await
+            .map_err(anyhow::Error::from),
         "git/github/pulls" => {
             let repo_path_raw = require_string(&params, "repoPath")?;
             let repo_path = urlencoding::encode(&repo_path_raw);
@@ -11941,30 +12634,19 @@ async fn execute_ws_method(
         )
         .await
         .map_err(anyhow::Error::from),
-        "git/file/get" => {
-            let repo_path_raw = require_string(&params, "repoPath")?;
-            let file_path_raw = require_string(&params, "filePath")?;
-            let repo_path = urlencoding::encode(&repo_path_raw);
-            let file_path = urlencoding::encode(&file_path_raw);
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!("/api/git/file?repoPath={repo_path}&filePath={file_path}"),
-                None,
-            )
-            .await
-        }
-        "git/file/resolve" => {
-            let file_path_raw = require_string(&params, "filePath")?;
-            let file_path = urlencoding::encode(&file_path_raw);
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!("/api/git/file/resolve?filePath={file_path}"),
-                None,
-            )
-            .await
-        }
+        "git/file/get" => get_git_file_payload(
+            state,
+            &require_string(&params, "repoPath")?,
+            &require_string(&params, "filePath")?,
+        )
+        .await
+        .map_err(anyhow::Error::from),
+        "git/file/resolve" => resolve_git_file_from_absolute_path_payload(
+            state,
+            &require_string(&params, "filePath")?,
+        )
+        .await
+        .map_err(anyhow::Error::from),
         "git/file/save" => {
             let payload = json!({
                 "repoPath": require_string(&params, "repoPath")?,
@@ -12006,19 +12688,13 @@ async fn execute_ws_method(
             });
             internal_json_request(state, Method::POST, "/api/git/commit", Some(payload)).await
         }
-        "git/commit/diff" => {
-            let repo_path_raw = require_string(&params, "repoPath")?;
-            let commit_hash_raw = require_string(&params, "commitHash")?;
-            let repo_path = urlencoding::encode(&repo_path_raw);
-            let commit_hash = urlencoding::encode(&commit_hash_raw);
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!("/api/git/commit/diff?repoPath={repo_path}&commitHash={commit_hash}"),
-                None,
-            )
-            .await
-        }
+        "git/commit/diff" => get_git_commit_diff_payload(
+            state,
+            &require_string(&params, "repoPath")?,
+            &require_string(&params, "commitHash")?,
+        )
+        .await
+        .map_err(anyhow::Error::from),
         "git/checkout" => {
             let payload = json!({
                 "repoPath": require_string(&params, "repoPath")?,
@@ -15653,6 +16329,8 @@ mod tests {
             response_cache: Arc::new(Mutex::new(HashMap::new())),
             static_asset_cache: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(Mutex::new(HashMap::new())),
+            git_repository_cache: Arc::new(Mutex::new(None)),
+            pinned_git_repositories: Arc::new(Mutex::new(HashMap::new())),
             inflight_requests: Arc::new(Mutex::new(HashMap::new())),
             quota_cache: Arc::new(Mutex::new(HashMap::new())),
             relays: Arc::new(Mutex::new(HashMap::new())),
@@ -16173,6 +16851,15 @@ for raw_line in sys.stdin:
                 .and_then(Value::as_array)
                 .is_some_and(|worktrees| worktrees.len() >= 2)
         );
+        let repositories = list_git_repositories_payload(&state, false).await.unwrap();
+        assert!(
+            repositories
+                .get("repositories")
+                .and_then(Value::as_array)
+                .is_some_and(|repositories| repositories.iter().any(|entry| {
+                    entry.get("path").and_then(Value::as_str) == Some(worktree.to_str().unwrap())
+                }))
+        );
 
         let removed = remove_git_worktree_payload(
             &state,
@@ -16192,6 +16879,100 @@ for raw_line in sys.stdin:
                             == Some(worktree.to_str().unwrap())
                     })
                 })
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn git_read_payloads_use_rust_helpers() {
+        let sandbox = unique_test_dir("git-read");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        let repo = workspace.join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+        init_test_git_repo(&repo);
+        fs::write(repo.join("README.md"), "changed\n").unwrap();
+        fs::write(repo.join("notes.txt"), "todo\n").unwrap();
+
+        let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+
+        let repositories = list_git_repositories_payload(&state, false).await.unwrap();
+        assert!(
+            repositories
+                .get("repositories")
+                .and_then(Value::as_array)
+                .is_some_and(|repositories| repositories.iter().any(|entry| {
+                    entry.get("path").and_then(Value::as_str) == Some(repo.to_str().unwrap())
+                }))
+        );
+
+        let status = get_git_status_payload(&state, repo.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            status
+                .get("repo")
+                .and_then(|value| value.get("path"))
+                .and_then(Value::as_str),
+            Some(repo.to_str().unwrap())
+        );
+        assert_eq!(status.get("clean").and_then(Value::as_bool), Some(false));
+        assert!(
+            status
+                .get("files")
+                .and_then(Value::as_array)
+                .is_some_and(|files| files.iter().any(|entry| {
+                    entry.get("path").and_then(Value::as_str) == Some("README.md")
+                        && entry.get("unstagedLabel").and_then(Value::as_str) == Some("modified")
+                }))
+        );
+        assert!(
+            status
+                .get("files")
+                .and_then(Value::as_array)
+                .is_some_and(|files| files.iter().any(|entry| {
+                    entry.get("path").and_then(Value::as_str) == Some("notes.txt")
+                        && entry.get("isUntracked").and_then(Value::as_bool) == Some(true)
+                }))
+        );
+
+        let file_payload = get_git_file_payload(&state, repo.to_str().unwrap(), "README.md")
+            .await
+            .unwrap();
+        assert_eq!(
+            file_payload.get("originalContent").and_then(Value::as_str),
+            Some("init\n")
+        );
+        assert_eq!(
+            file_payload.get("modifiedContent").and_then(Value::as_str),
+            Some("changed\n")
+        );
+
+        let diff_payload = get_git_commit_diff_payload(&state, repo.to_str().unwrap(), "HEAD")
+            .await
+            .unwrap();
+        assert!(
+            diff_payload
+                .get("diff")
+                .and_then(Value::as_str)
+                .is_some_and(|diff| diff.contains("README.md"))
+        );
+
+        let resolved = resolve_git_file_from_absolute_path_payload(
+            &state,
+            repo.join("README.md").to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved.get("repoPath").and_then(Value::as_str),
+            Some(repo.to_str().unwrap())
+        );
+        assert_eq!(
+            resolved.get("filePath").and_then(Value::as_str),
+            Some("README.md")
         );
 
         let _ = fs::remove_dir_all(sandbox);

@@ -6,8 +6,7 @@
 
 1. browser UI
 2. Rust public gateway
-3. internal Node API service
-4. `codex app-server`
+3. `codex app-server`
 
 The browser never talks to Codex directly.
 
@@ -37,27 +36,9 @@ It is responsible for:
 - long-lived terminal processes
 - runtime install/update checks
 - quota fetching
-- spawning and supervising the internal Node service
+- session, queue, attachment, Git, editor, notification, and runtime API handling
 - enforcing base path and CORS policy
 - appending audit-log entries for privileged login and WebSocket actions
-
-### Internal Node API service
-
-The internal service is no longer used as the public page renderer. It exists as an API-only private service behind Rust, is bundled into `build/internal/index.js`, and contains most Codex-specific application logic:
-
-- `codex app-server` client management
-- session hydration and turn shaping
-- queue persistence and dispatch
-- notification center persistence and webhook delivery settings
-- session organization persistence for pins, tags, and saved sidebar filters
-- prompt preset persistence for composer shortcuts and slash-command expansion
-- attachment storage
-- Git repository discovery, fetch/pull flows, and file operations
-- `config.toml` synchronization
-- plugin and skill catalog reads
-- local session indexing and search
-
-This service is not meant to be exposed directly.
 
 ### Codex app-server
 
@@ -85,12 +66,12 @@ This service is not meant to be exposed directly.
 - browser opens the public WebSocket exposed by Rust
 - Rust authenticates the socket
 - browser sends JSON-RPC-like requests
-- Rust either handles the request directly or forwards it to the internal Node service
+- Rust handles the request directly
 - mutating requests are keyed by profile-scoped request ID, so reconnect replays wait on the original in-flight result instead of executing a second time
 
 ### 3. Codex execution
 
-- Node talks to `codex app-server`
+- Rust talks to `codex app-server`
 - live notifications from `codex app-server` are normalized into UI events
 - Rust fans those events out to every subscribed browser client
 
@@ -99,24 +80,14 @@ This service is not meant to be exposed directly.
 Uploads are a deliberate exception to the WebSocket-first rule:
 
 - browser sends `multipart/form-data`
-- Rust strips the public base path and proxies the upload path to the internal API service
-- Node stores the upload and associates it with the target session
+- Rust stores the upload and associates it with the target session
 
-## Why Rust + Node
+## Why Rust + app-server
 
-The split is deliberate rather than transitional.
+The current split is deliberate:
 
-Rust is the public edge because it is a good fit for:
-
-- cookie auth
-- profile-scoped cookie routing
-- WebSocket lifecycle management
-- terminal persistence
-- durable fan-out to multiple clients
-- runtime actions that should survive browser churn
-- packaging as the publicly exposed backend binary
-
-Node remains the Codex-facing layer because it already matches the `codex app-server` model well and contains the higher-level session logic that is easier to iterate on there.
+- Rust is the public edge and owns browser-facing state, auth, API handling, terminal persistence, and reconnect safety
+- `codex app-server` stays responsible for live Codex execution and runtime thread notifications
 
 ## Multi-Account Runtime Model
 
@@ -125,8 +96,7 @@ Multi-account support is implemented as runtime profiles rather than by mutating
 - each profile has its own `CODEX_HOME`
 - each profile therefore has its own `auth.json`, `config.toml`, session tree, skills, and plugins
 - the browser chooses an active profile through a signed HTTP-only profile cookie
-- Rust forwards that profile identity to the internal Node service for HTTP proxy requests and WebSocket-driven relays
-- Node resolves a profile-local `codex app-server` client and profile-local UI state store for the current request context
+- Rust resolves a profile-local `codex app-server` client and profile-local UI state store for the current request context
 - account bootstrap reads are profile-local and use a degraded `requiresOpenaiAuth` fallback if an upstream refresh token is no longer valid
 
 This makes simultaneous use practical:
@@ -164,7 +134,7 @@ The sidebar is built from two sources:
 - `codex-webui`-owned per-session organization metadata such as pins and tags
 - `codex-webui`-owned prompt preset metadata used by the composer and settings workspace
 
-The local index is used because large session histories make direct thread enumeration expensive. The index work runs in a worker so the main Node event loop does not block while the sidebar updates.
+The local index is used because large session histories make direct thread enumeration expensive. The index work runs off the hot request path so session-list refreshes do not block the main server flow.
 
 Completion and input-required badges are not treated as frontend-only affordances. They are persisted in `codex-webui` state, injected into session summaries, and cleared by backend acknowledgement flows when a user opens the relevant session or resolves the pending request state.
 
@@ -206,7 +176,7 @@ Queue state is also part of the global shutdown-after-completion story:
 - arming it writes the intent into persisted `codex-webui` state
 - scheduling only happens once all queues are empty and no live turn remains active
 - if new work appears, the pending shutdown is cancelled and the updated state is broadcast to all clients
-- because the schedule lives on disk and in the Rust/Node backend, it can still fire with zero connected browsers
+- because the schedule lives on disk and in the Rust backend, it can still fire with zero connected browsers
 
 Queue mutations also use structured application errors for expected conflicts such as:
 
@@ -256,8 +226,7 @@ The UI can edit `config.toml` directly. Session preference changes also write th
 The trust boundary is narrow:
 
 - public browser traffic reaches only the Rust gateway
-- the internal Node service is protected behind the gateway
-- browser sessions can authenticate as either admin or viewer, and the Rust gateway enforces the write boundary before forwarding WebSocket methods
+- browser sessions can authenticate as either admin or viewer, and the Rust gateway enforces the write boundary before handling WebSocket methods
 - filesystem browsing is limited to allowed roots plus Codex-owned config/runtime paths
 - Git actions require explicit repository selection
 - cookies are signed and HTTP-only

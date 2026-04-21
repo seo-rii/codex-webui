@@ -28,7 +28,7 @@ The goal is not to replace upstream surfaces. The goal is to make Codex usable f
 - Multi-account profile switching backed by separate `CODEX_HOME` directories and profile-scoped `codex app-server` instances
 - Reconnect-safe WebSocket control plane for chat, sessions, Git, terminals, runtime actions, and account flows
 - Request-ID dedupe at the public gateway so reconnect replays do not execute queue or other mutating RPC calls twice
-- Dedicated runtime error logs under `<dataDir>/logs/` for Rust gateway failures, internal Node backend crashes, and per-profile `codex app-server` stderr
+- Dedicated runtime error logs under `<dataDir>/logs/` for Rust gateway failures and per-profile `codex app-server` stderr
 - Session queue, explicit steer flow, persisted queued follow-ups, and resume prompts after restart
 - Composer history recall with keyboard navigation, a quick "reuse last message" chip, and one-click resend/queue for the most recent prompt
 - Session completion and input-required badges are persisted server-side, so they survive reconnects and show up consistently across multiple clients
@@ -86,8 +86,8 @@ Still evolving:
 1. the browser loads a single workspace page
 2. password login and attachment upload use credentialed HTTP requests
 3. session activity, chat, Git, terminals, and runtime state use a reconnect-safe WebSocket RPC channel
-4. a Rust gateway owns auth, cookies, WebSocket fan-out, terminal persistence, runtime install/update actions, and static asset serving
-5. the Rust gateway serves the prebuilt static SPA from `build/static`, rewrites the compile-time base-path placeholder at response time, and starts an internal API-only Node bundle from `build/internal/index.js` for Codex-specific logic such as session hydration, queue persistence, Git operations, attachment storage, and `config.toml` synchronization
+4. a Rust gateway owns auth, cookies, WebSocket fan-out, terminal persistence, runtime install/update actions, session and Git APIs, and static asset serving
+5. the Rust gateway serves the prebuilt static SPA from `build/static`, rewrites the compile-time base-path placeholder at response time, and talks directly to per-profile `codex app-server` processes for live Codex state
 
 More detail is in [docs/architecture.md](./docs/architecture.md).
 
@@ -120,10 +120,7 @@ After setup, running `codex-webui` again starts the background server and prints
 - log path
 - runtime error log path
 
-`pnpm build` now produces two runtime artifacts:
-
-- `build/static` for the public SPA assets served by Rust
-- `build/internal/index.js` for the private Node API service supervised by Rust
+`pnpm build` produces the public SPA bundle under `build/static`, which the Rust gateway serves directly.
 
 The printed URL may still end in `/login` for compatibility, but that route redirects to the main workspace and the login experience is handled inline by the workspace shell.
 
@@ -246,7 +243,7 @@ If you only want one account at a time, you can still keep a single profile and 
 
 ## Environment Overrides
 
-The Rust gateway and the internal Node service honor a focused set of `CODEX_WEBUI_*` environment variables. The most important ones are:
+The Rust gateway honors a focused set of `CODEX_WEBUI_*` environment variables. The most important ones are:
 
 - `CODEX_WEBUI_PASSWORD_HASH`
 - `CODEX_WEBUI_PASSWORD`
@@ -282,7 +279,6 @@ See [.env.example](./.env.example) for a concise example set.
 - Restrict `CODEX_WEBUI_ALLOWED_ROOTS` to the smallest practical set.
 - Leave cookies on `SameSite=Strict` unless you explicitly need cross-site browser sessions.
 - Run behind HTTPS in production.
-- Do not expose the internal Node API service directly.
 - Use the viewer password for observation-only access instead of sharing the admin password when multiple humans need browser visibility.
 - Git actions are intentionally gated on explicit repository selection.
 - System shutdown support is disabled by default and must be explicitly enabled.

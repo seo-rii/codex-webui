@@ -17112,7 +17112,7 @@ fn load_dotenv(cwd: &PathBuf) {
 }
 
 fn resolve_project_root(cwd: &PathBuf) -> PathBuf {
-    if cwd.join("build/internal/index.js").exists() || cwd.join("svelte.config.js").exists() {
+    if cwd.join("build/static").exists() || cwd.join("svelte.config.js").exists() {
         return cwd.clone();
     }
 
@@ -17123,9 +17123,7 @@ fn resolve_project_root(cwd: &PathBuf) -> PathBuf {
     {
         if let Some(parent) = cwd.parent() {
             let parent = parent.to_path_buf();
-            if parent.join("build/internal/index.js").exists()
-                || parent.join("svelte.config.js").exists()
-            {
+            if parent.join("build/static").exists() || parent.join("svelte.config.js").exists() {
                 return parent;
             }
         }

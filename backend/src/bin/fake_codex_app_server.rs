@@ -468,6 +468,46 @@ fn main() {
                     }
                 }));
             }
+            Some("model/list") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "data": [
+                            {
+                                "id": "gpt-5",
+                                "displayName": "GPT-5",
+                                "description": "Default coding model",
+                                "defaultReasoningEffort": "medium",
+                                "supportedReasoningEfforts": ["low", "medium", "high"],
+                                "additionalSpeedTiers": ["fast", "flex"],
+                                "inputModalities": ["text", "image"],
+                                "isDefault": true
+                            }
+                        ]
+                    }
+                }));
+            }
+            Some("collaborationMode/list") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "data": [
+                            {
+                                "name": "Default",
+                                "mode": "default",
+                                "model": Value::Null,
+                                "reasoning_effort": Value::Null
+                            },
+                            {
+                                "name": "Plan",
+                                "mode": "plan",
+                                "model": Value::Null,
+                                "reasoning_effort": "high"
+                            }
+                        ]
+                    }
+                }));
+            }
             Some("account/login/start") => {
                 let login_type = payload
                     .get("params")

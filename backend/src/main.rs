@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
     body::{Body, to_bytes},
     extract::{
-        Request, State,
+        FromRequest, Multipart, Request, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{
@@ -33,7 +33,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use futures_util::{FutureExt, SinkExt, StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
-use reqwest::multipart::{Form, Part};
+use reqwest::multipart::Form;
 use scrypt::{Params as ScryptParams, scrypt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -199,6 +199,8 @@ struct Config {
     node_entry: PathBuf,
     node_binary: String,
     codex_bin: String,
+    max_upload_bytes: u64,
+    git_discovery_depth: u64,
     system_shutdown_enabled: bool,
     system_shutdown_delay_seconds: u64,
     system_shutdown_command_override: Option<String>,
@@ -236,6 +238,7 @@ impl Config {
 
 #[derive(Clone, Debug)]
 struct RuntimeProfile {
+    label: String,
     codex_home: PathBuf,
     data_dir: PathBuf,
 }
@@ -326,6 +329,7 @@ struct PendingServerRequestEntry {
 #[derive(Debug, Deserialize)]
 struct RuntimeProfileShape {
     id: Option<String>,
+    label: Option<String>,
     #[serde(alias = "codex_home", alias = "codexHome")]
     codex_home: Option<String>,
     #[serde(alias = "data_dir", alias = "dataDir")]
@@ -450,7 +454,14 @@ struct UploadFilePayload {
     data_base64: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug)]
+struct AttachmentUploadPayload {
+    name: String,
+    mime_type: Option<String>,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredAttachmentRecord {
     id: String,
@@ -461,6 +472,7 @@ struct StoredAttachmentRecord {
     mime_type: Option<String>,
     size: Option<u64>,
     kind: Option<String>,
+    #[serde(alias = "createdAt")]
     created_at: Option<String>,
 }
 
@@ -748,6 +760,17 @@ impl Config {
             env::var("CODEX_WEBUI_INTERNAL_PORT").ok(),
             choose_free_port()?,
         )?;
+        let max_upload_bytes = env::var("CODEX_WEBUI_MAX_UPLOAD_MB")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| *value > 0.0)
+            .map(|value| (value * 1024.0 * 1024.0).round() as u64)
+            .unwrap_or(20 * 1024 * 1024);
+        let git_discovery_depth = env::var("CODEX_WEBUI_GIT_DISCOVERY_DEPTH")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
         let system_shutdown_delay_seconds = env::var("CODEX_WEBUI_SHUTDOWN_DELAY_SECONDS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -786,6 +809,8 @@ impl Config {
             node_entry,
             node_binary: env::var("NODE_BINARY").unwrap_or_else(|_| "node".to_string()),
             codex_bin: env::var("CODEX_WEBUI_CODEX_BIN").unwrap_or_else(|_| "codex".to_string()),
+            max_upload_bytes,
+            git_discovery_depth,
             system_shutdown_enabled: env::var("CODEX_WEBUI_ENABLE_SYSTEM_SHUTDOWN")
                 .is_ok_and(|value| value == "true"),
             system_shutdown_delay_seconds,
@@ -846,6 +871,7 @@ fn parse_runtime_profiles(
         profiles.insert(
             default_profile_id.clone(),
             RuntimeProfile {
+                label: "Default".to_string(),
                 codex_home: default_codex_home.clone(),
                 data_dir: root_data_dir.join("profiles").join(&default_profile_id),
             },
@@ -859,9 +885,23 @@ fn parse_runtime_profiles(
 
     for entry in parsed {
         let id = sanitize_profile_id(entry.id.as_deref().unwrap_or("default"));
+        let label = entry
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if id == default_profile_id {
+                    "Default".to_string()
+                } else {
+                    id.clone()
+                }
+            });
         profiles
             .entry(id.clone())
             .or_insert_with(|| RuntimeProfile {
+                label,
                 codex_home: entry
                     .codex_home
                     .as_deref()
@@ -879,6 +919,7 @@ fn parse_runtime_profiles(
         profiles.insert(
             default_profile_id.clone(),
             RuntimeProfile {
+                label: "Default".to_string(),
                 codex_home: default_codex_home.clone(),
                 data_dir: root_data_dir.join("profiles").join(&default_profile_id),
             },
@@ -2807,6 +2848,140 @@ fn attachment_storage_paths(
     )
 }
 
+fn attachment_kind_for_mime(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif" => "image",
+        _ => "file",
+    }
+}
+
+fn attachment_limit_error_message(max_upload_bytes: u64) -> String {
+    let max_upload_mb = ((max_upload_bytes as f64) / (1024.0 * 1024.0)).round() as u64;
+    format!("Upload exceeds the {max_upload_mb}MB limit.")
+}
+
+fn attachment_payload_from_record(record: &StoredAttachmentRecord) -> Value {
+    json!({
+        "id": record.id,
+        "originalName": record.original_name,
+        "path": record.path.clone().unwrap_or_default(),
+        "mimeType": record
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
+        "size": record.size.unwrap_or(0),
+        "kind": record.kind.clone().unwrap_or_else(|| "file".to_string()),
+        "createdAt": record.created_at.clone().unwrap_or_default()
+    })
+}
+
+async fn save_uploaded_attachment_records(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    uploads: Vec<AttachmentUploadPayload>,
+) -> ApiResult<Vec<StoredAttachmentRecord>> {
+    let mut stored = Vec::new();
+    if uploads.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Select at least one file.",
+        ));
+    }
+
+    let uploads_dir = resolve_runtime_profile(&state.config, profile_id)
+        .data_dir
+        .join("uploads")
+        .join(session_id);
+    tokio_fs::create_dir_all(&uploads_dir)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    for upload in uploads {
+        if upload.bytes.is_empty() {
+            continue;
+        }
+
+        let size = upload.bytes.len() as u64;
+        if size > state.config.max_upload_bytes {
+            return Err(api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                attachment_limit_error_message(state.config.max_upload_bytes),
+            ));
+        }
+
+        let attachment_id = Uuid::new_v4().to_string();
+        let original_name = if upload.name.trim().is_empty() {
+            "attachment".to_string()
+        } else {
+            upload.name.trim().to_string()
+        };
+        let mime_type = upload
+            .mime_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let (file_path, meta_path) = attachment_storage_paths(
+            state,
+            profile_id,
+            session_id,
+            &attachment_id,
+            &original_name,
+        );
+        let record = StoredAttachmentRecord {
+            id: attachment_id,
+            original_name,
+            path: Some(file_path.display().to_string()),
+            mime_type: Some(mime_type.clone()),
+            size: Some(size),
+            kind: Some(attachment_kind_for_mime(&mime_type).to_string()),
+            created_at: Some(now_unix_ms().to_string()),
+        };
+
+        tokio_fs::write(&file_path, &upload.bytes)
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        let metadata = serde_json::to_vec_pretty(&record)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        tokio_fs::write(&meta_path, metadata)
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        stored.push(record);
+    }
+
+    if stored.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Select at least one file.",
+        ));
+    }
+
+    Ok(stored)
+}
+
+async fn emit_attachments_updated(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<()> {
+    emit_session_notification(
+        state,
+        profile_id,
+        session_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/attachmentsUpdated",
+            "params": {
+                "attachments": list_session_attachments_payload(state, profile_id, session_id).await?
+            }
+        }),
+    )
+    .await;
+    Ok(())
+}
+
 async fn resolve_queue_attachment_metadata(
     state: &AppState,
     profile_id: &str,
@@ -2899,19 +3074,7 @@ async fn delete_attachment_payload(
         tokio_fs::remove_file(file_path),
         tokio_fs::remove_file(meta_path),
     );
-    emit_session_notification(
-        state,
-        profile_id,
-        session_id,
-        json!({
-            "kind": "notification",
-            "method": "codex-webui/attachmentsUpdated",
-            "params": {
-                "attachments": list_session_attachments_payload(state, profile_id, session_id).await?
-            }
-        }),
-    )
-    .await;
+    emit_attachments_updated(state, profile_id, session_id).await?;
     Ok(json!({ "ok": true }))
 }
 
@@ -3395,6 +3558,17 @@ async fn mark_queues_pending_resume_payload(state: &AppState, profile_id: &str) 
 const CONFIG_SCHEMA_HEADER: &str =
     "#:schema https://developers.openai.com/codex/config-schema.json";
 
+#[derive(Default)]
+struct CodexTomlDefaults {
+    model: Option<String>,
+    model_reasoning_effort: Option<String>,
+    plan_mode_reasoning_effort: Option<String>,
+    approval_policy: Option<String>,
+    sandbox_mode: Option<String>,
+    service_tier: String,
+    network_access: Option<bool>,
+}
+
 fn config_toml_path(codex_home: &Path) -> PathBuf {
     codex_home.join("config.toml")
 }
@@ -3407,6 +3581,115 @@ fn parse_toml_section_name(line: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn trim_toml_value(value: &str) -> String {
+    let mut trimmed = String::new();
+    let mut escaped = false;
+    let mut quote = None;
+    for character in value.chars() {
+        if escaped {
+            trimmed.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            trimmed.push(character);
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '"' | '\'') && (quote.is_none() || quote == Some(character)) {
+            quote = if quote.is_some() {
+                None
+            } else {
+                Some(character)
+            };
+            trimmed.push(character);
+            continue;
+        }
+        if character == '#' && quote.is_none() {
+            break;
+        }
+        trimmed.push(character);
+    }
+    trimmed.trim().to_string()
+}
+
+fn get_toml_value(raw: &str, section: Option<&str>, key: &str) -> Option<String> {
+    let mut current_section: Option<String> = None;
+    for line in raw.lines() {
+        if let Some(next_section) = parse_toml_section_name(line) {
+            current_section = Some(next_section);
+            continue;
+        }
+        if current_section.as_deref() != section || !matches_toml_key(line, key) {
+            continue;
+        }
+        let (_, value) = line.split_once('=')?;
+        return Some(trim_toml_value(value));
+    }
+    None
+}
+
+fn parse_toml_string_value(value: Option<String>) -> Option<String> {
+    let value = value?;
+    if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        return serde_json::from_str::<String>(&value).ok().or_else(|| {
+            Some(
+                value[1..value.len().saturating_sub(1)]
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\"),
+            )
+        });
+    }
+    if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
+        return Some(value[1..value.len().saturating_sub(1)].to_string());
+    }
+    None
+}
+
+fn parse_toml_bool_value(value: Option<String>) -> Option<bool> {
+    match value.as_deref() {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
+}
+
+fn read_codex_toml_defaults(codex_home: &Path) -> CodexTomlDefaults {
+    let file_path = config_toml_path(codex_home);
+    let Ok(raw) = fs::read_to_string(file_path) else {
+        return CodexTomlDefaults {
+            service_tier: "auto".to_string(),
+            ..CodexTomlDefaults::default()
+        };
+    };
+
+    let service_tier = parse_toml_string_value(get_toml_value(&raw, None, "service_tier"))
+        .filter(|value| value == "fast" || value == "flex")
+        .unwrap_or_else(|| "auto".to_string());
+
+    CodexTomlDefaults {
+        model: parse_toml_string_value(get_toml_value(&raw, None, "model")),
+        model_reasoning_effort: parse_toml_string_value(get_toml_value(
+            &raw,
+            None,
+            "model_reasoning_effort",
+        )),
+        plan_mode_reasoning_effort: parse_toml_string_value(get_toml_value(
+            &raw,
+            None,
+            "plan_mode_reasoning_effort",
+        )),
+        approval_policy: parse_toml_string_value(get_toml_value(&raw, None, "approval_policy")),
+        sandbox_mode: parse_toml_string_value(get_toml_value(&raw, None, "sandbox_mode")),
+        service_tier,
+        network_access: parse_toml_bool_value(get_toml_value(
+            &raw,
+            Some("sandbox_workspace_write"),
+            "network_access",
+        )),
+    }
 }
 
 fn matches_toml_key(line: &str, key: &str) -> bool {
@@ -3669,10 +3952,10 @@ async fn normalize_session_preferences_payload(
     profile_id: &str,
     preferences: Value,
 ) -> ApiResult<Value> {
-    let defaults = get_config_payload(state, profile_id)
+    let defaults = session_preferences_defaults_payload(state, profile_id)
         .await
-        .ok()
-        .and_then(|payload| payload.get("defaults").and_then(Value::as_object).cloned())
+        .as_object()
+        .cloned()
         .unwrap_or_default();
     let mut next_preferences = defaults;
     if let Some(overrides) = preferences.as_object() {
@@ -4519,18 +4802,8 @@ async fn list_session_attachments_payload(
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(attachments
-        .into_iter()
-        .map(|attachment| {
-            json!({
-                "id": attachment.id,
-                "originalName": attachment.original_name,
-                "path": attachment.path.unwrap_or_default(),
-                "mimeType": attachment.mime_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                "size": attachment.size.unwrap_or(0),
-                "kind": attachment.kind.unwrap_or_else(|| "file".to_string()),
-                "createdAt": attachment.created_at
-            })
-        })
+        .iter()
+        .map(attachment_payload_from_record)
         .collect())
 }
 
@@ -8089,6 +8362,41 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                 return response;
             }
 
+            if route_path.starts_with("/api/sessions/")
+                && route_path.trim_end_matches('/').ends_with("/attachments")
+                && !route_path.contains("/attachments/")
+            {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .trim_end_matches('/')
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/attachments"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_attachments_api_http(state, request, auth, &session_id).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
             if route_path.starts_with("/api/sessions/") && route_path.contains("/attachments/") {
                 let Some(auth) = auth_context(&state.config, &jar) else {
                     let mut response =
@@ -8333,22 +8641,206 @@ async fn handle_directories_api_http(state: AppState, request: Request) -> Respo
     }
 }
 
-async fn get_config_payload(state: &AppState, profile_id: &str) -> ApiResult<Value> {
-    let mut payload = internal_json_request_for_profile(
-        state,
-        Some(profile_id),
-        Method::GET,
-        "/api/config",
-        None,
-    )
-    .await
-    .map_err(|error| {
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to load config from the internal backend: {error}"),
-        )
-    })?;
+fn env_choice(var: &str, allowed: &[&str]) -> Option<String> {
+    env::var(var)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| allowed.iter().any(|allowed_value| value == allowed_value))
+}
 
+fn env_bool(var: &str) -> Option<bool> {
+    match env::var(var).ok()?.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+async fn session_preferences_defaults_payload(state: &AppState, profile_id: &str) -> Value {
+    let (_, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
+    let codex_defaults = read_codex_toml_defaults(&profile.codex_home);
+    let allowed_roots = resolved_allowed_roots(&state.config).await;
+    let default_cwd = allowed_roots
+        .first()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| state.config.project_root.display().to_string());
+    let mode = env_choice("CODEX_WEBUI_DEFAULT_MODE", &["default", "plan"])
+        .unwrap_or_else(|| "default".to_string());
+    let speed = env_choice("CODEX_WEBUI_DEFAULT_SPEED", &["auto", "fast", "flex"])
+        .or_else(|| {
+            (codex_defaults.service_tier == "fast" || codex_defaults.service_tier == "flex")
+                .then(|| codex_defaults.service_tier.clone())
+        })
+        .unwrap_or_else(|| "auto".to_string());
+    let sandbox_mode = env_choice(
+        "CODEX_WEBUI_DEFAULT_SANDBOX",
+        &["read-only", "workspace-write", "danger-full-access"],
+    )
+    .or_else(|| codex_defaults.sandbox_mode.clone())
+    .unwrap_or_else(|| "workspace-write".to_string());
+    let approval_policy = env_choice(
+        "CODEX_WEBUI_DEFAULT_APPROVAL_POLICY",
+        &["never", "on-request", "on-failure", "untrusted"],
+    )
+    .or_else(|| codex_defaults.approval_policy.clone())
+    .unwrap_or_else(|| "on-request".to_string());
+    let effort = env_choice(
+        "CODEX_WEBUI_DEFAULT_EFFORT",
+        &["minimal", "low", "medium", "high", "xhigh"],
+    )
+    .or_else(|| {
+        if mode == "plan" {
+            codex_defaults.plan_mode_reasoning_effort.clone()
+        } else {
+            codex_defaults.model_reasoning_effort.clone()
+        }
+    })
+    .unwrap_or_else(|| "medium".to_string());
+
+    json!({
+        "cwd": default_cwd,
+        "model": env::var("CODEX_WEBUI_DEFAULT_MODEL")
+            .ok()
+            .map(Value::String)
+            .or_else(|| codex_defaults.model.clone().map(Value::String))
+            .unwrap_or(Value::Null),
+        "effort": effort,
+        "speed": speed,
+        "mode": mode,
+        "sendOnEnter": env_bool("CODEX_WEBUI_DEFAULT_SEND_ON_ENTER").unwrap_or(false),
+        "sandboxMode": sandbox_mode,
+        "approvalPolicy": approval_policy,
+        "networkAccess": env_bool("CODEX_WEBUI_DEFAULT_NETWORK")
+            .unwrap_or(codex_defaults.network_access.unwrap_or(false)),
+        "autoApproveMode": env_choice(
+            "CODEX_WEBUI_DEFAULT_AUTO_APPROVE",
+            &["manual", "turn", "session"]
+        )
+        .unwrap_or_else(|| "manual".to_string()),
+        "steeringResumeMode": env_choice(
+            "CODEX_WEBUI_DEFAULT_STEERING_RESUME",
+            &["ask", "auto"]
+        )
+        .unwrap_or_else(|| "ask".to_string()),
+        "shutdownOnCompletion": false,
+        "gitRepoPath": Value::Null
+    })
+}
+
+async fn config_models_payload(state: &AppState, profile_id: &str) -> ApiResult<Vec<Value>> {
+    let client = app_server_client(state, profile_id)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    let response = client
+        .request("model/list", json!({ "includeHidden": false }))
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    Ok(response
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|model| {
+            json!({
+                "id": model.get("id").and_then(Value::as_str).unwrap_or_default(),
+                "displayName": model
+                    .get("displayName")
+                    .or_else(|| model.get("model"))
+                    .or_else(|| model.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "description": model.get("description").and_then(Value::as_str).unwrap_or_default(),
+                "defaultReasoningEffort": model
+                    .get("defaultReasoningEffort")
+                    .and_then(Value::as_str)
+                    .unwrap_or("medium"),
+                "supportedReasoningEfforts": model
+                    .get("supportedReasoningEfforts")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(|entry| {
+                                entry
+                                    .get("reasoningEffort")
+                                    .or_else(|| entry.get("effort"))
+                                    .or(Some(entry))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                "additionalSpeedTiers": model
+                    .get("additionalSpeedTiers")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                "inputModalities": model
+                    .get("inputModalities")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                "isDefault": model.get("isDefault").and_then(Value::as_bool).unwrap_or(false)
+            })
+        })
+        .collect())
+}
+
+async fn config_collaboration_modes_payload(
+    state: &AppState,
+    profile_id: &str,
+) -> ApiResult<Vec<Value>> {
+    let client = app_server_client(state, profile_id)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    let response = client
+        .request("collaborationMode/list", json!({}))
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    Ok(response
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mode| {
+            json!({
+                "name": mode.get("name").and_then(Value::as_str).unwrap_or_default(),
+                "mode": mode.get("mode").cloned().unwrap_or(Value::Null),
+                "model": mode.get("model").cloned().unwrap_or(Value::Null),
+                "reasoning_effort": mode
+                    .get("reasoning_effort")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            })
+        })
+        .collect())
+}
+
+async fn get_config_payload(state: &AppState, profile_id: &str) -> ApiResult<Value> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let defaults = session_preferences_defaults_payload(state, profile_id).await;
+    let allowed_roots = list_directories_payload(state, None)
+        .await?
+        .get("allowedRoots")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
     let notifications =
         get_notifications_payload(state, profile_id, DEFAULT_NOTIFICATION_LIMIT).await?;
     let autostart = get_autostart_state(&state.config)
@@ -8357,12 +8849,26 @@ async fn get_config_payload(state: &AppState, profile_id: &str) -> ApiResult<Val
     let theme_override = read_stored_theme_settings(&state.config, profile_id)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let theme = theme_override.unwrap_or_else(|| json!({}));
+    let models = config_models_payload(state, profile_id).await?;
+    let collaboration_modes = config_collaboration_modes_payload(state, profile_id).await?;
+    let account_state = get_account_state(state, profile_id)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
     let (shutdown_available, _) = system_shutdown_capability(&state.config).await;
     let paused_queues = list_resume_pending_queues_payload(state, profile_id)
         .await
         .unwrap_or_else(|_| json!([]));
-    let (overlays, shutdown_after_queue_completes, scheduled_shutdown) =
-        with_ui_state_read(state, profile_id, |ui_state| {
+    let (
+        saved_filters,
+        known_tags,
+        prompt_presets,
+        automations,
+        recent_runs,
+        notification_settings,
+        shutdown_after_queue_completes,
+        scheduled_shutdown,
+    ) = with_ui_state_read(state, profile_id, |ui_state| {
         let notification_settings = ui_state
             .get("notifications")
             .and_then(Value::as_object)
@@ -8370,70 +8876,29 @@ async fn get_config_payload(state: &AppState, profile_id: &str) -> ApiResult<Val
             .map(|value| normalize_notification_settings_value(Some(value)))
             .unwrap_or_else(default_notification_settings_value);
 
-            Ok((
-                json!({
-                    "notifications": {
-                        "unreadCount": notifications.get("unreadCount").cloned().unwrap_or_else(|| json!(0)),
-                        "settings": notification_settings
-                    },
-                    "sessionOrganization": {
-                        "savedFilters": ui_state
-                            .get("savedSessionFilters")
-                            .cloned()
-                            .unwrap_or_else(|| json!([])),
-                        "knownTags": known_tags_from_ui_state(ui_state)
-                    },
-                    "promptPresets": sorted_prompt_presets_from_ui_state(ui_state),
-                    "automations": {
-                        "items": sorted_automations_from_ui_state(ui_state),
-                        "recentRuns": recent_automation_runs_from_ui_state(ui_state, DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT)
-                    }
-                }),
-                ui_state
-                    .get("global")
-                    .and_then(|value| value.get("shutdownAfterQueueCompletes"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                ui_state
-                    .get("global")
-                    .and_then(|value| value.get("scheduledShutdown"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            ))
-        })
-        .await?;
-
-    let payload_object = payload.as_object_mut().ok_or_else(|| {
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            "Internal config response had an unexpected shape.",
-        )
-    })?;
-    let overlay_object = overlays.as_object().ok_or_else(|| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Config overlays had an unexpected shape.",
-        )
-    })?;
-
-    for (key, value) in overlay_object {
-        payload_object.insert(key.clone(), value.clone());
-    }
-
-    payload_object.insert("autostart".to_string(), autostart);
-    payload_object.insert(
-        "systemShutdown".to_string(),
-        json!({
-            "available": shutdown_available,
-            "delaySeconds": state.config.system_shutdown_delay_seconds,
-            "armed": shutdown_available
-                && state.config.system_shutdown_enabled
-                && shutdown_after_queue_completes
-        }),
-    );
-    if let Some(theme) = theme_override {
-        payload_object.insert("theme".to_string(), theme);
-    }
+        Ok((
+            ui_state
+                .get("savedSessionFilters")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            known_tags_from_ui_state(ui_state),
+            sorted_prompt_presets_from_ui_state(ui_state),
+            sorted_automations_from_ui_state(ui_state),
+            recent_automation_runs_from_ui_state(ui_state, DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT),
+            notification_settings,
+            ui_state
+                .get("global")
+                .and_then(|value| value.get("shutdownAfterQueueCompletes"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            ui_state
+                .get("global")
+                .and_then(|value| value.get("scheduledShutdown"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        ))
+    })
+    .await?;
 
     let next_scheduled_shutdown = if shutdown_available
         && scheduled_shutdown
@@ -8445,23 +8910,93 @@ async fn get_config_payload(state: &AppState, profile_id: &str) -> ApiResult<Val
     } else {
         Value::Null
     };
-    if let Some(startup) = payload_object
-        .get_mut("startup")
-        .and_then(Value::as_object_mut)
-    {
-        startup.insert("scheduledShutdown".to_string(), next_scheduled_shutdown);
-        startup.insert("pausedQueues".to_string(), paused_queues);
-    } else {
-        payload_object.insert(
-            "startup".to_string(),
+    let mut profiles = state
+        .config
+        .profiles
+        .iter()
+        .map(|(id, profile)| {
             json!({
-                "pausedQueues": paused_queues,
-                "scheduledShutdown": next_scheduled_shutdown
-            }),
-        );
-    }
+                "id": id,
+                "label": profile.label,
+                "codexHome": profile.codex_home.display().to_string(),
+                "active": id == &resolved_profile_id
+            })
+        })
+        .collect::<Vec<_>>();
+    profiles.sort_by(|left, right| {
+        right
+            .get("active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            .cmp(&left.get("active").and_then(Value::as_bool).unwrap_or(false))
+            .then_with(|| {
+                left.get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(
+                        right
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+            })
+    });
 
-    Ok(payload)
+    let profile = resolve_runtime_profile(&state.config, profile_id);
+    let account = account_state
+        .get("account")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    Ok(json!({
+        "models": models,
+        "collaborationModes": collaboration_modes,
+        "allowedRoots": allowed_roots,
+        "defaults": defaults,
+        "paths": {
+            "codexHome": profile.codex_home.display().to_string(),
+            "configFilePath": config_toml_path(&profile.codex_home).display().to_string()
+        },
+        "git": {
+            "discoveryDepth": state.config.git_discovery_depth
+        },
+        "autostart": autostart,
+        "systemShutdown": {
+            "available": shutdown_available,
+            "delaySeconds": state.config.system_shutdown_delay_seconds,
+            "armed": shutdown_available
+                && state.config.system_shutdown_enabled
+                && shutdown_after_queue_completes
+        },
+        "startup": {
+            "pausedQueues": paused_queues,
+            "scheduledShutdown": next_scheduled_shutdown
+        },
+        "notifications": {
+            "unreadCount": notifications.get("unreadCount").cloned().unwrap_or_else(|| json!(0)),
+            "settings": notification_settings
+        },
+        "sessionOrganization": {
+            "savedFilters": saved_filters,
+            "knownTags": known_tags
+        },
+        "promptPresets": prompt_presets,
+        "automations": {
+            "items": automations,
+            "recentRuns": recent_runs
+        },
+        "account": {
+            "type": account.get("type").cloned().unwrap_or(Value::Null),
+            "email": account.get("email").cloned().unwrap_or(Value::Null),
+            "planType": account.get("planType").cloned().unwrap_or(Value::Null),
+            "requiresOpenaiAuth": account_state
+                .get("requiresOpenaiAuth")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        },
+        "theme": theme,
+        "profiles": profiles
+    }))
 }
 
 async fn update_config_payload(
@@ -9231,6 +9766,104 @@ async fn handle_session_steer_api_http(
     match result {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_attachments_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    session_id: &str,
+) -> Response {
+    let method = request.method().clone();
+    match method {
+        Method::GET => {
+            match list_session_attachments_payload(&state, &auth.profile_id, session_id).await {
+                Ok(attachments) => Json(json!({ "attachments": attachments })).into_response(),
+                Err(error) => json_error(error.status, &error.message),
+            }
+        }
+        Method::POST => {
+            if auth.role != UserRole::Admin {
+                return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+            }
+
+            let multipart = match Multipart::from_request(request, &()).await {
+                Ok(multipart) => multipart,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "Failed to read attachment upload body.",
+                    );
+                }
+            };
+            let mut multipart = multipart;
+            let mut uploads = Vec::new();
+
+            loop {
+                let field = match multipart.next_field().await {
+                    Ok(Some(field)) => field,
+                    Ok(None) => break,
+                    Err(_) => {
+                        return json_error(
+                            StatusCode::BAD_REQUEST,
+                            "Failed to read attachment upload body.",
+                        );
+                    }
+                };
+
+                if field.name() != Some("files") {
+                    continue;
+                }
+
+                let file_name = field
+                    .file_name()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "attachment".to_string());
+                let mime_type = field.content_type().map(str::to_string);
+                let bytes = match field.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return json_error(
+                            StatusCode::BAD_REQUEST,
+                            "Failed to read attachment upload body.",
+                        );
+                    }
+                };
+                if bytes.is_empty() {
+                    continue;
+                }
+
+                uploads.push(AttachmentUploadPayload {
+                    name: file_name,
+                    mime_type,
+                    bytes: bytes.to_vec(),
+                });
+            }
+
+            match save_uploaded_attachment_records(&state, &auth.profile_id, session_id, uploads)
+                .await
+            {
+                Ok(stored) => {
+                    if let Err(error) =
+                        emit_attachments_updated(&state, &auth.profile_id, session_id).await
+                    {
+                        return json_error(error.status, &error.message);
+                    }
+                    let mut response = Json(json!({
+                        "attachments": stored
+                            .iter()
+                            .map(attachment_payload_from_record)
+                            .collect::<Vec<_>>()
+                    }))
+                    .into_response();
+                    *response.status_mut() = StatusCode::CREATED;
+                    response
+                }
+                Err(error) => json_error(error.status, &error.message),
+            }
+        }
+        _ => json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
     }
 }
 
@@ -11001,7 +11634,9 @@ async fn execute_ws_method(
                 .cloned()
                 .ok_or_else(|| anyhow!("files is required"))?;
             let files: Vec<UploadFilePayload> = serde_json::from_value(files)?;
-            upload_attachments(state, &session_id, files).await
+            upload_attachments(state, &auth.profile_id, &session_id, files)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "attachments/delete" => {
             let session_id = require_string(&params, "sessionId")?;
@@ -11302,7 +11937,9 @@ async fn execute_ws_method(
                 mime_type: Some("text/markdown".to_string()),
                 data_base64: base64::engine::general_purpose::STANDARD.encode(content.as_bytes()),
             };
-            let uploaded = upload_attachments(state, &session_id, vec![upload]).await?;
+            let uploaded = upload_attachments(state, &auth.profile_id, &session_id, vec![upload])
+                .await
+                .map_err(anyhow::Error::from)?;
             Ok(json!({
                 "terminal": summary,
                 "attachments": uploaded.get("attachments").cloned().unwrap_or_else(|| json!([])),
@@ -13720,45 +14357,29 @@ fn now_rfc3339() -> String {
 
 async fn upload_attachments(
     state: &AppState,
+    profile_id: &str,
     session_id: &str,
     files: Vec<UploadFilePayload>,
-) -> Result<Value> {
-    let mut form = Form::new();
+) -> ApiResult<Value> {
+    let mut uploads = Vec::new();
     for file in files {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(file.data_base64)
-            .context("invalid base64 attachment payload")?;
-        let part = Part::bytes(bytes)
-            .file_name(file.name.clone())
-            .mime_str(
-                file.mime_type
-                    .as_deref()
-                    .unwrap_or("application/octet-stream"),
-            )
-            .context("invalid attachment mime type")?;
-        form = form.part("files", part);
+            .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+        uploads.push(AttachmentUploadPayload {
+            name: file.name,
+            mime_type: file.mime_type,
+            bytes,
+        });
     }
-
-    let target = internal_url(
-        &state.config,
-        &format!("/api/sessions/{session_id}/attachments"),
-    );
-    let response = state
-        .http
-        .post(target)
-        .header(INTERNAL_HEADER, &state.config.internal_proxy_token)
-        .header(
-            PROFILE_HEADER,
-            ACTIVE_PROFILE_ID
-                .try_with(|profile_id| profile_id.clone())
-                .unwrap_or_else(|_| state.config.default_profile_id.clone()),
-        )
-        .multipart(form)
-        .send()
-        .await
-        .context("failed to upload attachments to internal backend")?;
-
-    parse_json_response(response).await
+    let stored = save_uploaded_attachment_records(state, profile_id, session_id, uploads).await?;
+    emit_attachments_updated(state, profile_id, session_id).await?;
+    Ok(json!({
+        "attachments": stored
+            .iter()
+            .map(attachment_payload_from_record)
+            .collect::<Vec<_>>()
+    }))
 }
 
 async fn internal_json_request(
@@ -14556,6 +15177,7 @@ mod tests {
         profiles.insert(
             profile_id.clone(),
             RuntimeProfile {
+                label: "Default".to_string(),
                 codex_home,
                 data_dir: profile_data_dir,
             },
@@ -14578,6 +15200,8 @@ mod tests {
                 node_entry: project_root.join("node-entry.js"),
                 node_binary: "node".to_string(),
                 codex_bin: "codex".to_string(),
+                max_upload_bytes: 20 * 1024 * 1024,
+                git_discovery_depth: 1,
                 system_shutdown_enabled: false,
                 system_shutdown_delay_seconds: 30,
                 system_shutdown_command_override: None,
@@ -14883,6 +15507,56 @@ for raw_line in sys.stdin:
             "id": request_id,
             "result": {
                 "interrupted": True
+            }
+        })
+    elif method == "account/read":
+        write({
+            "id": request_id,
+            "result": {
+                "account": {
+                    "type": "chatgpt",
+                    "email": "demo@example.com",
+                    "planType": "plus"
+                },
+                "requiresOpenaiAuth": False
+            }
+        })
+    elif method == "model/list":
+        write({
+            "id": request_id,
+            "result": {
+                "data": [
+                    {
+                        "id": "gpt-5",
+                        "displayName": "GPT-5",
+                        "description": "Default coding model",
+                        "defaultReasoningEffort": "medium",
+                        "supportedReasoningEfforts": ["low", "medium", "high"],
+                        "additionalSpeedTiers": ["fast", "flex"],
+                        "inputModalities": ["text", "image"],
+                        "isDefault": True
+                    }
+                ]
+            }
+        })
+    elif method == "collaborationMode/list":
+        write({
+            "id": request_id,
+            "result": {
+                "data": [
+                    {
+                        "name": "Default",
+                        "mode": "default",
+                        "model": None,
+                        "reasoning_effort": None
+                    },
+                    {
+                        "name": "Plan",
+                        "mode": "plan",
+                        "model": None,
+                        "reasoning_effort": "high"
+                    }
+                ]
             }
         })
     else:
@@ -16446,6 +17120,208 @@ for raw_line in sys.stdin:
                 .await
                 .unwrap()
                 .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_attachments_store_files_without_internal_backend() {
+        let sandbox = unique_test_dir("attachment-upload-rust");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+
+        let payload = upload_attachments(
+            &state,
+            "default",
+            "thread-1",
+            vec![
+                UploadFilePayload {
+                    name: "notes.md".to_string(),
+                    mime_type: Some("text/markdown".to_string()),
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(b"notes"),
+                },
+                UploadFilePayload {
+                    name: "diagram.png".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(b"pngdata"),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let returned = payload
+            .get("attachments")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(returned.len(), 2);
+
+        let stored = list_session_attachment_records(&state, "default", "thread-1")
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().any(|attachment| {
+            attachment.original_name == "notes.md"
+                && attachment.kind.as_deref() == Some("file")
+                && attachment.size == Some(5)
+        }));
+        assert!(stored.iter().any(|attachment| {
+            attachment.original_name == "diagram.png"
+                && attachment.kind.as_deref() == Some("image")
+                && attachment.size == Some(7)
+        }));
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_attachments_http_handlers_use_rust_storage() {
+        let sandbox = unique_test_dir("attachment-http-rust");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+        let boundary = "codex-webui-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"notes.md\"\r\nContent-Type: text/markdown\r\n\r\nnotes\r\n--{boundary}--\r\n"
+        );
+        let request = Request::builder()
+            .method(Method::POST)
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = handle_session_attachments_api_http(
+            state.clone(),
+            request,
+            AuthContext {
+                role: UserRole::Admin,
+                profile_id: "default".to_string(),
+            },
+            "thread-1",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&response_body).unwrap();
+        assert_eq!(
+            payload
+                .get("attachments")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let get_request = Request::builder()
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap();
+        let get_response = handle_session_attachments_api_http(
+            state.clone(),
+            get_request,
+            AuthContext {
+                role: UserRole::Admin,
+                profile_id: "default".to_string(),
+            },
+            "thread-1",
+        )
+        .await;
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_body = to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let get_payload: Value = serde_json::from_slice(&get_body).unwrap();
+        assert_eq!(
+            get_payload
+                .get("attachments")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_config_payload_uses_rust_state_and_app_server_metadata() {
+        let sandbox = unique_test_dir("config-rust");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            config_toml_path(&codex_home),
+            "model = \"gpt-5.4\"\nservice_tier = \"fast\"\napproval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n[sandbox_workspace_write]\nnetwork_access = true\n",
+        )
+        .unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+
+        let payload = get_config_payload(&state, "default").await.unwrap();
+        assert_eq!(
+            payload
+                .get("models")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            payload
+                .get("collaborationModes")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            payload
+                .get("defaults")
+                .and_then(|value| value.get("model"))
+                .and_then(Value::as_str),
+            Some("gpt-5.4")
+        );
+        assert_eq!(
+            payload
+                .get("defaults")
+                .and_then(|value| value.get("speed"))
+                .and_then(Value::as_str),
+            Some("fast")
+        );
+        assert_eq!(
+            payload
+                .get("git")
+                .and_then(|value| value.get("discoveryDepth"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            payload
+                .get("profiles")
+                .and_then(Value::as_array)
+                .and_then(|profiles| profiles.first())
+                .and_then(|profile| profile.get("label"))
+                .and_then(Value::as_str),
+            Some("Default")
+        );
+        assert_eq!(
+            payload
+                .get("account")
+                .and_then(|value| value.get("email"))
+                .and_then(Value::as_str),
+            Some("demo@example.com")
         );
 
         let _ = fs::remove_dir_all(sandbox);

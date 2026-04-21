@@ -2759,6 +2759,54 @@ async fn list_session_attachment_records(
     Ok(attachments)
 }
 
+fn sanitize_attachment_file_name(name: &str) -> String {
+    let mut sanitized = String::new();
+    let mut last_was_dash = false;
+    for ch in name.chars() {
+        let next = if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            ch
+        } else {
+            '-'
+        };
+        if next == '-' {
+            if last_was_dash {
+                continue;
+            }
+            last_was_dash = true;
+        } else {
+            last_was_dash = false;
+        }
+        sanitized.push(next);
+    }
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.is_empty() {
+        "attachment".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn attachment_storage_paths(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    attachment_id: &str,
+    original_name: &str,
+) -> (PathBuf, PathBuf) {
+    let uploads_dir = resolve_runtime_profile(&state.config, profile_id)
+        .data_dir
+        .join("uploads")
+        .join(session_id);
+    let base = format!(
+        "{attachment_id}-{}",
+        sanitize_attachment_file_name(original_name)
+    );
+    (
+        uploads_dir.join(&base),
+        uploads_dir.join(format!("{base}.json")),
+    )
+}
+
 async fn resolve_queue_attachment_metadata(
     state: &AppState,
     profile_id: &str,
@@ -2823,6 +2871,48 @@ async fn emit_queue_updated(
     .await;
     emit_session_summary_updated(state, profile_id, session_id, None).await;
     emit_runtime_profile_config_updated(state, profile_id).await;
+}
+
+async fn delete_attachment_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    attachment_id: &str,
+) -> ApiResult<Value> {
+    let attachments = list_session_attachment_records(state, profile_id, session_id)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let Some(target) = attachments
+        .iter()
+        .find(|attachment| attachment.id == attachment_id)
+    else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Attachment not found."));
+    };
+    let (file_path, meta_path) = attachment_storage_paths(
+        state,
+        profile_id,
+        session_id,
+        attachment_id,
+        &target.original_name,
+    );
+    let _ = tokio::join!(
+        tokio_fs::remove_file(file_path),
+        tokio_fs::remove_file(meta_path),
+    );
+    emit_session_notification(
+        state,
+        profile_id,
+        session_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/attachmentsUpdated",
+            "params": {
+                "attachments": list_session_attachments_payload(state, profile_id, session_id).await?
+            }
+        }),
+    )
+    .await;
+    Ok(json!({ "ok": true }))
 }
 
 async fn enqueue_session_queue_payload(
@@ -3237,16 +3327,8 @@ async fn list_resume_pending_queues_payload(
             .cloned()
             .unwrap_or(Value::Null);
 
-        if let Ok(session_payload) = internal_json_request_for_profile(
-            state,
-            Some(profile_id),
-            Method::GET,
-            &format!("/api/sessions/{session_id}?limit=1"),
-            None,
-        )
-        .await
-        {
-            if let Some(thread) = session_payload.get("thread").and_then(Value::as_object) {
+        if let Ok(thread) = read_thread_payload(state, profile_id, &session_id, false).await {
+            if let Some(thread) = thread.as_object() {
                 name = display_thread_name(
                     thread.get("name").and_then(Value::as_str),
                     thread.get("preview").and_then(Value::as_str),
@@ -4817,33 +4899,14 @@ async fn build_session_summary_payload(
     session_id: &str,
     preferences_override: Option<Value>,
 ) -> ApiResult<Value> {
-    let session_payload = internal_json_request_for_profile(
-        state,
-        Some(profile_id),
-        Method::GET,
-        &format!("/api/sessions/{session_id}?limit=1"),
-        None,
-    )
-    .await
-    .map_err(|error| {
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to load the session summary source: {error}"),
-        )
-    })?;
-    let thread = session_payload.get("thread").ok_or_else(|| {
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            "Internal session payload had an unexpected shape.",
-        )
-    })?;
+    let thread = read_thread_payload(state, profile_id, session_id, false).await?;
     let snapshot = read_session_summary_ui_snapshot(state, profile_id).await?;
     let summary =
-        build_session_summary_from_thread_payload(thread, &snapshot, preferences_override)?;
+        build_session_summary_from_thread_payload(&thread, &snapshot, preferences_override)?;
     if summary.get("id").and_then(Value::as_str) != Some(session_id) {
         return Err(api_error(
             StatusCode::BAD_GATEWAY,
-            "Internal session payload returned an unexpected session id.",
+            "Session summary payload returned an unexpected session id.",
         ));
     }
     Ok(summary)
@@ -6423,21 +6486,17 @@ async fn run_automation_payload(
             }
         }
 
-        let session = internal_json_request_for_profile(
+        let session = create_session_payload(
             state,
-            Some(profile_id),
-            Method::POST,
-            "/api/sessions",
-            Some(json!({
-                "name": build_automation_thread_name(&automation_name),
-                "preferences": preferences
-            })),
+            profile_id,
+            Value::Object(preferences.clone()),
+            Some(&build_automation_thread_name(&automation_name)),
         )
         .await
         .map_err(|error| {
             api_error(
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to create the automation session: {error}"),
+                format!("Failed to create the automation session: {}", error.message),
             )
         })?;
 
@@ -6797,19 +6856,11 @@ async fn list_arena_runs_payload(state: &AppState, profile_id: &str) -> ApiResul
 
     for run in &mut arena_state.runs {
         for contestant in &mut run.contestants {
-            let session_payload = internal_json_request_for_profile(
-                state,
-                Some(profile_id),
-                Method::GET,
-                &format!("/api/sessions/{}?limit=20", contestant.session_id),
-                None,
-            )
-            .await;
-            let Ok(session_payload) = session_payload else {
+            let thread = read_thread_payload(state, profile_id, &contestant.session_id, true).await;
+            let Ok(thread) = thread else {
                 continue;
             };
-
-            let Some(thread) = session_payload.get("thread").and_then(Value::as_object) else {
+            let Some(thread) = thread.as_object() else {
                 continue;
             };
             let status = normalized_thread_status(thread.get("status"))
@@ -8038,6 +8089,50 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                 return response;
             }
 
+            if route_path.starts_with("/api/sessions/") && route_path.contains("/attachments/") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let mut segments = route_path
+                    .trim_start_matches("/api/sessions/")
+                    .split("/attachments/");
+                let session_id = segments
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let attachment_id = segments
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response = handle_session_attachment_api_http(
+                    state,
+                    request,
+                    auth,
+                    &session_id,
+                    &attachment_id,
+                )
+                .await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
             if route_path.starts_with("/api/sessions/") && route_path.contains("/turns/") {
                 let Some(auth) = auth_context(&state.config, &jar) else {
                     let mut response =
@@ -9134,6 +9229,26 @@ async fn handle_session_steer_api_http(
     };
 
     match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_attachment_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    session_id: &str,
+    attachment_id: &str,
+) -> Response {
+    if request.method() != Method::DELETE {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+    if auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    match delete_attachment_payload(&state, &auth.profile_id, session_id, attachment_id).await {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => json_error(error.status, &error.message),
     }
@@ -10891,13 +11006,9 @@ async fn execute_ws_method(
         "attachments/delete" => {
             let session_id = require_string(&params, "sessionId")?;
             let attachment_id = require_string(&params, "attachmentId")?;
-            internal_json_request(
-                state,
-                Method::DELETE,
-                &format!("/api/sessions/{session_id}/attachments/{attachment_id}"),
-                None,
-            )
-            .await
+            delete_attachment_payload(state, &auth.profile_id, &session_id, &attachment_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "account/get" => get_account_state(state, &auth.profile_id).await,
         "account/login/start" => start_account_login(state, &auth.profile_id, &params).await,
@@ -11904,19 +12015,11 @@ async fn session_has_active_turn(state: &AppState, profile_id: &str, session_id:
         return true;
     }
 
-    let session_payload = match internal_json_request_for_profile(
-        state,
-        Some(profile_id),
-        Method::GET,
-        &format!("/api/sessions/{session_id}?limit=1"),
-        None,
-    )
-    .await
-    {
+    let thread = match read_thread_payload(state, profile_id, session_id, true).await {
         Ok(payload) => payload,
         Err(_) => return true,
     };
-    let Some(thread) = session_payload.get("thread") else {
+    let Some(thread) = thread.as_object() else {
         return true;
     };
     if !is_live_thread_status(
@@ -16296,6 +16399,53 @@ for raw_line in sys.stdin:
         assert_eq!(
             stored_preferences.get("model").and_then(Value::as_str),
             Some("gpt-5")
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_attachment_payload_removes_attachment_files() {
+        let sandbox = unique_test_dir("attachment-delete-rust");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+        let runtime_profile = resolve_runtime_profile(&state.config, "default");
+        let uploads_dir = runtime_profile.data_dir.join("uploads").join("thread-1");
+        fs::create_dir_all(&uploads_dir).unwrap();
+        let stored_file = uploads_dir.join("att-1-notes.md");
+        let stored_meta = uploads_dir.join("att-1-notes.md.json");
+        fs::write(&stored_file, "notes").unwrap();
+        fs::write(
+            &stored_meta,
+            serde_json::to_vec(&json!({
+                "id": "att-1",
+                "originalName": "notes.md",
+                "path": stored_file.display().to_string(),
+                "mimeType": "text/markdown",
+                "size": 5,
+                "kind": "file",
+                "createdAt": "2026-04-20T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let payload = delete_attachment_payload(&state, "default", "thread-1", "att-1")
+            .await
+            .unwrap();
+        assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+        assert!(!stored_file.exists());
+        assert!(!stored_meta.exists());
+        assert!(
+            list_session_attachment_records(&state, "default", "thread-1")
+                .await
+                .unwrap()
+                .is_empty()
         );
 
         let _ = fs::remove_dir_all(sandbox);

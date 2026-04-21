@@ -12080,26 +12080,6 @@ async fn ensure_stream_relay(
     let (sender, _) = broadcast::channel(256);
     relays.insert(relay_key, sender.clone());
 
-    let state = state.clone();
-    let session_id = session_id.to_string();
-    let profile_id = profile_id.to_string();
-    let relay_sender = sender.clone();
-    tokio::spawn(async move {
-        loop {
-            if let Err(error) = stream_session_events(
-                state.clone(),
-                relay_sender.clone(),
-                profile_id.clone(),
-                session_id.clone(),
-            )
-            .await
-            {
-                warn!("session stream relay failed for {session_id}: {error:#}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    });
-
     Ok(sender)
 }
 
@@ -12177,44 +12157,6 @@ async fn bridge_app_server_global_notifications(
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
-}
-
-async fn stream_session_events(
-    state: AppState,
-    sender: broadcast::Sender<Value>,
-    profile_id: String,
-    session_id: String,
-) -> Result<()> {
-    let target = internal_url(&state.config, &format!("/api/sessions/{session_id}/stream"));
-    let response = state
-        .http
-        .get(target)
-        .header(INTERNAL_HEADER, &state.config.internal_proxy_token)
-        .header(PROFILE_HEADER, &profile_id)
-        .send()
-        .await
-        .context("failed to connect to internal SSE stream")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("internal SSE request failed with {status}: {body}"));
-    }
-
-    let stream = response
-        .bytes_stream()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error));
-    let reader = StreamReader::new(stream);
-    let mut lines = BufReader::new(reader).lines();
-
-    while let Some(line) = lines.next_line().await.context("failed to read SSE line")? {
-        if let Some(data) = line.strip_prefix("data: ") {
-            let payload: Value = serde_json::from_str(data).context("invalid SSE json payload")?;
-            let _ = sender.send(payload);
-        }
-    }
-
-    Err(anyhow!("internal SSE stream ended"))
 }
 
 async fn stream_global_events(
@@ -13287,23 +13229,7 @@ async fn resolve_server_request_payload(
         .cloned();
 
     let Some(pending) = pending else {
-        return internal_json_request_for_profile(
-            state,
-            Some(profile_id),
-            Method::POST,
-            &format!("/api/sessions/{session_id}/approval"),
-            Some(json!({
-                "requestId": request_id,
-                "result": result
-            })),
-        )
-        .await
-        .map_err(|error| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to resolve the server request: {error}"),
-            )
-        });
+        return Err(api_error(StatusCode::NOT_FOUND, "SERVER_REQUEST_NOT_FOUND"));
     };
 
     let client = app_server_client(state, profile_id)
@@ -13406,6 +13332,17 @@ async fn handle_profile_runtime_notification(
             }
         }
         _ => {}
+    }
+
+    if let Some(event) = map_app_server_session_notification(notification) {
+        emit_session_notification(state, profile_id, &session_id, event).await;
+    }
+
+    if matches!(
+        notification.method.as_str(),
+        "turn/started" | "turn/completed" | "thread/name/updated" | "thread/status/changed"
+    ) {
+        emit_session_summary_updated(state, profile_id, &session_id, None).await;
     }
 }
 
@@ -14028,6 +13965,281 @@ fn normalize_quota_window(window: Option<&UsageWindowShape>) -> Option<Value> {
 fn is_invalid_refresh_token_error_message(message: &str) -> bool {
     let lowered = message.to_ascii_lowercase();
     lowered.contains("tokenrefreshfailed") || lowered.contains("invalid refresh token")
+}
+
+fn normalize_token_usage_payload(value: Option<&Value>) -> Value {
+    let Some(record) = value.and_then(Value::as_object) else {
+        return Value::Null;
+    };
+
+    let normalize_breakdown = |input: Option<&Value>| {
+        let breakdown = input.and_then(Value::as_object);
+        json!({
+            "totalTokens": breakdown
+                .and_then(|value| value.get("totalTokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "inputTokens": breakdown
+                .and_then(|value| value.get("inputTokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "cachedInputTokens": breakdown
+                .and_then(|value| value.get("cachedInputTokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "outputTokens": breakdown
+                .and_then(|value| value.get("outputTokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "reasoningOutputTokens": breakdown
+                .and_then(|value| value.get("reasoningOutputTokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        })
+    };
+
+    json!({
+        "total": normalize_breakdown(record.get("total")),
+        "last": normalize_breakdown(record.get("last")),
+        "modelContextWindow": record
+            .get("modelContextWindow")
+            .and_then(Value::as_u64)
+            .map(Value::from)
+            .unwrap_or(Value::Null)
+    })
+}
+
+fn summarize_command_payload(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::Array(entries)) => {
+            let summary = entries
+                .iter()
+                .filter_map(value_text)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let trimmed = summary.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Some(Value::String(command)) => {
+            let trimmed = command.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Some(other) => value_text(other),
+        None => None,
+    }
+}
+
+fn summarize_tool_invocation_payload(value: Option<&Value>) -> Option<String> {
+    let record = value.and_then(Value::as_object)?;
+    let tool_name = ["toolName", "name", "tool", "method", "displayName"]
+        .iter()
+        .find_map(|key| record.get(*key).and_then(value_text));
+    let server_name = ["serverName", "server"]
+        .iter()
+        .find_map(|key| record.get(*key).and_then(value_text));
+
+    match (server_name, tool_name) {
+        (Some(server_name), Some(tool_name)) => Some(format!("{server_name} · {tool_name}")),
+        (Some(server_name), None) => Some(server_name),
+        (None, Some(tool_name)) => Some(tool_name),
+        (None, None) => None,
+    }
+}
+
+fn prepare_session_stream_item_payload(item: &Value, turn_id: &str) -> Value {
+    let mut normalized = normalize_session_item_payload(item, turn_id, 0)
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let item_type = normalized
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    match item_type {
+        "contextCompaction" => {
+            normalized.insert("title".to_string(), json!("Context compression"));
+            normalized.insert("detailState".to_string(), json!("inline"));
+            normalized.insert(
+                "detailPreview".to_string(),
+                json!("Compressing conversation context"),
+            );
+        }
+        "commandExecution" => {
+            normalized.insert("title".to_string(), json!("Command"));
+            normalized.insert("detailState".to_string(), json!("deferred"));
+            normalized.insert(
+                "detailPreview".to_string(),
+                summarize_command_payload(normalized.get("command"))
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            if !normalized.contains_key("parsed_cmd") && normalized.contains_key("parsedCmd") {
+                if let Some(parsed_cmd) = normalized.get("parsedCmd").cloned() {
+                    normalized.insert("parsed_cmd".to_string(), parsed_cmd);
+                }
+            }
+        }
+        "fileChange" => {
+            let changes = normalized
+                .get("changes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let first_path = changes
+                .iter()
+                .find_map(|entry| entry.get("path").and_then(value_text));
+            normalized.insert("title".to_string(), json!("Files changed"));
+            normalized.insert("detailState".to_string(), json!("deferred"));
+            normalized.insert("changeCount".to_string(), json!(changes.len()));
+            normalized.insert(
+                "firstChangePath".to_string(),
+                first_path.clone().map(Value::String).unwrap_or(Value::Null),
+            );
+            normalized.insert(
+                "detailPreview".to_string(),
+                first_path.map(Value::String).unwrap_or_else(|| {
+                    if changes.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(format!("{} files", changes.len()))
+                    }
+                }),
+            );
+            normalized.insert(
+                "changes".to_string(),
+                Value::Array(
+                    changes
+                        .into_iter()
+                        .map(|entry| {
+                            json!({
+                                "path": entry.get("path").and_then(value_text).unwrap_or_else(|| "Code edit".to_string()),
+                                "kind": entry.get("kind").and_then(value_text).unwrap_or_else(|| "update".to_string())
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        "webSearch" => {
+            normalized.insert("title".to_string(), json!("Web search"));
+            normalized.insert("detailState".to_string(), json!("deferred"));
+            normalized.insert(
+                "detailPreview".to_string(),
+                value_text(normalized.get("query").unwrap_or(&Value::Null))
+                    .or_else(|| summarize_tool_invocation_payload(normalized.get("action")))
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+        }
+        "mcpToolCall" | "dynamicToolCall" => {
+            normalized.insert(
+                "title".to_string(),
+                Value::String(if item_type == "mcpToolCall" {
+                    "MCP call".to_string()
+                } else {
+                    "Tool call".to_string()
+                }),
+            );
+            normalized.insert("detailState".to_string(), json!("deferred"));
+            normalized.insert(
+                "detailPreview".to_string(),
+                summarize_tool_invocation_payload(normalized.get("invocation"))
+                    .or_else(|| value_text(normalized.get("tool").unwrap_or(&Value::Null)))
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+        }
+        _ => {
+            normalized
+                .entry("detailState".to_string())
+                .or_insert_with(|| json!("inline"));
+        }
+    }
+
+    Value::Object(normalized)
+}
+
+fn map_app_server_session_notification(notification: &AppServerNotification) -> Option<Value> {
+    let params = notification.params.as_object().cloned().unwrap_or_default();
+    let mut mapped = params.clone();
+
+    match notification.method.as_str() {
+        "turn/started" | "turn/completed" => {
+            let fallback_turn_id = mapped
+                .get("turnId")
+                .and_then(Value::as_str)
+                .unwrap_or("turn-0")
+                .to_string();
+            let fallback_status = if notification.method == "turn/started" {
+                "inProgress"
+            } else {
+                "completed"
+            };
+            let turn = mapped.get("turn").cloned().unwrap_or_else(|| {
+                json!({
+                    "id": fallback_turn_id,
+                    "status": fallback_status,
+                    "items": []
+                })
+            });
+            mapped.insert("turn".to_string(), normalize_session_turn_payload(&turn, 0));
+        }
+        "item/started" | "item/completed" => {
+            let turn_id = mapped
+                .get("turnId")
+                .and_then(Value::as_str)
+                .unwrap_or("turn-0");
+            let item = mapped.get("item").cloned().unwrap_or_else(
+                || json!({ "id": mapped.get("itemId").cloned().unwrap_or(Value::Null) }),
+            );
+            mapped.insert(
+                "item".to_string(),
+                prepare_session_stream_item_payload(&item, turn_id),
+            );
+        }
+        "thread/name/updated" => {
+            mapped.insert(
+                "threadName".to_string(),
+                mapped
+                    .get("threadName")
+                    .and_then(value_text)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+        }
+        "thread/status/changed" => {
+            mapped.insert(
+                "status".to_string(),
+                Value::String(
+                    normalized_thread_status(mapped.get("status"))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+            );
+        }
+        "thread/tokenUsage/updated" => {
+            mapped.insert(
+                "tokenUsage".to_string(),
+                normalize_token_usage_payload(mapped.get("tokenUsage")),
+            );
+        }
+        "item/commandExecution/outputDelta" => {
+            let delta = mapped
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            mapped.insert("delta".to_string(), Value::String(delta.clone()));
+            mapped.insert("deltaLength".to_string(), json!(delta.chars().count()));
+        }
+        _ => {}
+    }
+
+    Some(json!({
+        "kind": "notification",
+        "method": notification.method,
+        "params": Value::Object(mapped)
+    }))
 }
 
 fn map_app_server_global_notification(notification: &AppServerNotification) -> Option<Value> {
@@ -15565,6 +15777,47 @@ for raw_line in sys.stdin:
                     "loginId": "login-1",
                     "success": true,
                     "error": Value::Null
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn maps_session_item_notifications_for_stream_clients() {
+        let mapped = map_app_server_session_notification(&AppServerNotification {
+            method: "item/started".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "commandExecution",
+                    "command": ["sed", "-n", "1,20p", "src/main.rs"],
+                    "cwd": "/tmp/project"
+                }
+            }),
+        })
+        .expect("notification should map");
+
+        assert_eq!(
+            mapped,
+            json!({
+                "kind": "notification",
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                    "item": {
+                        "id": "item-1",
+                        "type": "commandExecution",
+                        "command": ["sed", "-n", "1,20p", "src/main.rs"],
+                        "cwd": "/tmp/project",
+                        "title": "Command",
+                        "detailState": "deferred",
+                        "detailPreview": "sed -n 1,20p src/main.rs"
+                    }
                 }
             })
         );
@@ -17421,6 +17674,182 @@ for raw_line in sys.stdin:
         .await
         .unwrap();
         assert!(highlight_after.is_null());
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_server_request_payload_returns_not_found_without_pending_request() {
+        let sandbox = unique_test_dir("approval-missing");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+
+        let error = resolve_server_request_payload(
+            &state,
+            "default",
+            "thread-1",
+            "missing-request",
+            json!({ "answer": "yes" }),
+        )
+        .await
+        .expect_err("missing request should fail");
+
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.message, "SERVER_REQUEST_NOT_FOUND");
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_notifications_emit_session_stream_events_from_rust_relay() {
+        let sandbox = unique_test_dir("session-stream-rust");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+        let relay = ensure_stream_relay(&state, "default", "thread-1")
+            .await
+            .expect("relay should initialize");
+        let mut receiver = relay.subscribe();
+
+        handle_profile_runtime_notification(
+            &state,
+            "default",
+            &AppServerNotification {
+                method: "item/started".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                    "item": {
+                        "id": "item-1",
+                        "type": "commandExecution",
+                        "command": ["sed", "-n", "1,20p", "src/main.rs"]
+                    }
+                }),
+            },
+        )
+        .await;
+
+        let item_started = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("item event should arrive")
+            .expect("item event should be readable");
+        assert_eq!(
+            item_started.get("method").and_then(Value::as_str),
+            Some("item/started")
+        );
+        assert_eq!(
+            item_started
+                .get("params")
+                .and_then(|value| value.get("item"))
+                .and_then(|value| value.get("title"))
+                .and_then(Value::as_str),
+            Some("Command")
+        );
+
+        handle_profile_runtime_notification(
+            &state,
+            "default",
+            &AppServerNotification {
+                method: "item/commandExecution/outputDelta".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                    "delta": "hello"
+                }),
+            },
+        )
+        .await;
+
+        let command_delta = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("command delta should arrive")
+            .expect("command delta should be readable");
+        assert_eq!(
+            command_delta
+                .get("params")
+                .and_then(|value| value.get("deltaLength"))
+                .and_then(Value::as_u64),
+            Some(5)
+        );
+
+        handle_profile_runtime_notification(
+            &state,
+            "default",
+            &AppServerNotification {
+                method: "thread/status/changed".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "status": { "type": "completed" }
+                }),
+            },
+        )
+        .await;
+
+        let status_changed = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("status event should arrive")
+            .expect("status event should be readable");
+        assert_eq!(
+            status_changed
+                .get("params")
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("completed")
+        );
+
+        handle_profile_runtime_notification(
+            &state,
+            "default",
+            &AppServerNotification {
+                method: "thread/tokenUsage/updated".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "tokenUsage": {
+                        "total": {
+                            "totalTokens": 15,
+                            "inputTokens": 7,
+                            "cachedInputTokens": 1,
+                            "outputTokens": 8,
+                            "reasoningOutputTokens": 2
+                        },
+                        "last": {
+                            "totalTokens": 10,
+                            "inputTokens": 4,
+                            "cachedInputTokens": 1,
+                            "outputTokens": 6,
+                            "reasoningOutputTokens": 1
+                        },
+                        "modelContextWindow": 2000
+                    }
+                }),
+            },
+        )
+        .await;
+
+        let token_usage = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("token usage event should arrive")
+            .expect("token usage event should be readable");
+        assert_eq!(
+            token_usage
+                .get("params")
+                .and_then(|value| value.get("tokenUsage"))
+                .and_then(|value| value.get("total"))
+                .and_then(|value| value.get("totalTokens"))
+                .and_then(Value::as_u64),
+            Some(15)
+        );
 
         let _ = fs::remove_dir_all(sandbox);
     }

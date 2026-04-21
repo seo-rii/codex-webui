@@ -59,6 +59,7 @@ mod config_support;
 mod event_mapping_support;
 mod git_support;
 mod github_support;
+mod runtime_env_support;
 mod session_state_support;
 mod static_support;
 mod terminal_support;
@@ -75,6 +76,7 @@ use config_support::*;
 use event_mapping_support::*;
 use git_support::*;
 use github_support::*;
+use runtime_env_support::*;
 use session_state_support::*;
 use static_support::*;
 use terminal_support::*;
@@ -8013,186 +8015,6 @@ async fn restore_runtime_profile_state(state: AppState, profile_id: String) {
         }
 
         tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-}
-
-async fn app_server_client(state: &AppState, profile_id: &str) -> Result<AppServerClient> {
-    let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
-    Ok(state
-        .app_servers
-        .get_or_create(AppServerProfile {
-            id: resolved_profile_id.to_string(),
-            codex_home: profile.codex_home.clone(),
-        })
-        .await)
-}
-
-fn resolve_runtime_profile_entry<'a>(
-    config: &'a Config,
-    profile_id: &'a str,
-) -> (&'a str, &'a RuntimeProfile) {
-    if let Some(profile) = config.profiles.get(profile_id) {
-        return (profile_id, profile);
-    }
-
-    if let Some(profile) = config.profiles.get(&config.default_profile_id) {
-        return (config.default_profile_id.as_str(), profile);
-    }
-
-    config
-        .profiles
-        .iter()
-        .next()
-        .map(|(resolved_profile_id, profile)| (resolved_profile_id.as_str(), profile))
-        .expect("at least one runtime profile must exist")
-}
-
-fn resolve_runtime_profile<'a>(config: &'a Config, profile_id: &'a str) -> &'a RuntimeProfile {
-    resolve_runtime_profile_entry(config, profile_id).1
-}
-
-async fn read_codex_version(state: &AppState) -> Result<String> {
-    let output = run_command_with_timeout(
-        &state.config.codex_bin,
-        vec!["--version".to_string()],
-        Duration::from_secs(5),
-    )
-    .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let message = if !stderr.is_empty() { stderr } else { stdout };
-        anyhow::bail!(if message.is_empty() {
-            "Codex binary did not report a version.".to_string()
-        } else {
-            message
-        });
-    }
-
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if version.is_empty() {
-        anyhow::bail!("Codex version output was empty.");
-    }
-    Ok(version)
-}
-
-async fn fetch_latest_published_version() -> Result<Option<String>> {
-    let output = run_command_with_timeout(
-        npm_command(),
-        vec![
-            "view".to_string(),
-            CODEX_NPM_PACKAGE.to_string(),
-            "version".to_string(),
-            "--json".to_string(),
-        ],
-        NPM_VIEW_TIMEOUT,
-    )
-    .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let message = if !stderr.is_empty() { stderr } else { stdout };
-        anyhow::bail!(if message.is_empty() {
-            "Failed to query npm for the latest Codex version.".to_string()
-        } else {
-            message
-        });
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        return Ok(None);
-    }
-
-    if let Ok(value) = serde_json::from_str::<String>(&stdout) {
-        return Ok(Some(value));
-    }
-
-    Ok(Some(stdout))
-}
-
-async fn run_command_with_timeout(
-    command: &str,
-    args: Vec<String>,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let child = Command::new(command)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to start `{command}`"))?;
-
-    tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| anyhow!("`{command}` timed out"))?
-        .with_context(|| format!("failed to wait for `{command}`"))
-}
-
-async fn command_available(name: &str) -> bool {
-    run_command_with_timeout(
-        which_command(),
-        vec![name.to_string()],
-        Duration::from_secs(2),
-    )
-    .await
-    .map(|output| output.status.success())
-    .unwrap_or(false)
-}
-
-async fn resolve_binary_path(command: &str) -> Option<String> {
-    let candidate = PathBuf::from(command);
-    if candidate.exists() {
-        return Some(candidate.display().to_string());
-    }
-
-    let output = run_command_with_timeout(
-        which_command(),
-        vec![command.to_string()],
-        Duration::from_secs(2),
-    )
-    .await
-    .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let path = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .to_string();
-    if path.is_empty() { None } else { Some(path) }
-}
-
-fn which_command() -> &'static str {
-    if cfg!(windows) { "where" } else { "which" }
-}
-
-fn npm_command() -> &'static str {
-    if cfg!(windows) { "npm.cmd" } else { "npm" }
-}
-
-fn extract_semver(value: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = value
-        .split(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
-        .find(|part| part.split('.').count() >= 3)?
-        .split('.');
-
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    Some((major, minor, patch))
-}
-
-fn compare_versions(left: &(u64, u64, u64), right: &(u64, u64, u64)) -> i8 {
-    match left.cmp(right) {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
     }
 }
 

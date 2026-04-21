@@ -81,6 +81,8 @@ const WINDOWS_STARTUP_SCRIPT: &str = "codex-webui.vbs";
 const MACOS_LAUNCH_AGENT: &str = "dev.seorii.codex-webui.plist";
 const LINUX_SYSTEMD_SERVICE: &str = "codex-webui-autostart.service";
 const LINUX_DESKTOP_ENTRY: &str = "codex-webui.desktop";
+const ATTACHMENT_PREAMBLE_START: &str = "[[codex-webui-attachments]]";
+const ATTACHMENT_PREAMBLE_END: &str = "[[/codex-webui-attachments]]";
 
 tokio::task_local! {
     static ACTIVE_PROFILE_ID: String;
@@ -452,7 +454,13 @@ struct UploadFilePayload {
 #[serde(rename_all = "camelCase")]
 struct StoredAttachmentRecord {
     id: String,
+    #[serde(alias = "originalName")]
     original_name: String,
+    path: Option<String>,
+    #[serde(alias = "mimeType")]
+    mime_type: Option<String>,
+    size: Option<u64>,
+    kind: Option<String>,
     created_at: Option<String>,
 }
 
@@ -3899,21 +3907,6 @@ async fn read_session_summary_ui_snapshot(
     .await
 }
 
-fn thread_is_subagent(thread: &Value) -> bool {
-    thread
-        .get("isSubagent")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || thread
-            .get("agentNickname")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-        || thread
-            .get("agentRole")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-}
-
 fn build_session_summary_from_thread_payload(
     thread: &Value,
     snapshot: &SessionSummaryUiSnapshot,
@@ -4214,6 +4207,576 @@ async fn create_session_payload(
     .await;
 
     Ok(summary)
+}
+
+fn is_unmaterialized_thread_error_message(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("not materialized yet")
+        || lowered.contains("includeturns is unavailable before first user message")
+}
+
+fn thread_agent_nickname(thread: &Value) -> Option<String> {
+    thread
+        .get("agentNickname")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            thread
+                .get("agent_nickname")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            thread
+                .get("source")
+                .and_then(|value| value.get("subagent"))
+                .and_then(|value| value.get("thread_spawn"))
+                .and_then(|value| value.get("agent_nickname"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn thread_agent_role(thread: &Value) -> Option<String> {
+    thread
+        .get("agentRole")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            thread
+                .get("agent_role")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            thread
+                .get("source")
+                .and_then(|value| value.get("subagent"))
+                .and_then(|value| value.get("thread_spawn"))
+                .and_then(|value| value.get("agent_role"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn thread_is_subagent(thread: &Value) -> bool {
+    thread
+        .get("isSubagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || thread
+            .get("source")
+            .and_then(|value| value.get("subagent"))
+            .and_then(Value::as_object)
+            .is_some_and(|value| !value.is_empty())
+        || thread_agent_nickname(thread).is_some()
+        || thread_agent_role(thread).is_some()
+}
+
+fn normalize_session_item_payload(item: &Value, turn_id: &str, item_index: usize) -> Value {
+    let mut normalized = item.as_object().cloned().unwrap_or_default();
+    if normalized
+        .get("id")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        normalized.insert(
+            "id".to_string(),
+            Value::String(format!("{turn_id}:item:{item_index}")),
+        );
+    }
+    if normalized
+        .get("type")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        normalized.insert("type".to_string(), Value::String("unknown".to_string()));
+    }
+    Value::Object(normalized)
+}
+
+fn normalize_session_turn_payload(turn: &Value, turn_index: usize) -> Value {
+    let mut normalized = turn.as_object().cloned().unwrap_or_default();
+    let turn_id = normalized
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("turn-{turn_index}"));
+    let items = normalized
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(item_index, item)| normalize_session_item_payload(item, &turn_id, item_index))
+        .collect::<Vec<_>>();
+    normalized.insert("id".to_string(), Value::String(turn_id));
+    normalized.insert("items".to_string(), Value::Array(items));
+    normalized.insert(
+        "status".to_string(),
+        Value::String(
+            value_text(normalized.get("status").unwrap_or(&Value::Null))
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+    );
+    normalized
+        .entry("error".to_string())
+        .or_insert_with(|| Value::Null);
+    normalized
+        .entry("startedAt".to_string())
+        .or_insert_with(|| Value::Null);
+    normalized
+        .entry("completedAt".to_string())
+        .or_insert_with(|| Value::Null);
+    normalized
+        .entry("durationMs".to_string())
+        .or_insert_with(|| Value::Null);
+    normalized.insert("detailState".to_string(), Value::String("full".to_string()));
+    normalized.insert("hiddenItemCount".to_string(), Value::from(0));
+    Value::Object(normalized)
+}
+
+fn normalize_thread_payload(thread: &Value) -> Value {
+    let mut normalized = thread.as_object().cloned().unwrap_or_default();
+    let turns = normalized
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(turn_index, turn)| normalize_session_turn_payload(turn, turn_index))
+        .collect::<Vec<_>>();
+    let preview = normalized
+        .get("preview")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    normalized.insert(
+        "name".to_string(),
+        normalized
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|value| Value::String(value.to_string()))
+            .unwrap_or(Value::Null),
+    );
+    normalized.insert("preview".to_string(), Value::String(preview));
+    normalized.insert(
+        "status".to_string(),
+        Value::String(
+            normalized_thread_status(normalized.get("status"))
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+    );
+    normalized.insert("turns".to_string(), Value::Array(turns));
+    normalized.insert(
+        "isSubagent".to_string(),
+        Value::Bool(thread_is_subagent(thread)),
+    );
+    normalized.insert(
+        "agentNickname".to_string(),
+        thread_agent_nickname(thread)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    normalized.insert(
+        "agentRole".to_string(),
+        thread_agent_role(thread)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    Value::Object(normalized)
+}
+
+fn active_turn_id_from_turns(turns: &[Value]) -> Option<String> {
+    turns.iter().find_map(|turn| {
+        (turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+            .then(|| {
+                turn.get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_default()
+            })
+            .filter(|value| !value.is_empty())
+    })
+}
+
+async fn list_session_attachments_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Vec<Value>> {
+    let attachments = list_session_attachment_records(state, profile_id, session_id)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(attachments
+        .into_iter()
+        .map(|attachment| {
+            json!({
+                "id": attachment.id,
+                "originalName": attachment.original_name,
+                "path": attachment.path.unwrap_or_default(),
+                "mimeType": attachment.mime_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+                "size": attachment.size.unwrap_or(0),
+                "kind": attachment.kind.unwrap_or_else(|| "file".to_string()),
+                "createdAt": attachment.created_at
+            })
+        })
+        .collect())
+}
+
+async fn session_pending_requests_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> Vec<Value> {
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        session_id,
+    );
+    let mut requests = state
+        .pending_server_requests
+        .lock()
+        .await
+        .get(&runtime_key)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|(request_id, pending)| {
+                    json!({
+                        "id": request_id,
+                        "method": pending.method,
+                        "params": pending.params,
+                        "createdAt": pending.created_at
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    requests.sort_by(|left, right| {
+        right
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                left.get("createdAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+    });
+    requests
+}
+
+async fn read_thread_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    include_turns: bool,
+) -> ApiResult<Value> {
+    let client = app_server_client(state, profile_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to codex app-server: {error}"),
+            )
+        })?;
+    let response = match client
+        .request(
+            "thread/read",
+            json!({
+                "threadId": session_id,
+                "includeTurns": include_turns
+            }),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error)
+            if include_turns && is_unmaterialized_thread_error_message(&error.to_string()) =>
+        {
+            client
+                .request(
+                    "thread/read",
+                    json!({
+                        "threadId": session_id,
+                        "includeTurns": false
+                    }),
+                )
+                .await
+                .map_err(|fallback_error| {
+                    api_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to read the session: {fallback_error}"),
+                    )
+                })?
+        }
+        Err(error) => {
+            return Err(api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to read the session: {error}"),
+            ));
+        }
+    };
+    let thread = response.get("thread").cloned().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            "Codex app-server returned an invalid thread payload.",
+        )
+    })?;
+    Ok(normalize_thread_payload(&thread))
+}
+
+async fn session_detail_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    limit: u64,
+) -> ApiResult<Value> {
+    let thread = read_thread_payload(state, profile_id, session_id, true).await?;
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let total_turns = turns.len();
+    let window_size = limit.clamp(1, 200) as usize;
+    let start = total_turns.saturating_sub(window_size);
+    let visible_turns = turns[start..].to_vec();
+    let active_turn_id = state
+        .active_turns
+        .lock()
+        .await
+        .get(&runtime_session_key(
+            resolve_runtime_profile_entry(&state.config, profile_id).0,
+            session_id,
+        ))
+        .cloned()
+        .or_else(|| active_turn_id_from_turns(&turns));
+    let preferences = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("preferencesByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get(session_id))
+            .cloned()
+            .unwrap_or_else(|| {
+                json!({
+                    "cwd": thread.get("cwd").cloned().unwrap_or(Value::Null)
+                })
+            }))
+    })
+    .await?;
+
+    Ok(json!({
+        "thread": {
+            "id": thread.get("id").cloned().unwrap_or_else(|| json!(session_id)),
+            "preview": thread.get("preview").cloned().unwrap_or_else(|| json!("")),
+            "name": thread.get("name").cloned().unwrap_or(Value::Null),
+            "cwd": thread.get("cwd").cloned().unwrap_or(Value::Null),
+            "status": thread.get("status").cloned().unwrap_or_else(|| json!("unknown")),
+            "createdAt": thread.get("createdAt").cloned().unwrap_or_else(|| json!(0)),
+            "updatedAt": thread.get("updatedAt").cloned().unwrap_or_else(|| json!(0)),
+            "isSubagent": thread.get("isSubagent").cloned().unwrap_or_else(|| json!(false)),
+            "agentNickname": thread.get("agentNickname").cloned().unwrap_or(Value::Null),
+            "agentRole": thread.get("agentRole").cloned().unwrap_or(Value::Null),
+            "turns": visible_turns
+        },
+        "preferences": preferences,
+        "attachments": list_session_attachments_payload(state, profile_id, session_id).await?,
+        "queue": get_session_queue_payload(state, profile_id, session_id).await?,
+        "pendingRequests": session_pending_requests_payload(state, profile_id, session_id).await,
+        "activeTurnId": active_turn_id,
+        "tokenUsage": thread.get("tokenUsage").cloned().unwrap_or(Value::Null),
+        "hydration": {
+            "state": "complete",
+            "loadedTurns": total_turns.saturating_sub(start),
+            "totalTurns": total_turns,
+            "remainingTurns": start,
+            "message": Value::Null,
+            "recovery": {
+                "available": false,
+                "issue": Value::Null,
+                "totalLines": Value::Null,
+                "recoverableLines": Value::Null,
+                "skippedLines": Value::Null
+            }
+        }
+    }))
+}
+
+async fn session_older_turns_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    before_turn_id: &str,
+    limit: u64,
+) -> ApiResult<Value> {
+    let thread = read_thread_payload(state, profile_id, session_id, true).await?;
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let Some(before_index) = turns
+        .iter()
+        .position(|turn| turn.get("id").and_then(Value::as_str) == Some(before_turn_id))
+    else {
+        return Ok(json!({
+            "turns": [],
+            "loadedTurns": turns.len(),
+            "totalTurns": turns.len(),
+            "remainingTurns": 0
+        }));
+    };
+    let window_size = limit.clamp(1, 200) as usize;
+    let start = before_index.saturating_sub(window_size);
+    Ok(json!({
+        "turns": turns[start..before_index].to_vec(),
+        "loadedTurns": before_index,
+        "totalTurns": turns.len(),
+        "remainingTurns": start
+    }))
+}
+
+async fn session_turn_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    turn_id: &str,
+) -> ApiResult<Value> {
+    let thread = read_thread_payload(state, profile_id, session_id, true).await?;
+    let turn = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| {
+            turns
+                .iter()
+                .find(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id))
+        })
+        .cloned()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Turn not found."))?;
+    Ok(json!({ "turn": turn }))
+}
+
+async fn session_item_detail_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    turn_id: &str,
+    item_id: &str,
+) -> ApiResult<Value> {
+    let turn = session_turn_payload(state, profile_id, session_id, turn_id)
+        .await?
+        .get("turn")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut item = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some(item_id))
+        })
+        .cloned()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Transcript item detail not found."))?;
+    if let Some(item_object) = item.as_object_mut() {
+        item_object.insert(
+            "detailState".to_string(),
+            Value::String("loaded".to_string()),
+        );
+    }
+    Ok(json!({ "item": item }))
+}
+
+async fn search_session_turns_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    query: &str,
+    cursor: Option<&str>,
+    limit: u64,
+) -> ApiResult<Value> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(json!({
+            "matches": [],
+            "nextCursor": Value::Null,
+            "totalMatches": 0
+        }));
+    }
+
+    let thread = read_thread_payload(state, profile_id, session_id, true).await?;
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut matches = Vec::new();
+
+    for (turn_index, turn) in turns.iter().enumerate() {
+        let started_at = turn.get("startedAt").and_then(Value::as_i64);
+        for item in turn
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let serialized = serde_json::to_string(&item).unwrap_or_default();
+            let normalized = serialized.replace("\\n", " ").replace('\n', " ");
+            let lowered = normalized.to_lowercase();
+            let Some(match_index) = lowered.find(&needle) else {
+                continue;
+            };
+            let normalized_chars = normalized.chars().collect::<Vec<_>>();
+            let match_char_index = lowered[..match_index].chars().count();
+            let snippet_start = match_char_index.saturating_sub(54);
+            let snippet_end =
+                (match_char_index + needle.chars().count() + 54).min(normalized_chars.len());
+            matches.push(json!({
+                "turnId": turn.get("id").cloned().unwrap_or(Value::Null),
+                "turnIndex": turn_index,
+                "itemId": item.get("id").cloned().unwrap_or(Value::Null),
+                "itemType": item.get("type").cloned().unwrap_or(Value::Null),
+                "preview": format!(
+                    "{}{}{}",
+                    if snippet_start > 0 { "..." } else { "" },
+                    normalized_chars[snippet_start..snippet_end]
+                        .iter()
+                        .collect::<String>()
+                        .trim(),
+                    if snippet_end < normalized_chars.len() { "..." } else { "" }
+                ),
+                "startedAt": started_at,
+                "requiresFullTurn": false,
+                "requiresItemDetail": false
+            }));
+        }
+    }
+
+    let window_size = limit.clamp(1, 200) as usize;
+    let start = cursor
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let end = start.saturating_add(window_size).min(matches.len());
+    Ok(json!({
+        "matches": if start < matches.len() { matches[start..end].to_vec() } else { Vec::<Value>::new() },
+        "nextCursor": (end < matches.len()).then(|| end.to_string()),
+        "totalMatches": matches.len()
+    }))
 }
 
 async fn emit_session_notification(
@@ -6546,6 +7109,161 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                 return response;
             }
 
+            if route_path.starts_with("/api/sessions/") && route_path.ends_with("/search") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/search"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_search_api_http(state, request, auth, &session_id).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path.starts_with("/api/sessions/") && route_path.ends_with("/turns") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/turns"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_turns_api_http(state, request, auth, &session_id).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path.starts_with("/api/sessions/")
+                && route_path.contains("/turns/")
+                && route_path.contains("/items/")
+            {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let mut segments = route_path
+                    .trim_start_matches("/api/sessions/")
+                    .split("/turns/");
+                let session_id = segments
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let rest = segments.next().unwrap_or_default();
+                let mut turn_segments = rest.split("/items/");
+                let turn_id = turn_segments
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let item_id = turn_segments
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response = handle_session_item_detail_api_http(
+                    state,
+                    request,
+                    auth,
+                    &session_id,
+                    &turn_id,
+                    &item_id,
+                )
+                .await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path.starts_with("/api/sessions/") && route_path.contains("/turns/") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let mut segments = route_path
+                    .trim_start_matches("/api/sessions/")
+                    .split("/turns/");
+                let session_id = segments
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let turn_id = segments
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_turn_api_http(state, request, auth, &session_id, &turn_id).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
             if route_path.starts_with("/api/sessions/") && route_path.ends_with("/abort") {
                 let Some(auth) = auth_context(&state.config, &jar) else {
                     let mut response =
@@ -7043,20 +7761,7 @@ async fn handle_session_api_http(
             let limit = query_param_value(request.uri().query(), "limit")
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(20);
-            internal_json_request_for_profile(
-                &state,
-                Some(&auth.profile_id),
-                Method::GET,
-                &format!("/api/sessions/{session_id}?limit={limit}"),
-                None,
-            )
-            .await
-            .map_err(|error| {
-                api_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("Failed to load the session from the internal backend: {error}"),
-                )
-            })
+            session_detail_payload(&state, &auth.profile_id, session_id, limit).await
         }
         &Method::PATCH => {
             if auth.role != UserRole::Admin {
@@ -7658,6 +8363,95 @@ async fn handle_session_abort_api_http(
     }
 
     match abort_turn_payload(&state, &auth.profile_id, session_id).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_search_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    session_id: &str,
+) -> Response {
+    if request.method() != Method::GET {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+
+    let query = query_param_value(request.uri().query(), "query").unwrap_or_default();
+    let cursor = query_param_value(request.uri().query(), "cursor");
+    let limit = query_param_value(request.uri().query(), "limit")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(20);
+    match search_session_turns_payload(
+        &state,
+        &auth.profile_id,
+        session_id,
+        &query,
+        cursor.as_deref(),
+        limit,
+    )
+    .await
+    {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_turns_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    session_id: &str,
+) -> Response {
+    if request.method() != Method::GET {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+
+    let before_turn_id =
+        query_param_value(request.uri().query(), "beforeTurnId").unwrap_or_default();
+    let limit = query_param_value(request.uri().query(), "limit")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(20);
+    match session_older_turns_payload(&state, &auth.profile_id, session_id, &before_turn_id, limit)
+        .await
+    {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_turn_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    session_id: &str,
+    turn_id: &str,
+) -> Response {
+    if request.method() != Method::GET {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+
+    match session_turn_payload(&state, &auth.profile_id, session_id, turn_id).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_item_detail_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    session_id: &str,
+    turn_id: &str,
+    item_id: &str,
+) -> Response {
+    if request.method() != Method::GET {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+
+    match session_item_detail_payload(&state, &auth.profile_id, session_id, turn_id, item_id).await
+    {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => json_error(error.status, &error.message),
     }
@@ -8878,13 +9672,9 @@ async fn execute_ws_method(
         "session/get" => {
             let session_id = require_string(&params, "sessionId")?;
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!("/api/sessions/{session_id}?limit={limit}"),
-                None,
-            )
-            .await
+            session_detail_payload(state, &auth.profile_id, &session_id, limit)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "session/fork" => {
             let session_id = require_string(&params, "sessionId")?;
@@ -8904,56 +9694,50 @@ async fn execute_ws_method(
         "session/search" => {
             let session_id = require_string(&params, "sessionId")?;
             let query_raw = require_string(&params, "query")?;
-            let query = urlencoding::encode(&query_raw);
             let cursor = params
                 .get("cursor")
                 .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(urlencoding::encode);
+                .filter(|value| !value.is_empty());
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
-            let mut path = format!("/api/sessions/{session_id}/search?query={query}&limit={limit}");
-            if let Some(cursor) = cursor {
-                path.push_str(&format!("&cursor={cursor}"));
-            }
-            internal_json_request(state, Method::GET, &path, None).await
+            search_session_turns_payload(
+                state,
+                &auth.profile_id,
+                &session_id,
+                &query_raw,
+                cursor,
+                limit,
+            )
+            .await
+            .map_err(anyhow::Error::from)
         }
         "session/olderTurns/get" => {
             let session_id = require_string(&params, "sessionId")?;
             let before_turn_id = require_string(&params, "beforeTurnId")?;
-            let before_turn_id = urlencoding::encode(&before_turn_id);
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
-            internal_json_request(
+            session_older_turns_payload(
                 state,
-                Method::GET,
-                &format!(
-                    "/api/sessions/{session_id}/turns?beforeTurnId={before_turn_id}&limit={limit}"
-                ),
-                None,
+                &auth.profile_id,
+                &session_id,
+                &before_turn_id,
+                limit,
             )
             .await
+            .map_err(anyhow::Error::from)
         }
         "session/turn/get" => {
             let session_id = require_string(&params, "sessionId")?;
             let turn_id = require_string(&params, "turnId")?;
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!("/api/sessions/{session_id}/turns/{turn_id}"),
-                None,
-            )
-            .await
+            session_turn_payload(state, &auth.profile_id, &session_id, &turn_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "session/itemDetail/get" => {
             let session_id = require_string(&params, "sessionId")?;
             let turn_id = require_string(&params, "turnId")?;
             let item_id = require_string(&params, "itemId")?;
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!("/api/sessions/{session_id}/turns/{turn_id}/items/{item_id}"),
-                None,
-            )
-            .await
+            session_item_detail_payload(state, &auth.profile_id, &session_id, &turn_id, &item_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "session/draft/get" => {
             let session_id = require_string(&params, "sessionId")?;
@@ -12914,6 +13698,17 @@ for raw_line in sys.stdin:
                 "ok": True
             }
         })
+    elif method == "thread/seed":
+        thread = params.get("thread") or {}
+        thread_id = thread.get("id")
+        if isinstance(thread_id, str) and thread_id:
+            threads[thread_id] = thread
+        write({
+            "id": request_id,
+            "result": {
+                "ok": True
+            }
+        })
     elif method == "thread/read":
         thread_id = params.get("threadId", "")
         thread = threads.get(thread_id, {
@@ -13878,6 +14673,146 @@ for raw_line in sys.stdin:
         assert_eq!(
             payload.get("interrupted").and_then(Value::as_bool),
             Some(true)
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_detail_and_turn_search_payloads_use_rust_thread_reads() {
+        let sandbox = unique_test_dir("session-detail-rust");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+        app_server_client(&state, "default")
+            .await
+            .unwrap()
+            .request(
+                "thread/seed",
+                json!({
+                    "thread": {
+                        "id": "thread-1",
+                        "name": "Investigate bug",
+                        "preview": "Investigate websocket bug",
+                        "cwd": workspace.display().to_string(),
+                        "archived": false,
+                        "createdAt": 1,
+                        "updatedAt": 2,
+                        "status": "running",
+                        "isSubagent": false,
+                        "turns": [
+                            {
+                                "id": "turn-1",
+                                "status": "completed",
+                                "error": Value::Null,
+                                "startedAt": 10,
+                                "completedAt": 20,
+                                "durationMs": 10,
+                                "items": [
+                                    {
+                                        "id": "item-1",
+                                        "type": "userMessage",
+                                        "text": "Find the websocket bug"
+                                    },
+                                    {
+                                        "id": "item-2",
+                                        "type": "agentMessage",
+                                        "text": "Investigating the websocket bug now"
+                                    }
+                                ]
+                            },
+                            {
+                                "id": "turn-2",
+                                "status": "inProgress",
+                                "error": Value::Null,
+                                "startedAt": 30,
+                                "completedAt": Value::Null,
+                                "durationMs": Value::Null,
+                                "items": [
+                                    {
+                                        "id": "item-3",
+                                        "type": "reasoning",
+                                        "text": "Need to inspect websocket state handling"
+                                    }
+                                ]
+                            }
+                        ],
+                        "tokenUsage": {
+                            "total": { "totalTokens": 12, "inputTokens": 6, "cachedInputTokens": 0, "outputTokens": 6, "reasoningOutputTokens": 2 },
+                            "last": { "totalTokens": 7, "inputTokens": 3, "cachedInputTokens": 0, "outputTokens": 4, "reasoningOutputTokens": 1 },
+                            "modelContextWindow": 1000
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        let detail = session_detail_payload(&state, "default", "thread-1", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            detail
+                .get("thread")
+                .and_then(|value| value.get("turns"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            detail.get("activeTurnId").and_then(Value::as_str),
+            Some("turn-2")
+        );
+        assert_eq!(
+            detail
+                .get("hydration")
+                .and_then(|value| value.get("remainingTurns"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+
+        let older = session_older_turns_payload(&state, "default", "thread-1", "turn-2", 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            older.get("turns").and_then(Value::as_array).map(Vec::len),
+            Some(1)
+        );
+
+        let turn = session_turn_payload(&state, "default", "thread-1", "turn-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            turn.get("turn")
+                .and_then(|value| value.get("id"))
+                .and_then(Value::as_str),
+            Some("turn-1")
+        );
+
+        let item = session_item_detail_payload(&state, "default", "thread-1", "turn-1", "item-2")
+            .await
+            .unwrap();
+        assert_eq!(
+            item.get("item")
+                .and_then(|value| value.get("detailState"))
+                .and_then(Value::as_str),
+            Some("loaded")
+        );
+
+        let search =
+            search_session_turns_payload(&state, "default", "thread-1", "websocket", None, 20)
+                .await
+                .unwrap();
+        assert_eq!(
+            search
+                .get("matches")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(3)
         );
 
         let _ = fs::remove_dir_all(sandbox);

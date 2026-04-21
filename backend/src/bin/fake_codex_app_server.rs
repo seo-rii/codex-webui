@@ -152,6 +152,22 @@ fn main() {
                     }
                 }));
             }
+            Some("thread/seed") => {
+                let thread = payload
+                    .get("params")
+                    .and_then(|params| params.get("thread"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                if let Some(thread_id) = thread.get("id").and_then(Value::as_str) {
+                    threads.insert(thread_id.to_string(), thread);
+                }
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "ok": true
+                    }
+                }));
+            }
             Some("thread/read") => {
                 let thread_id = payload
                     .get("params")

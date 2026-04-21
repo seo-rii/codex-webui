@@ -4444,6 +4444,7 @@ async fn search_sessions_payload(
     state: &AppState,
     profile_id: &str,
     query: &str,
+    scope: &str,
     archived: bool,
     cursor: Option<&str>,
     limit: u64,
@@ -4454,11 +4455,37 @@ async fn search_sessions_payload(
         return list_sessions_payload(state, profile_id, archived, cursor, limit, filter).await;
     }
 
+    let include_full_text = scope == "full";
     let sessions = collect_session_summaries_payload(state, profile_id, archived, filter).await?;
-    let matched = sessions
-        .into_iter()
-        .filter(|summary| session_summary_matches_query(summary, &needle))
-        .collect::<Vec<_>>();
+    let mut matched = Vec::new();
+
+    for summary in sessions {
+        if session_summary_matches_query(&summary, &needle) {
+            matched.push(summary);
+            continue;
+        }
+
+        if !include_full_text {
+            continue;
+        }
+
+        let Some(session_id) = summary.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(thread) = read_thread_payload(state, profile_id, session_id, true).await else {
+            continue;
+        };
+        if thread
+            .get("turns")
+            .cloned()
+            .unwrap_or_else(|| json!([]))
+            .to_string()
+            .to_lowercase()
+            .contains(&needle)
+        {
+            matched.push(summary);
+        }
+    }
     Ok(session_summary_page(matched, cursor, limit))
 }
 
@@ -9125,31 +9152,12 @@ async fn handle_sessions_api_http(
                     &filter,
                 )
                 .await
-            } else if scope == "full" {
-                let path = if let Some(query) = query.as_deref() {
-                    format!("/api/sessions?{query}")
-                } else {
-                    "/api/sessions".to_string()
-                };
-                internal_json_request_for_profile(
-                    &state,
-                    Some(&auth.profile_id),
-                    Method::GET,
-                    &path,
-                    None,
-                )
-                .await
-                .map_err(|error| {
-                    api_error(
-                        StatusCode::BAD_GATEWAY,
-                        format!("Failed to search sessions in the internal backend: {error}"),
-                    )
-                })
             } else {
                 search_sessions_payload(
                     &state,
                     &auth.profile_id,
                     &search_query,
+                    &scope,
                     archived,
                     cursor.as_deref(),
                     limit,
@@ -11117,51 +11125,6 @@ async fn execute_ws_method(
         ));
     }
 
-    fn append_session_filter_query(path: &mut String, params: &Value) {
-        let Some(filter) = params.get("filter") else {
-            return;
-        };
-        if filter
-            .get("pinnedOnly")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            path.push_str("&filterPinned=true");
-        }
-        if filter
-            .get("runningOnly")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            path.push_str("&filterRunning=true");
-        }
-        if filter
-            .get("queuedOnly")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            path.push_str("&filterQueued=true");
-        }
-        let highlight = filter
-            .get("highlight")
-            .and_then(Value::as_str)
-            .filter(|value| *value == "attention" || *value == "completed");
-        if let Some(highlight) = highlight {
-            path.push_str("&filterHighlight=");
-            path.push_str(highlight);
-        }
-        if let Some(tags) = filter.get("tags").and_then(Value::as_array) {
-            for tag in tags
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-            {
-                path.push_str("&filterTag=");
-                path.push_str(&urlencoding::encode(tag));
-            }
-        }
-    }
-
     match method {
         "config/get" => get_config_payload(state, &auth.profile_id)
             .await
@@ -11298,31 +11261,19 @@ async fn execute_ws_method(
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty());
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
-            if scope == "full" {
-                let query = urlencoding::encode(&query_raw);
-                let mut path = format!(
-                    "/api/sessions?query={query}&scope={scope}&archived={archived}&limit={limit}"
-                );
-                if let Some(cursor) = cursor {
-                    path.push_str("&cursor=");
-                    path.push_str(&urlencoding::encode(cursor));
-                }
-                append_session_filter_query(&mut path, &params);
-                internal_json_request(state, Method::GET, &path, None).await
-            } else {
-                let filter = session_filter_from_value(params.get("filter"));
-                search_sessions_payload(
-                    state,
-                    &auth.profile_id,
-                    &query_raw,
-                    archived,
-                    cursor,
-                    limit,
-                    &filter,
-                )
-                .await
-                .map_err(anyhow::Error::from)
-            }
+            let filter = session_filter_from_value(params.get("filter"));
+            search_sessions_payload(
+                state,
+                &auth.profile_id,
+                &query_raw,
+                scope,
+                archived,
+                cursor,
+                limit,
+                &filter,
+            )
+            .await
+            .map_err(anyhow::Error::from)
         }
         "session/create" => create_session_payload(
             state,
@@ -16416,6 +16367,7 @@ for raw_line in sys.stdin:
             &state,
             "default",
             "queue",
+            "summary",
             false,
             None,
             20,
@@ -16437,6 +16389,7 @@ for raw_line in sys.stdin:
             &state,
             "default",
             "BUILD",
+            "summary",
             false,
             None,
             20,
@@ -16452,6 +16405,69 @@ for raw_line in sys.stdin:
                 .and_then(|entry| entry.get("name"))
                 .and_then(Value::as_str),
             Some("Build Docs")
+        );
+
+        app_server_client(&state, "default")
+            .await
+            .unwrap()
+            .request(
+                "thread/seed",
+                json!({
+                    "thread": {
+                        "id": "thread-full",
+                        "name": "Research notes",
+                        "preview": "Unrelated summary",
+                        "cwd": workspace.display().to_string(),
+                        "archived": false,
+                        "createdAt": 3,
+                        "updatedAt": 4,
+                        "status": "idle",
+                        "isSubagent": false,
+                        "agentNickname": Value::Null,
+                        "agentRole": Value::Null,
+                        "turns": [
+                            {
+                                "id": "turn-1",
+                                "status": "completed",
+                                "error": Value::Null,
+                                "startedAt": 30,
+                                "completedAt": 40,
+                                "durationMs": 10,
+                                "items": [
+                                    {
+                                        "id": "item-1",
+                                        "type": "assistantMessage",
+                                        "text": "The websocket duplicate send race originates from optimistic queue replay."
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        let full_text = search_sessions_payload(
+            &state,
+            "default",
+            "optimistic queue replay",
+            "full",
+            false,
+            None,
+            20,
+            &SessionFilterCriteria::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            full_text
+                .get("sessions")
+                .and_then(Value::as_array)
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry.get("id"))
+                .and_then(Value::as_str),
+            Some("thread-full")
         );
 
         let _ = fs::remove_dir_all(sandbox);

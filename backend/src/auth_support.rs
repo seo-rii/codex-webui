@@ -266,3 +266,91 @@ fn append_vary(headers: &mut HeaderMap, value: &str) {
         headers.insert(header::VARY, header_value);
     }
 }
+
+pub(crate) async fn check_rate_limit(state: &AppState, identifier: &str) -> bool {
+    let now = now_millis();
+    let mut attempts = state.login_attempts.lock().await;
+    let history = attempts.entry(identifier.to_string()).or_default();
+    history.retain(|entry| now.saturating_sub(*entry) < LOGIN_WINDOW_MS);
+    history.len() < LOGIN_MAX_ATTEMPTS
+}
+
+pub(crate) async fn record_login_failure(state: &AppState, identifier: &str) {
+    let now = now_millis();
+    let mut attempts = state.login_attempts.lock().await;
+    let history = attempts.entry(identifier.to_string()).or_default();
+    history.retain(|entry| now.saturating_sub(*entry) < LOGIN_WINDOW_MS);
+    history.push(now);
+}
+
+pub(crate) async fn clear_login_failures(state: &AppState, identifier: &str) {
+    state.login_attempts.lock().await.remove(identifier);
+}
+
+pub(crate) fn verify_password_pair(
+    plain: Option<&String>,
+    hashed: Option<&String>,
+    input: &str,
+    required_error: &str,
+) -> Result<bool> {
+    if let Some(password) = plain {
+        return Ok(password.as_bytes().ct_eq(input.as_bytes()).into());
+    }
+
+    let Some(password_hash) = hashed else {
+        return Err(anyhow!(required_error.to_string()));
+    };
+
+    let mut parts = password_hash.split('$');
+    let Some(kind) = parts.next() else {
+        return Ok(false);
+    };
+    let Some(saved_salt) = parts.next() else {
+        return Ok(false);
+    };
+    let Some(saved_key) = parts.next() else {
+        return Ok(false);
+    };
+
+    if kind != "scrypt" {
+        return Err(anyhow!("Unsupported password hash format."));
+    }
+
+    let salt = URL_SAFE_NO_PAD
+        .decode(saved_salt)
+        .context("invalid password hash salt")?;
+    let expected = URL_SAFE_NO_PAD
+        .decode(saved_key)
+        .context("invalid password hash key")?;
+    let params = ScryptParams::new(14, 8, 1, expected.len())?;
+    let mut derived = vec![0_u8; expected.len()];
+    scrypt(input.as_bytes(), &salt, &params, &mut derived)
+        .context("failed to derive password hash")?;
+    Ok(derived.ct_eq(&expected).into())
+}
+
+pub(crate) fn authenticate_role(config: &Config, input: &str) -> Result<Option<UserRole>> {
+    if verify_password_pair(
+        config.password.as_ref(),
+        config.password_hash.as_ref(),
+        input,
+        "Set CODEX_WEBUI_PASSWORD_HASH or CODEX_WEBUI_PASSWORD before using the Rust gateway.",
+    )? {
+        return Ok(Some(UserRole::Admin));
+    }
+
+    if config.viewer_password.is_none() && config.viewer_password_hash.is_none() {
+        return Ok(None);
+    }
+
+    if verify_password_pair(
+        config.viewer_password.as_ref(),
+        config.viewer_password_hash.as_ref(),
+        input,
+        "Failed to verify viewer password.",
+    )? {
+        return Ok(Some(UserRole::Viewer));
+    }
+
+    Ok(None)
+}

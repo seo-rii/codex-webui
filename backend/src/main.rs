@@ -60,6 +60,7 @@ mod config_support;
 mod event_mapping_support;
 mod git_support;
 mod github_support;
+mod request_cache_support;
 mod runtime_env_support;
 mod session_state_support;
 mod static_support;
@@ -78,6 +79,7 @@ use config_support::*;
 use event_mapping_support::*;
 use git_support::*;
 use github_support::*;
+use request_cache_support::*;
 use runtime_env_support::*;
 use session_state_support::*;
 use static_support::*;
@@ -8104,52 +8106,6 @@ async fn upload_attachments(
             .map(attachment_payload_from_record)
             .collect::<Vec<_>>()
     }))
-}
-
-async fn cached_response(state: &AppState, request_id: &str) -> Option<ServerEnvelope> {
-    let mut cache = state.response_cache.lock().await;
-    cache.retain(|_, entry| entry.created_at.elapsed() < CACHE_TTL);
-    cache.get(request_id).map(|entry| entry.message.clone())
-}
-
-async fn cache_response(state: &AppState, request_id: &str, message: ServerEnvelope) {
-    let mut cache = state.response_cache.lock().await;
-    cache.retain(|_, entry| entry.created_at.elapsed() < CACHE_TTL);
-    cache.insert(
-        request_id.to_string(),
-        CachedResponse {
-            created_at: Instant::now(),
-            message,
-        },
-    );
-}
-
-async fn register_inflight_request(
-    state: &AppState,
-    request_id: &str,
-    out_tx: &mpsc::UnboundedSender<ServerEnvelope>,
-) -> bool {
-    let mut inflight = state.inflight_requests.lock().await;
-    inflight.retain(|_, waiters| !waiters.is_empty());
-
-    if let Some(waiters) = inflight.get_mut(request_id) {
-        waiters.push(out_tx.clone());
-        return false;
-    }
-
-    inflight.insert(request_id.to_string(), vec![out_tx.clone()]);
-    true
-}
-
-async fn resolve_inflight_request(state: &AppState, request_id: &str, message: ServerEnvelope) {
-    let waiters = {
-        let mut inflight = state.inflight_requests.lock().await;
-        inflight.remove(request_id).unwrap_or_default()
-    };
-
-    for waiter in waiters {
-        let _ = waiter.send(message.clone());
-    }
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response {

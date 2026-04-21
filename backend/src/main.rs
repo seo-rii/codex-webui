@@ -1,6 +1,7 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
+    future::Future,
     net::{SocketAddr, TcpListener},
     path::{Component, Path, PathBuf},
     process::Stdio,
@@ -30,7 +31,7 @@ use backend::codex_app_server::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt, TryStreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
 use reqwest::multipart::{Form, Part};
 use scrypt::{Params as ScryptParams, scrypt};
@@ -67,12 +68,19 @@ const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(10);
 const QUOTA_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const DEFAULT_NOTIFICATION_LIMIT: usize = 80;
+const DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT: usize = 40;
 const TERMINAL_BUFFER_LIMIT: usize = 500_000;
 const TERMINAL_RELAY_PREFIX: &str = "__terminal__:";
 const STATIC_BASE_PLACEHOLDER: &str = "/__CODEX_WEBUI_BASE__";
 const RUNTIME_ERROR_LOG_NAME: &str = "runtime-errors.jsonl";
 const INTERNAL_NODE_LOG_NAME: &str = "internal-node.log";
 const INTERNAL_NODE_STDERR_TAIL_LIMIT: usize = 120;
+const INTERNAL_NODE_DISABLE_QUEUE_LIFECYCLE_ENV: &str = "CODEX_WEBUI_RUST_OWNS_QUEUE_LIFECYCLE";
+const AUTOSTART_LABEL: &str = "dev.seorii.codex-webui";
+const WINDOWS_STARTUP_SCRIPT: &str = "codex-webui.vbs";
+const MACOS_LAUNCH_AGENT: &str = "dev.seorii.codex-webui.plist";
+const LINUX_SYSTEMD_SERVICE: &str = "codex-webui-autostart.service";
+const LINUX_DESKTOP_ENTRY: &str = "codex-webui.desktop";
 
 tokio::task_local! {
     static ACTIVE_PROFILE_ID: String;
@@ -88,6 +96,10 @@ fn global_relay_key(profile_id: &str) -> String {
 
 fn request_cache_key(profile_id: &str, request_id: &str) -> String {
     format!("profile::{profile_id}::request::{request_id}")
+}
+
+fn runtime_session_key(profile_id: &str, session_id: &str) -> String {
+    format!("profile::{profile_id}::session-runtime::{session_id}")
 }
 
 fn runtime_logs_dir(config: &Config) -> PathBuf {
@@ -185,6 +197,9 @@ struct Config {
     node_entry: PathBuf,
     node_binary: String,
     codex_bin: String,
+    system_shutdown_enabled: bool,
+    system_shutdown_delay_seconds: u64,
+    system_shutdown_command_override: Option<String>,
     password: Option<String>,
     password_hash: Option<String>,
     viewer_password: Option<String>,
@@ -264,6 +279,10 @@ struct AppState {
     relays: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
     terminals: Arc<Mutex<HashMap<String, Arc<TerminalSession>>>>,
     ui_state_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    automation_timers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    queue_dispatching: Arc<Mutex<HashSet<String>>>,
+    active_turns: Arc<Mutex<HashMap<String, String>>>,
+    shutdown_timers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Clone)]
@@ -418,6 +437,14 @@ struct UploadFilePayload {
     data_base64: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredAttachmentRecord {
+    id: String,
+    original_name: String,
+    created_at: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AuditLogEntry {
     id: String,
@@ -456,6 +483,36 @@ struct EditableFilePayload {
     content: String,
     language: String,
     writable: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ArenaContestantRecord {
+    id: String,
+    session_id: String,
+    model: String,
+    label: String,
+    status: String,
+    response: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ArenaRunRecord {
+    id: String,
+    prompt: String,
+    cwd: String,
+    status: String,
+    created_at: u64,
+    updated_at: u64,
+    contestants: Vec<ArenaContestantRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct ArenaStoreState {
+    runs: Vec<ArenaRunRecord>,
 }
 
 #[derive(Clone, Debug)]
@@ -584,7 +641,16 @@ async fn main() -> Result<()> {
             relays: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),
             ui_state_locks: Arc::new(Mutex::new(HashMap::new())),
+            automation_timers: Arc::new(Mutex::new(HashMap::new())),
+            queue_dispatching: Arc::new(Mutex::new(HashSet::new())),
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
         };
+
+        tokio::spawn(restore_automation_schedules(state.clone()));
+        for profile_id in state.config.profiles.keys().cloned().collect::<Vec<_>>() {
+            tokio::spawn(restore_runtime_profile_state(state.clone(), profile_id));
+        }
 
         let router = Router::new()
             .route(&with_base(&config.base_path, "/ws"), get(handle_ws))
@@ -662,6 +728,10 @@ impl Config {
             env::var("CODEX_WEBUI_INTERNAL_PORT").ok(),
             choose_free_port()?,
         )?;
+        let system_shutdown_delay_seconds = env::var("CODEX_WEBUI_SHUTDOWN_DELAY_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(30);
         let internal_proxy_token = Uuid::new_v4().to_string();
         let node_entry = project_root.join("build/internal/index.js");
         if !node_entry.exists() {
@@ -696,6 +766,13 @@ impl Config {
             node_entry,
             node_binary: env::var("NODE_BINARY").unwrap_or_else(|_| "node".to_string()),
             codex_bin: env::var("CODEX_WEBUI_CODEX_BIN").unwrap_or_else(|_| "codex".to_string()),
+            system_shutdown_enabled: env::var("CODEX_WEBUI_ENABLE_SYSTEM_SHUTDOWN")
+                .is_ok_and(|value| value == "true"),
+            system_shutdown_delay_seconds,
+            system_shutdown_command_override: env::var("CODEX_WEBUI_SHUTDOWN_COMMAND")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             password: env::var("CODEX_WEBUI_PASSWORD").ok(),
             password_hash: env::var("CODEX_WEBUI_PASSWORD_HASH").ok(),
             viewer_password: env::var("CODEX_WEBUI_VIEWER_PASSWORD").ok(),
@@ -917,6 +994,23 @@ fn query_param_value(query: Option<&str>, key: &str) -> Option<String> {
             .ok()
             .map(|value| value.into_owned())
     })
+}
+
+fn query_param_values(query: Option<&str>, key: &str) -> Vec<String> {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|entry| {
+            let (raw_key, raw_value) = entry.split_once('=').unwrap_or((entry, ""));
+            if raw_key != key {
+                return None;
+            }
+            let decoded = raw_value.replace('+', "%20");
+            urlencoding::decode(&decoded)
+                .ok()
+                .map(|value| value.into_owned())
+        })
+        .collect()
 }
 
 async fn list_directories_payload(
@@ -1299,6 +1393,593 @@ async fn write_profile_ui_state(config: &Config, profile_id: &str, ui_state: &Va
         .await
         .context("failed to write ui-state file")?;
     Ok(())
+}
+
+fn theme_settings_path(config: &Config, profile_id: &str) -> PathBuf {
+    resolve_runtime_profile(config, profile_id)
+        .data_dir
+        .join("theme-settings.json")
+}
+
+async fn read_stored_theme_settings(config: &Config, profile_id: &str) -> Result<Option<Value>> {
+    let path = theme_settings_path(config, profile_id);
+    let raw = match tokio_fs::read_to_string(&path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("failed to read theme settings"),
+    };
+
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => {
+            let backup_path = path.with_extension(format!("json.corrupt-{}", now_millis()));
+            let _ = tokio_fs::rename(&path, &backup_path).await;
+            Ok(None)
+        }
+    }
+}
+
+async fn write_stored_theme_settings(
+    config: &Config,
+    profile_id: &str,
+    theme: &Value,
+) -> Result<Value> {
+    let path = theme_settings_path(config, profile_id);
+    if let Some(parent) = path.parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .context("failed to create theme settings directory")?;
+    }
+    let payload = theme.clone();
+    let bytes = serde_json::to_vec_pretty(&payload).context("failed to encode theme settings")?;
+    tokio_fs::write(&path, bytes)
+        .await
+        .context("failed to write theme settings")?;
+    Ok(payload)
+}
+
+fn home_dir_path() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn config_home_path() -> Option<PathBuf> {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir_path().map(|home| home.join(".config")))
+}
+
+fn windows_startup_path() -> Option<PathBuf> {
+    env::var_os("APPDATA").map(PathBuf::from).map(|value| {
+        value
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("Startup")
+            .join(WINDOWS_STARTUP_SCRIPT)
+    })
+}
+
+fn macos_launch_agent_path() -> Option<PathBuf> {
+    home_dir_path().map(|home| {
+        home.join("Library")
+            .join("LaunchAgents")
+            .join(MACOS_LAUNCH_AGENT)
+    })
+}
+
+fn linux_systemd_user_path(config_home: &Path) -> PathBuf {
+    config_home
+        .join("systemd")
+        .join("user")
+        .join(LINUX_SYSTEMD_SERVICE)
+}
+
+fn linux_desktop_entry_path(config_home: &Path) -> PathBuf {
+    config_home.join("autostart").join(LINUX_DESKTOP_ENTRY)
+}
+
+async fn path_exists_async(path: Option<&Path>) -> bool {
+    match path {
+        Some(path) => tokio_fs::metadata(path).await.is_ok(),
+        None => false,
+    }
+}
+
+fn current_launch_command(config: &Config) -> Result<(PathBuf, PathBuf)> {
+    let executable = env::current_exe().context("failed to resolve the current executable")?;
+    if !executable.exists() {
+        anyhow::bail!(
+            "Could not resolve the codex-webui executable at {}.",
+            executable.display()
+        );
+    }
+    Ok((executable, config.project_root.clone()))
+}
+
+fn escape_windows_vbs_string(value: &str) -> String {
+    value.replace('"', "\"\"")
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn escape_systemd_value(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn escape_desktop_value(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+async fn can_use_linux_systemd_user() -> bool {
+    run_command_with_timeout(
+        "systemctl",
+        vec!["--user".to_string(), "show-environment".to_string()],
+        Duration::from_secs(3),
+    )
+    .await
+    .map(|output| output.status.success())
+    .unwrap_or(false)
+}
+
+async fn preferred_linux_autostart_provider(config_home: &Path) -> &'static str {
+    if path_exists_async(Some(linux_systemd_user_path(config_home).as_path())).await {
+        return "linux-systemd-user";
+    }
+    if path_exists_async(Some(linux_desktop_entry_path(config_home).as_path())).await {
+        return "linux-xdg-autostart";
+    }
+    if can_use_linux_systemd_user().await {
+        "linux-systemd-user"
+    } else {
+        "linux-xdg-autostart"
+    }
+}
+
+async fn get_autostart_state(config: &Config) -> Result<Value> {
+    if current_launch_command(config).is_err() {
+        return Ok(json!({
+            "available": false,
+            "enabled": false,
+            "provider": Value::Null,
+            "location": Value::Null
+        }));
+    }
+
+    if cfg!(windows) {
+        let location = windows_startup_path();
+        return Ok(json!({
+            "available": location.is_some(),
+            "enabled": path_exists_async(location.as_deref()).await,
+            "provider": location.as_ref().map(|_| "windows-startup"),
+            "location": location.map(|value| value.display().to_string())
+        }));
+    }
+
+    if cfg!(target_os = "macos") {
+        let location = macos_launch_agent_path();
+        return Ok(json!({
+            "available": location.is_some(),
+            "enabled": path_exists_async(location.as_deref()).await,
+            "provider": location.as_ref().map(|_| "macos-launch-agent"),
+            "location": location.map(|value| value.display().to_string())
+        }));
+    }
+
+    if cfg!(target_os = "linux") {
+        let Some(config_home) = config_home_path() else {
+            return Ok(json!({
+                "available": false,
+                "enabled": false,
+                "provider": Value::Null,
+                "location": Value::Null
+            }));
+        };
+        let provider = preferred_linux_autostart_provider(&config_home).await;
+        let location = if provider == "linux-systemd-user" {
+            linux_systemd_user_path(&config_home)
+        } else {
+            linux_desktop_entry_path(&config_home)
+        };
+        return Ok(json!({
+            "available": true,
+            "enabled": path_exists_async(Some(location.as_path())).await,
+            "provider": provider,
+            "location": location.display().to_string()
+        }));
+    }
+
+    Ok(json!({
+        "available": false,
+        "enabled": false,
+        "provider": Value::Null,
+        "location": Value::Null
+    }))
+}
+
+async fn write_windows_startup_script(config: &Config) -> Result<()> {
+    let target_path =
+        windows_startup_path().ok_or_else(|| anyhow!("Windows startup folder is unavailable."))?;
+    let (executable, working_directory) = current_launch_command(config)?;
+    if let Some(parent) = target_path.parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .context("failed to create the Windows startup directory")?;
+    }
+    tokio_fs::write(
+        &target_path,
+        [
+            "Set WshShell = CreateObject(\"WScript.Shell\")".to_string(),
+            format!(
+                "WshShell.CurrentDirectory = \"{}\"",
+                escape_windows_vbs_string(&working_directory.display().to_string())
+            ),
+            format!(
+                "WshShell.Run \"\"\"\" & \"{}\" & \"\"\"\", 0, False",
+                escape_windows_vbs_string(&executable.display().to_string())
+            ),
+        ]
+        .join("\r\n"),
+    )
+    .await
+    .context("failed to write the Windows startup script")?;
+    Ok(())
+}
+
+async fn write_macos_launch_agent(config: &Config) -> Result<()> {
+    let target_path = macos_launch_agent_path()
+        .ok_or_else(|| anyhow!("LaunchAgents directory is unavailable."))?;
+    let (executable, working_directory) = current_launch_command(config)?;
+    if let Some(parent) = target_path.parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .context("failed to create the LaunchAgents directory")?;
+    }
+    let log_path = config.data_dir.join("autostart-launch.log");
+    if let Some(parent) = log_path.parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .context("failed to create the autostart log directory")?;
+    }
+    tokio_fs::write(
+        &target_path,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n  <dict>\n    <key>Label</key>\n    <string>{}</string>\n    <key>ProgramArguments</key>\n    <array>\n      <string>{}</string>\n    </array>\n    <key>WorkingDirectory</key>\n    <string>{}</string>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>KeepAlive</key>\n    <false/>\n    <key>StandardOutPath</key>\n    <string>{}</string>\n    <key>StandardErrorPath</key>\n    <string>{}</string>\n  </dict>\n</plist>\n",
+            AUTOSTART_LABEL,
+            escape_xml(&executable.display().to_string()),
+            escape_xml(&working_directory.display().to_string()),
+            escape_xml(&log_path.display().to_string()),
+            escape_xml(&log_path.display().to_string())
+        ),
+    )
+    .await
+    .context("failed to write the launch agent")?;
+
+    if let Ok(uid) = env::var("UID").or_else(|_| env::var("EUID")) {
+        let domain = format!("gui/{uid}");
+        let _ = run_command_with_timeout(
+            "launchctl",
+            vec![
+                "bootout".to_string(),
+                domain.clone(),
+                target_path.display().to_string(),
+            ],
+            Duration::from_secs(4),
+        )
+        .await;
+        let _ = run_command_with_timeout(
+            "launchctl",
+            vec![
+                "bootstrap".to_string(),
+                domain,
+                target_path.display().to_string(),
+            ],
+            Duration::from_secs(4),
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+async fn write_linux_systemd_user_service(config: &Config) -> Result<()> {
+    let config_home =
+        config_home_path().ok_or_else(|| anyhow!("XDG config home is unavailable."))?;
+    let target_path = linux_systemd_user_path(&config_home);
+    let (executable, working_directory) = current_launch_command(config)?;
+    if let Some(parent) = target_path.parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .context("failed to create the systemd user directory")?;
+    }
+    tokio_fs::write(
+        &target_path,
+        format!(
+            "[Unit]\nDescription=Codex Web UI autostart\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+            escape_systemd_value(&working_directory.display().to_string()),
+            escape_systemd_value(&executable.display().to_string())
+        ),
+    )
+    .await
+    .context("failed to write the systemd user service")?;
+
+    let daemon_reload = run_command_with_timeout(
+        "systemctl",
+        vec!["--user".to_string(), "daemon-reload".to_string()],
+        Duration::from_secs(5),
+    )
+    .await?;
+    if !daemon_reload.status.success() {
+        anyhow::bail!("Failed to reload the user systemd daemon.");
+    }
+
+    let enable = run_command_with_timeout(
+        "systemctl",
+        vec![
+            "--user".to_string(),
+            "enable".to_string(),
+            LINUX_SYSTEMD_SERVICE.to_string(),
+        ],
+        Duration::from_secs(5),
+    )
+    .await?;
+    if !enable.status.success() {
+        anyhow::bail!("Failed to enable the user systemd service.");
+    }
+
+    Ok(())
+}
+
+async fn write_linux_desktop_entry(config: &Config) -> Result<()> {
+    let config_home =
+        config_home_path().ok_or_else(|| anyhow!("XDG config home is unavailable."))?;
+    let target_path = linux_desktop_entry_path(&config_home);
+    let (executable, working_directory) = current_launch_command(config)?;
+    if let Some(parent) = target_path.parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .context("failed to create the desktop autostart directory")?;
+    }
+    tokio_fs::write(
+        &target_path,
+        format!(
+            "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Codex Web UI\nComment=Start Codex Web UI automatically when you sign in\nExec={}\nPath={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\nHidden=false\n",
+            escape_desktop_value(&executable.display().to_string()),
+            escape_desktop_value(&working_directory.display().to_string())
+        ),
+    )
+    .await
+    .context("failed to write the desktop autostart entry")?;
+    Ok(())
+}
+
+async fn disable_windows_startup() {
+    if let Some(path) = windows_startup_path() {
+        let _ = tokio_fs::remove_file(path).await;
+    }
+}
+
+async fn disable_macos_launch_agent() {
+    if let Some(path) = macos_launch_agent_path() {
+        if let Ok(uid) = env::var("UID").or_else(|_| env::var("EUID")) {
+            let _ = run_command_with_timeout(
+                "launchctl",
+                vec![
+                    "bootout".to_string(),
+                    format!("gui/{uid}"),
+                    path.display().to_string(),
+                ],
+                Duration::from_secs(4),
+            )
+            .await;
+        }
+        let _ = tokio_fs::remove_file(path).await;
+    }
+}
+
+async fn disable_linux_autostart() {
+    if let Some(config_home) = config_home_path() {
+        let systemd_path = linux_systemd_user_path(&config_home);
+        if path_exists_async(Some(systemd_path.as_path())).await {
+            let _ = run_command_with_timeout(
+                "systemctl",
+                vec![
+                    "--user".to_string(),
+                    "disable".to_string(),
+                    LINUX_SYSTEMD_SERVICE.to_string(),
+                ],
+                Duration::from_secs(5),
+            )
+            .await;
+            let _ = tokio_fs::remove_file(&systemd_path).await;
+            let _ = run_command_with_timeout(
+                "systemctl",
+                vec!["--user".to_string(), "daemon-reload".to_string()],
+                Duration::from_secs(5),
+            )
+            .await;
+        }
+        let _ = tokio_fs::remove_file(linux_desktop_entry_path(&config_home)).await;
+    }
+}
+
+async fn save_autostart_enabled(config: &Config, enabled: bool) -> Result<Value> {
+    if !enabled {
+        if cfg!(windows) {
+            disable_windows_startup().await;
+        } else if cfg!(target_os = "macos") {
+            disable_macos_launch_agent().await;
+        } else if cfg!(target_os = "linux") {
+            disable_linux_autostart().await;
+        }
+        return get_autostart_state(config).await;
+    }
+
+    if cfg!(windows) {
+        write_windows_startup_script(config).await?;
+        return get_autostart_state(config).await;
+    }
+
+    if cfg!(target_os = "macos") {
+        write_macos_launch_agent(config).await?;
+        return get_autostart_state(config).await;
+    }
+
+    if cfg!(target_os = "linux") {
+        if can_use_linux_systemd_user().await {
+            match write_linux_systemd_user_service(config).await {
+                Ok(()) => return get_autostart_state(config).await,
+                Err(error) => {
+                    warn!("failed to configure systemd user autostart: {error:#}");
+                    if let Some(config_home) = config_home_path() {
+                        let _ = tokio_fs::remove_file(linux_systemd_user_path(&config_home)).await;
+                    }
+                }
+            }
+        }
+
+        write_linux_desktop_entry(config).await?;
+        return get_autostart_state(config).await;
+    }
+
+    anyhow::bail!("Automatic startup is not supported on this operating system.");
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct SystemShutdownPlan {
+    command: String,
+    args: Vec<String>,
+    availability_check: Option<(String, Vec<String>)>,
+}
+
+async fn is_root_user() -> bool {
+    run_command_with_timeout("id", vec!["-u".to_string()], Duration::from_secs(2))
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+async fn resolve_command_path(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = PathBuf::from(trimmed);
+    if candidate.is_absolute() || trimmed.contains('/') || trimmed.contains('\\') {
+        if candidate.exists() {
+            return Some(candidate.display().to_string());
+        }
+    }
+
+    resolve_binary_path(trimmed).await
+}
+
+async fn resolve_system_shutdown_plan(config: &Config) -> Option<SystemShutdownPlan> {
+    if !config.system_shutdown_enabled {
+        return None;
+    }
+
+    if cfg!(windows) {
+        let command = config
+            .system_shutdown_command_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("shutdown")
+            .to_string();
+        return Some(SystemShutdownPlan {
+            command,
+            args: if config.system_shutdown_command_override.is_some() {
+                Vec::new()
+            } else {
+                vec!["/s".to_string(), "/t".to_string(), "0".to_string()]
+            },
+            availability_check: None,
+        });
+    }
+
+    let override_command = config
+        .system_shutdown_command_override
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let direct_command = if !override_command.is_empty() {
+        resolve_command_path(&override_command).await
+    } else if let Some(command) = resolve_command_path("shutdown").await {
+        Some(command)
+    } else if let Some(command) = resolve_command_path("/usr/sbin/shutdown").await {
+        Some(command)
+    } else if let Some(command) = resolve_command_path("/sbin/shutdown").await {
+        Some(command)
+    } else {
+        resolve_command_path("systemctl").await
+    }?;
+
+    let direct_args = if !override_command.is_empty() {
+        Vec::new()
+    } else if Path::new(&direct_command)
+        .file_name()
+        .and_then(|value| value.to_str())
+        == Some("systemctl")
+    {
+        vec!["poweroff".to_string()]
+    } else {
+        vec!["-h".to_string(), "now".to_string()]
+    };
+
+    if is_root_user().await {
+        return Some(SystemShutdownPlan {
+            command: direct_command,
+            args: direct_args,
+            availability_check: None,
+        });
+    }
+
+    let sudo_command = resolve_command_path("sudo").await?;
+    let mut sudo_args = vec!["-n".to_string(), direct_command.clone()];
+    sudo_args.extend(direct_args.clone());
+    let mut check_args = vec!["-n".to_string(), "-l".to_string(), direct_command];
+    check_args.extend(direct_args);
+    Some(SystemShutdownPlan {
+        command: sudo_command.clone(),
+        args: sudo_args,
+        availability_check: Some((sudo_command, check_args)),
+    })
+}
+
+async fn system_shutdown_capability(config: &Config) -> (bool, Option<SystemShutdownPlan>) {
+    let Some(plan) = resolve_system_shutdown_plan(config).await else {
+        return (false, None);
+    };
+
+    let Some((check_command, check_args)) = plan.availability_check.clone() else {
+        return (true, Some(plan));
+    };
+
+    let available =
+        run_command_with_timeout(&check_command, check_args, Duration::from_millis(1500))
+            .await
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+    if available {
+        (true, Some(plan))
+    } else {
+        (false, None)
+    }
 }
 
 async fn with_ui_state_read<R, F>(state: &AppState, profile_id: &str, reader: F) -> ApiResult<R>
@@ -1869,6 +2550,3329 @@ async fn delete_prompt_preset_payload(
     Ok(payload)
 }
 
+async fn get_session_draft_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Value> {
+    with_ui_state_read(state, profile_id, |ui_state| {
+        let stored = ui_state
+            .get("draftsByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get(session_id));
+        Ok(json!({
+            "sessionId": session_id,
+            "draft": stored
+                .and_then(|entry| entry.get("draft"))
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            "intent": stored
+                .and_then(|entry| entry.get("intent"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "updatedAt": stored
+                .and_then(|entry| entry.get("updatedAt"))
+                .cloned()
+                .unwrap_or(Value::Null)
+        }))
+    })
+    .await
+}
+
+async fn save_session_draft_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    draft: &str,
+    intent: &str,
+) -> ApiResult<Value> {
+    let trimmed = draft.trim();
+    if trimmed.is_empty() {
+        return clear_session_draft_payload(state, profile_id, session_id).await;
+    }
+
+    let normalized_intent = match intent {
+        "steer" => "steer",
+        "queue" => "queue",
+        _ => "message",
+    };
+    let updated_at = now_unix_ms();
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(drafts_by_thread_id) = ui_state
+            .get_mut("draftsByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "draft state is missing",
+            ));
+        };
+        drafts_by_thread_id.insert(
+            session_id.to_string(),
+            json!({
+                "draft": draft,
+                "intent": normalized_intent,
+                "updatedAt": updated_at
+            }),
+        );
+        Ok(json!({
+            "sessionId": session_id,
+            "draft": draft,
+            "intent": normalized_intent,
+            "updatedAt": updated_at
+        }))
+    })
+    .await
+}
+
+async fn clear_session_draft_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Value> {
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(drafts_by_thread_id) = ui_state
+            .get_mut("draftsByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "draft state is missing",
+            ));
+        };
+        drafts_by_thread_id.remove(session_id);
+        Ok(json!({
+            "sessionId": session_id,
+            "draft": "",
+            "intent": Value::Null,
+            "updatedAt": Value::Null
+        }))
+    })
+    .await
+}
+
+async fn get_session_queue_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Value> {
+    with_ui_state_read(state, profile_id, |ui_state| {
+        let stored = ui_state
+            .get("queuesByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get(session_id));
+        let items = stored
+            .and_then(|entry| entry.get("items"))
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let resume_pending = stored
+            .and_then(|entry| entry.get("resumePending"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let item_count = items.as_array().map(Vec::len).unwrap_or(0);
+        Ok(json!({
+            "sessionId": session_id,
+            "items": items,
+            "resumeRequired": resume_pending && item_count > 0,
+            "updatedAt": stored
+                .and_then(|entry| entry.get("updatedAt"))
+                .cloned()
+                .unwrap_or(Value::Null)
+        }))
+    })
+    .await
+}
+
+fn string_array_from_value(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+async fn list_session_attachment_records(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> Result<Vec<StoredAttachmentRecord>> {
+    let uploads_dir = resolve_runtime_profile(&state.config, profile_id)
+        .data_dir
+        .join("uploads")
+        .join(session_id);
+    let mut entries = match tokio_fs::read_dir(&uploads_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read session uploads directory {}",
+                    uploads_dir.display()
+                )
+            });
+        }
+    };
+
+    let mut attachments = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = match tokio_fs::read_to_string(&path).await {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        if let Ok(record) = serde_json::from_str::<StoredAttachmentRecord>(&raw) {
+            attachments.push(record);
+        }
+    }
+
+    attachments.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(attachments)
+}
+
+async fn resolve_queue_attachment_metadata(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    attachment_ids: Option<&Value>,
+) -> ApiResult<(Vec<String>, Vec<String>)> {
+    let requested_ids = string_array_from_value(attachment_ids);
+    if requested_ids.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let requested = requested_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let attachments = list_session_attachment_records(state, profile_id, session_id)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let filtered = attachments
+        .into_iter()
+        .filter(|attachment| requested.contains(attachment.id.as_str()))
+        .collect::<Vec<_>>();
+
+    Ok((
+        filtered
+            .iter()
+            .map(|attachment| attachment.id.clone())
+            .collect(),
+        filtered
+            .iter()
+            .map(|attachment| attachment.original_name.clone())
+            .collect(),
+    ))
+}
+
+async fn emit_queue_updated(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    queue: Option<Value>,
+) {
+    let queue = match queue {
+        Some(queue) => queue,
+        None => match get_session_queue_payload(state, profile_id, session_id).await {
+            Ok(queue) => queue,
+            Err(_) => return,
+        },
+    };
+
+    emit_session_notification(
+        state,
+        profile_id,
+        session_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/queueUpdated",
+            "params": {
+                "queue": queue
+            }
+        }),
+    )
+    .await;
+    emit_session_summary_updated(state, profile_id, session_id, None).await;
+    emit_runtime_profile_config_updated(state, profile_id).await;
+}
+
+async fn enqueue_session_queue_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    prompt: &str,
+    attachment_ids: Option<&Value>,
+) -> ApiResult<Value> {
+    let trimmed_prompt = prompt.trim();
+    let (resolved_attachment_ids, attachment_names) =
+        resolve_queue_attachment_metadata(state, profile_id, session_id, attachment_ids).await?;
+    if trimmed_prompt.is_empty() && resolved_attachment_ids.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
+    }
+
+    cancel_scheduled_shutdown_for_activity(state, profile_id).await;
+
+    let queue_item_id = Uuid::new_v4().to_string();
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(queues_by_thread_id) = ui_state
+            .get_mut("queuesByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue state is missing",
+            ));
+        };
+
+        let updated_at = now_unix_ms();
+        let entry = queues_by_thread_id
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                json!({
+                    "items": [],
+                    "resumePending": false,
+                    "updatedAt": updated_at
+                })
+            });
+        let Some(queue) = entry.as_object_mut() else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue state had an unexpected shape",
+            ));
+        };
+        let Some(items) = queue.get_mut("items").and_then(Value::as_array_mut) else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue items are missing",
+            ));
+        };
+        items.push(json!({
+            "id": queue_item_id,
+            "prompt": trimmed_prompt,
+            "attachmentIds": resolved_attachment_ids,
+            "attachmentNames": attachment_names,
+            "createdAt": updated_at
+        }));
+        queue.insert("resumePending".to_string(), json!(false));
+        queue.insert("updatedAt".to_string(), json!(updated_at));
+        Ok(())
+    })
+    .await?;
+
+    let mut queue = get_session_queue_payload(state, profile_id, session_id).await?;
+    if let Some(queue_object) = queue.as_object_mut() {
+        queue_object.insert("enqueueAccepted".to_string(), json!(true));
+        queue_object.insert("enqueueItemId".to_string(), json!(queue_item_id));
+    }
+    emit_queue_updated(state, profile_id, session_id, Some(queue.clone())).await;
+
+    Ok(queue)
+}
+
+async fn remove_session_queue_item_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    queue_id: &str,
+) -> ApiResult<Value> {
+    let changed = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(queues_by_thread_id) = ui_state
+            .get_mut("queuesByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue state is missing",
+            ));
+        };
+
+        let Some(existing) = queues_by_thread_id.get_mut(session_id) else {
+            return Ok(false);
+        };
+        let Some(queue) = existing.as_object_mut() else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue state had an unexpected shape",
+            ));
+        };
+        let Some(items) = queue.get_mut("items").and_then(Value::as_array_mut) else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue items are missing",
+            ));
+        };
+
+        let previous_len = items.len();
+        items.retain(|item| item.get("id").and_then(Value::as_str) != Some(queue_id));
+        if items.len() == previous_len {
+            return Ok(false);
+        }
+
+        if items.is_empty() {
+            queues_by_thread_id.remove(session_id);
+        } else {
+            queue.insert("updatedAt".to_string(), json!(now_unix_ms()));
+        }
+        Ok(true)
+    })
+    .await?;
+    if !changed {
+        return Err(api_error(StatusCode::NOT_FOUND, "QUEUE_ITEM_NOT_FOUND"));
+    }
+
+    let queue = get_session_queue_payload(state, profile_id, session_id).await?;
+    emit_queue_updated(state, profile_id, session_id, Some(queue.clone())).await;
+    maybe_schedule_global_shutdown(state, profile_id, None).await;
+    Ok(queue)
+}
+
+async fn update_session_queue_item_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    queue_id: &str,
+    prompt: Option<&str>,
+    attachment_ids: Option<&Value>,
+) -> ApiResult<Value> {
+    let existing_queue = get_session_queue_payload(state, profile_id, session_id).await?;
+    let queued_item = existing_queue
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some(queue_id))
+                .cloned()
+        })
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "QUEUE_ITEM_NOT_FOUND"))?;
+
+    let next_prompt = prompt.map(str::to_string).unwrap_or_else(|| {
+        queued_item
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    });
+    let requested_attachment_ids = attachment_ids.cloned().unwrap_or_else(|| {
+        queued_item
+            .get("attachmentIds")
+            .cloned()
+            .unwrap_or_else(|| json!([]))
+    });
+    let (resolved_attachment_ids, attachment_names) = resolve_queue_attachment_metadata(
+        state,
+        profile_id,
+        session_id,
+        Some(&requested_attachment_ids),
+    )
+    .await?;
+    if next_prompt.trim().is_empty() && resolved_attachment_ids.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
+    }
+
+    let changed = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(queues_by_thread_id) = ui_state
+            .get_mut("queuesByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue state is missing",
+            ));
+        };
+        let Some(existing) = queues_by_thread_id.get_mut(session_id) else {
+            return Ok(false);
+        };
+        let Some(items) = existing.get_mut("items").and_then(Value::as_array_mut) else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue items are missing",
+            ));
+        };
+        let Some(item) = items
+            .iter_mut()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(queue_id))
+        else {
+            return Ok(false);
+        };
+        let Some(item_object) = item.as_object_mut() else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue item had an unexpected shape",
+            ));
+        };
+        item_object.insert("prompt".to_string(), json!(next_prompt.trim()));
+        item_object.insert("attachmentIds".to_string(), json!(resolved_attachment_ids));
+        item_object.insert("attachmentNames".to_string(), json!(attachment_names));
+        if let Some(existing_object) = existing.as_object_mut() {
+            existing_object.insert("updatedAt".to_string(), json!(now_unix_ms()));
+        }
+        Ok(true)
+    })
+    .await?;
+    if !changed {
+        return Err(api_error(StatusCode::NOT_FOUND, "QUEUE_ITEM_NOT_FOUND"));
+    }
+
+    let queue = get_session_queue_payload(state, profile_id, session_id).await?;
+    emit_queue_updated(state, profile_id, session_id, Some(queue.clone())).await;
+    Ok(queue)
+}
+
+async fn reorder_session_queue_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    ordered_ids: &[String],
+) -> ApiResult<Value> {
+    if ordered_ids.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "QUEUE_ITEM_NOT_FOUND"));
+    }
+
+    let reordered = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(queues_by_thread_id) = ui_state
+            .get_mut("queuesByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue state is missing",
+            ));
+        };
+        let Some(existing) = queues_by_thread_id.get_mut(session_id) else {
+            return Ok(false);
+        };
+        let Some(items) = existing.get_mut("items").and_then(Value::as_array_mut) else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue items are missing",
+            ));
+        };
+        if ordered_ids.len() != items.len() {
+            return Ok(false);
+        }
+
+        let items_by_id = items
+            .iter()
+            .filter_map(|item| {
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| (id.to_string(), item.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        let next_items = ordered_ids
+            .iter()
+            .filter_map(|queue_id| items_by_id.get(queue_id).cloned())
+            .collect::<Vec<_>>();
+        if next_items.len() != items.len()
+            || ordered_ids.iter().collect::<HashSet<_>>().len() != ordered_ids.len()
+        {
+            return Ok(false);
+        }
+
+        *items = next_items;
+        if let Some(existing_object) = existing.as_object_mut() {
+            existing_object.insert("updatedAt".to_string(), json!(now_unix_ms()));
+        }
+        Ok(true)
+    })
+    .await?;
+    if !reordered {
+        return Err(api_error(StatusCode::NOT_FOUND, "QUEUE_ITEM_NOT_FOUND"));
+    }
+
+    let queue = get_session_queue_payload(state, profile_id, session_id).await?;
+    emit_queue_updated(state, profile_id, session_id, Some(queue.clone())).await;
+    Ok(queue)
+}
+
+async fn resume_session_queue_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Value> {
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(queues_by_thread_id) = ui_state
+            .get_mut("queuesByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue state is missing",
+            ));
+        };
+        let Some(existing) = queues_by_thread_id.get_mut(session_id) else {
+            return Ok(());
+        };
+        let Some(queue_object) = existing.as_object_mut() else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue state had an unexpected shape",
+            ));
+        };
+        queue_object.insert("resumePending".to_string(), json!(false));
+        queue_object.insert("updatedAt".to_string(), json!(now_unix_ms()));
+        Ok(())
+    })
+    .await?;
+
+    let queue = get_session_queue_payload(state, profile_id, session_id).await?;
+    emit_queue_updated(state, profile_id, session_id, Some(queue.clone())).await;
+    maybe_drain_queue(state, profile_id, session_id).await;
+    Ok(queue)
+}
+
+async fn dispatch_session_queue_item_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    queue_id: &str,
+    mode: &str,
+) -> ApiResult<Value> {
+    if mode != "message" && mode != "steer" {
+        return Err(api_error(StatusCode::BAD_REQUEST, "INVALID_QUEUE_MODE"));
+    }
+
+    let queue = with_queue_dispatch_guard(state, profile_id, session_id, async {
+        let stored_queue = get_session_queue_payload(state, profile_id, session_id).await?;
+        let queued_item = stored_queue
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(Value::as_str) == Some(queue_id))
+                    .cloned()
+            })
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "QUEUE_ITEM_NOT_FOUND"))?;
+
+        cancel_scheduled_shutdown_for_activity(state, profile_id).await;
+        dispatch_queue_item(state, profile_id, session_id, &queued_item, mode).await?;
+        let next_queue =
+            remove_session_queue_item_after_dispatch(state, profile_id, session_id, queue_id)
+                .await?;
+        Ok(next_queue)
+    })
+    .await;
+
+    match queue {
+        Some(result) => result,
+        None => Err(api_error(StatusCode::CONFLICT, "QUEUE_ALREADY_DISPATCHING")),
+    }
+}
+
+async fn list_resume_pending_queues_payload(
+    state: &AppState,
+    profile_id: &str,
+) -> ApiResult<Value> {
+    let (entries, preferences_by_thread_id) = with_ui_state_read(state, profile_id, |ui_state| {
+        let entries = ui_state
+            .get("queuesByThreadId")
+            .and_then(Value::as_object)
+            .map(|queues| {
+                queues
+                    .iter()
+                    .filter_map(|(session_id, queue)| {
+                        let items = queue.get("items").and_then(Value::as_array)?;
+                        let resume_pending = queue
+                            .get("resumePending")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if !resume_pending || items.is_empty() {
+                            return None;
+                        }
+                        Some((
+                            session_id.clone(),
+                            items.len(),
+                            queue.get("updatedAt").and_then(Value::as_u64).unwrap_or(0),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let preferences = ui_state
+            .get("preferencesByThreadId")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        Ok((entries, preferences))
+    })
+    .await?;
+
+    let mut paused = Vec::with_capacity(entries.len());
+    for (session_id, pending_count, updated_at) in entries {
+        let mut name = Value::Null;
+        let mut cwd = preferences_by_thread_id
+            .get(&session_id)
+            .and_then(|entry| entry.get("cwd"))
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        if let Ok(session_payload) = internal_json_request_for_profile(
+            state,
+            Some(profile_id),
+            Method::GET,
+            &format!("/api/sessions/{session_id}?limit=1"),
+            None,
+        )
+        .await
+        {
+            if let Some(thread) = session_payload.get("thread").and_then(Value::as_object) {
+                name = display_thread_name(
+                    thread.get("name").and_then(Value::as_str),
+                    thread.get("preview").and_then(Value::as_str),
+                )
+                .map(Value::from)
+                .unwrap_or(Value::Null);
+                if !thread.get("cwd").is_none_or(Value::is_null) {
+                    cwd = thread.get("cwd").cloned().unwrap_or(Value::Null);
+                }
+            }
+        }
+
+        paused.push(json!({
+            "sessionId": session_id,
+            "name": name,
+            "cwd": cwd,
+            "pendingCount": pending_count,
+            "updatedAt": updated_at
+        }));
+    }
+
+    Ok(Value::Array(paused))
+}
+
+async fn mark_queues_pending_resume_payload(state: &AppState, profile_id: &str) -> ApiResult<bool> {
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(queues_by_thread_id) = ui_state
+            .get_mut("queuesByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue state is missing",
+            ));
+        };
+
+        let mut changed = false;
+        for queue in queues_by_thread_id.values_mut() {
+            let Some(queue_object) = queue.as_object_mut() else {
+                continue;
+            };
+            let item_count = queue_object
+                .get("items")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            let resume_pending = queue_object
+                .get("resumePending")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if item_count == 0 || resume_pending {
+                continue;
+            }
+            queue_object.insert("resumePending".to_string(), json!(true));
+            queue_object.insert("updatedAt".to_string(), json!(now_unix_ms()));
+            changed = true;
+        }
+
+        Ok(changed)
+    })
+    .await
+}
+
+const CONFIG_SCHEMA_HEADER: &str =
+    "#:schema https://developers.openai.com/codex/config-schema.json";
+
+fn config_toml_path(codex_home: &Path) -> PathBuf {
+    codex_home.join("config.toml")
+}
+
+fn parse_toml_section_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn matches_toml_key(line: &str, key: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed
+        .strip_prefix(key)
+        .is_some_and(|rest| rest.trim_start().starts_with('='))
+}
+
+fn normalize_toml_lines(raw: &str) -> Vec<String> {
+    let mut lines = raw
+        .split('\n')
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .collect::<Vec<_>>();
+    while lines.len() > 1 && lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+fn stringify_toml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn upsert_toml_value(raw: &str, section: Option<&str>, key: &str, value: Option<String>) -> String {
+    let mut lines = normalize_toml_lines(raw);
+    let mut current_section: Option<String> = None;
+    let mut section_start = if section.is_none() {
+        Some(0usize)
+    } else {
+        None
+    };
+    let mut section_end = lines.len();
+    let mut replaced = false;
+
+    for index in 0..lines.len() {
+        if let Some(next_section) = parse_toml_section_name(&lines[index]) {
+            if current_section.as_deref() == section && section_end == lines.len() {
+                section_end = index;
+            }
+            current_section = Some(next_section.clone());
+            if section.is_some() && section_start.is_none() && current_section.as_deref() == section
+            {
+                section_start = Some(index);
+            }
+            continue;
+        }
+
+        if current_section.as_deref() != section || !matches_toml_key(&lines[index], key) {
+            continue;
+        }
+
+        replaced = true;
+        if let Some(value) = &value {
+            lines[index] = format!("{key} = {value}");
+        } else {
+            lines.remove(index);
+            return upsert_toml_value(&lines.join("\n"), section, key, None);
+        }
+    }
+
+    if !replaced {
+        if let Some(value) = value {
+            if section.is_none() {
+                let insert_index = lines
+                    .iter()
+                    .position(|line| parse_toml_section_name(line).is_some())
+                    .unwrap_or(lines.len());
+                lines.insert(insert_index, format!("{key} = {value}"));
+            } else if let Some(section_start) = section_start {
+                lines.insert(
+                    section_end.max(section_start + 1),
+                    format!("{key} = {value}"),
+                );
+            } else {
+                if !lines.is_empty() && lines.last().is_some_and(|line| !line.is_empty()) {
+                    lines.push(String::new());
+                }
+                lines.push(format!("[{}]", section.unwrap_or_default()));
+                lines.push(format!("{key} = {value}"));
+            }
+        }
+    }
+
+    while lines.len() > 1 && lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+
+    format!("{}\n", lines.join("\n"))
+}
+
+async fn sync_codex_toml_with_preferences(codex_home: &Path, preferences: &Value) -> Result<()> {
+    let file_path = config_toml_path(codex_home);
+    if let Some(parent) = file_path.parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .context("failed to create the Codex config directory")?;
+    }
+
+    let mut raw = match tokio_fs::read_to_string(&file_path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).context("failed to read config.toml"),
+    };
+    if raw.trim().is_empty() {
+        raw = format!("{CONFIG_SCHEMA_HEADER}\n");
+    }
+
+    raw = upsert_toml_value(
+        &raw,
+        None,
+        "model",
+        preferences
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(stringify_toml_string),
+    );
+    raw = upsert_toml_value(
+        &raw,
+        None,
+        "approval_policy",
+        preferences
+            .get("approvalPolicy")
+            .and_then(Value::as_str)
+            .map(stringify_toml_string),
+    );
+    raw = upsert_toml_value(
+        &raw,
+        None,
+        "sandbox_mode",
+        preferences
+            .get("sandboxMode")
+            .and_then(Value::as_str)
+            .map(stringify_toml_string),
+    );
+    raw = upsert_toml_value(
+        &raw,
+        None,
+        "service_tier",
+        preferences
+            .get("speed")
+            .and_then(Value::as_str)
+            .filter(|value| *value == "fast" || *value == "flex")
+            .map(stringify_toml_string),
+    );
+
+    let effort_key = if preferences.get("mode").and_then(Value::as_str) == Some("plan") {
+        "plan_mode_reasoning_effort"
+    } else {
+        "model_reasoning_effort"
+    };
+    raw = upsert_toml_value(
+        &raw,
+        None,
+        effort_key,
+        preferences
+            .get("effort")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(stringify_toml_string),
+    );
+    raw = upsert_toml_value(
+        &raw,
+        Some("sandbox_workspace_write"),
+        "network_access",
+        Some(
+            if preferences
+                .get("networkAccess")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        ),
+    );
+
+    tokio_fs::write(&file_path, raw)
+        .await
+        .context("failed to write config.toml")
+}
+
+async fn resolve_allowed_directory(state: &AppState, requested_path: &str) -> ApiResult<String> {
+    if requested_path.trim().is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "A working directory is required.",
+        ));
+    }
+
+    let candidate = resolve_input_path(&state.config.project_root, requested_path);
+    let resolved = tokio_fs::canonicalize(&candidate).await.map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "The selected working directory does not exist.",
+        )
+    })?;
+    let metadata = tokio_fs::metadata(&resolved).await.map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "The selected working directory is invalid.",
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "The selected working directory must be a directory.",
+        ));
+    }
+
+    let allowed_roots = resolved_allowed_roots(&state.config).await;
+    if !allowed_roots
+        .iter()
+        .any(|root| path_is_within(root, &resolved))
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "The selected working directory is outside the allowed roots.",
+        ));
+    }
+
+    Ok(resolved.display().to_string())
+}
+
+async fn normalize_git_repo_path(state: &AppState, git_repo_path: &Value) -> ApiResult<Value> {
+    let Some(raw_path) = git_repo_path
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Value::Null);
+    };
+
+    let candidate = resolve_input_path(&state.config.project_root, raw_path);
+    let resolved = tokio_fs::canonicalize(&candidate).await.map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "The selected repository path does not exist.",
+        )
+    })?;
+    let allowed_roots = resolved_allowed_roots(&state.config).await;
+    if !allowed_roots
+        .iter()
+        .any(|root| path_is_within(root, &resolved))
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "The selected repository path is outside the allowed roots.",
+        ));
+    }
+
+    Ok(Value::String(resolved.display().to_string()))
+}
+
+async fn normalize_session_preferences_payload(
+    state: &AppState,
+    profile_id: &str,
+    preferences: Value,
+) -> ApiResult<Value> {
+    let defaults = get_config_payload(state, profile_id)
+        .await
+        .ok()
+        .and_then(|payload| payload.get("defaults").and_then(Value::as_object).cloned())
+        .unwrap_or_default();
+    let mut next_preferences = defaults;
+    if let Some(overrides) = preferences.as_object() {
+        for (key, value) in overrides {
+            next_preferences.insert(key.clone(), value.clone());
+        }
+    }
+
+    let cwd = next_preferences
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    next_preferences.insert(
+        "cwd".to_string(),
+        Value::String(resolve_allowed_directory(state, &cwd).await?),
+    );
+    let normalized_git_repo_path = normalize_git_repo_path(
+        state,
+        next_preferences.get("gitRepoPath").unwrap_or(&Value::Null),
+    )
+    .await?;
+    next_preferences.insert("gitRepoPath".to_string(), normalized_git_repo_path);
+
+    Ok(Value::Object(next_preferences))
+}
+
+fn normalize_session_title_from_preview(preview: &str) -> Option<String> {
+    let normalized = preview.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let candidate = normalized
+        .chars()
+        .take(60)
+        .collect::<String>()
+        .trim()
+        .trim_end_matches(['.', '?', '!'])
+        .trim()
+        .to_string();
+    if candidate.is_empty() {
+        None
+    } else if normalized.chars().count() > 60 {
+        Some(format!("{candidate}..."))
+    } else {
+        Some(candidate)
+    }
+}
+
+fn display_thread_name(name: Option<&str>, preview: Option<&str>) -> Option<String> {
+    let trimmed = name.unwrap_or_default().trim();
+    if !trimmed.is_empty() && trimmed != "New thread" {
+        Some(trimmed.to_string())
+    } else {
+        normalize_session_title_from_preview(preview.unwrap_or_default())
+    }
+}
+
+#[derive(Clone, Default)]
+struct SessionFilterCriteria {
+    pinned_only: bool,
+    running_only: bool,
+    queued_only: bool,
+    highlight: Option<String>,
+    tags: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct SessionSummaryUiSnapshot {
+    session_meta_by_thread_id: serde_json::Map<String, Value>,
+    preferences_by_thread_id: serde_json::Map<String, Value>,
+    highlights_by_thread_id: serde_json::Map<String, Value>,
+    queue_counts_by_thread_id: HashMap<String, usize>,
+}
+
+fn session_filter_from_value(filter: Option<&Value>) -> SessionFilterCriteria {
+    let mut tags = filter
+        .and_then(|value| value.get("tags"))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    tags.sort();
+    tags.dedup();
+
+    SessionFilterCriteria {
+        pinned_only: filter
+            .and_then(|value| value.get("pinnedOnly"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        running_only: filter
+            .and_then(|value| value.get("runningOnly"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        queued_only: filter
+            .and_then(|value| value.get("queuedOnly"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        highlight: filter
+            .and_then(|value| value.get("highlight"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| *value == "attention" || *value == "completed")
+            .map(str::to_string),
+        tags,
+    }
+}
+
+fn session_filter_from_query(query: Option<&str>) -> SessionFilterCriteria {
+    let mut tags = query_param_values(query, "filterTag")
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    tags.sort();
+    tags.dedup();
+
+    SessionFilterCriteria {
+        pinned_only: query_param_value(query, "filterPinned").as_deref() == Some("true"),
+        running_only: query_param_value(query, "filterRunning").as_deref() == Some("true"),
+        queued_only: query_param_value(query, "filterQueued").as_deref() == Some("true"),
+        highlight: query_param_value(query, "filterHighlight")
+            .map(|value| value.trim().to_string())
+            .filter(|value| value == "attention" || value == "completed"),
+        tags,
+    }
+}
+
+fn session_sort_priority(status: Option<&str>) -> i32 {
+    match status.unwrap_or_default() {
+        "running" | "active" => 1,
+        _ => 0,
+    }
+}
+
+fn session_summary_matches_filter(summary: &Value, filter: &SessionFilterCriteria) -> bool {
+    if filter.pinned_only
+        && !summary
+            .get("pinned")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    if filter.running_only
+        && session_sort_priority(summary.get("status").and_then(Value::as_str)) == 0
+    {
+        return false;
+    }
+    if filter.queued_only
+        && summary
+            .get("queueCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            == 0
+    {
+        return false;
+    }
+    if let Some(highlight) = &filter.highlight {
+        if summary
+            .get("highlight")
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+            != Some(highlight.as_str())
+        {
+            return false;
+        }
+    }
+    if filter.tags.is_empty() {
+        return true;
+    }
+
+    let session_tags = summary
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+
+    filter
+        .tags
+        .iter()
+        .all(|tag| session_tags.contains(tag.as_str()))
+}
+
+fn session_summary_matches_query(summary: &Value, needle: &str) -> bool {
+    let haystack = format!(
+        "{}\n{}",
+        summary
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        summary
+            .get("preview")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    )
+    .to_lowercase();
+    haystack.contains(needle)
+}
+
+fn sort_session_summaries(summaries: &mut [Value]) {
+    summaries.sort_by(|left, right| {
+        let pinned_difference = right
+            .get("pinned")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            .cmp(&left.get("pinned").and_then(Value::as_bool).unwrap_or(false));
+        if pinned_difference != std::cmp::Ordering::Equal {
+            return pinned_difference;
+        }
+
+        let priority_difference =
+            session_sort_priority(right.get("status").and_then(Value::as_str)).cmp(
+                &session_sort_priority(left.get("status").and_then(Value::as_str)),
+            );
+        if priority_difference != std::cmp::Ordering::Equal {
+            return priority_difference;
+        }
+
+        let updated_difference = right
+            .get("updatedAt")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .cmp(&left.get("updatedAt").and_then(Value::as_i64).unwrap_or(0));
+        if updated_difference != std::cmp::Ordering::Equal {
+            return updated_difference;
+        }
+
+        right
+            .get("createdAt")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .cmp(&left.get("createdAt").and_then(Value::as_i64).unwrap_or(0))
+    });
+}
+
+fn session_summary_page(mut summaries: Vec<Value>, cursor: Option<&str>, limit: u64) -> Value {
+    let window_size = limit.clamp(1, 200) as usize;
+    let start = cursor
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let end = start.saturating_add(window_size).min(summaries.len());
+    let next_cursor = (end < summaries.len()).then(|| end.to_string());
+    let page = if start < summaries.len() {
+        summaries.drain(start..end).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    json!({
+        "sessions": page,
+        "nextCursor": next_cursor
+    })
+}
+
+async fn read_session_summary_ui_snapshot(
+    state: &AppState,
+    profile_id: &str,
+) -> ApiResult<SessionSummaryUiSnapshot> {
+    with_ui_state_read(state, profile_id, |ui_state| {
+        let queue_counts_by_thread_id = ui_state
+            .get("queuesByThreadId")
+            .and_then(Value::as_object)
+            .map(|queues| {
+                queues
+                    .iter()
+                    .map(|(thread_id, queue)| {
+                        (
+                            thread_id.clone(),
+                            queue
+                                .get("items")
+                                .and_then(Value::as_array)
+                                .map(Vec::len)
+                                .unwrap_or(0),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+
+        Ok(SessionSummaryUiSnapshot {
+            session_meta_by_thread_id: ui_state
+                .get("sessionMetaByThreadId")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            preferences_by_thread_id: ui_state
+                .get("preferencesByThreadId")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            highlights_by_thread_id: ui_state
+                .get("highlightsByThreadId")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            queue_counts_by_thread_id,
+        })
+    })
+    .await
+}
+
+fn thread_is_subagent(thread: &Value) -> bool {
+    thread
+        .get("isSubagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || thread
+            .get("agentNickname")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        || thread
+            .get("agentRole")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn build_session_summary_from_thread_payload(
+    thread: &Value,
+    snapshot: &SessionSummaryUiSnapshot,
+    preferences_override: Option<Value>,
+) -> ApiResult<Value> {
+    let session_id = thread.get("id").and_then(Value::as_str).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            "Codex app-server returned a thread without an id.",
+        )
+    })?;
+    let meta = snapshot
+        .session_meta_by_thread_id
+        .get(session_id)
+        .cloned()
+        .unwrap_or_else(|| json!({ "pinned": false, "tags": [] }));
+    let highlight = snapshot
+        .highlights_by_thread_id
+        .get(session_id)
+        .cloned()
+        .unwrap_or(Value::Null);
+    let stored_preferences = snapshot
+        .preferences_by_thread_id
+        .get(session_id)
+        .cloned()
+        .unwrap_or(Value::Null);
+    let preferences = preferences_override
+        .filter(|value| !value.is_null())
+        .or_else(|| (!stored_preferences.is_null()).then_some(stored_preferences))
+        .unwrap_or_else(|| {
+            json!({
+                "cwd": thread.get("cwd").cloned().unwrap_or(Value::Null)
+            })
+        });
+    let preview = thread
+        .get("preview")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    Ok(json!({
+        "id": session_id,
+        "name": display_thread_name(
+            thread.get("name").and_then(Value::as_str),
+            Some(preview.as_str())
+        ),
+        "preview": preview,
+        "queueCount": snapshot.queue_counts_by_thread_id.get(session_id).copied().unwrap_or(0),
+        "highlight": highlight,
+        "pinned": meta.get("pinned").and_then(Value::as_bool).unwrap_or(false),
+        "tags": meta.get("tags").cloned().unwrap_or_else(|| json!([])),
+        "cwd": thread
+            .get("cwd")
+            .cloned()
+            .unwrap_or_else(|| preferences.get("cwd").cloned().unwrap_or(Value::Null)),
+        "archived": thread.get("archived").and_then(Value::as_bool).unwrap_or(false),
+        "createdAt": thread.get("createdAt").cloned().unwrap_or_else(|| json!(0)),
+        "updatedAt": thread.get("updatedAt").cloned().unwrap_or_else(|| json!(0)),
+        "status": normalized_thread_status(thread.get("status")).unwrap_or_else(|| "unknown".to_string()),
+        "isSubagent": thread.get("isSubagent").and_then(Value::as_bool).unwrap_or(false),
+        "agentNickname": thread.get("agentNickname").cloned().unwrap_or(Value::Null),
+        "agentRole": thread.get("agentRole").cloned().unwrap_or(Value::Null),
+        "preferences": preferences
+    }))
+}
+
+async fn list_app_server_threads(
+    state: &AppState,
+    profile_id: &str,
+    archived: bool,
+) -> ApiResult<Vec<Value>> {
+    let client = app_server_client(state, profile_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to codex app-server: {error}"),
+            )
+        })?;
+    let mut cursor: Option<String> = None;
+    let mut threads = Vec::new();
+
+    loop {
+        let response = client
+            .request(
+                "thread/list",
+                json!({
+                    "limit": 200,
+                    "archived": archived,
+                    "cursor": cursor.clone()
+                }),
+            )
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to list sessions: {error}"),
+                )
+            })?;
+        let batch = response
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        threads.extend(batch);
+        cursor = response
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    Ok(threads)
+}
+
+async fn collect_session_summaries_payload(
+    state: &AppState,
+    profile_id: &str,
+    archived: bool,
+    filter: &SessionFilterCriteria,
+) -> ApiResult<Vec<Value>> {
+    let snapshot = read_session_summary_ui_snapshot(state, profile_id).await?;
+    let mut summaries = Vec::new();
+
+    for thread in list_app_server_threads(state, profile_id, archived).await? {
+        if thread_is_subagent(&thread) {
+            continue;
+        }
+        let summary = build_session_summary_from_thread_payload(&thread, &snapshot, None)?;
+        if session_summary_matches_filter(&summary, filter) {
+            summaries.push(summary);
+        }
+    }
+
+    sort_session_summaries(&mut summaries);
+    Ok(summaries)
+}
+
+async fn list_sessions_payload(
+    state: &AppState,
+    profile_id: &str,
+    archived: bool,
+    cursor: Option<&str>,
+    limit: u64,
+    filter: &SessionFilterCriteria,
+) -> ApiResult<Value> {
+    let sessions = collect_session_summaries_payload(state, profile_id, archived, filter).await?;
+    Ok(session_summary_page(sessions, cursor, limit))
+}
+
+async fn search_sessions_payload(
+    state: &AppState,
+    profile_id: &str,
+    query: &str,
+    archived: bool,
+    cursor: Option<&str>,
+    limit: u64,
+    filter: &SessionFilterCriteria,
+) -> ApiResult<Value> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return list_sessions_payload(state, profile_id, archived, cursor, limit, filter).await;
+    }
+
+    let sessions = collect_session_summaries_payload(state, profile_id, archived, filter).await?;
+    let matched = sessions
+        .into_iter()
+        .filter(|summary| session_summary_matches_query(summary, &needle))
+        .collect::<Vec<_>>();
+    Ok(session_summary_page(matched, cursor, limit))
+}
+
+async fn create_session_payload(
+    state: &AppState,
+    profile_id: &str,
+    preferences: Value,
+    name: Option<&str>,
+) -> ApiResult<Value> {
+    let next_preferences =
+        normalize_session_preferences_payload(state, profile_id, preferences).await?;
+    let session_preferences = next_preferences.as_object().cloned().ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid preferences state.",
+        )
+    })?;
+    let cwd = session_preferences
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "A working directory is required."))?;
+    let client = app_server_client(state, profile_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to codex app-server: {error}"),
+            )
+        })?;
+    let response = client
+        .request(
+            "thread/start",
+            json!({
+                "model": session_preferences.get("model").cloned().unwrap_or(Value::Null),
+                "cwd": cwd,
+                "approvalPolicy": session_preferences.get("approvalPolicy").cloned().unwrap_or_else(|| json!("on-request")),
+                "sandbox": session_preferences.get("sandboxMode").cloned().unwrap_or_else(|| json!("workspace-write")),
+                "serviceTier": match session_preferences.get("speed").and_then(Value::as_str) {
+                    Some("fast") => Value::String("fast".to_string()),
+                    Some("flex") => Value::String("flex".to_string()),
+                    _ => Value::Null
+                },
+                "experimentalRawEvents": false,
+                "persistExtendedHistory": true
+            }),
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to create the session: {error}"),
+            )
+        })?;
+    let mut thread = response.get("thread").cloned().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            "Codex app-server returned an invalid thread payload.",
+        )
+    })?;
+    let session_id = thread.get("id").and_then(Value::as_str).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            "Codex app-server returned a session without an id.",
+        )
+    })?;
+
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(preferences_by_thread_id) = ui_state
+            .get_mut("preferencesByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "preferences state is missing",
+            ));
+        };
+        preferences_by_thread_id.insert(session_id.to_string(), next_preferences.clone());
+        Ok(())
+    })
+    .await?;
+
+    let next_name = name
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "New thread");
+    if let Some(next_name) = next_name {
+        client
+            .request(
+                "thread/name/set",
+                json!({
+                    "threadId": session_id,
+                    "name": next_name
+                }),
+            )
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to name the session: {error}"),
+                )
+            })?;
+        if let Some(thread_object) = thread.as_object_mut() {
+            thread_object.insert("name".to_string(), Value::String(next_name.to_string()));
+        }
+    }
+
+    let snapshot = read_session_summary_ui_snapshot(state, profile_id).await?;
+    let summary = build_session_summary_from_thread_payload(
+        &thread,
+        &snapshot,
+        Some(next_preferences.clone()),
+    )?;
+    emit_profile_global_notification(
+        state,
+        profile_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/sessionSummaryUpdated",
+            "params": {
+                "session": summary.clone()
+            }
+        }),
+    )
+    .await;
+
+    Ok(summary)
+}
+
+async fn emit_session_notification(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    event: Value,
+) {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let relay = {
+        let relays = state.relays.lock().await;
+        relays
+            .get(&session_relay_key(resolved_profile_id, session_id))
+            .cloned()
+    };
+    if let Some(relay) = relay {
+        let _ = relay.send(event);
+    }
+}
+
+async fn build_session_summary_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    preferences_override: Option<Value>,
+) -> ApiResult<Value> {
+    let session_payload = internal_json_request_for_profile(
+        state,
+        Some(profile_id),
+        Method::GET,
+        &format!("/api/sessions/{session_id}?limit=1"),
+        None,
+    )
+    .await
+    .map_err(|error| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to load the session summary source: {error}"),
+        )
+    })?;
+    let thread = session_payload.get("thread").ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            "Internal session payload had an unexpected shape.",
+        )
+    })?;
+    let snapshot = read_session_summary_ui_snapshot(state, profile_id).await?;
+    let summary =
+        build_session_summary_from_thread_payload(thread, &snapshot, preferences_override)?;
+    if summary.get("id").and_then(Value::as_str) != Some(session_id) {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            "Internal session payload returned an unexpected session id.",
+        ));
+    }
+    Ok(summary)
+}
+
+async fn emit_session_summary_updated(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    preferences_override: Option<Value>,
+) {
+    let summary =
+        build_session_summary_payload(state, profile_id, session_id, preferences_override).await;
+    if let Ok(summary) = summary {
+        emit_profile_global_notification(
+            state,
+            profile_id,
+            json!({
+                "kind": "notification",
+                "method": "codex-webui/sessionSummaryUpdated",
+                "params": {
+                    "session": summary
+                }
+            }),
+        )
+        .await;
+    }
+}
+
+async fn update_session_organization_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    patch: Value,
+) -> ApiResult<Value> {
+    let payload = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(session_meta_by_thread_id) = ui_state
+            .get_mut("sessionMetaByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session metadata state is missing",
+            ));
+        };
+
+        let current = session_meta_by_thread_id
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| json!({ "pinned": false, "tags": [] }));
+        let pinned = patch
+            .get("pinned")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| {
+                current
+                    .get("pinned")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            });
+        let mut tags = patch
+            .get("tags")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                current
+                    .get("tags")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            });
+        tags.sort();
+        tags.dedup();
+
+        let meta = json!({
+            "pinned": pinned,
+            "tags": tags
+        });
+        if !pinned
+            && meta
+                .get("tags")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.is_empty())
+        {
+            session_meta_by_thread_id.remove(session_id);
+        } else {
+            session_meta_by_thread_id.insert(session_id.to_string(), meta.clone());
+        }
+
+        Ok(json!({
+            "meta": meta,
+            "knownTags": known_tags_from_ui_state(ui_state)
+        }))
+    })
+    .await?;
+
+    emit_profile_config_updated(
+        state,
+        profile_id,
+        json!({
+            "sessionOrganization": {
+                "knownTags": payload.get("knownTags").cloned().unwrap_or_else(|| json!([]))
+            }
+        }),
+    )
+    .await;
+    emit_session_summary_updated(state, profile_id, session_id, None).await;
+
+    Ok(payload)
+}
+
+async fn save_session_preferences_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    preferences: Value,
+) -> ApiResult<Value> {
+    let next_preferences =
+        normalize_session_preferences_payload(state, profile_id, preferences).await?;
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(preferences_by_thread_id) = ui_state
+            .get_mut("preferencesByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "preferences state is missing",
+            ));
+        };
+        preferences_by_thread_id.insert(session_id.to_string(), next_preferences.clone());
+        Ok(())
+    })
+    .await?;
+    sync_codex_toml_with_preferences(
+        &resolve_runtime_profile(&state.config, profile_id).codex_home,
+        &next_preferences,
+    )
+    .await
+    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    emit_session_notification(
+        state,
+        profile_id,
+        session_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/preferencesUpdated",
+            "params": {
+                "preferences": next_preferences.clone()
+            }
+        }),
+    )
+    .await;
+    emit_profile_config_updated(
+        state,
+        profile_id,
+        json!({
+            "defaults": next_preferences.clone()
+        }),
+    )
+    .await;
+    emit_session_summary_updated(
+        state,
+        profile_id,
+        session_id,
+        Some(next_preferences.clone()),
+    )
+    .await;
+
+    Ok(next_preferences)
+}
+
+async fn rename_session_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    name: &str,
+) -> ApiResult<Value> {
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Session name is required.",
+        ));
+    }
+
+    app_server_client(state, profile_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to codex app-server: {error}"),
+            )
+        })?
+        .request(
+            "thread/name/set",
+            json!({
+                "threadId": session_id,
+                "name": trimmed_name
+            }),
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to rename the session: {error}"),
+            )
+        })?;
+
+    emit_session_notification(
+        state,
+        profile_id,
+        session_id,
+        json!({
+            "kind": "notification",
+            "method": "thread/name/updated",
+            "params": {
+                "threadId": session_id,
+                "threadName": trimmed_name
+            }
+        }),
+    )
+    .await;
+    emit_session_summary_updated(state, profile_id, session_id, None).await;
+
+    Ok(json!({
+        "ok": true,
+        "name": trimmed_name
+    }))
+}
+
+async fn invalidate_session_lists(state: &AppState, profile_id: &str) {
+    emit_profile_global_notification(
+        state,
+        profile_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/sessionListsInvalidated",
+            "params": {}
+        }),
+    )
+    .await;
+}
+
+async fn archive_session_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Value> {
+    app_server_client(state, profile_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to codex app-server: {error}"),
+            )
+        })?
+        .request(
+            "thread/archive",
+            json!({
+                "threadId": session_id
+            }),
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to archive the session: {error}"),
+            )
+        })?;
+
+    invalidate_session_lists(state, profile_id).await;
+    Ok(json!({ "ok": true }))
+}
+
+async fn unarchive_session_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Value> {
+    app_server_client(state, profile_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to codex app-server: {error}"),
+            )
+        })?
+        .request(
+            "thread/unarchive",
+            json!({
+                "threadId": session_id
+            }),
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to unarchive the session: {error}"),
+            )
+        })?;
+
+    invalidate_session_lists(state, profile_id).await;
+    let session = build_session_summary_payload(state, profile_id, session_id, None).await?;
+    Ok(json!({
+        "ok": true,
+        "session": session
+    }))
+}
+
+fn sorted_prompt_presets_from_ui_state(ui_state: &Value) -> Vec<Value> {
+    let mut prompt_presets = ui_state
+        .get("promptPresets")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    prompt_presets.sort_by(|left, right| {
+        right
+            .get("updatedAt")
+            .and_then(Value::as_i64)
+            .unwrap_or_default()
+            .cmp(
+                &left
+                    .get("updatedAt")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+            )
+    });
+    prompt_presets
+}
+
+fn sorted_automations_from_ui_state(ui_state: &Value) -> Vec<Value> {
+    let mut automations = ui_state
+        .get("automations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    automations.sort_by(|left, right| {
+        right
+            .get("updatedAt")
+            .and_then(Value::as_i64)
+            .unwrap_or_default()
+            .cmp(
+                &left
+                    .get("updatedAt")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+            )
+    });
+    automations
+}
+
+fn recent_automation_runs_from_ui_state(ui_state: &Value, limit: usize) -> Vec<Value> {
+    let mut automation_runs = ui_state
+        .get("automationRuns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    automation_runs.sort_by(|left, right| {
+        right
+            .get("startedAt")
+            .and_then(Value::as_i64)
+            .unwrap_or_default()
+            .cmp(
+                &left
+                    .get("startedAt")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+            )
+    });
+    automation_runs.truncate(limit.max(1));
+    automation_runs
+}
+
+fn automation_timer_key(profile_id: &str, automation_id: &str) -> String {
+    format!("profile::{profile_id}::automation::{automation_id}")
+}
+
+fn trimmed_json_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn automation_schedule_mode(value: Option<&Value>) -> &'static str {
+    match value.and_then(Value::as_str) {
+        Some("interval") => "interval",
+        _ => "manual",
+    }
+}
+
+fn automation_target(value: Option<&Value>) -> &'static str {
+    match value.and_then(Value::as_str) {
+        Some("worktree") => "worktree",
+        _ => "local",
+    }
+}
+
+fn build_automation_thread_name(name: &str) -> String {
+    format!("Automation · {}", name.trim())
+}
+
+fn build_automation_worktree_name(name: &str) -> String {
+    let sanitized = name
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | '0'..='9' => character,
+            _ => '-',
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    if sanitized.is_empty() {
+        "automation".to_string()
+    } else {
+        sanitized.chars().take(48).collect()
+    }
+}
+
+async fn emit_profile_automations_updated(state: &AppState, profile_id: &str) {
+    let payload = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(json!({
+            "automations": {
+                "items": sorted_automations_from_ui_state(ui_state),
+                "recentRuns": recent_automation_runs_from_ui_state(ui_state, DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT)
+            }
+        }))
+    })
+    .await;
+
+    if let Ok(payload) = payload {
+        emit_profile_config_updated(state, profile_id, payload).await;
+    }
+}
+
+async fn clear_automation_timer(state: &AppState, profile_id: &str, automation_id: &str) {
+    let timer_key = automation_timer_key(profile_id, automation_id);
+    if let Some(handle) = state.automation_timers.lock().await.remove(&timer_key) {
+        handle.abort();
+    }
+}
+
+fn schedule_automation_timer(
+    state: AppState,
+    profile_id: String,
+    automation: Value,
+) -> futures_util::future::BoxFuture<'static, ()> {
+    async move {
+        let automation_id = trimmed_json_string(automation.get("id"));
+        let enabled = automation
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let schedule_mode = automation_schedule_mode(automation.get("scheduleMode"));
+        let next_run_at = automation.get("nextRunAt").and_then(Value::as_i64);
+
+        let Some(automation_id) = automation_id else {
+            return;
+        };
+
+        clear_automation_timer(&state, &profile_id, &automation_id).await;
+
+        if !enabled || schedule_mode != "interval" {
+            return;
+        }
+
+        let Some(next_run_at) = next_run_at else {
+            return;
+        };
+
+        let timer_key = automation_timer_key(&profile_id, &automation_id);
+        let sleep_ms = next_run_at.saturating_sub(now_unix_ms() as i64).max(0) as u64;
+        let next_state = state.clone();
+        let next_profile_id = profile_id.clone();
+        let next_automation_id = automation_id.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            next_state
+                .automation_timers
+                .lock()
+                .await
+                .remove(&automation_timer_key(&next_profile_id, &next_automation_id));
+            if let Err(error) = run_automation_payload(
+                &next_state,
+                &next_profile_id,
+                &next_automation_id,
+                "schedule",
+            )
+            .await
+            {
+                warn!(
+                    "scheduled automation run failed for {} on profile {}: {}",
+                    next_automation_id, next_profile_id, error.message
+                );
+            }
+        });
+        state
+            .automation_timers
+            .lock()
+            .await
+            .insert(timer_key, handle);
+    }
+    .boxed()
+}
+
+async fn restore_automation_schedules(state: AppState) {
+    let profile_ids = state.config.profiles.keys().cloned().collect::<Vec<_>>();
+    for profile_id in profile_ids {
+        let result = with_ui_state_read(&state, &profile_id, |ui_state| {
+            Ok(sorted_automations_from_ui_state(ui_state))
+        })
+        .await;
+        match result {
+            Ok(automations) => {
+                for automation in automations {
+                    schedule_automation_timer(state.clone(), profile_id.clone(), automation).await;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    "failed to restore automation schedules for profile {}: {}",
+                    profile_id, error.message
+                );
+            }
+        }
+    }
+}
+
+async fn save_automation_payload(
+    state: &AppState,
+    profile_id: &str,
+    automation: Value,
+) -> ApiResult<Value> {
+    let automation_id = trimmed_json_string(automation.get("id"))
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "automation.id is required."))?;
+    let automation_name = trimmed_json_string(automation.get("name"))
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Automation name is required."))?;
+    let automation_prompt = automation
+        .get("prompt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Automation prompt is required."))?;
+    if automation_prompt.trim().is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Automation prompt is required.",
+        ));
+    }
+
+    let schedule_mode = automation_schedule_mode(automation.get("scheduleMode"));
+    let normalized_interval = if schedule_mode == "interval" {
+        automation
+            .get("intervalMinutes")
+            .and_then(|value| {
+                value
+                    .as_i64()
+                    .or_else(|| value.as_u64().map(|entry| entry as i64))
+                    .or_else(|| value.as_f64().map(|entry| entry.round() as i64))
+            })
+            .map(|value| value.max(1))
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Automation interval must be at least 1 minute.",
+                )
+            })?
+    } else {
+        0
+    };
+
+    let normalized_target = automation_target(automation.get("target"));
+    let repo_path = trimmed_json_string(automation.get("repoPath"));
+    if normalized_target == "worktree" && repo_path.is_none() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Worktree automations require a repository.",
+        ));
+    }
+
+    let now = now_unix_ms() as i64;
+    let payload = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(automations) = ui_state.get_mut("automations").and_then(Value::as_array_mut) else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "automations state is missing",
+            ));
+        };
+
+        let created_at = automations
+            .iter()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(automation_id.as_str()))
+            .and_then(|entry| entry.get("createdAt").and_then(Value::as_i64))
+            .or_else(|| automation.get("createdAt").and_then(Value::as_i64))
+            .unwrap_or(now);
+        let enabled = automation
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let next_run_at = if enabled && schedule_mode == "interval" {
+            Some(now + normalized_interval * 60_000)
+        } else {
+            None
+        };
+
+        let next_automation = json!({
+            "id": automation_id,
+            "name": automation_name,
+            "prompt": automation_prompt,
+            "enabled": enabled,
+            "scheduleMode": schedule_mode,
+            "intervalMinutes": if schedule_mode == "interval" { Value::from(normalized_interval) } else { Value::Null },
+            "target": normalized_target,
+            "repoPath": repo_path.clone().map(Value::from).unwrap_or(Value::Null),
+            "cwd": trimmed_json_string(automation.get("cwd")).map(Value::from).unwrap_or(Value::Null),
+            "model": trimmed_json_string(automation.get("model")).map(Value::from).unwrap_or(Value::Null),
+            "effort": trimmed_json_string(automation.get("effort")).map(Value::from).unwrap_or(Value::Null),
+            "speed": trimmed_json_string(automation.get("speed")).map(Value::from).unwrap_or(Value::Null),
+            "mode": trimmed_json_string(automation.get("mode")).map(Value::from).unwrap_or(Value::Null),
+            "createdAt": created_at,
+            "updatedAt": now,
+            "lastRunAt": automation.get("lastRunAt").cloned().unwrap_or(Value::Null),
+            "nextRunAt": next_run_at.map(Value::from).unwrap_or(Value::Null)
+        });
+
+        let mut next_automations = vec![next_automation];
+        next_automations.extend(
+            automations
+                .iter()
+                .filter(|entry| entry.get("id").and_then(Value::as_str) != Some(automation_id.as_str()))
+                .cloned(),
+        );
+        next_automations.truncate(80);
+        next_automations.sort_by(|left, right| {
+            right
+                .get("updatedAt")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+                .cmp(
+                    &left
+                        .get("updatedAt")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default(),
+                )
+        });
+        *automations = next_automations;
+
+        Ok(json!({
+            "automations": automations.clone()
+        }))
+    })
+    .await?;
+
+    if let Some(saved_automation) = payload
+        .get("automations")
+        .and_then(Value::as_array)
+        .and_then(|entries| {
+            entries.iter().find(|entry| {
+                entry.get("id").and_then(Value::as_str) == Some(automation_id.as_str())
+            })
+        })
+        .cloned()
+    {
+        schedule_automation_timer(state.clone(), profile_id.to_string(), saved_automation).await;
+    } else {
+        clear_automation_timer(state, profile_id, &automation_id).await;
+    }
+
+    emit_profile_automations_updated(state, profile_id).await;
+    Ok(payload)
+}
+
+async fn delete_automation_payload(
+    state: &AppState,
+    profile_id: &str,
+    automation_id: &str,
+) -> ApiResult<Value> {
+    let trimmed_automation_id = automation_id.trim();
+    clear_automation_timer(state, profile_id, trimmed_automation_id).await;
+
+    let payload = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(automations) = ui_state
+            .get_mut("automations")
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "automations state is missing",
+            ));
+        };
+
+        *automations = automations
+            .iter()
+            .filter(|entry| entry.get("id").and_then(Value::as_str) != Some(trimmed_automation_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        automations.sort_by(|left, right| {
+            right
+                .get("updatedAt")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+                .cmp(
+                    &left
+                        .get("updatedAt")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default(),
+                )
+        });
+
+        Ok(json!({
+            "automations": automations.clone()
+        }))
+    })
+    .await?;
+
+    emit_profile_automations_updated(state, profile_id).await;
+    Ok(payload)
+}
+
+async fn run_automation_payload(
+    state: &AppState,
+    profile_id: &str,
+    automation_id: &str,
+    trigger: &str,
+) -> ApiResult<Value> {
+    let automation = with_ui_state_read(state, profile_id, |ui_state| {
+        sorted_automations_from_ui_state(ui_state)
+            .into_iter()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(automation_id))
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Automation not found."))
+    })
+    .await?;
+
+    let automation_name = trimmed_json_string(automation.get("name"))
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Automation name is required."))?;
+    let automation_prompt = automation
+        .get("prompt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Automation prompt is required."))?
+        .to_string();
+    let automation_target = automation_target(automation.get("target"));
+    let repo_path = trimmed_json_string(automation.get("repoPath"));
+    let mut cwd = trimmed_json_string(automation.get("cwd")).or_else(|| repo_path.clone());
+    let mut git_repo_path = repo_path.clone();
+    let mut worktree_path: Option<String> = None;
+    let run_id = Uuid::new_v4().to_string();
+    let now = now_unix_ms() as i64;
+    let normalized_trigger = if trigger == "schedule" {
+        "schedule"
+    } else {
+        "manual"
+    };
+
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(automation_runs) = ui_state
+            .get_mut("automationRuns")
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "automation runs state is missing",
+            ));
+        };
+
+        let next_run = json!({
+            "id": run_id,
+            "automationId": automation_id,
+            "automationName": automation_name,
+            "status": "running",
+            "trigger": normalized_trigger,
+            "sessionId": Value::Null,
+            "repoPath": git_repo_path.clone().map(Value::from).unwrap_or(Value::Null),
+            "cwd": cwd.clone().map(Value::from).unwrap_or(Value::Null),
+            "worktreePath": Value::Null,
+            "startedAt": now,
+            "completedAt": Value::Null,
+            "error": Value::Null
+        });
+        let mut next_runs = vec![next_run];
+        next_runs.extend(
+            automation_runs
+                .iter()
+                .filter(|entry| entry.get("id").and_then(Value::as_str) != Some(run_id.as_str()))
+                .cloned(),
+        );
+        next_runs.truncate(200);
+        *automation_runs = next_runs;
+        Ok(())
+    })
+    .await?;
+    emit_profile_automations_updated(state, profile_id).await;
+
+    let result: ApiResult<Value> = async {
+        if automation_target == "worktree" {
+            let repo_root = repo_path.clone().ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Worktree automations require a repository.",
+                )
+            })?;
+            let repo_root_path = PathBuf::from(&repo_root);
+            let time_suffix = now.to_string();
+            let worktree_name = build_automation_worktree_name(&automation_name);
+            let worktree = repo_root_path
+                .parent()
+                .unwrap_or_else(|| repo_root_path.as_path())
+                .join(".codex-webui-worktrees")
+                .join(&worktree_name)
+                .join(&time_suffix);
+            let branch_name = format!("automation/{worktree_name}-{time_suffix}");
+
+            internal_json_request_for_profile(
+                state,
+                Some(profile_id),
+                Method::POST,
+                "/api/git/worktrees",
+                Some(json!({
+                    "repoPath": repo_root,
+                    "worktreePath": worktree.display().to_string(),
+                    "branchName": branch_name,
+                    "createBranch": true,
+                    "detach": false
+                })),
+            )
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to create the automation worktree: {error}"),
+                )
+            })?;
+
+            let worktree_display = worktree.display().to_string();
+            worktree_path = Some(worktree_display.clone());
+            cwd = Some(worktree_display.clone());
+            git_repo_path = Some(worktree_display);
+        }
+
+        let mut preferences = serde_json::Map::new();
+        if let Some(cwd) = &cwd {
+            preferences.insert("cwd".to_string(), json!(cwd));
+        }
+        if let Some(git_repo_path) = &git_repo_path {
+            preferences.insert("gitRepoPath".to_string(), json!(git_repo_path));
+        }
+        for key in ["model", "effort", "speed", "mode"] {
+            if let Some(value) = trimmed_json_string(automation.get(key)) {
+                preferences.insert(key.to_string(), Value::String(value));
+            }
+        }
+
+        let session = internal_json_request_for_profile(
+            state,
+            Some(profile_id),
+            Method::POST,
+            "/api/sessions",
+            Some(json!({
+                "name": build_automation_thread_name(&automation_name),
+                "preferences": preferences
+            })),
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to create the automation session: {error}"),
+            )
+        })?;
+
+        let session_id = session
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "Internal session creation returned an invalid payload.",
+                )
+            })?
+            .to_string();
+
+        with_ui_state_write(state, profile_id, |ui_state| {
+            let Some(automation_runs) = ui_state
+                .get_mut("automationRuns")
+                .and_then(Value::as_array_mut)
+            else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "automation runs state is missing",
+                ));
+            };
+
+            if let Some(run) = automation_runs
+                .iter_mut()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(run_id.as_str()))
+            {
+                *run = json!({
+                    "id": run_id,
+                    "automationId": automation_id,
+                    "automationName": automation_name,
+                    "status": "started",
+                    "trigger": normalized_trigger,
+                    "sessionId": session_id,
+                    "repoPath": git_repo_path.clone().map(Value::from).unwrap_or(Value::Null),
+                    "cwd": cwd.clone().map(Value::from).unwrap_or(Value::Null),
+                    "worktreePath": worktree_path.clone().map(Value::from).unwrap_or(Value::Null),
+                    "startedAt": now,
+                    "completedAt": Value::Null,
+                    "error": Value::Null
+                });
+            }
+            Ok(())
+        })
+        .await?;
+
+        internal_json_request_for_profile(
+            state,
+            Some(profile_id),
+            Method::POST,
+            &format!("/api/sessions/{session_id}/messages"),
+            Some(json!({
+                "prompt": automation_prompt,
+                "attachmentIds": [],
+                "preferences": preferences
+            })),
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to send the automation prompt: {error}"),
+            )
+        })?;
+
+        let updated_automation = with_ui_state_write(state, profile_id, |ui_state| {
+            let Some(automations) = ui_state
+                .get_mut("automations")
+                .and_then(Value::as_array_mut)
+            else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "automations state is missing",
+                ));
+            };
+
+            let Some(automation_entry) = automations
+                .iter_mut()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(automation_id))
+            else {
+                return Err(api_error(StatusCode::NOT_FOUND, "Automation not found."));
+            };
+
+            let enabled = automation_entry
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let interval_minutes = automation_entry
+                .get("intervalMinutes")
+                .and_then(Value::as_i64);
+            let next_run_at = if enabled
+                && automation_schedule_mode(automation_entry.get("scheduleMode")) == "interval"
+            {
+                interval_minutes.map(|value| now + value.max(1) * 60_000)
+            } else {
+                None
+            };
+
+            if let Some(object) = automation_entry.as_object_mut() {
+                object.insert("lastRunAt".to_string(), Value::from(now));
+                object.insert("updatedAt".to_string(), Value::from(now));
+                object.insert(
+                    "nextRunAt".to_string(),
+                    next_run_at.map(Value::from).unwrap_or(Value::Null),
+                );
+            }
+
+            Ok(automation_entry.clone())
+        })
+        .await?;
+
+        emit_profile_automations_updated(state, profile_id).await;
+        let schedule_state = state.clone();
+        let schedule_profile_id = profile_id.to_string();
+        tokio::spawn(async move {
+            schedule_automation_timer(schedule_state, schedule_profile_id, updated_automation)
+                .await;
+        });
+
+        let run = with_ui_state_read(state, profile_id, |ui_state| {
+            recent_automation_runs_from_ui_state(ui_state, 200)
+                .into_iter()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(run_id.as_str()))
+                .ok_or_else(|| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to read the automation run after dispatch.",
+                    )
+                })
+        })
+        .await?;
+
+        Ok(json!({
+            "ok": true,
+            "session": session,
+            "run": run
+        }))
+    }
+    .await;
+
+    if let Err(error) = &result {
+        let error_message = error.message.clone();
+        let completed_at = now_unix_ms() as i64;
+        let _ = with_ui_state_write(state, profile_id, |ui_state| {
+            let Some(automation_runs) = ui_state
+                .get_mut("automationRuns")
+                .and_then(Value::as_array_mut)
+            else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "automation runs state is missing",
+                ));
+            };
+
+            if let Some(run) = automation_runs
+                .iter_mut()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(run_id.as_str()))
+            {
+                let session_id = run.get("sessionId").cloned().unwrap_or(Value::Null);
+                *run = json!({
+                    "id": run_id,
+                    "automationId": automation_id,
+                    "automationName": automation_name,
+                    "status": "failed",
+                    "trigger": normalized_trigger,
+                    "sessionId": session_id,
+                    "repoPath": git_repo_path.clone().map(Value::from).unwrap_or(Value::Null),
+                    "cwd": cwd.clone().map(Value::from).unwrap_or(Value::Null),
+                    "worktreePath": worktree_path.clone().map(Value::from).unwrap_or(Value::Null),
+                    "startedAt": now,
+                    "completedAt": completed_at,
+                    "error": error_message
+                });
+            }
+            Ok(())
+        })
+        .await;
+        emit_profile_automations_updated(state, profile_id).await;
+
+        if normalized_trigger == "schedule" {
+            let interval_minutes = automation
+                .get("intervalMinutes")
+                .and_then(Value::as_i64)
+                .unwrap_or(1)
+                .max(1);
+            let next_run_at = completed_at + interval_minutes * 60_000;
+            if let Ok(updated_automation) = with_ui_state_write(state, profile_id, |ui_state| {
+                let Some(automations) = ui_state
+                    .get_mut("automations")
+                    .and_then(Value::as_array_mut)
+                else {
+                    return Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "automations state is missing",
+                    ));
+                };
+                let Some(automation_entry) = automations
+                    .iter_mut()
+                    .find(|entry| entry.get("id").and_then(Value::as_str) == Some(automation_id))
+                else {
+                    return Err(api_error(StatusCode::NOT_FOUND, "Automation not found."));
+                };
+                if let Some(object) = automation_entry.as_object_mut() {
+                    object.insert("nextRunAt".to_string(), Value::from(next_run_at));
+                }
+                Ok(automation_entry.clone())
+            })
+            .await
+            {
+                let schedule_state = state.clone();
+                let schedule_profile_id = profile_id.to_string();
+                tokio::spawn(async move {
+                    schedule_automation_timer(
+                        schedule_state,
+                        schedule_profile_id,
+                        updated_automation,
+                    )
+                    .await;
+                });
+                emit_profile_automations_updated(state, profile_id).await;
+            }
+        }
+    }
+
+    result
+}
+
+fn arena_store_path(config: &Config, profile_id: &str) -> PathBuf {
+    resolve_runtime_profile(config, profile_id)
+        .data_dir
+        .join("arena-runs.json")
+}
+
+async fn read_arena_store_state(state: &AppState, profile_id: &str) -> Result<ArenaStoreState> {
+    let _guard = ui_state_lock(state, profile_id).await.lock_owned().await;
+    let path = arena_store_path(&state.config, profile_id);
+    match tokio_fs::read_to_string(&path).await {
+        Ok(raw) => match serde_json::from_str::<ArenaStoreState>(&raw) {
+            Ok(parsed) => Ok(parsed),
+            Err(_) => {
+                let empty = ArenaStoreState::default();
+                if let Some(parent) = path.parent() {
+                    tokio_fs::create_dir_all(parent).await.ok();
+                }
+                tokio_fs::write(
+                    &path,
+                    serde_json::to_vec_pretty(&empty).unwrap_or_else(|_| b"{\"runs\":[]}".to_vec()),
+                )
+                .await
+                .ok();
+                Ok(empty)
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ArenaStoreState::default())
+        }
+        Err(error) => Err(error).context("failed to read arena store"),
+    }
+}
+
+async fn write_arena_store_state(
+    state: &AppState,
+    profile_id: &str,
+    arena_state: &ArenaStoreState,
+) -> Result<()> {
+    let _guard = ui_state_lock(state, profile_id).await.lock_owned().await;
+    let path = arena_store_path(&state.config, profile_id);
+    if let Some(parent) = path.parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .context("failed to create arena store directory")?;
+    }
+    let bytes =
+        serde_json::to_vec_pretty(arena_state).context("failed to encode arena store state")?;
+    tokio_fs::write(path, bytes)
+        .await
+        .context("failed to write arena store state")
+}
+
+fn value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Value::Object(object) => {
+            for key in ["text", "title", "value", "name", "status", "state"] {
+                if let Some(text) = object.get(key).and_then(value_text) {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn normalized_thread_status(value: Option<&Value>) -> Option<String> {
+    let Some(value) = value else {
+        return None;
+    };
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Value::Object(object) => object
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| value_text(value)),
+        _ => None,
+    }
+}
+
+fn is_live_thread_status(status: &str) -> bool {
+    matches!(status, "running" | "active")
+}
+
+fn extract_arena_response(turns: &[Value]) -> Option<String> {
+    for turn in turns.iter().rev() {
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items.iter().rev() {
+            if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
+                continue;
+            }
+            if let Some(text) = item.get("text").and_then(value_text) {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+async fn list_arena_runs_payload(state: &AppState, profile_id: &str) -> ApiResult<Value> {
+    let mut arena_state = read_arena_store_state(state, profile_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read arena runs: {error}"),
+            )
+        })?;
+    let mut changed = false;
+
+    for run in &mut arena_state.runs {
+        for contestant in &mut run.contestants {
+            let session_payload = internal_json_request_for_profile(
+                state,
+                Some(profile_id),
+                Method::GET,
+                &format!("/api/sessions/{}?limit=20", contestant.session_id),
+                None,
+            )
+            .await;
+            let Ok(session_payload) = session_payload else {
+                continue;
+            };
+
+            let Some(thread) = session_payload.get("thread").and_then(Value::as_object) else {
+                continue;
+            };
+            let status = normalized_thread_status(thread.get("status"))
+                .unwrap_or_else(|| contestant.status.clone());
+            let mut response = contestant.response.clone();
+            if response.is_none() && !is_live_thread_status(&status) {
+                if let Some(turns) = thread.get("turns").and_then(Value::as_array) {
+                    response = extract_arena_response(turns);
+                }
+            }
+            let updated_at = contestant.updated_at.max(
+                thread
+                    .get("updatedAt")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(contestant.updated_at),
+            );
+            if status != contestant.status
+                || response != contestant.response
+                || updated_at != contestant.updated_at
+            {
+                contestant.status = status;
+                contestant.response = response;
+                contestant.updated_at = updated_at;
+                changed = true;
+            }
+        }
+
+        let next_status = if run
+            .contestants
+            .iter()
+            .any(|contestant| is_live_thread_status(&contestant.status))
+        {
+            "running".to_string()
+        } else {
+            "completed".to_string()
+        };
+        let next_updated_at = run
+            .contestants
+            .iter()
+            .map(|contestant| contestant.updated_at)
+            .max()
+            .unwrap_or(run.updated_at)
+            .max(run.updated_at);
+        if run.status != next_status || run.updated_at != next_updated_at {
+            run.status = next_status;
+            run.updated_at = next_updated_at;
+            changed = true;
+        }
+    }
+
+    arena_state
+        .runs
+        .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    if changed {
+        write_arena_store_state(state, profile_id, &arena_state)
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to persist hydrated arena runs: {error}"),
+                )
+            })?;
+    }
+
+    Ok(json!({
+        "runs": arena_state.runs
+    }))
+}
+
+async fn start_arena_run_payload(
+    state: &AppState,
+    profile_id: &str,
+    prompt: &str,
+    contestants: &Value,
+    preferences: &Value,
+) -> ApiResult<Value> {
+    let trimmed_prompt = prompt.trim();
+    if trimmed_prompt.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Prompt is required."));
+    }
+
+    let mut normalized_contestants = Vec::<(String, String)>::new();
+    let mut seen_models = std::collections::HashSet::new();
+    for contestant in contestants
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .take(8)
+    {
+        let model = contestant
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_default();
+        let label = contestant
+            .get("label")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| model.clone());
+        if model.is_empty() || label.is_empty() || !seen_models.insert(model.clone()) {
+            continue;
+        }
+        normalized_contestants.push((model, label));
+        if normalized_contestants.len() >= 4 {
+            break;
+        }
+    }
+
+    if normalized_contestants.len() < 2 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Choose at least two models for an arena run.",
+        ));
+    }
+
+    let config_payload = get_config_payload(state, profile_id).await?;
+    let mut base_preferences = config_payload
+        .get("defaults")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(overrides) = preferences.as_object() {
+        for (key, value) in overrides {
+            if !value.is_null() {
+                base_preferences.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    let created_at = now_unix_ms();
+    let title_source = trimmed_prompt
+        .split('\n')
+        .next()
+        .unwrap_or(trimmed_prompt)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title = if title_source.is_empty() {
+        "Arena run".to_string()
+    } else {
+        title_source.chars().take(60).collect::<String>()
+    };
+    let client = app_server_client(state, profile_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to codex app-server: {error}"),
+            )
+        })?;
+    let mut arena_contestants = Vec::new();
+
+    for (model, label) in &normalized_contestants {
+        let mut session_preferences = base_preferences.clone();
+        session_preferences.insert("model".to_string(), Value::String(model.clone()));
+        let cwd = session_preferences
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "A working directory is required to start an arena run.",
+                )
+            })?;
+
+        let response = client
+            .request(
+                "thread/start",
+                json!({
+                    "model": session_preferences.get("model").cloned().unwrap_or(Value::Null),
+                    "cwd": cwd,
+                    "approvalPolicy": session_preferences.get("approvalPolicy").cloned().unwrap_or_else(|| json!("on-request")),
+                    "sandbox": session_preferences.get("sandboxMode").cloned().unwrap_or_else(|| json!("workspace-write")),
+                    "serviceTier": match session_preferences.get("speed").and_then(Value::as_str) {
+                        Some("fast") => Value::String("fast".to_string()),
+                        Some("flex") => Value::String("flex".to_string()),
+                        _ => Value::Null
+                    },
+                    "experimentalRawEvents": false,
+                    "persistExtendedHistory": true
+                }),
+            )
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to create an arena session: {error}"),
+                )
+            })?;
+        let session_id = response
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "Codex app-server returned an invalid arena session payload.",
+                )
+            })?;
+
+        with_ui_state_write(state, profile_id, |ui_state| {
+            let Some(preferences_by_thread_id) = ui_state
+                .get_mut("preferencesByThreadId")
+                .and_then(Value::as_object_mut)
+            else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "preferences state is missing",
+                ));
+            };
+            preferences_by_thread_id.insert(
+                session_id.clone(),
+                Value::Object(session_preferences.clone()),
+            );
+            Ok(())
+        })
+        .await?;
+
+        let thread_name = format!("Arena · {} · {}", title, label)
+            .chars()
+            .take(120)
+            .collect::<String>();
+        client
+            .request(
+                "thread/name/set",
+                json!({
+                    "threadId": session_id,
+                    "name": thread_name
+                }),
+            )
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to name an arena session: {error}"),
+                )
+            })?;
+
+        arena_contestants.push(ArenaContestantRecord {
+            id: Uuid::new_v4().to_string(),
+            session_id,
+            model: model.clone(),
+            label: label.clone(),
+            status: "running".to_string(),
+            response: None,
+            created_at,
+            updated_at: created_at,
+        });
+    }
+
+    let run = ArenaRunRecord {
+        id: Uuid::new_v4().to_string(),
+        prompt: trimmed_prompt.to_string(),
+        cwd: base_preferences
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        status: "running".to_string(),
+        created_at,
+        updated_at: created_at,
+        contestants: arena_contestants.clone(),
+    };
+
+    let mut arena_state = read_arena_store_state(state, profile_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read arena runs: {error}"),
+            )
+        })?;
+    arena_state.runs.retain(|entry| entry.id != run.id);
+    arena_state.runs.insert(0, run.clone());
+    arena_state.runs.truncate(60);
+    write_arena_store_state(state, profile_id, &arena_state)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to persist arena runs: {error}"),
+            )
+        })?;
+
+    for contestant in &arena_contestants {
+        let mut session_preferences = base_preferences.clone();
+        session_preferences.insert("model".to_string(), Value::String(contestant.model.clone()));
+        let send_result = internal_json_request_for_profile(
+            state,
+            Some(profile_id),
+            Method::POST,
+            &format!("/api/sessions/{}/messages", contestant.session_id),
+            Some(json!({
+                "prompt": trimmed_prompt,
+                "attachmentIds": [],
+                "preferences": Value::Object(session_preferences)
+            })),
+        )
+        .await;
+
+        if let Err(error) = send_result {
+            let mut current_state =
+                read_arena_store_state(state, profile_id)
+                    .await
+                    .map_err(|read_error| {
+                        api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!(
+                                "Failed to refresh arena runs after send failure: {read_error}"
+                            ),
+                        )
+                    })?;
+            if let Some(current_run) = current_state
+                .runs
+                .iter_mut()
+                .find(|entry| entry.id == run.id)
+            {
+                current_run.updated_at = now_unix_ms();
+                if let Some(current_contestant) = current_run
+                    .contestants
+                    .iter_mut()
+                    .find(|entry| entry.id == contestant.id)
+                {
+                    current_contestant.status = "failed".to_string();
+                    current_contestant.response = Some(error.to_string());
+                    current_contestant.updated_at = current_run.updated_at;
+                }
+            }
+            write_arena_store_state(state, profile_id, &current_state)
+                .await
+                .map_err(|write_error| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to persist arena send failure: {write_error}"),
+                    )
+                })?;
+        }
+    }
+
+    let payload = list_arena_runs_payload(state, profile_id).await?;
+    let matching_run = payload
+        .get("runs")
+        .and_then(Value::as_array)
+        .and_then(|runs| {
+            runs.iter()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(run.id.as_str()))
+        })
+        .cloned()
+        .unwrap_or_else(|| serde_json::to_value(&run).unwrap_or(Value::Null));
+    Ok(matching_run)
+}
+
 fn parse_front_matter(raw: &str) -> (Option<String>, Option<String>) {
     let Some(stripped) = raw.strip_prefix("---\n") else {
         return (None, None);
@@ -2188,7 +6192,8 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
 
             if matches!(
                 route_path.as_str(),
-                "/api/directories"
+                "/api/config"
+                    | "/api/directories"
                     | "/api/editor"
                     | "/api/catalog"
                     | "/api/notifications"
@@ -2210,6 +6215,7 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                 };
 
                 let mut response = match route_path.as_str() {
+                    "/api/config" => handle_config_api_http(state, request, auth).await,
                     "/api/directories" => handle_directories_api_http(state, request).await,
                     "/api/editor" => handle_editor_api_http(state, request, auth).await,
                     "/api/catalog" => handle_catalog_api_http(state, request, auth).await,
@@ -2227,6 +6233,297 @@ async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Req
                     }
                     _ => unreachable!(),
                 };
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path == "/api/automations" || route_path.starts_with("/api/automations/") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+
+                let mut response =
+                    handle_automations_api_http(state, request, auth, &route_path).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path == "/api/arena" {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+
+                let mut response = handle_arena_api_http(state, request, auth).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path == "/api/sessions" {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+
+                let mut response = handle_sessions_api_http(state, request, auth).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path.starts_with("/api/sessions/") && route_path.ends_with("/organization") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/organization"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_organization_api_http(state, &session_id, request, auth).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path.starts_with("/api/sessions/") && route_path.ends_with("/name") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/name"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_name_api_http(state, &session_id, request, auth).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path.starts_with("/api/sessions/") && route_path.ends_with("/archive") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/archive"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_archive_api_http(state, &session_id, request, auth, true).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path.starts_with("/api/sessions/") && route_path.ends_with("/unarchive") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/unarchive"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_archive_api_http(state, &session_id, request, auth, false).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if let Some(session_id) = route_path
+                .strip_prefix("/api/sessions/")
+                .filter(|value| !value.is_empty() && !value.contains('/'))
+                .map(str::to_string)
+            {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let mut response = handle_session_api_http(state, &session_id, request, auth).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path.starts_with("/api/sessions/") && route_path.ends_with("/draft") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.strip_suffix("/draft"))
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_draft_api_http(state, request, auth, &session_id).await;
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path.starts_with("/api/sessions/") && route_path.contains("/queue") {
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    let mut response =
+                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                };
+                let session_id = route_path
+                    .strip_prefix("/api/sessions/")
+                    .and_then(|suffix| suffix.split("/queue").next())
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let mut response =
+                    handle_session_queue_api_http(state, request, auth, &session_id, &route_path)
+                        .await;
                 if let Some(origin_value) = cors_origin {
                     apply_cors_headers(
                         response.headers_mut(),
@@ -2332,6 +6629,495 @@ async fn handle_directories_api_http(state: AppState, request: Request) -> Respo
 
     let current_path = query_param_value(request.uri().query(), "path");
     match list_directories_payload(&state, current_path.as_deref()).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn get_config_payload(state: &AppState, profile_id: &str) -> ApiResult<Value> {
+    let mut payload = internal_json_request_for_profile(
+        state,
+        Some(profile_id),
+        Method::GET,
+        "/api/config",
+        None,
+    )
+    .await
+    .map_err(|error| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to load config from the internal backend: {error}"),
+        )
+    })?;
+
+    let notifications =
+        get_notifications_payload(state, profile_id, DEFAULT_NOTIFICATION_LIMIT).await?;
+    let autostart = get_autostart_state(&state.config)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let theme_override = read_stored_theme_settings(&state.config, profile_id)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let (shutdown_available, _) = system_shutdown_capability(&state.config).await;
+    let paused_queues = list_resume_pending_queues_payload(state, profile_id)
+        .await
+        .unwrap_or_else(|_| json!([]));
+    let (overlays, shutdown_after_queue_completes, scheduled_shutdown) =
+        with_ui_state_read(state, profile_id, |ui_state| {
+        let notification_settings = ui_state
+            .get("notifications")
+            .and_then(Value::as_object)
+            .and_then(|notifications| notifications.get("settings"))
+            .map(|value| normalize_notification_settings_value(Some(value)))
+            .unwrap_or_else(default_notification_settings_value);
+
+            Ok((
+                json!({
+                    "notifications": {
+                        "unreadCount": notifications.get("unreadCount").cloned().unwrap_or_else(|| json!(0)),
+                        "settings": notification_settings
+                    },
+                    "sessionOrganization": {
+                        "savedFilters": ui_state
+                            .get("savedSessionFilters")
+                            .cloned()
+                            .unwrap_or_else(|| json!([])),
+                        "knownTags": known_tags_from_ui_state(ui_state)
+                    },
+                    "promptPresets": sorted_prompt_presets_from_ui_state(ui_state),
+                    "automations": {
+                        "items": sorted_automations_from_ui_state(ui_state),
+                        "recentRuns": recent_automation_runs_from_ui_state(ui_state, DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT)
+                    }
+                }),
+                ui_state
+                    .get("global")
+                    .and_then(|value| value.get("shutdownAfterQueueCompletes"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                ui_state
+                    .get("global")
+                    .and_then(|value| value.get("scheduledShutdown"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ))
+        })
+        .await?;
+
+    let payload_object = payload.as_object_mut().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            "Internal config response had an unexpected shape.",
+        )
+    })?;
+    let overlay_object = overlays.as_object().ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Config overlays had an unexpected shape.",
+        )
+    })?;
+
+    for (key, value) in overlay_object {
+        payload_object.insert(key.clone(), value.clone());
+    }
+
+    payload_object.insert("autostart".to_string(), autostart);
+    payload_object.insert(
+        "systemShutdown".to_string(),
+        json!({
+            "available": shutdown_available,
+            "delaySeconds": state.config.system_shutdown_delay_seconds,
+            "armed": shutdown_available
+                && state.config.system_shutdown_enabled
+                && shutdown_after_queue_completes
+        }),
+    );
+    if let Some(theme) = theme_override {
+        payload_object.insert("theme".to_string(), theme);
+    }
+
+    let next_scheduled_shutdown = if shutdown_available
+        && scheduled_shutdown
+            .get("scheduledFor")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > now_unix_ms())
+    {
+        scheduled_shutdown
+    } else {
+        Value::Null
+    };
+    if let Some(startup) = payload_object
+        .get_mut("startup")
+        .and_then(Value::as_object_mut)
+    {
+        startup.insert("scheduledShutdown".to_string(), next_scheduled_shutdown);
+        startup.insert("pausedQueues".to_string(), paused_queues);
+    } else {
+        payload_object.insert(
+            "startup".to_string(),
+            json!({
+                "pausedQueues": paused_queues,
+                "scheduledShutdown": next_scheduled_shutdown
+            }),
+        );
+    }
+
+    Ok(payload)
+}
+
+async fn update_config_payload(
+    state: &AppState,
+    profile_id: &str,
+    payload: Value,
+) -> ApiResult<Value> {
+    let mut event_patch = serde_json::Map::new();
+
+    if let Some(theme) = payload.get("theme").filter(|value| !value.is_null()) {
+        let saved_theme = write_stored_theme_settings(&state.config, profile_id, theme)
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        event_patch.insert("theme".to_string(), saved_theme);
+    }
+
+    if let Some(enabled) = payload
+        .get("autostart")
+        .and_then(|value| value.get("enabled"))
+        .and_then(Value::as_bool)
+    {
+        let autostart = save_autostart_enabled(&state.config, enabled)
+            .await
+            .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+        event_patch.insert("autostart".to_string(), autostart);
+    }
+
+    if let Some(armed) = payload
+        .get("systemShutdown")
+        .and_then(|value| value.get("armed"))
+        .and_then(Value::as_bool)
+    {
+        with_ui_state_write(state, profile_id, |ui_state| {
+            let Some(global) = ui_state.get_mut("global").and_then(Value::as_object_mut) else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "global state is missing",
+                ));
+            };
+            global.insert("shutdownAfterQueueCompletes".to_string(), json!(armed));
+            if !armed {
+                global.insert("scheduledShutdown".to_string(), Value::Null);
+            }
+            Ok(())
+        })
+        .await?;
+        if armed {
+            maybe_schedule_global_shutdown(state, profile_id, None).await;
+        } else {
+            clear_scheduled_shutdown(state, profile_id).await;
+        }
+    }
+
+    if !event_patch.is_empty() {
+        emit_profile_config_updated(state, profile_id, Value::Object(event_patch)).await;
+    }
+    if payload.get("systemShutdown").is_some() {
+        emit_runtime_profile_config_updated(state, profile_id).await;
+    }
+
+    get_config_payload(state, profile_id).await
+}
+
+async fn handle_config_api_http(state: AppState, request: Request, auth: AuthContext) -> Response {
+    let result = match request.method() {
+        &Method::GET => get_config_payload(&state, &auth.profile_id).await,
+        &Method::PATCH => {
+            if auth.role != UserRole::Admin {
+                return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+            }
+
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .context("failed to read config request body");
+            match body {
+                Ok(body) => {
+                    let payload: Value =
+                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    update_config_payload(&state, &auth.profile_id, payload).await
+                }
+                Err(_) => Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Failed to read config request body.",
+                )),
+            }
+        }
+        _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_sessions_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+) -> Response {
+    let query = request.uri().query().map(str::to_string);
+    let result = match request.method() {
+        &Method::GET => {
+            let archived =
+                query_param_value(query.as_deref(), "archived").as_deref() == Some("true");
+            let cursor = query_param_value(query.as_deref(), "cursor");
+            let limit = query_param_value(query.as_deref(), "limit")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(20);
+            let search_query = query_param_value(query.as_deref(), "query").unwrap_or_default();
+            let scope = query_param_value(query.as_deref(), "scope")
+                .unwrap_or_else(|| "summary".to_string());
+            let filter = session_filter_from_query(query.as_deref());
+
+            if search_query.trim().is_empty() {
+                list_sessions_payload(
+                    &state,
+                    &auth.profile_id,
+                    archived,
+                    cursor.as_deref(),
+                    limit,
+                    &filter,
+                )
+                .await
+            } else if scope == "full" {
+                let path = if let Some(query) = query.as_deref() {
+                    format!("/api/sessions?{query}")
+                } else {
+                    "/api/sessions".to_string()
+                };
+                internal_json_request_for_profile(
+                    &state,
+                    Some(&auth.profile_id),
+                    Method::GET,
+                    &path,
+                    None,
+                )
+                .await
+                .map_err(|error| {
+                    api_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to search sessions in the internal backend: {error}"),
+                    )
+                })
+            } else {
+                search_sessions_payload(
+                    &state,
+                    &auth.profile_id,
+                    &search_query,
+                    archived,
+                    cursor.as_deref(),
+                    limit,
+                    &filter,
+                )
+                .await
+            }
+        }
+        &Method::POST => {
+            if auth.role != UserRole::Admin {
+                return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+            }
+
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .context("failed to read session create body");
+            match body {
+                Ok(body) => {
+                    let payload: Value =
+                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    create_session_payload(
+                        &state,
+                        &auth.profile_id,
+                        payload
+                            .get("preferences")
+                            .cloned()
+                            .unwrap_or_else(|| json!({})),
+                        payload.get("name").and_then(Value::as_str),
+                    )
+                    .await
+                }
+                Err(_) => Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Failed to read session create body.",
+                )),
+            }
+        }
+        _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_api_http(
+    state: AppState,
+    session_id: &str,
+    request: Request,
+    auth: AuthContext,
+) -> Response {
+    let result = match request.method() {
+        &Method::GET => {
+            let limit = query_param_value(request.uri().query(), "limit")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(20);
+            internal_json_request_for_profile(
+                &state,
+                Some(&auth.profile_id),
+                Method::GET,
+                &format!("/api/sessions/{session_id}?limit={limit}"),
+                None,
+            )
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to load the session from the internal backend: {error}"),
+                )
+            })
+        }
+        &Method::PATCH => {
+            if auth.role != UserRole::Admin {
+                return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+            }
+
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .context("failed to read session update body");
+            match body {
+                Ok(body) => {
+                    let payload: Value =
+                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    save_session_preferences_payload(
+                        &state,
+                        &auth.profile_id,
+                        session_id,
+                        payload
+                            .get("preferences")
+                            .cloned()
+                            .unwrap_or_else(|| json!({})),
+                    )
+                    .await
+                }
+                Err(_) => Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Failed to read session update body.",
+                )),
+            }
+        }
+        _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_organization_api_http(
+    state: AppState,
+    session_id: &str,
+    request: Request,
+    auth: AuthContext,
+) -> Response {
+    if request.method() != Method::PATCH {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+    if auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    let result = match to_bytes(request.into_body(), usize::MAX)
+        .await
+        .context("failed to read session organization body")
+    {
+        Ok(body) => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            update_session_organization_payload(&state, &auth.profile_id, session_id, payload).await
+        }
+        Err(_) => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Failed to read session organization body.",
+        )),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_name_api_http(
+    state: AppState,
+    session_id: &str,
+    request: Request,
+    auth: AuthContext,
+) -> Response {
+    if request.method() != Method::POST {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+    if auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    let result = match to_bytes(request.into_body(), usize::MAX)
+        .await
+        .context("failed to read session name body")
+    {
+        Ok(body) => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            rename_session_payload(
+                &state,
+                &auth.profile_id,
+                session_id,
+                payload
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+            .await
+        }
+        Err(_) => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Failed to read session name body.",
+        )),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_archive_api_http(
+    state: AppState,
+    session_id: &str,
+    request: Request,
+    auth: AuthContext,
+    archived: bool,
+) -> Response {
+    if request.method() != Method::POST {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+    if auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    let result = if archived {
+        archive_session_payload(&state, &auth.profile_id, session_id).await
+    } else {
+        unarchive_session_payload(&state, &auth.profile_id, session_id).await
+    };
+
+    match result {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => json_error(error.status, &error.message),
     }
@@ -2559,6 +7345,341 @@ async fn handle_prompt_presets_api_http(
             let preset_id =
                 query_param_value(request.uri().query(), "presetId").unwrap_or_default();
             delete_prompt_preset_payload(&state, &auth.profile_id, &preset_id).await
+        }
+        _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_draft_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    session_id: &str,
+) -> Response {
+    let result = match request.method() {
+        &Method::GET => get_session_draft_payload(&state, &auth.profile_id, session_id).await,
+        &Method::PATCH => {
+            if auth.role != UserRole::Admin {
+                return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+            }
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .context("failed to read draft request body");
+            match body {
+                Ok(body) => {
+                    let payload: Value =
+                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    save_session_draft_payload(
+                        &state,
+                        &auth.profile_id,
+                        session_id,
+                        payload
+                            .get("draft")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        payload
+                            .get("intent")
+                            .and_then(Value::as_str)
+                            .unwrap_or("message"),
+                    )
+                    .await
+                }
+                Err(_) => Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Failed to read draft request body.",
+                )),
+            }
+        }
+        &Method::DELETE => {
+            if auth.role != UserRole::Admin {
+                return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+            }
+            clear_session_draft_payload(&state, &auth.profile_id, session_id).await
+        }
+        _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_session_queue_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    session_id: &str,
+    route_path: &str,
+) -> Response {
+    let queue_prefix = format!("/api/sessions/{session_id}/queue");
+    let suffix = route_path.strip_prefix(&queue_prefix).unwrap_or_default();
+    let requires_admin = request.method() != Method::GET;
+    if requires_admin && auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    let result = if suffix.is_empty() {
+        match request.method() {
+            &Method::GET => get_session_queue_payload(&state, &auth.profile_id, session_id).await,
+            &Method::POST => {
+                let body = to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .context("failed to read queue request body");
+                match body {
+                    Ok(body) => {
+                        let payload: Value =
+                            serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                        enqueue_session_queue_payload(
+                            &state,
+                            &auth.profile_id,
+                            session_id,
+                            payload
+                                .get("prompt")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                            payload.get("attachmentIds"),
+                        )
+                        .await
+                    }
+                    Err(_) => Err(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "Failed to read queue request body.",
+                    )),
+                }
+            }
+            _ => Err(api_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "Method not allowed.",
+            )),
+        }
+    } else if suffix == "/resume" {
+        if request.method() != Method::POST {
+            Err(api_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "Method not allowed.",
+            ))
+        } else {
+            resume_session_queue_payload(&state, &auth.profile_id, session_id).await
+        }
+    } else if suffix == "/reorder" {
+        if request.method() != Method::POST {
+            Err(api_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "Method not allowed.",
+            ))
+        } else {
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .context("failed to read queue reorder request body");
+            match body {
+                Ok(body) => {
+                    let payload: Value =
+                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    let queue_ids = string_array_from_value(payload.get("queueIds"));
+                    reorder_session_queue_payload(&state, &auth.profile_id, session_id, &queue_ids)
+                        .await
+                }
+                Err(_) => Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Failed to read queue reorder request body.",
+                )),
+            }
+        }
+    } else {
+        let queue_id = suffix.trim_start_matches('/');
+        if queue_id.is_empty() || queue_id.contains('/') {
+            Err(api_error(StatusCode::NOT_FOUND, "Not found."))
+        } else {
+            match request.method() {
+                &Method::DELETE => {
+                    remove_session_queue_item_payload(
+                        &state,
+                        &auth.profile_id,
+                        session_id,
+                        queue_id,
+                    )
+                    .await
+                }
+                &Method::PATCH => {
+                    let body = to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .context("failed to read queue update request body");
+                    match body {
+                        Ok(body) => {
+                            let payload: Value =
+                                serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                            update_session_queue_item_payload(
+                                &state,
+                                &auth.profile_id,
+                                session_id,
+                                queue_id,
+                                payload.get("prompt").and_then(Value::as_str),
+                                payload.get("attachmentIds"),
+                            )
+                            .await
+                        }
+                        Err(_) => Err(api_error(
+                            StatusCode::BAD_REQUEST,
+                            "Failed to read queue update request body.",
+                        )),
+                    }
+                }
+                &Method::POST => {
+                    let body = to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .context("failed to read queue dispatch request body");
+                    match body {
+                        Ok(body) => {
+                            let payload: Value =
+                                serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                            dispatch_session_queue_item_payload(
+                                &state,
+                                &auth.profile_id,
+                                session_id,
+                                queue_id,
+                                payload
+                                    .get("mode")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                            )
+                            .await
+                        }
+                        Err(_) => Err(api_error(
+                            StatusCode::BAD_REQUEST,
+                            "Failed to read queue dispatch request body.",
+                        )),
+                    }
+                }
+                _ => Err(api_error(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "Method not allowed.",
+                )),
+            }
+        }
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_automations_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+    route_path: &str,
+) -> Response {
+    if auth.role != UserRole::Admin {
+        return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+    }
+
+    let result = if route_path == "/api/automations" {
+        match request.method() {
+            &Method::POST => {
+                let body = to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .context("failed to read automations request body");
+                match body {
+                    Ok(body) => {
+                        let payload: Value =
+                            serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                        save_automation_payload(
+                            &state,
+                            &auth.profile_id,
+                            payload
+                                .get("automation")
+                                .cloned()
+                                .unwrap_or_else(|| json!({})),
+                        )
+                        .await
+                    }
+                    Err(_) => Err(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "Failed to read automations request body.",
+                    )),
+                }
+            }
+            &Method::DELETE => {
+                let automation_id =
+                    query_param_value(request.uri().query(), "automationId").unwrap_or_default();
+                delete_automation_payload(&state, &auth.profile_id, &automation_id).await
+            }
+            _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
+        }
+    } else if request.method() == Method::POST && route_path.ends_with("/run") {
+        let automation_id = route_path
+            .strip_prefix("/api/automations/")
+            .and_then(|suffix| suffix.strip_suffix("/run"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .context("failed to read automation run request body");
+        match body {
+            Ok(body) => {
+                let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                let trigger = if payload.get("trigger").and_then(Value::as_str) == Some("schedule")
+                {
+                    "schedule"
+                } else {
+                    "manual"
+                };
+                run_automation_payload(&state, &auth.profile_id, &automation_id, trigger).await
+            }
+            Err(_) => Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "Failed to read automation run request body.",
+            )),
+        }
+    } else {
+        return json_error(StatusCode::NOT_FOUND, "Not found.");
+    };
+
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
+async fn handle_arena_api_http(state: AppState, request: Request, auth: AuthContext) -> Response {
+    let result = match request.method() {
+        &Method::GET => list_arena_runs_payload(&state, &auth.profile_id).await,
+        &Method::POST => {
+            if auth.role != UserRole::Admin {
+                return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+            }
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .context("failed to read arena request body");
+            match body {
+                Ok(body) => {
+                    let payload: Value =
+                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    start_arena_run_payload(
+                        &state,
+                        &auth.profile_id,
+                        payload
+                            .get("prompt")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        payload.get("contestants").unwrap_or(&Value::Null),
+                        payload.get("preferences").unwrap_or(&Value::Null),
+                    )
+                    .await
+                }
+                Err(_) => Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Failed to read arena request body.",
+                )),
+            }
         }
         _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
     };
@@ -3412,15 +8533,12 @@ async fn execute_ws_method(
     }
 
     match method {
-        "config/get" => internal_json_request(state, Method::GET, "/api/config", None).await,
-        "config/update" => {
-            let payload = json!({
-                "autostart": params.get("autostart").cloned().unwrap_or_else(|| json!({})),
-                "systemShutdown": params.get("systemShutdown").cloned().unwrap_or_else(|| json!({})),
-                "theme": params.get("theme").cloned().unwrap_or(Value::Null)
-            });
-            internal_json_request(state, Method::PATCH, "/api/config", Some(payload)).await
-        }
+        "config/get" => get_config_payload(state, &auth.profile_id)
+            .await
+            .map_err(anyhow::Error::from),
+        "config/update" => update_config_payload(state, &auth.profile_id, params)
+            .await
+            .map_err(anyhow::Error::from),
         "notifications/list" => {
             let limit = params
                 .get("limit")
@@ -3460,34 +8578,29 @@ async fn execute_ws_method(
                 .await
                 .map_err(anyhow::Error::from)
         }
-        "automations/save" => {
-            let payload = json!({
-                "automation": params.get("automation").cloned().unwrap_or(Value::Null)
-            });
-            internal_json_request(state, Method::POST, "/api/automations", Some(payload)).await
-        }
+        "automations/save" => save_automation_payload(
+            state,
+            &auth.profile_id,
+            params.get("automation").cloned().unwrap_or(Value::Null),
+        )
+        .await
+        .map_err(anyhow::Error::from),
         "automations/delete" => {
             let automation_id = require_string(&params, "automationId")?;
-            internal_json_request(
-                state,
-                Method::DELETE,
-                &format!("/api/automations?automationId={automation_id}"),
-                None,
-            )
-            .await
+            delete_automation_payload(state, &auth.profile_id, &automation_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "automations/run" => {
             let automation_id = require_string(&params, "automationId")?;
-            let payload = json!({
-                "trigger": params.get("trigger").cloned().unwrap_or_else(|| json!("manual"))
-            });
-            internal_json_request(
-                state,
-                Method::POST,
-                &format!("/api/automations/{automation_id}/run"),
-                Some(payload),
-            )
-            .await
+            let trigger = if params.get("trigger").and_then(Value::as_str) == Some("schedule") {
+                "schedule"
+            } else {
+                "manual"
+            };
+            run_automation_payload(state, &auth.profile_id, &automation_id, trigger)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "runtime/status" => codex_runtime_status(state, false).await,
         "runtime/checkUpdate" => codex_runtime_status(state, true).await,
@@ -3532,15 +8645,12 @@ async fn execute_ws_method(
             let cursor = params
                 .get("cursor")
                 .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(urlencoding::encode);
+                .filter(|value| !value.is_empty());
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
-            let mut path = format!("/api/sessions?archived={archived}&limit={limit}");
-            if let Some(cursor) = cursor {
-                path.push_str(&format!("&cursor={cursor}"));
-            }
-            append_session_filter_query(&mut path, &params);
-            internal_json_request(state, Method::GET, &path, None).await
+            let filter = session_filter_from_value(params.get("filter"));
+            list_sessions_payload(state, &auth.profile_id, archived, cursor, limit, &filter)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "sessions/search" => {
             let archived = params
@@ -3548,7 +8658,6 @@ async fn execute_ws_method(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let query_raw = require_string(&params, "query")?;
-            let query = urlencoding::encode(&query_raw);
             let scope = if params.get("scope").and_then(Value::as_str) == Some("full") {
                 "full"
             } else {
@@ -3557,38 +8666,50 @@ async fn execute_ws_method(
             let cursor = params
                 .get("cursor")
                 .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(urlencoding::encode);
+                .filter(|value| !value.is_empty());
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
-            let mut path = format!(
-                "/api/sessions?query={query}&scope={scope}&archived={archived}&limit={limit}"
-            );
-            if let Some(cursor) = cursor {
-                path.push_str(&format!("&cursor={cursor}"));
+            if scope == "full" {
+                let query = urlencoding::encode(&query_raw);
+                let mut path = format!(
+                    "/api/sessions?query={query}&scope={scope}&archived={archived}&limit={limit}"
+                );
+                if let Some(cursor) = cursor {
+                    path.push_str("&cursor=");
+                    path.push_str(&urlencoding::encode(cursor));
+                }
+                append_session_filter_query(&mut path, &params);
+                internal_json_request(state, Method::GET, &path, None).await
+            } else {
+                let filter = session_filter_from_value(params.get("filter"));
+                search_sessions_payload(
+                    state,
+                    &auth.profile_id,
+                    &query_raw,
+                    archived,
+                    cursor,
+                    limit,
+                    &filter,
+                )
+                .await
+                .map_err(anyhow::Error::from)
             }
-            append_session_filter_query(&mut path, &params);
-            internal_json_request(state, Method::GET, &path, None).await
         }
-        "session/create" => {
-            let payload = json!({
-                "preferences": params.get("preferences").cloned().unwrap_or_else(|| json!({})),
-                "name": params.get("name").cloned().unwrap_or(Value::Null),
-            });
-            internal_json_request(state, Method::POST, "/api/sessions", Some(payload)).await
-        }
+        "session/create" => create_session_payload(
+            state,
+            &auth.profile_id,
+            params
+                .get("preferences")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            params.get("name").and_then(Value::as_str),
+        )
+        .await
+        .map_err(anyhow::Error::from),
         "session/organization/update" => {
             let session_id = require_string(&params, "sessionId")?;
-            let payload = json!({
-                "pinned": params.get("pinned").cloned().unwrap_or(Value::Null),
-                "tags": params.get("tags").cloned().unwrap_or(Value::Null)
-            });
-            internal_json_request(
-                state,
-                Method::PATCH,
-                &format!("/api/sessions/{session_id}/organization"),
-                Some(payload),
-            )
-            .await
+            update_session_organization_payload(state, &auth.profile_id, &session_id, params)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "sessionFilters/save" => save_session_filter_payload(
             state,
@@ -3698,168 +8819,138 @@ async fn execute_ws_method(
         }
         "session/draft/get" => {
             let session_id = require_string(&params, "sessionId")?;
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!("/api/sessions/{session_id}/draft"),
-                None,
-            )
-            .await
+            get_session_draft_payload(state, &auth.profile_id, &session_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "session/draft/save" => {
             let session_id = require_string(&params, "sessionId")?;
-            let payload = json!({
-                "draft": params.get("draft").cloned().unwrap_or_else(|| Value::String(String::new())),
-                "intent": params.get("intent").cloned().unwrap_or_else(|| Value::String("message".to_string()))
-            });
-            internal_json_request(
+            save_session_draft_payload(
                 state,
-                Method::PATCH,
-                &format!("/api/sessions/{session_id}/draft"),
-                Some(payload),
+                &auth.profile_id,
+                &session_id,
+                params
+                    .get("draft")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                params
+                    .get("intent")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message"),
             )
             .await
+            .map_err(anyhow::Error::from)
         }
         "session/draft/clear" => {
             let session_id = require_string(&params, "sessionId")?;
-            internal_json_request(
-                state,
-                Method::DELETE,
-                &format!("/api/sessions/{session_id}/draft"),
-                None,
-            )
-            .await
+            clear_session_draft_payload(state, &auth.profile_id, &session_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "session/queue/get" => {
             let session_id = require_string(&params, "sessionId")?;
-            internal_json_request(
-                state,
-                Method::GET,
-                &format!("/api/sessions/{session_id}/queue"),
-                None,
-            )
-            .await
+            get_session_queue_payload(state, &auth.profile_id, &session_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "session/queue/enqueue" => {
             let session_id = require_string(&params, "sessionId")?;
-            let payload = json!({
-                "prompt": params.get("prompt").cloned().unwrap_or_else(|| Value::String(String::new())),
-                "attachmentIds": params.get("attachmentIds").cloned().unwrap_or_else(|| json!([]))
-            });
-            internal_json_request(
+            enqueue_session_queue_payload(
                 state,
-                Method::POST,
-                &format!("/api/sessions/{session_id}/queue"),
-                Some(payload),
+                &auth.profile_id,
+                &session_id,
+                params
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                params.get("attachmentIds"),
             )
             .await
+            .map_err(anyhow::Error::from)
         }
         "session/queue/resume" => {
             let session_id = require_string(&params, "sessionId")?;
-            internal_json_request(
-                state,
-                Method::POST,
-                &format!("/api/sessions/{session_id}/queue/resume"),
-                Some(json!({})),
-            )
-            .await
+            resume_session_queue_payload(state, &auth.profile_id, &session_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "session/queue/remove" => {
             let session_id = require_string(&params, "sessionId")?;
             let queue_id = require_string(&params, "queueId")?;
-            internal_json_request(
-                state,
-                Method::DELETE,
-                &format!("/api/sessions/{session_id}/queue/{queue_id}"),
-                None,
-            )
-            .await
+            remove_session_queue_item_payload(state, &auth.profile_id, &session_id, &queue_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "session/queue/update" => {
             let session_id = require_string(&params, "sessionId")?;
             let queue_id = require_string(&params, "queueId")?;
-            let payload = json!({
-                "prompt": params.get("prompt").cloned().unwrap_or_else(|| Value::String(String::new())),
-                "attachmentIds": params.get("attachmentIds").cloned().unwrap_or_else(|| json!([]))
-            });
-            internal_json_request(
+            update_session_queue_item_payload(
                 state,
-                Method::PATCH,
-                &format!("/api/sessions/{session_id}/queue/{queue_id}"),
-                Some(payload),
+                &auth.profile_id,
+                &session_id,
+                &queue_id,
+                params.get("prompt").and_then(Value::as_str),
+                params.get("attachmentIds"),
             )
             .await
+            .map_err(anyhow::Error::from)
         }
         "session/queue/reorder" => {
             let session_id = require_string(&params, "sessionId")?;
-            let payload = json!({
-                "queueIds": params.get("queueIds").cloned().unwrap_or_else(|| json!([]))
-            });
-            internal_json_request(
-                state,
-                Method::POST,
-                &format!("/api/sessions/{session_id}/queue/reorder"),
-                Some(payload),
-            )
-            .await
+            let queue_ids = string_array_from_value(params.get("queueIds"));
+            reorder_session_queue_payload(state, &auth.profile_id, &session_id, &queue_ids)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "session/queue/dispatch" => {
             let session_id = require_string(&params, "sessionId")?;
             let queue_id = require_string(&params, "queueId")?;
-            let payload = json!({
-                "mode": require_string(&params, "mode")?
-            });
-            internal_json_request(
+            dispatch_session_queue_item_payload(
                 state,
-                Method::POST,
-                &format!("/api/sessions/{session_id}/queue/{queue_id}"),
-                Some(payload),
+                &auth.profile_id,
+                &session_id,
+                &queue_id,
+                &require_string(&params, "mode")?,
             )
             .await
+            .map_err(anyhow::Error::from)
         }
         "session/savePreferences" => {
             let session_id = require_string(&params, "sessionId")?;
-            let payload = json!({
-                "preferences": params.get("preferences").cloned().unwrap_or_else(|| json!({}))
-            });
-            internal_json_request(
+            save_session_preferences_payload(
                 state,
-                Method::PATCH,
-                &format!("/api/sessions/{session_id}"),
-                Some(payload),
+                &auth.profile_id,
+                &session_id,
+                params
+                    .get("preferences")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
             )
             .await
+            .map_err(anyhow::Error::from)
         }
         "session/rename" => {
             let session_id = require_string(&params, "sessionId")?;
-            let payload = json!({ "name": require_string(&params, "name")? });
-            internal_json_request(
+            rename_session_payload(
                 state,
-                Method::POST,
-                &format!("/api/sessions/{session_id}/name"),
-                Some(payload),
+                &auth.profile_id,
+                &session_id,
+                &require_string(&params, "name")?,
             )
             .await
+            .map_err(anyhow::Error::from)
         }
         "session/archive" => {
             let session_id = require_string(&params, "sessionId")?;
-            internal_json_request(
-                state,
-                Method::POST,
-                &format!("/api/sessions/{session_id}/archive"),
-                Some(json!({})),
-            )
-            .await
+            archive_session_payload(state, &auth.profile_id, &session_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "session/unarchive" => {
             let session_id = require_string(&params, "sessionId")?;
-            internal_json_request(
-                state,
-                Method::POST,
-                &format!("/api/sessions/{session_id}/unarchive"),
-                Some(json!({})),
-            )
-            .await
+            unarchive_session_payload(state, &auth.profile_id, &session_id)
+                .await
+                .map_err(anyhow::Error::from)
         }
         "turn/send" => {
             let session_id = require_string(&params, "sessionId")?;
@@ -3944,15 +9035,21 @@ async fn execute_ws_method(
         "account/login/start" => start_account_login(state, &auth.profile_id, &params).await,
         "account/login/cancel" => cancel_account_login(state, &auth.profile_id, &params).await,
         "account/logout" => logout_account(state, &auth.profile_id).await,
-        "arena/list" => internal_json_request(state, Method::GET, "/api/arena", None).await,
-        "arena/start" => {
-            let payload = json!({
-                "prompt": require_string(&params, "prompt")?,
-                "contestants": params.get("contestants").cloned().unwrap_or_else(|| json!([])),
-                "preferences": params.get("preferences").cloned().unwrap_or_else(|| json!({}))
-            });
-            internal_json_request(state, Method::POST, "/api/arena", Some(payload)).await
-        }
+        "arena/list" => list_arena_runs_payload(state, &auth.profile_id)
+            .await
+            .map_err(anyhow::Error::from),
+        "arena/start" => start_arena_run_payload(
+            state,
+            &auth.profile_id,
+            params
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            params.get("contestants").unwrap_or(&Value::Null),
+            params.get("preferences").unwrap_or(&Value::Null),
+        )
+        .await
+        .map_err(anyhow::Error::from),
         "git/repositories/list" => {
             internal_json_request(state, Method::GET, "/api/git/repositories", None).await
         }
@@ -4649,6 +9746,906 @@ async fn emit_profile_config_updated(state: &AppState, profile_id: &str, params:
         }),
     )
     .await;
+}
+
+async fn enqueue_profile_notification(
+    state: &AppState,
+    profile_id: &str,
+    notification_type: &str,
+    session_id: Option<&str>,
+    payload: Value,
+) {
+    if !is_valid_notification_event_type(notification_type) {
+        return;
+    }
+
+    let enabled = match with_ui_state_read(state, profile_id, |ui_state| {
+        let enabled_event_types = ui_state
+            .get("notifications")
+            .and_then(|value| value.get("settings"))
+            .and_then(|value| value.get("enabledEventTypes"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| {
+                default_notification_settings_value()["enabledEventTypes"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            });
+        Ok(enabled_event_types
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|entry| entry == notification_type))
+    })
+    .await
+    {
+        Ok(enabled) => enabled,
+        Err(_) => false,
+    };
+    if !enabled {
+        return;
+    }
+
+    let session_name = if let Some(session_id) = session_id {
+        build_session_summary_payload(state, profile_id, session_id, None)
+            .await
+            .ok()
+            .and_then(|summary| summary.get("name").cloned())
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+
+    let notification = json!({
+        "id": Uuid::new_v4().to_string(),
+        "type": notification_type,
+        "createdAt": now_unix_ms(),
+        "readAt": Value::Null,
+        "sessionId": session_id.map(Value::from).unwrap_or(Value::Null),
+        "sessionName": session_name,
+        "payload": payload
+    });
+
+    let unread_count = match with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(items) = ui_state
+            .get_mut("notifications")
+            .and_then(Value::as_object_mut)
+            .and_then(|notifications| notifications.get_mut("items"))
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "notifications state is missing",
+            ));
+        };
+
+        items.insert(0, notification.clone());
+        if items.len() > 200 {
+            items.truncate(200);
+        }
+        Ok(unread_notification_count(items))
+    })
+    .await
+    {
+        Ok(unread_count) => unread_count,
+        Err(_) => return,
+    };
+
+    emit_profile_global_notification(
+        state,
+        profile_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/notificationAdded",
+            "params": {
+                "notification": notification,
+                "unreadCount": unread_count
+            }
+        }),
+    )
+    .await;
+    emit_profile_config_updated(
+        state,
+        profile_id,
+        json!({
+            "notifications": {
+                "unreadCount": unread_count
+            }
+        }),
+    )
+    .await;
+}
+
+async fn emit_runtime_profile_config_updated(state: &AppState, profile_id: &str) {
+    let (shutdown_available, _) = system_shutdown_capability(&state.config).await;
+    let (shutdown_after_queue_completes, scheduled_shutdown) =
+        match with_ui_state_read(state, profile_id, |ui_state| {
+            Ok((
+                ui_state
+                    .get("global")
+                    .and_then(|value| value.get("shutdownAfterQueueCompletes"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                ui_state
+                    .get("global")
+                    .and_then(|value| value.get("scheduledShutdown"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ))
+        })
+        .await
+        {
+            Ok(values) => values,
+            Err(_) => return,
+        };
+
+    let next_scheduled_shutdown = if shutdown_available
+        && scheduled_shutdown
+            .get("scheduledFor")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > now_unix_ms())
+    {
+        scheduled_shutdown
+    } else {
+        Value::Null
+    };
+    let paused_queues = list_resume_pending_queues_payload(state, profile_id)
+        .await
+        .unwrap_or_else(|_| json!([]));
+
+    emit_profile_config_updated(
+        state,
+        profile_id,
+        json!({
+            "systemShutdown": {
+                "available": shutdown_available,
+                "delaySeconds": state.config.system_shutdown_delay_seconds,
+                "armed": shutdown_available
+                    && state.config.system_shutdown_enabled
+                    && shutdown_after_queue_completes
+            },
+            "startup": {
+                "pausedQueues": paused_queues,
+                "scheduledShutdown": next_scheduled_shutdown
+            }
+        }),
+    )
+    .await;
+}
+
+async fn with_queue_dispatch_guard<T, F>(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    work: F,
+) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let key = runtime_session_key(&resolved_profile_id, session_id);
+    {
+        let mut current = state.queue_dispatching.lock().await;
+        if current.contains(&key) {
+            return None;
+        }
+        current.insert(key.clone());
+    }
+
+    let result = work.await;
+    state.queue_dispatching.lock().await.remove(&key);
+    Some(result)
+}
+
+async fn remove_session_queue_item_after_dispatch(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    queue_id: &str,
+) -> ApiResult<Value> {
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(queues_by_thread_id) = ui_state
+            .get_mut("queuesByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue state is missing",
+            ));
+        };
+        let Some(existing) = queues_by_thread_id.get_mut(session_id) else {
+            return Err(api_error(StatusCode::NOT_FOUND, "QUEUE_ITEM_NOT_FOUND"));
+        };
+        let Some(queue) = existing.as_object_mut() else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue state had an unexpected shape",
+            ));
+        };
+        let Some(items) = queue.get_mut("items").and_then(Value::as_array_mut) else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue items are missing",
+            ));
+        };
+        let previous_len = items.len();
+        items.retain(|item| item.get("id").and_then(Value::as_str) != Some(queue_id));
+        if items.len() == previous_len {
+            return Err(api_error(StatusCode::NOT_FOUND, "QUEUE_ITEM_NOT_FOUND"));
+        }
+
+        if items.is_empty() {
+            queues_by_thread_id.remove(session_id);
+        } else {
+            queue.insert("resumePending".to_string(), json!(false));
+            queue.insert("updatedAt".to_string(), json!(now_unix_ms()));
+        }
+        Ok(())
+    })
+    .await?;
+
+    let queue = get_session_queue_payload(state, profile_id, session_id).await?;
+    emit_queue_updated(state, profile_id, session_id, Some(queue.clone())).await;
+    Ok(queue)
+}
+
+async fn dispatch_queue_item(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    queued_item: &Value,
+    mode: &str,
+) -> ApiResult<()> {
+    let prompt = queued_item
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let attachment_ids = queued_item
+        .get("attachmentIds")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+
+    let request = if mode == "steer" {
+        (
+            format!("/api/sessions/{session_id}/steer"),
+            json!({
+                "prompt": prompt,
+                "attachmentIds": attachment_ids
+            }),
+        )
+    } else {
+        (
+            format!("/api/sessions/{session_id}/messages"),
+            json!({
+                "prompt": prompt,
+                "attachmentIds": attachment_ids,
+                "preferences": {}
+            }),
+        )
+    };
+
+    internal_json_request_for_profile(
+        state,
+        Some(profile_id),
+        Method::POST,
+        &request.0,
+        Some(request.1),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to dispatch queued message: {error}"),
+        )
+    })
+}
+
+async fn session_has_active_turn(state: &AppState, profile_id: &str, session_id: &str) -> bool {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    if state
+        .active_turns
+        .lock()
+        .await
+        .contains_key(&runtime_session_key(resolved_profile_id, session_id))
+    {
+        return true;
+    }
+
+    let session_payload = match internal_json_request_for_profile(
+        state,
+        Some(profile_id),
+        Method::GET,
+        &format!("/api/sessions/{session_id}?limit=1"),
+        None,
+    )
+    .await
+    {
+        Ok(payload) => payload,
+        Err(_) => return true,
+    };
+    let Some(thread) = session_payload.get("thread") else {
+        return true;
+    };
+    if !is_live_thread_status(
+        &normalized_thread_status(thread.get("status")).unwrap_or_else(|| "unknown".to_string()),
+    ) {
+        return false;
+    }
+
+    thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .is_some_and(|turns| {
+            turns
+                .iter()
+                .any(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+        })
+}
+
+async fn has_outstanding_queued_work(state: &AppState, profile_id: &str) -> bool {
+    with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("queuesByThreadId")
+            .and_then(Value::as_object)
+            .is_some_and(|queues| {
+                queues.values().any(|queue| {
+                    queue
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| !items.is_empty())
+                })
+            }))
+    })
+    .await
+    .unwrap_or(true)
+}
+
+async fn has_active_work_across_threads(state: &AppState, profile_id: &str) -> bool {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    if state
+        .active_turns
+        .lock()
+        .await
+        .keys()
+        .any(|key| key.starts_with(&format!("profile::{resolved_profile_id}::")))
+    {
+        return true;
+    }
+
+    let client = match app_server_client(state, profile_id).await {
+        Ok(client) => client,
+        Err(_) => return true,
+    };
+    let mut cursor: Option<String> = None;
+    loop {
+        let payload = match client
+            .request(
+                "thread/list",
+                json!({
+                    "limit": 200,
+                    "archived": false,
+                    "cursor": cursor
+                }),
+            )
+            .await
+        {
+            Ok(payload) => payload,
+            Err(_) => return true,
+        };
+        if payload
+            .get("data")
+            .and_then(Value::as_array)
+            .is_some_and(|threads| {
+                threads.iter().any(|thread| {
+                    is_live_thread_status(
+                        &normalized_thread_status(thread.get("status"))
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    )
+                })
+            })
+        {
+            return true;
+        }
+
+        cursor = payload
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    false
+}
+
+async fn clear_scheduled_shutdown(state: &AppState, profile_id: &str) {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    if let Some(handle) = state
+        .shutdown_timers
+        .lock()
+        .await
+        .remove(&resolved_profile_id)
+    {
+        handle.abort();
+    }
+    let _ = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(global) = ui_state.get_mut("global").and_then(Value::as_object_mut) else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "global state is missing",
+            ));
+        };
+        global.insert("scheduledShutdown".to_string(), Value::Null);
+        Ok(())
+    })
+    .await;
+    emit_runtime_profile_config_updated(state, profile_id).await;
+}
+
+async fn cancel_scheduled_shutdown_for_activity(state: &AppState, profile_id: &str) {
+    let scheduled = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("global")
+            .and_then(|value| value.get("scheduledShutdown"))
+            .cloned()
+            .unwrap_or(Value::Null))
+    })
+    .await
+    .unwrap_or(Value::Null);
+
+    if !scheduled.is_null() {
+        clear_scheduled_shutdown(state, profile_id).await;
+    }
+}
+
+async fn execute_scheduled_shutdown(state: &AppState, profile_id: &str) {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    state
+        .shutdown_timers
+        .lock()
+        .await
+        .remove(&resolved_profile_id);
+    let _ = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(global) = ui_state.get_mut("global").and_then(Value::as_object_mut) else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "global state is missing",
+            ));
+        };
+        global.insert("scheduledShutdown".to_string(), Value::Null);
+        Ok(())
+    })
+    .await;
+    emit_runtime_profile_config_updated(state, profile_id).await;
+
+    let (available, plan) = system_shutdown_capability(&state.config).await;
+    let Some(plan) = plan.filter(|_| available) else {
+        emit_profile_global_notification(
+            state,
+            profile_id,
+            json!({
+                "kind": "notification",
+                "method": "codex-webui/shutdownFailed",
+                "params": {
+                    "message": "System shutdown is unavailable for this server user."
+                }
+            }),
+        )
+        .await;
+        return;
+    };
+
+    let command = plan.command.clone();
+    let args = plan.args.clone();
+    if let Err(error) = Command::new(&command).args(&args).spawn() {
+        emit_profile_global_notification(
+            state,
+            profile_id,
+            json!({
+                "kind": "notification",
+                "method": "codex-webui/shutdownFailed",
+                "params": {
+                    "message": error.to_string()
+                }
+            }),
+        )
+        .await;
+    }
+}
+
+async fn arm_scheduled_shutdown(state: &AppState, profile_id: &str, scheduled_shutdown: Value) {
+    let Some(scheduled_for) = scheduled_shutdown
+        .get("scheduledFor")
+        .and_then(Value::as_u64)
+    else {
+        return;
+    };
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    if let Some(handle) = state
+        .shutdown_timers
+        .lock()
+        .await
+        .remove(&resolved_profile_id)
+    {
+        handle.abort();
+    }
+
+    let delay_ms = scheduled_for.saturating_sub(now_unix_ms());
+    let shutdown_state = state.clone();
+    let shutdown_profile_id = profile_id.to_string();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        execute_scheduled_shutdown(&shutdown_state, &shutdown_profile_id).await;
+    });
+    state
+        .shutdown_timers
+        .lock()
+        .await
+        .insert(resolved_profile_id, handle);
+}
+
+async fn maybe_schedule_global_shutdown(
+    state: &AppState,
+    profile_id: &str,
+    completed_turn_id: Option<&str>,
+) {
+    if !state.config.system_shutdown_enabled {
+        return;
+    }
+
+    let (available, _) = system_shutdown_capability(&state.config).await;
+    if !available {
+        return;
+    }
+
+    let existing_scheduled = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok((
+            ui_state
+                .get("global")
+                .and_then(|value| value.get("shutdownAfterQueueCompletes"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            ui_state
+                .get("global")
+                .and_then(|value| value.get("scheduledShutdown"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        ))
+    })
+    .await;
+    let Ok((shutdown_after_queue_completes, scheduled_shutdown)) = existing_scheduled else {
+        return;
+    };
+    if !shutdown_after_queue_completes {
+        return;
+    }
+    if scheduled_shutdown
+        .get("scheduledFor")
+        .and_then(Value::as_u64)
+        .is_some_and(|value| value > now_unix_ms())
+    {
+        arm_scheduled_shutdown(state, profile_id, scheduled_shutdown).await;
+        return;
+    }
+    if has_outstanding_queued_work(state, profile_id).await
+        || has_active_work_across_threads(state, profile_id).await
+    {
+        return;
+    }
+
+    let scheduled_shutdown = json!({
+        "sessionId": Value::Null,
+        "scheduledFor": now_unix_ms() + state.config.system_shutdown_delay_seconds * 1000,
+        "delaySeconds": state.config.system_shutdown_delay_seconds
+    });
+    if with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(global) = ui_state.get_mut("global").and_then(Value::as_object_mut) else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "global state is missing",
+            ));
+        };
+        global.insert("scheduledShutdown".to_string(), scheduled_shutdown.clone());
+        Ok(())
+    })
+    .await
+    .is_err()
+    {
+        return;
+    }
+
+    arm_scheduled_shutdown(state, profile_id, scheduled_shutdown.clone()).await;
+    emit_profile_global_notification(
+        state,
+        profile_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/shutdownScheduled",
+            "params": {
+                "delaySeconds": state.config.system_shutdown_delay_seconds,
+                "turnId": completed_turn_id.map(Value::from).unwrap_or(Value::Null),
+                "scheduledFor": scheduled_shutdown.get("scheduledFor").cloned().unwrap_or(Value::Null),
+                "sessionId": Value::Null
+            }
+        }),
+    )
+    .await;
+    enqueue_profile_notification(
+        state,
+        profile_id,
+        "shutdownScheduled",
+        None,
+        json!({
+            "delaySeconds": state.config.system_shutdown_delay_seconds,
+            "scheduledFor": scheduled_shutdown.get("scheduledFor").cloned().unwrap_or(Value::Null),
+            "turnId": completed_turn_id.map(Value::from).unwrap_or(Value::Null)
+        }),
+    )
+    .await;
+    emit_runtime_profile_config_updated(state, profile_id).await;
+}
+
+async fn maybe_drain_queue(state: &AppState, profile_id: &str, session_id: &str) {
+    let _ = with_queue_dispatch_guard(state, profile_id, session_id, async {
+        let queue = match get_session_queue_payload(state, profile_id, session_id).await {
+            Ok(queue) => queue,
+            Err(_) => return,
+        };
+        if queue
+            .get("items")
+            .and_then(Value::as_array)
+            .is_none_or(|items| items.is_empty())
+        {
+            maybe_schedule_global_shutdown(state, profile_id, None).await;
+            return;
+        }
+        if queue
+            .get("resumeRequired")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if session_has_active_turn(state, profile_id, session_id).await {
+            return;
+        }
+
+        let queued_item = queue
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .cloned();
+        let Some(queued_item) = queued_item else {
+            return;
+        };
+        let queue_id = queued_item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        match dispatch_queue_item(state, profile_id, session_id, &queued_item, "message").await {
+            Ok(()) => {
+                let _ = remove_session_queue_item_after_dispatch(
+                    state, profile_id, session_id, &queue_id,
+                )
+                .await;
+            }
+            Err(error) => {
+                emit_session_notification(
+                    state,
+                    profile_id,
+                    session_id,
+                    json!({
+                        "kind": "notification",
+                        "method": "codex-webui/queueDispatchFailed",
+                        "params": {
+                            "queueId": queue_id,
+                            "code": Value::Null,
+                            "message": error.message
+                        }
+                    }),
+                )
+                .await;
+                enqueue_profile_notification(
+                    state,
+                    profile_id,
+                    "queueDispatchFailed",
+                    Some(session_id),
+                    json!({
+                        "queueId": queue_id,
+                        "code": Value::Null,
+                        "message": error.message
+                    }),
+                )
+                .await;
+            }
+        }
+    })
+    .await;
+}
+
+fn notification_thread_id(method: &str, params: &Value) -> Option<String> {
+    params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            method
+                .starts_with("thread/")
+                .then(|| {
+                    params
+                        .get("thread")
+                        .and_then(|thread| thread.get("id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .flatten()
+        })
+}
+
+fn notification_turn_id(params: &Value) -> Option<String> {
+    params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+async fn handle_profile_runtime_notification(
+    state: &AppState,
+    profile_id: &str,
+    notification: &AppServerNotification,
+) {
+    let Some(session_id) = notification_thread_id(&notification.method, &notification.params)
+    else {
+        return;
+    };
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let runtime_key = runtime_session_key(&resolved_profile_id, &session_id);
+
+    match notification.method.as_str() {
+        "turn/started" => {
+            if let Some(turn_id) = notification_turn_id(&notification.params) {
+                state.active_turns.lock().await.insert(runtime_key, turn_id);
+            }
+            cancel_scheduled_shutdown_for_activity(state, profile_id).await;
+        }
+        "turn/completed" => {
+            let turn_id = notification_turn_id(&notification.params);
+            let mut active_turns = state.active_turns.lock().await;
+            if turn_id
+                .as_ref()
+                .is_none_or(|turn_id| active_turns.get(&runtime_key) == Some(turn_id))
+            {
+                active_turns.remove(&runtime_key);
+            }
+            drop(active_turns);
+            maybe_drain_queue(state, profile_id, &session_id).await;
+            maybe_schedule_global_shutdown(state, profile_id, turn_id.as_deref()).await;
+        }
+        "thread/status/changed" => {
+            let status = normalized_thread_status(notification.params.get("status"))
+                .unwrap_or_else(|| "unknown".to_string());
+            if is_live_thread_status(&status) {
+                cancel_scheduled_shutdown_for_activity(state, profile_id).await;
+            } else {
+                state.active_turns.lock().await.remove(&runtime_key);
+                maybe_drain_queue(state, profile_id, &session_id).await;
+                maybe_schedule_global_shutdown(state, profile_id, None).await;
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn restore_persisted_shutdown_state(state: &AppState, profile_id: &str) -> ApiResult<()> {
+    let (shutdown_after_queue_completes, scheduled_shutdown) =
+        with_ui_state_read(state, profile_id, |ui_state| {
+            Ok((
+                ui_state
+                    .get("global")
+                    .and_then(|value| value.get("shutdownAfterQueueCompletes"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                ui_state
+                    .get("global")
+                    .and_then(|value| value.get("scheduledShutdown"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ))
+        })
+        .await?;
+
+    let (shutdown_available, _) = system_shutdown_capability(&state.config).await;
+    if !state.config.system_shutdown_enabled || !shutdown_available {
+        with_ui_state_write(state, profile_id, |ui_state| {
+            let Some(global) = ui_state.get_mut("global").and_then(Value::as_object_mut) else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "global state is missing",
+                ));
+            };
+            global.insert("shutdownAfterQueueCompletes".to_string(), json!(false));
+            global.insert("scheduledShutdown".to_string(), Value::Null);
+            Ok(())
+        })
+        .await?;
+        return Ok(());
+    }
+
+    if scheduled_shutdown
+        .get("scheduledFor")
+        .and_then(Value::as_u64)
+        .is_some_and(|value| value > now_unix_ms())
+    {
+        arm_scheduled_shutdown(state, profile_id, scheduled_shutdown).await;
+    } else if shutdown_after_queue_completes {
+        maybe_schedule_global_shutdown(state, profile_id, None).await;
+    }
+
+    Ok(())
+}
+
+async fn restore_runtime_profile_state(state: AppState, profile_id: String) {
+    if let Err(error) = mark_queues_pending_resume_payload(&state, &profile_id).await {
+        warn!("failed to mark queued sessions as pending resume for {profile_id}: {error}");
+    }
+    if let Err(error) = restore_persisted_shutdown_state(&state, &profile_id).await {
+        warn!("failed to restore shutdown state for {profile_id}: {error}");
+    }
+    emit_runtime_profile_config_updated(&state, &profile_id).await;
+
+    loop {
+        let client = match app_server_client(&state, &profile_id).await {
+            Ok(client) => client,
+            Err(error) => {
+                warn!("failed to create app-server client for {profile_id}: {error:#}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let _ = client
+            .request("model/list", json!({ "includeHidden": false }))
+            .await;
+        let mut notifications = client.subscribe_notifications();
+
+        loop {
+            match notifications.recv().await {
+                Ok(notification) => {
+                    handle_profile_runtime_notification(&state, &profile_id, &notification).await;
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        "runtime app-server relay lagged for {profile_id}: skipped {skipped} messages"
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 async fn emit_terminals_updated(state: &AppState) {
@@ -5494,6 +11491,19 @@ async fn internal_json_request(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value> {
+    let profile_id = ACTIVE_PROFILE_ID
+        .try_with(|profile_id| profile_id.clone())
+        .ok();
+    internal_json_request_for_profile(state, profile_id.as_deref(), method, path, body).await
+}
+
+async fn internal_json_request_for_profile(
+    state: &AppState,
+    profile_id: Option<&str>,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value> {
     let target = internal_url(&state.config, path);
     let mut request = state
         .http
@@ -5503,7 +11513,7 @@ async fn internal_json_request(
         )
         .header(INTERNAL_HEADER, &state.config.internal_proxy_token);
 
-    if let Ok(profile_id) = ACTIVE_PROFILE_ID.try_with(|profile_id| profile_id.clone()) {
+    if let Some(profile_id) = profile_id.filter(|value| !value.trim().is_empty()) {
         request = request.header(PROFILE_HEADER, profile_id);
     }
 
@@ -6154,6 +12164,7 @@ async fn spawn_internal_node(config: &Config) -> Result<(Child, Arc<Mutex<VecDeq
             "CODEX_WEBUI_INTERNAL_PROXY_TOKEN",
             &config.internal_proxy_token,
         )
+        .env(INTERNAL_NODE_DISABLE_QUEUE_LIFECYCLE_ENV, "true")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -6291,6 +12302,9 @@ mod tests {
                 node_entry: project_root.join("node-entry.js"),
                 node_binary: "node".to_string(),
                 codex_bin: "codex".to_string(),
+                system_shutdown_enabled: false,
+                system_shutdown_delay_seconds: 30,
+                system_shutdown_command_override: None,
                 password: None,
                 password_hash: None,
                 viewer_password: None,
@@ -6313,7 +12327,158 @@ mod tests {
             relays: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),
             ui_state_locks: Arc::new(Mutex::new(HashMap::new())),
+            automation_timers: Arc::new(Mutex::new(HashMap::new())),
+            queue_dispatching: Arc::new(Mutex::new(HashSet::new())),
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn test_state_with_fake_app_server(
+        project_root: PathBuf,
+        allowed_roots: Vec<PathBuf>,
+        codex_home: PathBuf,
+    ) -> AppState {
+        let mut state = test_state(project_root, allowed_roots, codex_home);
+        let fake_server_path = state.config.project_root.join("fake-codex-test.py");
+        fs::write(
+            &fake_server_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+threads = {}
+thread_counter = 0
+timestamp_counter = 0
+
+for raw_line in sys.stdin:
+    line = raw_line.strip()
+    if not line:
+        continue
+
+    payload = json.loads(line)
+    request_id = payload.get("id")
+    method = payload.get("method")
+    params = payload.get("params") or {}
+
+    def write(message):
+        sys.stdout.write(json.dumps(message) + "\n")
+        sys.stdout.flush()
+
+    if method == "initialize":
+        write({
+            "id": request_id,
+            "result": {
+                "serverInfo": {
+                    "name": "fake-codex",
+                    "title": "Fake Codex App Server",
+                    "version": "0.1.0"
+                }
+            }
+        })
+    elif method == "initialized":
+        write({
+            "method": "fake/ready",
+            "params": {}
+        })
+    elif method == "thread/start":
+        thread_counter += 1
+        timestamp_counter += 1
+        thread_id = f"thread-{thread_counter}"
+        thread = {
+            "id": thread_id,
+            "name": "New thread",
+            "preview": "",
+            "cwd": params.get("cwd", ""),
+            "archived": False,
+            "createdAt": timestamp_counter,
+            "updatedAt": timestamp_counter,
+            "status": "idle",
+            "isSubagent": False,
+            "agentNickname": None,
+            "agentRole": None,
+            "turns": []
+        }
+        threads[thread_id] = thread
+        write({
+            "id": request_id,
+            "result": {
+                "thread": thread
+            }
+        })
+    elif method == "thread/name/set":
+        thread_id = params.get("threadId", "")
+        timestamp_counter += 1
+        if thread_id in threads:
+            threads[thread_id]["name"] = params.get("name", "")
+            threads[thread_id]["updatedAt"] = timestamp_counter
+        write({
+            "id": request_id,
+            "result": {
+                "ok": True
+            }
+        })
+    elif method == "thread/read":
+        thread_id = params.get("threadId", "")
+        thread = threads.get(thread_id, {
+            "id": thread_id,
+            "name": "New thread",
+            "preview": "",
+            "cwd": "",
+            "archived": False,
+            "createdAt": 0,
+            "updatedAt": 0,
+            "status": "idle",
+            "isSubagent": False,
+            "agentNickname": None,
+            "agentRole": None,
+            "turns": []
+        })
+        write({
+            "id": request_id,
+            "result": {
+                "thread": thread
+            }
+        })
+    elif method == "thread/list":
+        archived = bool(params.get("archived", False))
+        limit = max(1, min(int(params.get("limit", 20) or 20), 200))
+        cursor = str(params.get("cursor") or "").strip()
+        start = int(cursor) if cursor.isdigit() else 0
+        data = [thread for thread in threads.values() if bool(thread.get("archived", False)) == archived]
+        data.sort(key=lambda thread: int(thread.get("updatedAt", 0)), reverse=True)
+        end = min(start + limit, len(data))
+        next_cursor = str(end) if end < len(data) else None
+        write({
+            "id": request_id,
+            "result": {
+                "data": data[start:end] if start < len(data) else [],
+                "nextCursor": next_cursor
+            }
+        })
+    else:
+        write({
+            "id": request_id,
+            "error": {
+                "code": -32000,
+                "message": f"unknown method: {method}"
+            }
+        })
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&fake_server_path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&fake_server_path, permissions).unwrap();
+        }
+        state.app_servers = AppServerManager::new(AppServerClientConfig {
+            codex_bin: fake_server_path.display().to_string(),
+            ..AppServerClientConfig::default()
+        });
+        state
     }
 
     #[test]
@@ -6560,6 +12725,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn theme_settings_round_trip_through_rust_store() {
+        let sandbox = unique_test_dir("theme-settings");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state = test_state(workspace.clone(), vec![workspace], codex_home);
+        let expected = json!({
+            "light": {
+                "bg": "#fffef7",
+                "sidebar": "#f8f1de"
+            },
+            "dark": {
+                "bg": "#181713",
+                "sidebar": "#12110d"
+            }
+        });
+
+        write_stored_theme_settings(&state.config, "default", &expected)
+            .await
+            .expect("theme settings should save");
+        let restored = read_stored_theme_settings(&state.config, "default")
+            .await
+            .expect("theme settings should load");
+
+        assert_eq!(restored, Some(expected));
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test]
+    async fn syncs_codex_toml_with_preferences_for_plan_mode() {
+        let sandbox = unique_test_dir("sync-codex-toml");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+
+        sync_codex_toml_with_preferences(
+            &codex_home,
+            &json!({
+                "model": "gpt-5.4",
+                "approvalPolicy": "on-request",
+                "sandboxMode": "workspace-write",
+                "speed": "fast",
+                "mode": "plan",
+                "effort": "high",
+                "networkAccess": true
+            }),
+        )
+        .await
+        .expect("config.toml should sync");
+
+        let raw = fs::read_to_string(config_toml_path(&codex_home)).unwrap();
+        assert!(raw.contains("model = \"gpt-5.4\""));
+        assert!(raw.contains("approval_policy = \"on-request\""));
+        assert!(raw.contains("sandbox_mode = \"workspace-write\""));
+        assert!(raw.contains("service_tier = \"fast\""));
+        assert!(raw.contains("plan_mode_reasoning_effort = \"high\""));
+        assert!(raw.contains("[sandbox_workspace_write]"));
+        assert!(raw.contains("network_access = true"));
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test]
+    async fn updates_session_organization_and_known_tags() {
+        let sandbox = unique_test_dir("session-organization");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state = test_state(workspace.clone(), vec![workspace], codex_home);
+        let ui_state_path = profile_ui_state_path(&state.config, "default");
+        fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+        fs::write(
+            &ui_state_path,
+            serde_json::to_vec_pretty(&json!({
+                "global": {
+                    "shutdownAfterQueueCompletes": false,
+                    "scheduledShutdown": Value::Null
+                },
+                "notifications": {
+                    "items": [],
+                    "settings": default_notification_settings_value()
+                },
+                "sessionMetaByThreadId": {
+                    "session-1": {
+                        "pinned": false,
+                        "tags": ["alpha"]
+                    }
+                },
+                "savedSessionFilters": [],
+                "promptPresets": [],
+                "automations": [],
+                "automationRuns": [],
+                "preferencesByThreadId": {},
+                "draftsByThreadId": {},
+                "queuesByThreadId": {},
+                "highlightsByThreadId": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let payload = update_session_organization_payload(
+            &state,
+            "default",
+            "session-1",
+            json!({
+                "pinned": true,
+                "tags": ["beta", "alpha", "beta", " "]
+            }),
+        )
+        .await
+        .expect("session organization should update");
+
+        assert_eq!(
+            payload.get("meta"),
+            Some(&json!({
+                "pinned": true,
+                "tags": ["alpha", "beta"]
+            }))
+        );
+        assert_eq!(
+            payload
+                .get("knownTags")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            vec![json!("alpha"), json!("beta")]
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test]
     async fn saves_filters_and_prompt_presets_with_normalization() {
         let sandbox = unique_test_dir("ui-state-saves");
         let workspace = sandbox.join("workspace");
@@ -6697,6 +12999,668 @@ mod tests {
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(0)
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test]
+    async fn saves_and_deletes_automations_with_normalization() {
+        let sandbox = unique_test_dir("automation-saves");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state = test_state(workspace.clone(), vec![workspace], codex_home);
+        let ui_state_path = profile_ui_state_path(&state.config, "default");
+        fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+        fs::write(
+            &ui_state_path,
+            serde_json::to_vec_pretty(&json!({
+                "global": {
+                    "shutdownAfterQueueCompletes": false,
+                    "scheduledShutdown": Value::Null
+                },
+                "notifications": {
+                    "items": [],
+                    "settings": default_notification_settings_value()
+                },
+                "sessionMetaByThreadId": {},
+                "savedSessionFilters": [],
+                "promptPresets": [],
+                "automations": [],
+                "automationRuns": [],
+                "preferencesByThreadId": {},
+                "draftsByThreadId": {},
+                "queuesByThreadId": {},
+                "highlightsByThreadId": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let saved = save_automation_payload(
+            &state,
+            "default",
+            json!({
+                "id": "auto-1",
+                "name": "  Morning Review  ",
+                "prompt": "Check the repo state.",
+                "enabled": true,
+                "scheduleMode": "interval",
+                "intervalMinutes": 5,
+                "target": "local",
+                "repoPath": "",
+                "cwd": " /tmp/review ",
+                "model": "gpt-5.4",
+                "effort": "high",
+                "speed": "fast",
+                "mode": "plan"
+            }),
+        )
+        .await
+        .unwrap();
+
+        let first_automation = saved
+            .get("automations")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.first())
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            first_automation.get("name").and_then(Value::as_str),
+            Some("Morning Review")
+        );
+        assert_eq!(
+            first_automation.get("scheduleMode").and_then(Value::as_str),
+            Some("interval")
+        );
+        assert_eq!(
+            first_automation
+                .get("intervalMinutes")
+                .and_then(Value::as_i64),
+            Some(5)
+        );
+        assert_eq!(
+            first_automation.get("cwd").and_then(Value::as_str),
+            Some("/tmp/review")
+        );
+        assert!(
+            first_automation
+                .get("nextRunAt")
+                .and_then(Value::as_i64)
+                .is_some()
+        );
+
+        let deleted = delete_automation_payload(&state, "default", "auto-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted
+                .get("automations")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_payload_uses_app_server_and_persists_preferences() {
+        let sandbox = unique_test_dir("session-create-rust");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+        let created = create_session_payload(
+            &state,
+            "default",
+            json!({
+                "cwd": workspace.display().to_string(),
+                "model": "gpt-5.4",
+                "approvalPolicy": "on-request",
+                "sandboxMode": "workspace-write"
+            }),
+            Some("Review docs"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            created.get("name").and_then(Value::as_str),
+            Some("Review docs")
+        );
+        let session_id = created
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let stored_preferences = with_ui_state_read(&state, "default", |ui_state| {
+            Ok(ui_state
+                .get("preferencesByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(&session_id))
+                .cloned()
+                .unwrap_or(Value::Null))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            stored_preferences.get("model").and_then(Value::as_str),
+            Some("gpt-5.4")
+        );
+
+        let thread = app_server_client(&state, "default")
+            .await
+            .unwrap()
+            .request(
+                "thread/read",
+                json!({
+                    "threadId": session_id,
+                    "includeTurns": false
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            thread
+                .get("thread")
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str),
+            Some("Review docs")
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_session_list_and_search_use_app_server_threads() {
+        let sandbox = unique_test_dir("session-list-rust");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+        let first = create_session_payload(
+            &state,
+            "default",
+            json!({ "cwd": workspace.display().to_string() }),
+            Some("Build Docs"),
+        )
+        .await
+        .unwrap();
+        let second = create_session_payload(
+            &state,
+            "default",
+            json!({ "cwd": workspace.display().to_string() }),
+            Some("Fix Queue"),
+        )
+        .await
+        .unwrap();
+        let first_id = first.get("id").and_then(Value::as_str).unwrap().to_string();
+        let second_id = second
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        with_ui_state_write(&state, "default", |ui_state| {
+            let Some(session_meta) = ui_state
+                .get_mut("sessionMetaByThreadId")
+                .and_then(Value::as_object_mut)
+            else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "session meta state is missing",
+                ));
+            };
+            session_meta.insert(
+                first_id.clone(),
+                json!({
+                    "pinned": true,
+                    "tags": ["docs"]
+                }),
+            );
+            let Some(queues) = ui_state
+                .get_mut("queuesByThreadId")
+                .and_then(Value::as_object_mut)
+            else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "queue state is missing",
+                ));
+            };
+            queues.insert(
+                second_id.clone(),
+                json!({
+                    "items": [
+                        {
+                            "id": "queue-1",
+                            "prompt": "follow up"
+                        }
+                    ],
+                    "resumePending": false,
+                    "updatedAt": 10
+                }),
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let pinned_only = list_sessions_payload(
+            &state,
+            "default",
+            false,
+            None,
+            20,
+            &SessionFilterCriteria {
+                pinned_only: true,
+                ..SessionFilterCriteria::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pinned_only
+                .get("sessions")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            pinned_only
+                .get("sessions")
+                .and_then(Value::as_array)
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry.get("id"))
+                .and_then(Value::as_str),
+            Some(first_id.as_str())
+        );
+
+        let queued_only = list_sessions_payload(
+            &state,
+            "default",
+            false,
+            None,
+            20,
+            &SessionFilterCriteria {
+                queued_only: true,
+                ..SessionFilterCriteria::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            queued_only
+                .get("sessions")
+                .and_then(Value::as_array)
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry.get("id"))
+                .and_then(Value::as_str),
+            Some(second_id.as_str())
+        );
+
+        let matched = search_sessions_payload(
+            &state,
+            "default",
+            "queue",
+            false,
+            None,
+            20,
+            &SessionFilterCriteria::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            matched
+                .get("sessions")
+                .and_then(Value::as_array)
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry.get("name"))
+                .and_then(Value::as_str),
+            Some("Fix Queue")
+        );
+
+        let uppercase = search_sessions_payload(
+            &state,
+            "default",
+            "BUILD",
+            false,
+            None,
+            20,
+            &SessionFilterCriteria::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            uppercase
+                .get("sessions")
+                .and_then(Value::as_array)
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry.get("name"))
+                .and_then(Value::as_str),
+            Some("Build Docs")
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test]
+    async fn arena_list_falls_back_to_stored_runs_when_sessions_cannot_be_loaded() {
+        let sandbox = unique_test_dir("arena-list");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state = test_state(workspace.clone(), vec![workspace], codex_home);
+        let arena_path = arena_store_path(&state.config, "default");
+        fs::create_dir_all(arena_path.parent().unwrap()).unwrap();
+        fs::write(
+            &arena_path,
+            serde_json::to_vec_pretty(&ArenaStoreState {
+                runs: vec![ArenaRunRecord {
+                    id: "arena-1".to_string(),
+                    prompt: "compare models".to_string(),
+                    cwd: "/tmp/project".to_string(),
+                    status: "running".to_string(),
+                    created_at: 100,
+                    updated_at: 110,
+                    contestants: vec![ArenaContestantRecord {
+                        id: "contestant-1".to_string(),
+                        session_id: "session-1".to_string(),
+                        model: "gpt-5.4".to_string(),
+                        label: "Primary".to_string(),
+                        status: "running".to_string(),
+                        response: None,
+                        created_at: 100,
+                        updated_at: 110,
+                    }],
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let payload = list_arena_runs_payload(&state, "default").await.unwrap();
+        let first_run = payload
+            .get("runs")
+            .and_then(Value::as_array)
+            .and_then(|runs| runs.first())
+            .cloned()
+            .unwrap();
+        assert_eq!(first_run.get("id").and_then(Value::as_str), Some("arena-1"));
+        assert_eq!(
+            first_run.get("status").and_then(Value::as_str),
+            Some("running")
+        );
+        assert_eq!(
+            first_run
+                .get("contestants")
+                .and_then(Value::as_array)
+                .and_then(|contestants| contestants.first())
+                .and_then(|contestant| contestant.get("sessionId"))
+                .and_then(Value::as_str),
+            Some("session-1")
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test]
+    async fn saves_drafts_and_reads_queue_payloads() {
+        let sandbox = unique_test_dir("draft-queue");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state = test_state(workspace.clone(), vec![workspace], codex_home);
+        let ui_state_path = profile_ui_state_path(&state.config, "default");
+        fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+        fs::write(
+            &ui_state_path,
+            serde_json::to_vec_pretty(&json!({
+                "global": {
+                    "shutdownAfterQueueCompletes": false,
+                    "scheduledShutdown": Value::Null
+                },
+                "notifications": {
+                    "items": [],
+                    "settings": default_notification_settings_value()
+                },
+                "sessionMetaByThreadId": {},
+                "savedSessionFilters": [],
+                "promptPresets": [],
+                "automations": [],
+                "automationRuns": [],
+                "preferencesByThreadId": {},
+                "draftsByThreadId": {},
+                "queuesByThreadId": {
+                    "thread-1": {
+                        "items": [
+                            {
+                                "id": "queue-1",
+                                "prompt": "follow up",
+                                "attachmentIds": ["att-1"],
+                                "attachmentNames": ["notes.txt"],
+                                "createdAt": 15
+                            }
+                        ],
+                        "resumePending": true,
+                        "updatedAt": 20
+                    }
+                },
+                "highlightsByThreadId": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let saved =
+            save_session_draft_payload(&state, "default", "thread-1", "Draft message", "queue")
+                .await
+                .unwrap();
+        assert_eq!(
+            saved.get("draft").and_then(Value::as_str),
+            Some("Draft message")
+        );
+        assert_eq!(saved.get("intent").and_then(Value::as_str), Some("queue"));
+
+        let cleared = clear_session_draft_payload(&state, "default", "thread-1")
+            .await
+            .unwrap();
+        assert_eq!(cleared.get("draft").and_then(Value::as_str), Some(""));
+        assert!(cleared.get("intent").is_some_and(Value::is_null));
+
+        let queue = get_session_queue_payload(&state, "default", "thread-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            queue.get("resumeRequired").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            queue
+                .get("items")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("attachmentNames"))
+                .and_then(Value::as_array)
+                .and_then(|names| names.first())
+                .and_then(Value::as_str),
+            Some("notes.txt")
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test]
+    async fn queue_write_helpers_mutate_queue_state() {
+        let sandbox = unique_test_dir("queue-write-helpers");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state = test_state(workspace.clone(), vec![workspace], codex_home);
+
+        let first = enqueue_session_queue_payload(&state, "default", "thread-1", "first", None)
+            .await
+            .unwrap();
+        let first_id = first
+            .get("enqueueItemId")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let second = enqueue_session_queue_payload(&state, "default", "thread-1", "second", None)
+            .await
+            .unwrap();
+        let second_id = second
+            .get("enqueueItemId")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let reordered = reorder_session_queue_payload(
+            &state,
+            "default",
+            "thread-1",
+            &[second_id.clone(), first_id.clone()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reordered
+                .get("items")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str),
+            Some(second_id.as_str())
+        );
+
+        let empty_attachments = json!([]);
+        let updated = update_session_queue_item_payload(
+            &state,
+            "default",
+            "thread-1",
+            &first_id,
+            Some("first updated"),
+            Some(&empty_attachments),
+        )
+        .await
+        .unwrap();
+        let updated_item = updated
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(Value::as_str) == Some(first_id.as_str()))
+            })
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            updated_item.get("prompt").and_then(Value::as_str),
+            Some("first updated")
+        );
+
+        let removed = remove_session_queue_item_payload(&state, "default", "thread-1", &second_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            removed.get("items").and_then(Value::as_array).map(Vec::len),
+            Some(1)
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[tokio::test]
+    async fn marks_resume_pending_queues_and_lists_paused_entries() {
+        let sandbox = unique_test_dir("queue-resume-pending");
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state = test_state(workspace.clone(), vec![workspace], codex_home);
+        let ui_state_path = profile_ui_state_path(&state.config, "default");
+        fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+        fs::write(
+            &ui_state_path,
+            serde_json::to_vec_pretty(&json!({
+                "global": {
+                    "shutdownAfterQueueCompletes": false,
+                    "scheduledShutdown": Value::Null
+                },
+                "notifications": {
+                    "items": [],
+                    "settings": default_notification_settings_value()
+                },
+                "sessionMetaByThreadId": {},
+                "savedSessionFilters": [],
+                "promptPresets": [],
+                "automations": [],
+                "automationRuns": [],
+                "preferencesByThreadId": {
+                    "thread-1": {
+                        "cwd": "/tmp/project"
+                    }
+                },
+                "draftsByThreadId": {},
+                "queuesByThreadId": {
+                    "thread-1": {
+                        "items": [
+                            {
+                                "id": "queue-1",
+                                "prompt": "follow up",
+                                "attachmentIds": [],
+                                "attachmentNames": [],
+                                "createdAt": 15
+                            }
+                        ],
+                        "resumePending": false,
+                        "updatedAt": 20
+                    }
+                },
+                "highlightsByThreadId": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            mark_queues_pending_resume_payload(&state, "default")
+                .await
+                .unwrap()
+        );
+        let paused = list_resume_pending_queues_payload(&state, "default")
+            .await
+            .unwrap();
+        let first = paused
+            .as_array()
+            .and_then(|items| items.first())
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            first.get("sessionId").and_then(Value::as_str),
+            Some("thread-1")
+        );
+        assert_eq!(first.get("pendingCount").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            first.get("cwd").and_then(Value::as_str),
+            Some("/tmp/project")
         );
 
         let _ = fs::remove_dir_all(sandbox);

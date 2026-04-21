@@ -97,6 +97,7 @@ const HYDRATION_CACHE_LIMIT = 2;
 const DEFERRED_ITEM_TYPES = new Set(["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"]);
 const DEFAULT_THREAD_NAME = "New thread";
 const LIVE_THREAD_STATUSES = new Set(["running", "active"]);
+const RUST_GATEWAY_OWNS_QUEUE_LIFECYCLE = process.env.CODEX_WEBUI_RUST_OWNS_QUEUE_LIFECYCLE === "true";
 const DEFAULT_NOTIFICATION_LIMIT = 80;
 const DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT = 40;
 const execFileAsync = promisify(execFile);
@@ -851,8 +852,10 @@ export class CodexGateway {
 
   constructor(private readonly profile: RuntimeProfileConfig) {
     this.client = new AppServerClient(profile);
-    void uiStateStore.markQueuesPendingResume();
-    void this.restorePersistedShutdownState();
+    if (!RUST_GATEWAY_OWNS_QUEUE_LIFECYCLE) {
+      void uiStateStore.markQueuesPendingResume();
+      void this.restorePersistedShutdownState();
+    }
     void this.restoreAutomationSchedules();
     this.client.onNotification((payload) => {
       void runWithProfile(this.profile.id, () => this.handleNotification(payload.method, payload.params));
@@ -2036,7 +2039,7 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     const activeTurnId = runtimeState.activeTurnId;
 
     let queue = await this.getQueue(threadId);
-    if (queue.resumeRequired && !activeTurnId && preferences.steeringResumeMode === "auto") {
+    if (!RUST_GATEWAY_OWNS_QUEUE_LIFECYCLE && queue.resumeRequired && !activeTurnId && preferences.steeringResumeMode === "auto") {
       await uiStateStore.setQueueResumePending(threadId, false);
       queue = await this.getQueue(threadId);
       void this.maybeDrainQueue(threadId);
@@ -2447,7 +2450,9 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       throw createAppError("EMPTY_MESSAGE");
     }
 
-    await this.cancelScheduledShutdownForActivity();
+    if (!RUST_GATEWAY_OWNS_QUEUE_LIFECYCLE) {
+      await this.cancelScheduledShutdownForActivity();
+    }
 
     const nextItem = {
       id: crypto.randomUUID(),
@@ -2478,7 +2483,9 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     }
     const queue = await this.getQueue(threadId);
     this.emitQueueUpdated(threadId, queue);
-    await this.maybeScheduleGlobalShutdown(null);
+    if (!RUST_GATEWAY_OWNS_QUEUE_LIFECYCLE) {
+      await this.maybeScheduleGlobalShutdown(null);
+    }
     return queue;
   }
 
@@ -2557,7 +2564,9 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
     await uiStateStore.setQueueResumePending(threadId, false);
     const queue = await this.getQueue(threadId);
     this.emitQueueUpdated(threadId, queue);
-    void this.maybeDrainQueue(threadId);
+    if (!RUST_GATEWAY_OWNS_QUEUE_LIFECYCLE) {
+      void this.maybeDrainQueue(threadId);
+    }
     return queue;
   }
 
@@ -2635,7 +2644,9 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
   }
 
   async sendMessage(threadId: string, prompt: string, attachments: AttachmentRecord[], preferences: Partial<SessionPreferences>) {
-    await this.cancelScheduledShutdownForActivity();
+    if (!RUST_GATEWAY_OWNS_QUEUE_LIFECYCLE) {
+      await this.cancelScheduledShutdownForActivity();
+    }
     const inferredTitle = inferPersistedSessionTitle(prompt);
     const nextPreferences = await this.preparePreferences(preferences);
     const defaultModel = nextPreferences.model ?? (await this.getDefaultModel());
@@ -3773,7 +3784,9 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       this.activeTurns.set(threadId, String(turn.id ?? ""));
       this.loadedThreadIds.add(threadId);
       this.loadedThreadIdsLoadedAt = Date.now();
-      void this.cancelScheduledShutdownForActivity();
+      if (!RUST_GATEWAY_OWNS_QUEUE_LIFECYCLE) {
+        void this.cancelScheduledShutdownForActivity();
+      }
       void this.setSessionHighlight(threadId, null, null, null, null, "running", Math.floor(Date.now() / 1000));
       void this.finalizeAutomationRunForSession(threadId, "running");
     } else if (method === "turn/completed") {
@@ -3781,8 +3794,10 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       if (this.activeTurns.get(threadId) === String(turn.id ?? "")) {
         this.activeTurns.delete(threadId);
       }
-      void this.maybeDrainQueue(threadId);
-      void this.maybeScheduleGlobalShutdown(String(turn.id ?? ""));
+      if (!RUST_GATEWAY_OWNS_QUEUE_LIFECYCLE) {
+        void this.maybeDrainQueue(threadId);
+        void this.maybeScheduleGlobalShutdown(String(turn.id ?? ""));
+      }
       void this.finalizeAutomationRunForSession(threadId, "completed");
       void this.enqueueAppNotification(
         buildNotificationPayload(
@@ -3818,10 +3833,14 @@ ${session.preview ?? ""}`.toLowerCase().includes(needle),
       const nextStatus = normalizeThreadStatus(params.status) ?? "unknown";
       if (nextStatus !== "running" && nextStatus !== "active") {
         this.activeTurns.delete(threadId);
-        void this.maybeDrainQueue(threadId);
-        void this.maybeScheduleGlobalShutdown(null);
+        if (!RUST_GATEWAY_OWNS_QUEUE_LIFECYCLE) {
+          void this.maybeDrainQueue(threadId);
+          void this.maybeScheduleGlobalShutdown(null);
+        }
       } else {
-        void this.cancelScheduledShutdownForActivity();
+        if (!RUST_GATEWAY_OWNS_QUEUE_LIFECYCLE) {
+          void this.cancelScheduledShutdownForActivity();
+        }
       }
       if (nextStatus === "notLoaded") {
         this.loadedThreadIds.delete(threadId);

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{self, BufRead, Write},
     path::Path,
@@ -23,6 +24,13 @@ fn print_message(payload: &Value) {
     io::stdout().flush().expect("stdout should flush");
 }
 
+fn thread_cursor_value(cursor: Option<&Value>) -> usize {
+    cursor
+        .and_then(Value::as_str)
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 fn main() {
     let start_log_path = env::var("FAKE_CODEX_START_LOG").ok();
     if let Some(path) = start_log_path.as_deref() {
@@ -31,6 +39,9 @@ fn main() {
 
     let stdin = io::stdin();
     let mut server_request_id = 0_u64;
+    let mut thread_counter = 0_u64;
+    let mut timestamp_counter = 0_i64;
+    let mut threads = BTreeMap::<String, Value>::new();
 
     for line in stdin.lock().lines() {
         let Ok(line) = line else {
@@ -80,6 +91,138 @@ fn main() {
                     "id": id,
                     "result": {
                         "ok": true
+                    }
+                }));
+            }
+            Some("thread/start") => {
+                thread_counter += 1;
+                timestamp_counter += 1;
+                let thread_id = format!("thread-{thread_counter}");
+                let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
+                let cwd = params
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let model = params.get("model").cloned().unwrap_or(Value::Null);
+                let thread = json!({
+                    "id": thread_id,
+                    "name": "New thread",
+                    "preview": "",
+                    "cwd": cwd,
+                    "archived": false,
+                    "createdAt": timestamp_counter,
+                    "updatedAt": timestamp_counter,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "model": model,
+                    "turns": []
+                });
+                threads.insert(thread_id.clone(), thread.clone());
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "thread": thread
+                    }
+                }));
+            }
+            Some("thread/name/set") => {
+                let thread_id = payload
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = payload
+                    .get("params")
+                    .and_then(|params| params.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                timestamp_counter += 1;
+                if let Some(thread) = threads.get_mut(&thread_id).and_then(Value::as_object_mut) {
+                    thread.insert("name".to_string(), Value::String(name.clone()));
+                    thread.insert("updatedAt".to_string(), Value::from(timestamp_counter));
+                }
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "ok": true
+                    }
+                }));
+            }
+            Some("thread/read") => {
+                let thread_id = payload
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let thread = threads.get(thread_id).cloned().unwrap_or_else(|| {
+                    json!({
+                        "id": thread_id,
+                        "name": "New thread",
+                        "preview": "",
+                        "cwd": "",
+                        "archived": false,
+                        "createdAt": 0,
+                        "updatedAt": 0,
+                        "status": "idle",
+                        "isSubagent": false,
+                        "agentNickname": Value::Null,
+                        "agentRole": Value::Null,
+                        "turns": []
+                    })
+                });
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "thread": thread
+                    }
+                }));
+            }
+            Some("thread/list") => {
+                let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
+                let archived = params
+                    .get("archived")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let limit = params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|value| value.clamp(1, 200) as usize)
+                    .unwrap_or(20);
+                let start = thread_cursor_value(params.get("cursor"));
+                let mut data = threads
+                    .values()
+                    .filter(|thread| {
+                        thread
+                            .get("archived")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                            == archived
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                data.sort_by(|left, right| {
+                    right
+                        .get("updatedAt")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
+                        .cmp(&left.get("updatedAt").and_then(Value::as_i64).unwrap_or(0))
+                });
+                let end = start.saturating_add(limit).min(data.len());
+                let next_cursor = (end < data.len()).then(|| end.to_string());
+                let page = if start < data.len() {
+                    data.drain(start..end).collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "data": page,
+                        "nextCursor": next_cursor
                     }
                 }));
             }

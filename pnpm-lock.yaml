@@ -45,9 +45,6 @@ importers:
       autoprefixer:
         specifier: ^10.5.0
         version: 10.5.0(postcss@8.5.9)
-      esbuild:
-        specifier: ^0.27.0
-        version: 0.27.7
       hast-util-to-html:
         specifier: ^9.0.5
         version: 9.0.5
@@ -1599,6 +1596,7 @@ snapshots:
       '@esbuild/win32-arm64': 0.27.7
       '@esbuild/win32-ia32': 0.27.7
       '@esbuild/win32-x64': 0.27.7
+    optional: true
 
   escalade@3.2.0: {}
 

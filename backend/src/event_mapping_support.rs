@@ -1,0 +1,286 @@
+use super::*;
+
+fn summarize_command_payload(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::Array(entries)) => {
+            let summary = entries
+                .iter()
+                .filter_map(value_text)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let trimmed = summary.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Some(Value::String(command)) => {
+            let trimmed = command.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Some(other) => value_text(other),
+        None => None,
+    }
+}
+
+fn summarize_tool_invocation_payload(value: Option<&Value>) -> Option<String> {
+    let record = value.and_then(Value::as_object)?;
+    let tool_name = ["toolName", "name", "tool", "method", "displayName"]
+        .iter()
+        .find_map(|key| record.get(*key).and_then(value_text));
+    let server_name = ["serverName", "server"]
+        .iter()
+        .find_map(|key| record.get(*key).and_then(value_text));
+
+    match (server_name, tool_name) {
+        (Some(server_name), Some(tool_name)) => Some(format!("{server_name} · {tool_name}")),
+        (Some(server_name), None) => Some(server_name),
+        (None, Some(tool_name)) => Some(tool_name),
+        (None, None) => None,
+    }
+}
+
+fn prepare_session_stream_item_payload(item: &Value, turn_id: &str) -> Value {
+    let mut normalized = normalize_session_item_payload(item, turn_id, 0)
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let item_type = normalized
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    match item_type {
+        "contextCompaction" => {
+            normalized.insert("title".to_string(), json!("Context compression"));
+            normalized.insert("detailState".to_string(), json!("inline"));
+            normalized.insert(
+                "detailPreview".to_string(),
+                json!("Compressing conversation context"),
+            );
+        }
+        "commandExecution" => {
+            normalized.insert("title".to_string(), json!("Command"));
+            normalized.insert("detailState".to_string(), json!("deferred"));
+            normalized.insert(
+                "detailPreview".to_string(),
+                summarize_command_payload(normalized.get("command"))
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            if !normalized.contains_key("parsed_cmd") && normalized.contains_key("parsedCmd") {
+                if let Some(parsed_cmd) = normalized.get("parsedCmd").cloned() {
+                    normalized.insert("parsed_cmd".to_string(), parsed_cmd);
+                }
+            }
+        }
+        "fileChange" => {
+            let changes = normalized
+                .get("changes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let first_path = changes
+                .iter()
+                .find_map(|entry: &Value| entry.get("path").and_then(value_text));
+            normalized.insert("title".to_string(), json!("Files changed"));
+            normalized.insert("detailState".to_string(), json!("deferred"));
+            normalized.insert("changeCount".to_string(), json!(changes.len()));
+            normalized.insert(
+                "firstChangePath".to_string(),
+                first_path.clone().map(Value::String).unwrap_or(Value::Null),
+            );
+            normalized.insert(
+                "detailPreview".to_string(),
+                first_path.map(Value::String).unwrap_or_else(|| {
+                    if changes.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(format!("{} files", changes.len()))
+                    }
+                }),
+            );
+            normalized.insert(
+                "changes".to_string(),
+                Value::Array(
+                    changes
+                        .into_iter()
+                        .map(|entry: Value| {
+                            json!({
+                                "path": entry.get("path").and_then(value_text).unwrap_or_else(|| "Code edit".to_string()),
+                                "kind": entry.get("kind").and_then(value_text).unwrap_or_else(|| "update".to_string())
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        "imageGeneration" => {
+            normalized.insert("title".to_string(), json!("Generated image"));
+            normalized.insert("detailState".to_string(), json!("inline"));
+            normalized.insert(
+                "detailPreview".to_string(),
+                value_text(normalized.get("revised_prompt").unwrap_or(&Value::Null))
+                    .or_else(|| value_text(normalized.get("status").unwrap_or(&Value::Null)))
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+        }
+        "webSearch" => {
+            normalized.insert("title".to_string(), json!("Web search"));
+            normalized.insert("detailState".to_string(), json!("deferred"));
+            normalized.insert(
+                "detailPreview".to_string(),
+                value_text(normalized.get("query").unwrap_or(&Value::Null))
+                    .or_else(|| summarize_tool_invocation_payload(normalized.get("action")))
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+        }
+        "mcpToolCall" | "dynamicToolCall" => {
+            normalized.insert(
+                "title".to_string(),
+                Value::String(if item_type == "mcpToolCall" {
+                    "MCP call".to_string()
+                } else {
+                    "Tool call".to_string()
+                }),
+            );
+            normalized.insert("detailState".to_string(), json!("deferred"));
+            normalized.insert(
+                "detailPreview".to_string(),
+                summarize_tool_invocation_payload(normalized.get("invocation"))
+                    .or_else(|| value_text(normalized.get("tool").unwrap_or(&Value::Null)))
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+        }
+        _ => {
+            normalized
+                .entry("detailState".to_string())
+                .or_insert_with(|| json!("inline"));
+        }
+    }
+
+    Value::Object(normalized)
+}
+
+pub(crate) fn map_app_server_session_notification(
+    notification: &AppServerNotification,
+) -> Option<Value> {
+    let params = notification.params.as_object().cloned().unwrap_or_default();
+    let mut mapped = params.clone();
+
+    match notification.method.as_str() {
+        "turn/started" | "turn/completed" => {
+            let fallback_turn_id = mapped
+                .get("turnId")
+                .and_then(Value::as_str)
+                .unwrap_or("turn-0")
+                .to_string();
+            let fallback_status = if notification.method == "turn/started" {
+                "inProgress"
+            } else {
+                "completed"
+            };
+            let turn = mapped.get("turn").cloned().unwrap_or_else(|| {
+                json!({
+                    "id": fallback_turn_id,
+                    "status": fallback_status,
+                    "items": []
+                })
+            });
+            mapped.insert("turn".to_string(), normalize_session_turn_payload(&turn, 0));
+        }
+        "item/started" | "item/completed" => {
+            let turn_id = mapped
+                .get("turnId")
+                .and_then(Value::as_str)
+                .unwrap_or("turn-0");
+            let item = mapped.get("item").cloned().unwrap_or_else(
+                || json!({ "id": mapped.get("itemId").cloned().unwrap_or(Value::Null) }),
+            );
+            mapped.insert(
+                "item".to_string(),
+                prepare_session_stream_item_payload(&item, turn_id),
+            );
+        }
+        "thread/name/updated" => {
+            mapped.insert(
+                "threadName".to_string(),
+                mapped
+                    .get("threadName")
+                    .and_then(value_text)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+        }
+        "thread/status/changed" => {
+            mapped.insert(
+                "status".to_string(),
+                Value::String(
+                    normalized_thread_status(mapped.get("status"))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+            );
+        }
+        "thread/tokenUsage/updated" => {
+            mapped.insert(
+                "tokenUsage".to_string(),
+                normalize_token_usage_payload(mapped.get("tokenUsage")),
+            );
+        }
+        "item/commandExecution/outputDelta" => {
+            let delta = mapped
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            mapped.insert("delta".to_string(), Value::String(delta.clone()));
+            mapped.insert("deltaLength".to_string(), json!(delta.chars().count()));
+        }
+        _ => {}
+    }
+
+    Some(json!({
+        "kind": "notification",
+        "method": notification.method,
+        "params": Value::Object(mapped)
+    }))
+}
+
+pub(crate) fn map_app_server_global_notification(
+    notification: &AppServerNotification,
+) -> Option<Value> {
+    match notification.method.as_str() {
+        "account/updated" => Some(json!({
+            "kind": "notification",
+            "method": "codex-webui/accountUpdated",
+            "params": notification.params
+        })),
+        "account/login/completed" => Some(json!({
+            "kind": "notification",
+            "method": "codex-webui/accountLoginCompleted",
+            "params": {
+                "loginId": notification
+                    .params
+                    .get("loginId")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "success": notification
+                    .params
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                "error": notification
+                    .params
+                    .get("error")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            }
+        })),
+        "account/rateLimits/updated" => Some(json!({
+            "kind": "notification",
+            "method": "codex-webui/accountRateLimitsUpdated",
+            "params": notification.params
+        })),
+        _ => None,
+    }
+}

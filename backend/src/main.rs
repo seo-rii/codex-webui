@@ -52,8 +52,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 mod config_support;
+mod workspace_support;
 
 use config_support::*;
+use workspace_support::*;
 
 const AUTH_COOKIE: &str = "codex_webui_auth";
 const PROFILE_COOKIE: &str = "codex_webui_profile";
@@ -333,35 +335,6 @@ struct AuditLogEntry {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct DirectoryEntryPayload {
-    name: String,
-    path: String,
-    #[serde(rename = "isDirectory")]
-    is_directory: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct DirectoryPayload {
-    #[serde(rename = "allowedRoots")]
-    allowed_roots: Vec<DirectoryEntryPayload>,
-    #[serde(rename = "currentPath")]
-    current_path: Option<String>,
-    #[serde(rename = "parentPath")]
-    parent_path: Option<String>,
-    entries: Vec<DirectoryEntryPayload>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct EditableFilePayload {
-    path: String,
-    #[serde(rename = "displayName")]
-    display_name: String,
-    content: String,
-    language: String,
-    writable: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct ArenaContestantRecord {
     id: String,
@@ -561,42 +534,6 @@ async fn main() -> Result<()> {
 }
 
 
-fn directory_entry_payload(path: &Path) -> DirectoryEntryPayload {
-    DirectoryEntryPayload {
-        name: path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| path.display().to_string()),
-        path: path.display().to_string(),
-        is_directory: true,
-    }
-}
-
-fn infer_editor_language(file_path: &Path) -> String {
-    match file_path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("ts" | "tsx") => "typescript",
-        Some("js" | "mjs" | "cjs" | "jsx") => "javascript",
-        Some("json") => "json",
-        Some("toml") => "ini",
-        Some("md") => "markdown",
-        Some("yml" | "yaml") => "yaml",
-        Some("svelte") => "html",
-        Some("rs") => "rust",
-        Some("py") => "python",
-        Some("css") => "css",
-        Some("sh") => "shell",
-        _ => "plaintext",
-    }
-    .to_string()
-}
-
 fn query_param_value(query: Option<&str>, key: &str) -> Option<String> {
     query?.split('&').find_map(|entry| {
         let (raw_key, raw_value) = entry.split_once('=').unwrap_or((entry, ""));
@@ -625,180 +562,6 @@ fn query_param_values(query: Option<&str>, key: &str) -> Vec<String> {
                 .map(|value| value.into_owned())
         })
         .collect()
-}
-
-async fn list_directories_payload(
-    state: &AppState,
-    current_path: Option<&str>,
-) -> ApiResult<Value> {
-    let resolved_roots = resolved_allowed_roots(&state.config).await;
-    let root_entries = resolved_roots
-        .iter()
-        .map(|root| directory_entry_payload(root))
-        .collect::<Vec<_>>();
-
-    let Some(current_path) = current_path.filter(|value| !value.trim().is_empty()) else {
-        return Ok(serde_json::to_value(DirectoryPayload {
-            allowed_roots: root_entries.clone(),
-            current_path: None,
-            parent_path: None,
-            entries: root_entries,
-        })
-        .expect("directory payload should serialize"));
-    };
-
-    let candidate = resolve_input_path(&state.config.project_root, current_path);
-    let resolved = real_path_safe(&candidate).await;
-    if !resolved_roots
-        .iter()
-        .any(|root| path_is_within(root, &resolved))
-    {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "The selected path is outside the allowed roots.",
-        ));
-    }
-
-    let metadata = tokio_fs::metadata(&resolved).await.map_err(|_| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            "The selected path is not a directory.",
-        )
-    })?;
-    if !metadata.is_dir() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "The selected path is not a directory.",
-        ));
-    }
-
-    let mut reader = tokio_fs::read_dir(&resolved).await.map_err(|_| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to read directory.",
-        )
-    })?;
-    let mut entries = Vec::new();
-    while let Some(entry) = reader.next_entry().await.map_err(|_| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to read directory.",
-        )
-    })? {
-        let file_type = entry.file_type().await.map_err(|_| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to inspect directory entry.",
-            )
-        })?;
-        if file_type.is_dir() {
-            entries.push(directory_entry_payload(&entry.path()));
-        }
-    }
-    entries.sort_by(|left, right| left.name.cmp(&right.name));
-
-    let parent_path = if resolved_roots.iter().any(|root| root == &resolved) {
-        None
-    } else {
-        resolved.parent().map(|parent| parent.display().to_string())
-    };
-
-    Ok(serde_json::to_value(DirectoryPayload {
-        allowed_roots: root_entries,
-        current_path: Some(resolved.display().to_string()),
-        parent_path,
-        entries,
-    })
-    .expect("directory payload should serialize"))
-}
-
-async fn resolve_editable_file_path(
-    state: &AppState,
-    profile_id: &str,
-    file_path: &str,
-) -> ApiResult<PathBuf> {
-    if file_path.trim().is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "filePath is required."));
-    }
-
-    let candidate = resolve_input_path(&state.config.project_root, file_path);
-    let existing = tokio_fs::canonicalize(&candidate).await.ok();
-    let path_to_check = existing.unwrap_or_else(|| candidate.clone());
-
-    let mut roots = resolved_allowed_roots(&state.config).await;
-    let profile_root =
-        real_path_safe(&resolve_runtime_profile(&state.config, profile_id).codex_home).await;
-    roots.push(profile_root);
-
-    if !roots
-        .iter()
-        .any(|root| path_is_within(root, &path_to_check))
-    {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "This file is outside editable roots.",
-        ));
-    }
-
-    Ok(candidate)
-}
-
-async fn read_editable_file_payload(
-    state: &AppState,
-    profile_id: &str,
-    file_path: &str,
-) -> ApiResult<Value> {
-    let resolved_path = resolve_editable_file_path(state, profile_id, file_path).await?;
-    let content = match tokio_fs::read_to_string(&resolved_path).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(_) => {
-            return Err(api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to read the selected file.",
-            ));
-        }
-    };
-
-    Ok(serde_json::to_value(EditableFilePayload {
-        path: resolved_path.display().to_string(),
-        display_name: resolved_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| resolved_path.display().to_string()),
-        content,
-        language: infer_editor_language(&resolved_path),
-        writable: true,
-    })
-    .expect("editable file payload should serialize"))
-}
-
-async fn write_editable_file_payload(
-    state: &AppState,
-    profile_id: &str,
-    file_path: &str,
-    content: &str,
-) -> ApiResult<Value> {
-    let resolved_path = resolve_editable_file_path(state, profile_id, file_path).await?;
-    if let Some(parent) = resolved_path.parent() {
-        tokio_fs::create_dir_all(parent).await.map_err(|_| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to create parent directories for the file.",
-            )
-        })?;
-    }
-    tokio_fs::write(&resolved_path, content)
-        .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to write the selected file.",
-            )
-        })?;
-    read_editable_file_payload(state, profile_id, &resolved_path.display().to_string()).await
 }
 
 fn default_notification_settings_value() -> Value {
@@ -3179,48 +2942,6 @@ async fn mark_queues_pending_resume_payload(state: &AppState, profile_id: &str) 
         Ok(changed)
     })
     .await
-}
-
-async fn resolve_allowed_directory(state: &AppState, requested_path: &str) -> ApiResult<String> {
-    if requested_path.trim().is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "A working directory is required.",
-        ));
-    }
-
-    let candidate = resolve_input_path(&state.config.project_root, requested_path);
-    let resolved = tokio_fs::canonicalize(&candidate).await.map_err(|_| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            "The selected working directory does not exist.",
-        )
-    })?;
-    let metadata = tokio_fs::metadata(&resolved).await.map_err(|_| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            "The selected working directory is invalid.",
-        )
-    })?;
-    if !metadata.is_dir() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "The selected working directory must be a directory.",
-        ));
-    }
-
-    let allowed_roots = resolved_allowed_roots(&state.config).await;
-    if !allowed_roots
-        .iter()
-        .any(|root| path_is_within(root, &resolved))
-    {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "The selected working directory is outside the allowed roots.",
-        ));
-    }
-
-    Ok(resolved.display().to_string())
 }
 
 async fn normalize_git_repo_path(state: &AppState, git_repo_path: &Value) -> ApiResult<Value> {

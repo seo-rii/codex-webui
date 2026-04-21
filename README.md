@@ -88,6 +88,7 @@ Still evolving:
 3. session activity, chat, Git, terminals, and runtime state use a reconnect-safe WebSocket RPC channel
 4. a Rust gateway owns auth, cookies, WebSocket fan-out, terminal persistence, runtime install/update actions, session and Git APIs, and static asset serving
 5. the Rust gateway serves the prebuilt static SPA from `build/static`, rewrites the compile-time base-path placeholder at response time, and talks directly to per-profile `codex app-server` processes for live Codex state
+6. SvelteKit server hooks and `/api` route handlers are removed from the frontend source tree; all shipped API behavior now lives in Rust
 
 More detail is in [docs/architecture.md](./docs/architecture.md).
 
@@ -121,6 +122,13 @@ After setup, running `codex-webui` again starts the background server and prints
 - runtime error log path
 
 `pnpm build` produces the public SPA bundle under `build/static`, which the Rust gateway serves directly.
+
+For migration regression checks, run:
+
+```bash
+pnpm verify:static-build
+pnpm verify:api-parity
+```
 
 The printed URL may still end in `/login` for compatibility, but that route redirects to the main workspace and the login experience is handled inline by the workspace shell.
 
@@ -304,6 +312,8 @@ cargo run --manifest-path backend/Cargo.toml
 ```bash
 pnpm check
 pnpm build
+pnpm verify:static-build
+pnpm verify:api-parity
 cargo check --manifest-path backend/Cargo.toml
 ```
 

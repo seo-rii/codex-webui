@@ -28,6 +28,7 @@
     "dev": "pnpm paraglide:compile && vite dev",
     "build": "pnpm paraglide:compile && svelte-kit sync && node ./scripts/build-app.mjs",
     "build:cross": "node ./scripts/build-cross.mjs",
+    "verify:static-build": "node ./scripts/verify-static-build.mjs",
     "gateway:dev": "cargo run --manifest-path backend/Cargo.toml",
     "gateway:check": "cargo check --manifest-path backend/Cargo.toml",
     "gateway:build": "cargo build --manifest-path backend/Cargo.toml",

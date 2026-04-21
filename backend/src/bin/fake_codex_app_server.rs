@@ -41,6 +41,7 @@ fn main() {
     let mut server_request_id = 0_u64;
     let mut thread_counter = 0_u64;
     let mut timestamp_counter = 0_i64;
+    let mut turn_counter = 0_u64;
     let mut threads = BTreeMap::<String, Value>::new();
 
     for line in stdin.lock().lines() {
@@ -239,6 +240,110 @@ fn main() {
                     "result": {
                         "data": page,
                         "nextCursor": next_cursor
+                    }
+                }));
+            }
+            Some("thread/resume") => {
+                let thread_id = payload
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(thread) = threads.get_mut(&thread_id).and_then(Value::as_object_mut) {
+                    let resume_count = thread
+                        .get("resumeCount")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        + 1;
+                    thread.insert("status".to_string(), Value::String("idle".to_string()));
+                    thread.insert("resumeCount".to_string(), Value::from(resume_count));
+                }
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "ok": true
+                    }
+                }));
+            }
+            Some("turn/start") => {
+                let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
+                let thread_id = params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                turn_counter += 1;
+                timestamp_counter += 1;
+                let turn_id = format!("turn-{turn_counter}");
+                let thread = threads.entry(thread_id.clone()).or_insert_with(|| {
+                    json!({
+                        "id": thread_id,
+                        "name": "New thread",
+                        "preview": "",
+                        "cwd": params.get("cwd").and_then(Value::as_str).unwrap_or_default(),
+                        "archived": false,
+                        "createdAt": timestamp_counter,
+                        "updatedAt": timestamp_counter,
+                        "status": "idle",
+                        "isSubagent": false,
+                        "agentNickname": Value::Null,
+                        "agentRole": Value::Null,
+                        "turns": []
+                    })
+                });
+
+                let input = params
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let text = input
+                    .iter()
+                    .find(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                    .and_then(|item| item.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let turn = json!({
+                    "id": turn_id,
+                    "status": "inProgress",
+                    "error": Value::Null,
+                    "startedAt": timestamp_counter,
+                    "completedAt": Value::Null,
+                    "durationMs": Value::Null,
+                    "items": [
+                        {
+                            "id": format!("{turn_id}:user:0"),
+                            "type": "userMessage",
+                            "text": text.clone()
+                        }
+                    ]
+                });
+
+                if let Some(thread_object) = thread.as_object_mut() {
+                    let turns = thread_object
+                        .entry("turns".to_string())
+                        .or_insert_with(|| Value::Array(Vec::new()));
+                    if let Some(turns) = turns.as_array_mut() {
+                        turns.push(turn);
+                    }
+                    thread_object.insert(
+                        "preview".to_string(),
+                        Value::String(text.trim().to_string()),
+                    );
+                    thread_object
+                        .insert("status".to_string(), Value::String("running".to_string()));
+                    thread_object.insert("updatedAt".to_string(), Value::from(timestamp_counter));
+                    thread_object.insert("lastTurnStart".to_string(), params);
+                }
+
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "turn": {
+                            "id": turn_id
+                        }
                     }
                 }));
             }

@@ -30,6 +30,7 @@
     NotificationEventType,
     NotificationSettings,
     PromptPreset,
+    SelectedSkill,
     UserRole
   } from "$lib/types";
 
@@ -65,6 +66,7 @@
     onSaveAutomation = null,
     onDeleteAutomation = null,
     onRunAutomation = null,
+    onOpenSession = null,
     onConfigSaved = null
   }: {
     codexHome: string;
@@ -87,6 +89,7 @@
     onSaveAutomation?: ((automation: AutomationDefinition) => void | Promise<void>) | null;
     onDeleteAutomation?: ((automationId: string) => void | Promise<void>) | null;
     onRunAutomation?: ((automationId: string) => void | Promise<void>) | null;
+    onOpenSession?: ((sessionId: string) => void | Promise<void>) | null;
     onConfigSaved?: (() => void | Promise<void>) | null;
   } = $props();
 
@@ -113,6 +116,7 @@
   let automationEffort = $state("");
   let automationSpeed = $state("");
   let automationMode = $state("");
+  let automationSkills = $state<SelectedSkill[]>([]);
   let auditEntries = $state<AuditLogEntry[]>([]);
   let themeDraft = $state<ThemeSettings>(cloneThemeSettings(DEFAULT_THEME_SETTINGS));
   let themeBaseFingerprint = $state(JSON.stringify(cloneThemeSettings(DEFAULT_THEME_SETTINGS)));
@@ -173,7 +177,9 @@
       automationModel.trim() !== (selectedAutomation.model ?? "") ||
       automationEffort.trim() !== (selectedAutomation.effort ?? "") ||
       automationSpeed.trim() !== (selectedAutomation.speed ?? "") ||
-      automationMode.trim() !== (selectedAutomation.mode ?? "")
+      automationMode.trim() !== (selectedAutomation.mode ?? "") ||
+      JSON.stringify(automationSkills.map((skill) => skill.path).sort()) !==
+        JSON.stringify((selectedAutomation.skills ?? []).map((skill) => skill.path).sort())
     );
   });
   const ui = $derived.by(() => {
@@ -252,6 +258,7 @@
       noDescription: m.no_description(),
       installedSkills: m.installed_skills(),
       noSkills: m.no_local_skills(),
+      openThread: m.open_thread(),
       themeEditor: m.theme_editor(),
       themeEditorDescription: m.theme_editor_description(),
       saveTheme: m.save_theme(),
@@ -651,6 +658,7 @@
     automationEffort = "";
     automationSpeed = "";
     automationMode = "";
+    automationSkills = [];
   }
 
   function editAutomation(automation: AutomationDefinition) {
@@ -667,6 +675,44 @@
     automationEffort = automation.effort ?? "";
     automationSpeed = automation.speed ?? "";
     automationMode = automation.mode ?? "";
+    automationSkills = [...(automation.skills ?? [])];
+  }
+
+  function normalizeSelectedSkills(skills: SelectedSkill[]) {
+    const seen = new Set<string>();
+    const normalized: SelectedSkill[] = [];
+    for (const skill of skills) {
+      const name = String(skill.name ?? "").trim();
+      const path = String(skill.path ?? "").trim();
+      if (!name || !path) {
+        continue;
+      }
+      const key = `${name}\u0000${path}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      normalized.push({
+        id: String(skill.id ?? path),
+        name,
+        path
+      });
+    }
+    return normalized;
+  }
+
+  function toggleAutomationSkill(skill: CatalogPayload["skills"][number]) {
+    const exists = automationSkills.some((entry) => entry.path === skill.path);
+    automationSkills = exists
+      ? automationSkills.filter((entry) => entry.path !== skill.path)
+      : normalizeSelectedSkills([
+          ...automationSkills,
+          {
+            id: skill.id,
+            name: skill.name,
+            path: skill.path
+          }
+        ]);
   }
 
   function editPromptPreset(preset: PromptPreset) {
@@ -733,6 +779,7 @@
         target: automationTarget,
         repoPath: automationRepoPath.trim() || null,
         cwd: automationCwd.trim() || null,
+        skills: normalizeSelectedSkills(automationSkills),
         model: automationModel.trim() || null,
         effort: (automationEffort.trim() || null) as AutomationDefinition["effort"],
         speed: (automationSpeed.trim() || null) as AutomationDefinition["speed"],
@@ -1243,6 +1290,49 @@
                 <span>{ui.automationPrompt}</span>
                 <textarea bind:value={automationPrompt} class="field-input field-textarea" disabled={readOnly} placeholder={ui.automationPrompt} rows="8"></textarea>
               </label>
+              <div class="field-block">
+                <span>{ui.installedSkills}</span>
+                {#if automationSkills.length > 0}
+                  <div class="mt-2 flex flex-wrap gap-1.5">
+                    {#each automationSkills as skill (skill.path)}
+                      <button
+                        class="inline-flex items-center gap-1.5 rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-[10px] font-bold text-violet-700 transition-colors hover:bg-violet-100"
+                        disabled={readOnly}
+                        onclick={() => (automationSkills = automationSkills.filter((entry) => entry.path !== skill.path))}
+                        type="button"
+                      >
+                        <span class="max-w-[12rem] truncate">{skill.name}</span>
+                        <Trash2 size={11} />
+                      </button>
+                    {/each}
+                  </div>
+                {/if}
+                <div class="catalog-list mt-3">
+                  {#if (catalog?.skills.length ?? 0) === 0}
+                    <p class="field-note">{ui.noSkills}</p>
+                  {:else}
+                    {#each catalog?.skills ?? [] as skill (skill.path)}
+                      {@const selected = automationSkills.some((entry) => entry.path === skill.path)}
+                      <button
+                        class={`catalog-card catalog-card--button ${selected ? "catalog-card--active" : ""}`}
+                        disabled={readOnly}
+                        onclick={() => toggleAutomationSkill(skill)}
+                        type="button"
+                      >
+                        <div class="catalog-card__title">
+                          <Sparkles size={14} />
+                          <strong>{skill.name}</strong>
+                        </div>
+                        <p>{skill.description || skill.path}</p>
+                        <small>
+                          {skill.source}
+                          {skill.pluginName ? ` · ${skill.pluginName}` : ""}
+                        </small>
+                      </button>
+                    {/each}
+                  {/if}
+                </div>
+              </div>
               <div class="settings-meta">
                 <label class="field-block">
                   <span>{ui.automationTarget}</span>
@@ -1341,9 +1431,17 @@
                   <article class="audit-log-entry">
                     <div class="audit-log-entry__header">
                       <strong>{run.automationName}</strong>
-                      <span class={`meta-pill subtle ${run.status === "failed" ? "audit-log-entry__result--error" : "audit-log-entry__result--ok"}`}>
-                        {run.status}
-                      </span>
+                      <div class="flex items-center gap-2">
+                        <span class={`meta-pill subtle ${run.status === "failed" ? "audit-log-entry__result--error" : "audit-log-entry__result--ok"}`}>
+                          {run.status}
+                        </span>
+                        {#if run.sessionId}
+                          <button class="ghost-button" onclick={() => void onOpenSession?.(run.sessionId!)} type="button">
+                            <Play size={13} />
+                            <span>{ui.openThread}</span>
+                          </button>
+                        {/if}
+                      </div>
                     </div>
                     <div class="audit-log-entry__meta">
                       <span>{run.trigger}</span>

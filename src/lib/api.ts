@@ -29,6 +29,7 @@ import type {
   NotificationSettings,
   PromptPreset,
   SavedSessionFilter,
+  SelectedSkill,
   SessionDetailPayload,
   SessionDraftPayload,
   SessionItemDetailPayload,
@@ -268,8 +269,8 @@ export const api = {
     return ws.request<SessionListPayload>("sessions/search", { query, scope, archived, cursor, limit, filter });
   },
 
-  createSession(preferences: Partial<SessionPreferences>, name: string | null = null) {
-    return ws.request<SessionSummary>("session/create", { preferences, name });
+  createSession(preferences: Partial<SessionPreferences>, name: string | null = null, selectedSkills: SelectedSkill[] = []) {
+    return ws.request<SessionSummary>("session/create", { preferences, name, selectedSkills });
   },
 
   getSession(sessionId: string, limit = 20) {
@@ -313,10 +314,11 @@ export const api = {
     return ws.request<SessionDetailPayload["queue"]>("session/queue/get", { sessionId });
   },
 
-  enqueueSessionMessage(sessionId: string, payload: { prompt: string; attachmentIds: string[] }) {
+  enqueueSessionMessage(sessionId: string, payload: { prompt: string; skills?: SelectedSkill[]; attachmentIds: string[] }) {
     return ws.request<SessionDetailPayload["queue"]>("session/queue/enqueue", {
       sessionId,
       prompt: payload.prompt,
+      skills: payload.skills ?? [],
       attachmentIds: payload.attachmentIds
     });
   },
@@ -329,11 +331,12 @@ export const api = {
     return ws.request<SessionDetailPayload["queue"]>("session/queue/remove", { sessionId, queueId });
   },
 
-  updateQueuedMessage(sessionId: string, queueId: string, payload: { prompt: string; attachmentIds?: string[] }) {
+  updateQueuedMessage(sessionId: string, queueId: string, payload: { prompt: string; skills?: SelectedSkill[]; attachmentIds?: string[] }) {
     return ws.request<SessionDetailPayload["queue"]>("session/queue/update", {
       sessionId,
       queueId,
       prompt: payload.prompt,
+      skills: payload.skills ?? [],
       attachmentIds: payload.attachmentIds
     });
   },
@@ -371,6 +374,10 @@ export const api = {
 
   savePreferences(sessionId: string, preferences: Partial<SessionPreferences>) {
     return ws.request<SessionPreferences>("session/savePreferences", { sessionId, preferences });
+  },
+
+  saveSessionSkills(sessionId: string, skills: SelectedSkill[]) {
+    return ws.request<SelectedSkill[]>("session/skills/save", { sessionId, skills });
   },
 
   renameSession(sessionId: string, name: string) {
@@ -427,19 +434,21 @@ export const api = {
     return ws.request<Record<string, never>>("account/logout");
   },
 
-  sendMessage(sessionId: string, payload: { prompt: string; attachmentIds: string[]; preferences: Partial<SessionPreferences> }) {
+  sendMessage(sessionId: string, payload: { prompt: string; skills?: SelectedSkill[]; attachmentIds: string[]; preferences: Partial<SessionPreferences> }) {
     return ws.request<{ ok: true }>("turn/send", {
       sessionId,
       prompt: payload.prompt,
+      skills: payload.skills ?? [],
       attachmentIds: payload.attachmentIds,
       preferences: payload.preferences
     });
   },
 
-  steerTurn(sessionId: string, prompt: string, attachmentIds: string[] = []) {
+  steerTurn(sessionId: string, prompt: string, attachmentIds: string[] = [], skills: SelectedSkill[] = []) {
     return ws.request<{ ok: true }>("turn/steer", {
       sessionId,
       prompt,
+      skills,
       attachmentIds
     });
   },

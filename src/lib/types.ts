@@ -84,10 +84,17 @@ export type PromptPreset = {
   updatedAt: number;
 };
 
+export type SelectedSkill = {
+  id: string;
+  name: string;
+  path: string;
+};
+
 export type AutomationDefinition = {
   id: string;
   name: string;
   prompt: string;
+  skills: SelectedSkill[];
   enabled: boolean;
   scheduleMode: AutomationScheduleMode;
   intervalMinutes: number | null;
@@ -373,6 +380,7 @@ export type CodexAccountLoginFlow =
 export type SessionDetailPayload = {
   thread: CodexThread;
   preferences: SessionPreferences;
+  selectedSkills: SelectedSkill[];
   attachments: AttachmentRecord[];
   queue: SessionQueuePayload;
   pendingRequests: PendingServerRequest[];
@@ -452,6 +460,7 @@ export type SessionDraftPayload = {
 export type SessionQueueItem = {
   id: string;
   prompt: string;
+  skills: SelectedSkill[];
   attachmentIds: string[];
   attachmentNames: string[];
   createdAt: number;

@@ -69,6 +69,7 @@
     AutomationDefinition,
     AppNotification,
     AppConfigPayload,
+    CatalogPayload,
     AttachmentRecord,
     CodexAccountLoginFlow,
     CodexItem,
@@ -83,6 +84,7 @@
     PendingServerRequest,
     PromptPreset,
     SavedSessionFilter,
+    SelectedSkill,
     SessionListPayload,
     SessionDetailPayload,
     SessionPreferences,
@@ -96,12 +98,13 @@
     StreamEvent,
     TerminalContextPayload,
     TerminalSummary,
+    SkillCatalogEntry,
     UserRole,
     WsConnectionState
   } from "$lib/types";
 
   type WorkspaceTabId = "chat" | "tasks" | "git" | "settings" | `git-diff:${string}` | `code-diff:${string}` | `terminal:${string}`;
-  type ComposerSettingsTabId = "session" | "security";
+  type ComposerSettingsTabId = "session" | "security" | "skills";
   type GitDiffTab = {
     id: `git-diff:${string}`;
     repoPath: string;
@@ -131,6 +134,7 @@
   type OptimisticMessageState = {
     sessionId: string;
     prompt: string;
+    skills: SelectedSkill[];
     attachmentNames: string[];
     createdAt: number;
     baselineTurnId: string | null;
@@ -162,6 +166,7 @@
   };
 
   let config = $state<AppConfigPayload | null>(null);
+  let catalog = $state<CatalogPayload | null>(null);
   let quota = $state<CodexQuotaStatus | null>(null);
   let runtime = $state<CodexRuntimeStatus | null>(null);
   let sessions = $state<SessionSummary[]>([]);
@@ -223,6 +228,9 @@
   let composerSettingsOpen = $state(false);
   let composerSettingsTab = $state<ComposerSettingsTabId>("session");
   let composerSettingsAnchor = $state<ComposerSettingsTabId>("session");
+  let catalogLoading = $state(false);
+  let composerSkillQuery = $state("");
+  let draftSelectedSkills = $state<SelectedSkill[]>([]);
   let connectionState = $state<WsConnectionState>("idle");
   let themeMode = $state<ThemeMode>("system");
   let resolvedTheme = $state<ResolvedTheme>("light");
@@ -393,6 +401,8 @@
       gitWorkspace: m.git_workspace(),
       settings: m.settings(),
       settingsSkills: m.settings_skills(),
+      installedSkills: m.installed_skills(),
+      noSkills: m.no_local_skills(),
       newTerminal: m.new_terminal(),
       threadTitle: m.thread_title(),
       restoreThread: m.restore_thread(),
@@ -1064,9 +1074,10 @@
     const draftTextSnapshot = draft;
     const draftAttachmentSnapshot = [...draftAttachments];
     const draftTitleSnapshot = titleDraft.trim();
+    const draftSelectedSkillsSnapshot = [...draftSelectedSkills];
     const nextTitle = draftTitleSnapshot && !isPlaceholderThreadTitle(draftTitleSnapshot) ? draftTitleSnapshot : null;
 
-    const created = await api.createSession(draftState.preferences, nextTitle);
+    const created = await api.createSession(draftState.preferences, nextTitle, draftSelectedSkillsSnapshot);
     upsertSessionSummary(created);
     const restored = await selectSession(created.id);
     if (!restored || !conversation || selectedSessionId !== created.id) {
@@ -1075,11 +1086,13 @@
         draftAttachments: draftAttachmentSnapshot,
         title: draftTitleSnapshot
       });
+      draftSelectedSkills = draftSelectedSkillsSnapshot;
       throw new Error("Failed to open the created session.");
     }
 
     draft = draftTextSnapshot;
     draftAttachments = draftAttachmentSnapshot;
+    draftSelectedSkills = [];
     scheduleComposerTextareaResize();
 
     return {
@@ -1381,9 +1394,29 @@
     const available = ["auto", ...(selectedModel?.additionalSpeedTiers ?? [])];
     return [...new Set(available.filter((value) => value === "auto" || value === "fast" || value === "flex"))];
   });
+  const composerSelectedSkills = $derived.by(() => conversation?.selectedSkills ?? draftSelectedSkills);
   const personalityOptions = $derived.by(
     () => ["pragmatic", "friendly", "none"] as Array<SessionPreferences["personality"]>
   );
+  const filteredComposerSkills = $derived.by(() => {
+    const skills = catalog?.skills ?? [];
+    const needle = composerSkillQuery.trim().toLowerCase();
+    const selectedPaths = new Set(composerSelectedSkills.map((skill) => skill.path));
+    const filtered = needle
+      ? skills.filter((skill) => {
+          const haystack = `${skill.name}\n${skill.description}\n${skill.pluginName ?? ""}\n${skill.source}`.toLowerCase();
+          return haystack.includes(needle);
+        })
+      : skills;
+    return [...filtered].sort((left, right) => {
+      const leftSelected = selectedPaths.has(left.path) ? 1 : 0;
+      const rightSelected = selectedPaths.has(right.path) ? 1 : 0;
+      if (leftSelected !== rightSelected) {
+        return rightSelected - leftSelected;
+      }
+      return left.name.localeCompare(right.name);
+    });
+  });
   const slashSuggestions = $derived.by(() => {
     const value = draft.trimStart();
     if (!value.startsWith("/")) {
@@ -4039,6 +4072,8 @@
     sessionSearchQuery = "";
     sessionSearchScope = "summary";
     mobileSidebarOpen = false;
+    draftSelectedSkills = [];
+    composerSkillQuery = "";
     activateDraftSession(config.defaults);
   }
 
@@ -4059,6 +4094,73 @@
       }
     };
     schedulePreferenceSave();
+  }
+
+  function normalizeSelectedSkills(skills: Array<SelectedSkill | SkillCatalogEntry>) {
+    const seen = new Set<string>();
+    const normalized: SelectedSkill[] = [];
+    for (const skill of skills) {
+      const name = String(skill.name ?? "").trim();
+      const path = String(skill.path ?? "").trim();
+      if (!name || !path) {
+        continue;
+      }
+      const key = `${name}\u0000${path}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      normalized.push({
+        id: String(skill.id ?? path),
+        name,
+        path
+      });
+    }
+    return normalized;
+  }
+
+  async function ensureCatalogLoaded() {
+    if (catalog || catalogLoading) {
+      return;
+    }
+    catalogLoading = true;
+    try {
+      catalog = await api.getCatalog();
+    } catch (error) {
+      errorText = describeError(error);
+    } finally {
+      catalogLoading = false;
+    }
+  }
+
+  function setSelectedSkills(skills: Array<SelectedSkill | SkillCatalogEntry>) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+
+    const nextSkills = normalizeSelectedSkills(skills);
+    if (conversation && selectedSessionId) {
+      conversation = {
+        ...conversation,
+        selectedSkills: nextSkills
+      };
+      void api.saveSessionSkills(selectedSessionId, nextSkills).catch((error) => {
+        errorText = describeError(error);
+      });
+      return;
+    }
+
+    draftSelectedSkills = nextSkills;
+  }
+
+  function toggleComposerSkill(skill: SkillCatalogEntry) {
+    const exists = composerSelectedSkills.some((entry) => entry.path === skill.path);
+    if (exists) {
+      setSelectedSkills(composerSelectedSkills.filter((entry) => entry.path !== skill.path));
+      return;
+    }
+    setSelectedSkills([...composerSelectedSkills, skill]);
   }
 
   function schedulePreferenceSave() {
@@ -4108,6 +4210,51 @@
     } catch (error) {
       errorText = describeError(error);
     }
+  }
+
+  function inferImageGenerationMimeType(item: CodexItem) {
+    const savedPath =
+      (typeof item.savedPath === "string" && item.savedPath.trim()) ||
+      (typeof item.saved_path === "string" && item.saved_path.trim()) ||
+      "";
+    const loweredPath = savedPath.toLowerCase();
+    if (loweredPath.endsWith(".jpg") || loweredPath.endsWith(".jpeg")) {
+      return "image/jpeg";
+    }
+    if (loweredPath.endsWith(".webp")) {
+      return "image/webp";
+    }
+    if (loweredPath.endsWith(".gif")) {
+      return "image/gif";
+    }
+    return "image/png";
+  }
+
+  function getImageGenerationSource(item: CodexItem) {
+    const result = typeof item.result === "string" ? item.result.trim() : "";
+    if (!result) {
+      return null;
+    }
+    if (result.startsWith("data:image/")) {
+      return result;
+    }
+    return `data:${inferImageGenerationMimeType(item)};base64,${result.replace(/\s+/gu, "")}`;
+  }
+
+  function getImageGenerationPrompt(item: CodexItem) {
+    return (
+      (typeof item.revisedPrompt === "string" && item.revisedPrompt.trim()) ||
+      (typeof item.revised_prompt === "string" && item.revised_prompt.trim()) ||
+      null
+    );
+  }
+
+  function getImageGenerationSavedPath(item: CodexItem) {
+    return (
+      (typeof item.savedPath === "string" && item.savedPath.trim()) ||
+      (typeof item.saved_path === "string" && item.saved_path.trim()) ||
+      null
+    );
   }
 
   async function saveAutostartEnabled(enabled: boolean) {
@@ -4374,8 +4521,9 @@
       const sessionId = materialized.sessionId;
       const activeConversation = materialized.state;
       const attachmentIds = attachmentSnapshot.map((attachment) => attachment.id);
+      const selectedSkillsSnapshot = [...(activeConversation.selectedSkills ?? [])];
       const preferences = activeConversation.preferences;
-      setOptimisticMessageState(sessionId, prompt, attachmentNames, activeConversation);
+      setOptimisticMessageState(sessionId, prompt, selectedSkillsSnapshot, attachmentNames, activeConversation);
       pendingQueueModeSessionId = sessionId;
       recordComposerHistory(prompt);
       rememberLastComposerPromptChip(sessionId, prompt);
@@ -4389,6 +4537,7 @@
       void api
         .sendMessage(sessionId, {
           prompt: draftText,
+          skills: selectedSkillsSnapshot,
           attachmentIds,
           preferences
         })
@@ -4449,11 +4598,13 @@
     sendIntent = "queue";
     errorText = "";
     noticeText = "";
-    const optimisticQueueId = addOptimisticQueuedItem(sessionId, draftText, attachmentSnapshot);
+    const selectedSkillsSnapshot = [...selectedBinding.state.selectedSkills];
+    const optimisticQueueId = addOptimisticQueuedItem(sessionId, draftText, selectedSkillsSnapshot, attachmentSnapshot);
 
     try {
       const queue = await api.enqueueSessionMessage(sessionId, {
         prompt: draftText,
+        skills: selectedSkillsSnapshot,
         attachmentIds: attachmentSnapshot.map((attachment) => attachment.id)
       });
       if (conversation?.thread.id === sessionId) {
@@ -4516,6 +4667,7 @@
     setOptimisticMessageState(
       sessionId,
       normalizedPrompt,
+      [...selectedBinding.state.selectedSkills],
       steerAttachmentSnapshot.map((attachment) => attachment.originalName),
       selectedBinding.state
     );
@@ -4523,7 +4675,8 @@
       await api.steerTurn(
         sessionId,
         normalizedPrompt,
-        steerAttachmentSnapshot.map((attachment) => attachment.id)
+        steerAttachmentSnapshot.map((attachment) => attachment.id),
+        [...selectedBinding.state.selectedSkills]
       );
       scheduleSessionRefresh(80);
       scheduleSelectedSessionStateRefresh(sessionId, 80);
@@ -4569,7 +4722,7 @@
     sendIntent = mode;
     errorText = "";
     noticeText = "";
-    setOptimisticMessageState(sessionId, queuedItem.prompt, queuedItem.attachmentNames, selectedBinding.state);
+    setOptimisticMessageState(sessionId, queuedItem.prompt, queuedItem.skills, queuedItem.attachmentNames, selectedBinding.state);
 
     try {
       const queue = await api.dispatchQueuedMessage(sessionId, queueId, mode);
@@ -4788,6 +4941,7 @@
     try {
       const queue = await api.updateQueuedMessage(selectedBinding.sessionId, queueId, {
         prompt: nextPrompt,
+        skills: queuedItem.skills,
         attachmentIds: queuedItem.attachmentIds
       });
       if (conversation?.thread.id === selectedBinding.sessionId) {
@@ -5898,6 +6052,7 @@
   function setOptimisticMessageState(
     sessionId: string,
     prompt: string,
+    skills: SelectedSkill[],
     attachmentNames: string[],
     currentConversation: ConversationState
   ) {
@@ -5910,6 +6065,7 @@
     optimisticMessage = {
       sessionId,
       prompt: normalizedPrompt,
+      skills: normalizeSelectedSkills(skills),
       attachmentNames: normalizedAttachmentNames,
       createdAt: Date.now(),
       baselineTurnId: currentConversation.thread.turns.at(-1)?.id ?? null,
@@ -5929,14 +6085,15 @@
     optimisticMessage = null;
   }
 
-  function buildQueueItemSignature(prompt: string, attachmentIds: string[]) {
-    return `${normalizeMessageForComparison(prompt)}\u0000${[...attachmentIds].sort().join("\u0001")}`;
+  function buildQueueItemSignature(prompt: string, skills: SelectedSkill[], attachmentIds: string[]) {
+    return `${normalizeMessageForComparison(prompt)}\u0000${normalizeSelectedSkills(skills).map((skill) => skill.path).sort().join("\u0001")}\u0000${[...attachmentIds].sort().join("\u0001")}`;
   }
 
-  function addOptimisticQueuedItem(sessionId: string, prompt: string, attachments: AttachmentRecord[]) {
+  function addOptimisticQueuedItem(sessionId: string, prompt: string, skills: SelectedSkill[], attachments: AttachmentRecord[]) {
     const item: SessionQueueItem = {
       id: `optimistic:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
       prompt,
+      skills: normalizeSelectedSkills(skills),
       attachmentIds: attachments.map((attachment) => attachment.id),
       attachmentNames: attachments.map((attachment) => attachment.originalName),
       createdAt: Date.now()
@@ -5982,12 +6139,12 @@
 
     const realCounts = new Map<string, number>();
     for (const item of queueItems) {
-      const signature = buildQueueItemSignature(item.prompt, item.attachmentIds);
+      const signature = buildQueueItemSignature(item.prompt, item.skills, item.attachmentIds);
       realCounts.set(signature, (realCounts.get(signature) ?? 0) + 1);
     }
 
     const nextItems = optimisticItems.filter((item) => {
-      const signature = buildQueueItemSignature(item.prompt, item.attachmentIds);
+      const signature = buildQueueItemSignature(item.prompt, item.skills, item.attachmentIds);
       const remaining = realCounts.get(signature) ?? 0;
       if (remaining <= 0) {
         return true;
@@ -7344,7 +7501,13 @@
       return [] as CodexItem[];
     }
 
-    return turn.items.filter((item) => item.type !== "userMessage" && item.type !== "fileChange" && item.id !== finalAgentItem.id);
+    return turn.items.filter(
+      (item) =>
+        item.type !== "userMessage" &&
+        item.type !== "fileChange" &&
+        item.type !== "imageGeneration" &&
+        item.id !== finalAgentItem.id
+    );
   }
 
   function getVisibleSummaryEntries(turn: ConversationState["thread"]["turns"][number]) {
@@ -7352,7 +7515,9 @@
       return [] as RenderableTurnEntry[];
     }
 
-    return getRenderableTurnEntries(turn.items.filter((item) => item.type === "fileChange"));
+    return getRenderableTurnEntries(
+      turn.items.filter((item) => item.type === "fileChange" || item.type === "imageGeneration")
+    );
   }
 
   function getFileChangeEntryKey(turnId: string, itemId: string, change: FileChangeView) {
@@ -7609,6 +7774,19 @@
       });
     }
 
+    if (composerSelectedSkills.length > 0) {
+      const [firstSkill] = composerSelectedSkills;
+      indicators.push({
+        key: "skills",
+        icon: "auto_awesome",
+        label:
+          composerSelectedSkills.length > 1
+            ? `${firstSkill.name} +${composerSelectedSkills.length - 1}`
+            : firstSkill.name,
+        text: null
+      });
+    }
+
     if ((conversation.preferences.mode ?? "default") === "plan") {
       indicators.push({
         key: "plan",
@@ -7637,6 +7815,12 @@
   const composerSettingsSummary = $derived.by(() => {
     const _locale = $localeSignal;
     return getComposerSettingsSummary();
+  });
+
+  $effect(() => {
+    if (composerSettingsOpen && composerSettingsTab === "skills") {
+      void ensureCatalogLoaded();
+    }
   });
 
   function getSpeedOptionLabel(option: SessionPreferences["speed"]) {
@@ -8866,7 +9050,7 @@
                         <button
                           bind:this={composerSettingsTriggerElement}
                           class={`composer-compact-trigger ui-animated-button ui-animated-button--soft flex h-8 min-w-0 max-w-[10.5rem] items-center gap-1.5 rounded-xl border px-2.5 text-[10px] font-bold transition-all group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:h-9 sm:max-w-[13.5rem] sm:gap-2 sm:px-3 sm:text-[11px] ${
-                            composerSettingsOpen && composerSettingsTab === "session"
+                            composerSettingsOpen && composerSettingsAnchor === "session"
                               ? "border-amber-200 bg-white text-gray-900 shadow-sm"
                               : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-white hover:text-gray-900"
                           }`}
@@ -8895,7 +9079,7 @@
                               {ui.speedFlex}
                             </span>
                           {/if}
-                          <ChevronDown size={14} class={`shrink-0 transition-transform ${composerSettingsOpen && composerSettingsTab === "session" ? "rotate-180" : ""}`} />
+                          <ChevronDown size={14} class={`shrink-0 transition-transform ${composerSettingsOpen && composerSettingsAnchor === "session" ? "rotate-180" : ""}`} />
                         </button>
                         <button
                           bind:this={composerSecurityTriggerElement}
@@ -8942,13 +9126,19 @@
                     <div class="composer-settings-popover__header mb-2.5 flex items-center justify-between border-b border-gray-100 pb-2.5">
                       <div>
                         <h3 class="text-xs font-bold uppercase tracking-widest text-gray-400">{ui.settings}</h3>
-                        <p class="mt-1 text-[11px] font-medium text-gray-500">{composerSettingsTab === "session" ? ui.composerSettings : ui.securitySession}</p>
+                        <p class="mt-1 text-[11px] font-medium text-gray-500">
+                          {composerSettingsTab === "session"
+                            ? ui.composerSettings
+                            : composerSettingsTab === "skills"
+                              ? ui.settingsSkills
+                              : ui.securitySession}
+                        </p>
                       </div>
                       <button class="composer-settings-popover__close text-gray-400 hover:text-gray-600" onclick={() => (composerSettingsOpen = false)} type="button">
                         <X size={16} />
                       </button>
                     </div>
-                    <div aria-label={ui.settings} class="composer-settings-tabs mb-3 grid grid-cols-2 gap-1 rounded-2xl border border-gray-200 bg-gray-50 p-1" role="tablist">
+                    <div aria-label={ui.settings} class="composer-settings-tabs mb-3 grid grid-cols-3 gap-1 rounded-2xl border border-gray-200 bg-gray-50 p-1" role="tablist">
                       <button
                         aria-selected={composerSettingsTab === "session"}
                         class={`composer-settings-tab ui-animated-button ui-animated-button--soft flex items-center justify-center rounded-xl px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
@@ -8964,6 +9154,22 @@
                         type="button"
                       >
                         {ui.composerSettings}
+                      </button>
+                      <button
+                        aria-selected={composerSettingsTab === "skills"}
+                        class={`composer-settings-tab ui-animated-button ui-animated-button--soft flex items-center justify-center rounded-xl px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
+                          composerSettingsTab === "skills"
+                            ? "border border-violet-200 bg-white text-violet-700 shadow-sm"
+                            : "border border-transparent text-gray-500 hover:bg-white hover:text-gray-700"
+                        }`}
+                        onclick={() => {
+                          composerSettingsAnchor = "session";
+                          composerSettingsTab = "skills";
+                        }}
+                        role="tab"
+                        type="button"
+                      >
+                        {ui.settingsSkills}
                       </button>
                       <button
                         aria-selected={composerSettingsTab === "security"}
@@ -9141,6 +9347,84 @@
                           </div>
                         </div>
                       </div>
+                    {:else if composerSettingsTab === "skills"}
+                      <div class="space-y-3" role="tabpanel">
+                        <label class="space-y-1">
+                          <span class="px-1 text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.installedSkills}</span>
+                          <div class="search-popover__header flex items-center gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2">
+                            <Search size={14} class="text-gray-400" />
+                            <input
+                              bind:value={composerSkillQuery}
+                              class="w-full border-none bg-transparent p-0 text-sm text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-0"
+                              placeholder={m.search()}
+                              type="search"
+                            />
+                          </div>
+                        </label>
+                        {#if composerSelectedSkills.length > 0}
+                          <div class="flex flex-wrap gap-1.5">
+                            {#each composerSelectedSkills as skill (skill.path)}
+                              <button
+                                class="inline-flex items-center gap-1.5 rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-[10px] font-bold text-violet-700 transition-colors hover:bg-violet-100"
+                                onclick={() => setSelectedSkills(composerSelectedSkills.filter((entry) => entry.path !== skill.path))}
+                                type="button"
+                              >
+                                <span class="max-w-[12rem] truncate">{skill.name}</span>
+                                <X size={11} />
+                              </button>
+                            {/each}
+                          </div>
+                        {/if}
+                        {#if catalogLoading}
+                          <div class="flex items-center justify-center gap-2 rounded-xl border border-gray-200 bg-gray-50 px-4 py-6 text-xs text-gray-500">
+                            <RefreshCw size={14} class="animate-spin" />
+                            <span>{m.loading()}</span>
+                          </div>
+                        {:else if filteredComposerSkills.length === 0}
+                          <div class="rounded-xl border border-dashed border-gray-200 bg-gray-50 px-4 py-6 text-center text-xs text-gray-500">
+                            {ui.noSkills}
+                          </div>
+                        {:else}
+                          <div class="max-h-80 space-y-1.5 overflow-y-auto pr-1">
+                            {#each filteredComposerSkills as skill (skill.path)}
+                              {@const selected = composerSelectedSkills.some((entry) => entry.path === skill.path)}
+                              <button
+                                class={`w-full rounded-xl border px-3 py-2.5 text-left transition-colors ${
+                                  selected
+                                    ? "border-violet-200 bg-violet-50/70"
+                                    : "border-gray-200 bg-white hover:border-gray-300 hover:bg-gray-50"
+                                }`}
+                                onclick={() => toggleComposerSkill(skill)}
+                                type="button"
+                              >
+                                <div class="flex items-start justify-between gap-3">
+                                  <div class="min-w-0">
+                                    <p class="truncate text-sm font-bold text-gray-900">{skill.name}</p>
+                                    <p class="mt-0.5 line-clamp-2 text-[11px] leading-relaxed text-gray-500">
+                                      {skill.description || skill.path}
+                                    </p>
+                                    <div class="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-gray-400">
+                                      <span class="rounded-full bg-gray-100 px-2 py-0.5 font-bold uppercase tracking-widest">
+                                        {skill.source}
+                                      </span>
+                                      {#if skill.pluginName}
+                                        <span class="truncate">{skill.pluginName}</span>
+                                      {/if}
+                                    </div>
+                                  </div>
+                                  <span
+                                    class={`mt-0.5 inline-flex h-5 min-w-[2.75rem] items-center justify-center rounded-full px-2 text-[10px] font-bold uppercase tracking-widest ${
+                                      selected ? "bg-violet-600 text-white" : "bg-gray-100 text-gray-400"
+                                    }`}
+                                  >
+                                    {selected ? "ON" : "OFF"}
+                                  </span>
+                                </div>
+                              </button>
+                            {/each}
+                          </div>
+                        {/if}
+                      </div>
                     {:else}
                       <div class="space-y-4" role="tabpanel">
                         <div class="space-y-1">
@@ -9246,6 +9530,10 @@
               }}
               onRunAutomation={async (automationId) => {
                 await runAutomation(automationId);
+              }}
+              onOpenSession={async (sessionId) => {
+                activeWorkspaceTabId = "chat";
+                await selectSession(sessionId);
               }}
             />
           </div>
@@ -10307,6 +10595,49 @@
         <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors" onclick={() => void copyMessageText(String(item.text ?? ""))} title={ui.copyReply} type="button"><Copy size={13} /></button>
       </div>
       <div class="prose prose-sm max-w-none text-gray-800 leading-relaxed animate-in fade-in slide-in-from-left-2 duration-700"><MarkdownMessage on:openLocalPath={(event: CustomEvent<{ href: string }>) => void openGitFileFromMessage(event.detail.href)} text={String(item.text ?? "")} /></div>
+    </div>
+  {:else if item.type === "imageGeneration"}
+    {@const imageSrc = getImageGenerationSource(item)}
+    {@const imagePrompt = getImageGenerationPrompt(item)}
+    {@const savedPath = getImageGenerationSavedPath(item)}
+    <div class="turn-card-shell overflow-hidden rounded-2xl border border-sky-100 bg-white shadow-sm">
+      <div class="turn-card-header turn-card-header--neutral flex items-center justify-between gap-3 border-b border-sky-100 px-4 py-3" data-sticky-level={stickyLevel}>
+        <div class="flex min-w-0 items-center gap-3">
+          <div class="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-sky-100 bg-sky-50 text-sky-700">
+            <Layout size={15} />
+          </div>
+          <div class="min-w-0">
+            <h4 class="truncate text-[10px] font-bold uppercase tracking-widest text-sky-700">{item.title ?? "Generated image"}</h4>
+            {#if imagePrompt}
+              <p class="mt-1 truncate text-xs text-gray-500">{imagePrompt}</p>
+            {/if}
+          </div>
+        </div>
+        {#if imageSrc}
+          <button
+            class="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-50"
+            onclick={() => window.open(imageSrc, "_blank", "noopener,noreferrer")}
+            type="button"
+          >
+            <ExternalLink size={12} />
+            <span>{ui.openInNewTab}</span>
+          </button>
+        {/if}
+      </div>
+      <div class="space-y-3 bg-sky-50/40 p-3">
+        {#if imageSrc}
+          <div class="overflow-hidden rounded-2xl border border-sky-100 bg-white">
+            <img alt={imagePrompt ?? "Generated image"} class="block h-auto max-h-[34rem] w-full object-contain" loading="lazy" src={imageSrc} />
+          </div>
+        {:else}
+          <div class="rounded-xl border border-dashed border-sky-200 bg-white px-4 py-6 text-center text-xs text-gray-500">
+            {ui.noAdditionalOutput}
+          </div>
+        {/if}
+        {#if savedPath}
+          <p class="truncate px-1 text-[11px] text-gray-500">{savedPath}</p>
+        {/if}
+      </div>
     </div>
   {:else if item.type === "reasoning"}
     <div class="turn-card-shell overflow-hidden rounded-2xl border border-amber-100 bg-amber-50/40 shadow-sm">

@@ -410,6 +410,11 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
     return next;
   }
 
+  if (method === "codex-webui/skillsUpdated") {
+    next.selectedSkills = Array.isArray(params.selectedSkills) ? (params.selectedSkills as SessionDetailPayload["selectedSkills"]) : [];
+    return next;
+  }
+
   if (method === "codex-webui/attachmentsUpdated") {
     next.attachments = Array.isArray(params.attachments) ? (params.attachments as SessionDetailPayload["attachments"]) : [];
     return next;

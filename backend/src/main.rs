@@ -1207,6 +1207,7 @@ fn default_ui_state_value() -> Value {
         "automations": [],
         "automationRuns": [],
         "preferencesByThreadId": {},
+        "skillsByThreadId": {},
         "draftsByThreadId": {},
         "queuesByThreadId": {},
         "highlightsByThreadId": {}
@@ -1260,6 +1261,7 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
         ("automations", json!([])),
         ("automationRuns", json!([])),
         ("preferencesByThreadId", json!({})),
+        ("skillsByThreadId", json!({})),
         ("draftsByThreadId", json!({})),
         ("queuesByThreadId", json!({})),
         ("highlightsByThreadId", json!({})),
@@ -2654,7 +2656,21 @@ async fn get_session_queue_payload(
             .and_then(|entries| entries.get(session_id));
         let items = stored
             .and_then(|entry| entry.get("items"))
-            .cloned()
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let mut normalized = item.as_object().cloned().unwrap_or_default();
+                        normalized.insert(
+                            "skills".to_string(),
+                            Value::Array(selected_skills_from_value(item.get("skills"))),
+                        );
+                        Value::Object(normalized)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .map(Value::Array)
             .unwrap_or_else(|| json!([]));
         let resume_pending = stored
             .and_then(|entry| entry.get("resumePending"))
@@ -2686,6 +2702,49 @@ fn string_array_from_value(value: Option<&Value>) -> Vec<String> {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         })
+        .unwrap_or_default()
+}
+
+fn selected_skills_from_value(value: Option<&Value>) -> Vec<Value> {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut seen = HashSet::new();
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let name = object.get("name").and_then(Value::as_str)?.trim();
+            let path = object.get("path").and_then(Value::as_str)?.trim();
+            if name.is_empty() || path.is_empty() {
+                return None;
+            }
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(path);
+            let key = format!("{name}\u{0}{path}");
+            if !seen.insert(key) {
+                return None;
+            }
+            Some(json!({
+                "id": id,
+                "name": name,
+                "path": path
+            }))
+        })
+        .collect()
+}
+
+fn session_selected_skills_from_ui_state(ui_state: &Value, session_id: &str) -> Vec<Value> {
+    ui_state
+        .get("skillsByThreadId")
+        .and_then(Value::as_object)
+        .and_then(|entries| entries.get(session_id))
+        .map(|value| selected_skills_from_value(Some(value)))
         .unwrap_or_default()
 }
 
@@ -3013,11 +3072,13 @@ async fn enqueue_session_queue_payload(
     profile_id: &str,
     session_id: &str,
     prompt: &str,
+    selected_skills: Option<&Value>,
     attachment_ids: Option<&Value>,
 ) -> ApiResult<Value> {
     let trimmed_prompt = prompt.trim();
     let (resolved_attachment_ids, attachment_names) =
         resolve_queue_attachment_metadata(state, profile_id, session_id, attachment_ids).await?;
+    let next_selected_skills = selected_skills_from_value(selected_skills);
     if trimmed_prompt.is_empty() && resolved_attachment_ids.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
     }
@@ -3061,6 +3122,7 @@ async fn enqueue_session_queue_payload(
         items.push(json!({
             "id": queue_item_id,
             "prompt": trimmed_prompt,
+            "skills": next_selected_skills,
             "attachmentIds": resolved_attachment_ids,
             "attachmentNames": attachment_names,
             "createdAt": updated_at
@@ -3144,6 +3206,7 @@ async fn update_session_queue_item_payload(
     session_id: &str,
     queue_id: &str,
     prompt: Option<&str>,
+    selected_skills: Option<&Value>,
     attachment_ids: Option<&Value>,
 ) -> ApiResult<Value> {
     let existing_queue = get_session_queue_payload(state, profile_id, session_id).await?;
@@ -3168,6 +3231,12 @@ async fn update_session_queue_item_payload(
     let requested_attachment_ids = attachment_ids.cloned().unwrap_or_else(|| {
         queued_item
             .get("attachmentIds")
+            .cloned()
+            .unwrap_or_else(|| json!([]))
+    });
+    let next_selected_skills = selected_skills.cloned().unwrap_or_else(|| {
+        queued_item
+            .get("skills")
             .cloned()
             .unwrap_or_else(|| json!([]))
     });
@@ -3214,6 +3283,10 @@ async fn update_session_queue_item_payload(
             ));
         };
         item_object.insert("prompt".to_string(), json!(next_prompt.trim()));
+        item_object.insert(
+            "skills".to_string(),
+            Value::Array(selected_skills_from_value(Some(&next_selected_skills))),
+        );
         item_object.insert("attachmentIds".to_string(), json!(resolved_attachment_ids));
         item_object.insert("attachmentNames".to_string(), json!(attachment_names));
         if let Some(existing_object) = existing.as_object_mut() {
@@ -5976,10 +6049,12 @@ async fn create_session_payload(
     state: &AppState,
     profile_id: &str,
     preferences: Value,
+    selected_skills: Option<&Value>,
     name: Option<&str>,
 ) -> ApiResult<Value> {
     let next_preferences =
         normalize_session_preferences_payload(state, profile_id, preferences).await?;
+    let next_selected_skills = selected_skills_from_value(selected_skills);
     let session_preferences = next_preferences.as_object().cloned().ok_or_else(|| {
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -6049,6 +6124,16 @@ async fn create_session_payload(
             ));
         };
         preferences_by_thread_id.insert(session_id.to_string(), next_preferences.clone());
+        let Some(skills_by_thread_id) = ui_state
+            .get_mut("skillsByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "skills state is missing",
+            ));
+        };
+        skills_by_thread_id.insert(session_id.to_string(), Value::Array(next_selected_skills));
         Ok(())
     })
     .await?;
@@ -6520,6 +6605,12 @@ async fn session_detail_payload(
             }))
     })
     .await?;
+    let selected_skills = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(Value::Array(session_selected_skills_from_ui_state(
+            ui_state, session_id,
+        )))
+    })
+    .await?;
 
     Ok(json!({
         "thread": {
@@ -6536,6 +6627,7 @@ async fn session_detail_payload(
             "turns": visible_turns
         },
         "preferences": preferences,
+        "selectedSkills": selected_skills,
         "attachments": list_session_attachments_payload(state, profile_id, session_id).await?,
         "queue": get_session_queue_payload(state, profile_id, session_id).await?,
         "pendingRequests": session_pending_requests_payload(state, profile_id, session_id).await,
@@ -6937,6 +7029,45 @@ async fn save_session_preferences_payload(
     Ok(next_preferences)
 }
 
+async fn save_session_skills_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    skills: Option<&Value>,
+) -> ApiResult<Value> {
+    let next_skills = selected_skills_from_value(skills);
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(skills_by_thread_id) = ui_state
+            .get_mut("skillsByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "skills state is missing",
+            ));
+        };
+        skills_by_thread_id.insert(session_id.to_string(), Value::Array(next_skills.clone()));
+        Ok(())
+    })
+    .await?;
+
+    emit_session_notification(
+        state,
+        profile_id,
+        session_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/skillsUpdated",
+            "params": {
+                "selectedSkills": next_skills.clone()
+            }
+        }),
+    )
+    .await;
+
+    Ok(Value::Array(next_skills))
+}
+
 async fn rename_session_payload(
     state: &AppState,
     profile_id: &str,
@@ -7024,6 +7155,7 @@ async fn resolve_selected_attachment_records(
 fn build_turn_input_payload(
     prompt: &str,
     attachments: &[StoredAttachmentRecord],
+    selected_skills: &[Value],
 ) -> (Vec<Value>, Vec<String>) {
     let mut additional_readable_roots = Vec::new();
     let mut readable_roots_seen = HashSet::new();
@@ -7048,18 +7180,41 @@ fn build_turn_input_payload(
         }
     }
 
+    let skill_markers = selected_skills
+        .iter()
+        .filter_map(|skill| skill.get("name").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| !prompt.contains(&format!("${value}")))
+        .map(|value| format!("${value}"))
+        .collect::<Vec<_>>();
+    let text_body = if skill_markers.is_empty() {
+        prompt.to_string()
+    } else if prompt.trim().is_empty() {
+        skill_markers.join("\n")
+    } else {
+        format!("{}\n\n{prompt}", skill_markers.join("\n"))
+    };
+
     let mut input = vec![json!({
         "type": "text",
         "text": if text_attachment_paths.is_empty() {
-            prompt.to_string()
+            text_body.clone()
         } else {
             format!(
-                "{ATTACHMENT_PREAMBLE_START}\n{}\n{ATTACHMENT_PREAMBLE_END}\n\n{prompt}",
+                "{ATTACHMENT_PREAMBLE_START}\n{}\n{ATTACHMENT_PREAMBLE_END}\n\n{text_body}",
                 text_attachment_paths.join("\n")
             )
         },
         "text_elements": []
     })];
+    input.extend(selected_skills.iter().cloned().map(|skill| {
+        json!({
+            "type": "skill",
+            "name": skill.get("name").and_then(Value::as_str).unwrap_or_default(),
+            "path": skill.get("path").and_then(Value::as_str).unwrap_or_default()
+        })
+    }));
     for image_path in image_attachment_paths {
         input.push(json!({
             "type": "localImage",
@@ -7101,11 +7256,13 @@ async fn send_turn_payload(
     session_id: &str,
     prompt: &str,
     attachment_ids: Option<&Value>,
+    selected_skills: Option<&Value>,
     preferences: Value,
 ) -> ApiResult<Value> {
     let trimmed_prompt = prompt.trim();
     let attachments =
         resolve_selected_attachment_records(state, profile_id, session_id, attachment_ids).await?;
+    let requested_selected_skills = selected_skills_from_value(selected_skills);
 
     if trimmed_prompt.is_empty() && attachments.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
@@ -7123,6 +7280,14 @@ async fn send_turn_payload(
     let thread = read_thread_payload(state, profile_id, session_id, false).await?;
     let should_backfill_title =
         is_placeholder_thread_name(thread.get("name").and_then(Value::as_str));
+    let next_selected_skills = if requested_selected_skills.is_empty() {
+        with_ui_state_read(state, profile_id, |ui_state| {
+            Ok(session_selected_skills_from_ui_state(ui_state, session_id))
+        })
+        .await?
+    } else {
+        requested_selected_skills
+    };
 
     with_ui_state_write(state, profile_id, |ui_state| {
         let Some(preferences_by_thread_id) = ui_state
@@ -7179,7 +7344,8 @@ async fn send_turn_payload(
             })?;
     }
 
-    let (input, attachment_readable_roots) = build_turn_input_payload(trimmed_prompt, &attachments);
+    let (input, attachment_readable_roots) =
+        build_turn_input_payload(trimmed_prompt, &attachments, &next_selected_skills);
     let mut readable_roots = vec![cwd.clone()];
     for readable_root in attachment_readable_roots {
         if !readable_roots.contains(&readable_root) {
@@ -7308,6 +7474,7 @@ async fn steer_turn_payload(
     session_id: &str,
     prompt: &str,
     attachment_ids: Option<&Value>,
+    selected_skills: Option<&Value>,
 ) -> ApiResult<Value> {
     let trimmed_prompt = prompt.trim();
     if trimmed_prompt.is_empty() {
@@ -7321,7 +7488,16 @@ async fn steer_turn_payload(
 
     let attachments =
         resolve_selected_attachment_records(state, profile_id, session_id, attachment_ids).await?;
-    let (input, _) = build_turn_input_payload(trimmed_prompt, &attachments);
+    let requested_selected_skills = selected_skills_from_value(selected_skills);
+    let next_selected_skills = if requested_selected_skills.is_empty() {
+        with_ui_state_read(state, profile_id, |ui_state| {
+            Ok(session_selected_skills_from_ui_state(ui_state, session_id))
+        })
+        .await?
+    } else {
+        requested_selected_skills
+    };
+    let (input, _) = build_turn_input_payload(trimmed_prompt, &attachments, &next_selected_skills);
     let client = app_server_client(state, profile_id)
         .await
         .map_err(|error| {
@@ -7683,7 +7859,7 @@ async fn fork_session_payload(
         }
     );
     let session =
-        create_session_payload(state, profile_id, preferences, Some(&handoff_name)).await?;
+        create_session_payload(state, profile_id, preferences, None, Some(&handoff_name)).await?;
     let handoff_session_id = session
         .get("id")
         .and_then(Value::as_str)
@@ -8090,6 +8266,7 @@ async fn save_automation_payload(
             "id": automation_id,
             "name": automation_name,
             "prompt": automation_prompt,
+            "skills": selected_skills_from_value(automation.get("skills")),
             "enabled": enabled,
             "scheduleMode": schedule_mode,
             "intervalMinutes": if schedule_mode == "interval" { Value::from(normalized_interval) } else { Value::Null },
@@ -8334,6 +8511,7 @@ async fn run_automation_payload(
             state,
             profile_id,
             Value::Object(preferences.clone()),
+            automation.get("skills"),
             Some(&build_automation_thread_name(&automation_name)),
         )
         .await
@@ -8395,6 +8573,7 @@ async fn run_automation_payload(
             &session_id,
             &automation_prompt,
             Some(&json!([])),
+            automation.get("skills"),
             Value::Object(preferences),
         )
         .await
@@ -9007,6 +9186,7 @@ async fn start_arena_run_payload(
             &contestant.session_id,
             trimmed_prompt,
             Some(&json!([])),
+            None,
             Value::Object(session_preferences),
         )
         .await;
@@ -11158,6 +11338,7 @@ async fn handle_sessions_api_http(
                             .get("preferences")
                             .cloned()
                             .unwrap_or_else(|| json!({})),
+                        payload.get("selectedSkills"),
                         payload.get("name").and_then(Value::as_str),
                     )
                     .await
@@ -11688,6 +11869,7 @@ async fn handle_session_messages_api_http(
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
                 payload.get("attachmentIds"),
+                payload.get("skills"),
                 payload
                     .get("preferences")
                     .cloned()
@@ -11735,6 +11917,7 @@ async fn handle_session_steer_api_http(
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
                 payload.get("attachmentIds"),
+                payload.get("skills"),
             )
             .await
         }
@@ -11901,6 +12084,7 @@ async fn handle_session_queue_api_http(
                                 .get("prompt")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default(),
+                            payload.get("skills"),
                             payload.get("attachmentIds"),
                         )
                         .await
@@ -11978,6 +12162,7 @@ async fn handle_session_queue_api_http(
                                 session_id,
                                 queue_id,
                                 payload.get("prompt").and_then(Value::as_str),
+                                payload.get("skills"),
                                 payload.get("attachmentIds"),
                             )
                             .await
@@ -13407,6 +13592,7 @@ async fn execute_ws_method(
                 .get("preferences")
                 .cloned()
                 .unwrap_or_else(|| json!({})),
+            params.get("selectedSkills"),
             params.get("name").and_then(Value::as_str),
         )
         .await
@@ -13557,6 +13743,7 @@ async fn execute_ws_method(
                     .get("prompt")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
+                params.get("skills"),
                 params.get("attachmentIds"),
             )
             .await
@@ -13584,6 +13771,7 @@ async fn execute_ws_method(
                 &session_id,
                 &queue_id,
                 params.get("prompt").and_then(Value::as_str),
+                params.get("skills"),
                 params.get("attachmentIds"),
             )
             .await
@@ -13623,6 +13811,12 @@ async fn execute_ws_method(
             .await
             .map_err(anyhow::Error::from)
         }
+        "session/skills/save" => {
+            let session_id = require_string(&params, "sessionId")?;
+            save_session_skills_payload(state, &auth.profile_id, &session_id, params.get("skills"))
+                .await
+                .map_err(anyhow::Error::from)
+        }
         "session/rename" => {
             let session_id = require_string(&params, "sessionId")?;
             rename_session_payload(
@@ -13657,6 +13851,7 @@ async fn execute_ws_method(
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
                 params.get("attachmentIds"),
+                params.get("skills"),
                 params
                     .get("preferences")
                     .cloned()
@@ -13674,6 +13869,7 @@ async fn execute_ws_method(
                 &session_id,
                 &prompt,
                 params.get("attachmentIds"),
+                params.get("skills"),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -14547,11 +14743,22 @@ async fn dispatch_queue_item(
         .get("attachmentIds")
         .cloned()
         .unwrap_or_else(|| json!([]));
+    let selected_skills = queued_item
+        .get("skills")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
 
     if mode == "steer" {
-        steer_turn_payload(state, profile_id, session_id, prompt, Some(&attachment_ids))
-            .await
-            .map(|_| ())
+        steer_turn_payload(
+            state,
+            profile_id,
+            session_id,
+            prompt,
+            Some(&attachment_ids),
+            Some(&selected_skills),
+        )
+        .await
+        .map(|_| ())
     } else {
         send_turn_payload(
             state,
@@ -14559,6 +14766,7 @@ async fn dispatch_queue_item(
             session_id,
             prompt,
             Some(&attachment_ids),
+            Some(&selected_skills),
             json!({}),
         )
         .await
@@ -16200,6 +16408,17 @@ fn prepare_session_stream_item_payload(item: &Value, turn_id: &str) -> Value {
                         })
                         .collect(),
                 ),
+            );
+        }
+        "imageGeneration" => {
+            normalized.insert("title".to_string(), json!("Generated image"));
+            normalized.insert("detailState".to_string(), json!("inline"));
+            normalized.insert(
+                "detailPreview".to_string(),
+                value_text(normalized.get("revised_prompt").unwrap_or(&Value::Null))
+                    .or_else(|| value_text(normalized.get("status").unwrap_or(&Value::Null)))
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
             );
         }
         "webSearch" => {
@@ -18970,6 +19189,7 @@ for raw_line in sys.stdin:
                 "approvalPolicy": "on-request",
                 "sandboxMode": "workspace-write"
             }),
+            None,
             Some("Review docs"),
         )
         .await
@@ -19037,6 +19257,7 @@ for raw_line in sys.stdin:
             &state,
             "default",
             json!({ "cwd": workspace.display().to_string() }),
+            None,
             Some("Build Docs"),
         )
         .await
@@ -19045,6 +19266,7 @@ for raw_line in sys.stdin:
             &state,
             "default",
             json!({ "cwd": workspace.display().to_string() }),
+            None,
             Some("Fix Queue"),
         )
         .await
@@ -19506,12 +19728,20 @@ for raw_line in sys.stdin:
             .unwrap();
 
         let prompt = "Inspect the duplicated websocket send behaviour and capture the root cause before patching it.";
+        let selected_skills = json!([
+            {
+                "id": "skill-1",
+                "name": "imagegen",
+                "path": "/skills/imagegen/SKILL.md"
+            }
+        ]);
         let payload = send_turn_payload(
             &state,
             "default",
             "thread-1",
             prompt,
             Some(&json!(["att-file", "att-image"])),
+            Some(&selected_skills),
             json!({
                 "cwd": workspace.display().to_string(),
                 "model": "gpt-5",
@@ -19558,23 +19788,38 @@ for raw_line in sys.stdin:
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert_eq!(input.len(), 2);
+        assert_eq!(input.len(), 3);
         let first_text = input
             .first()
             .and_then(|value| value.get("text"))
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        assert!(first_text.contains("$imagegen"));
         assert!(first_text.contains(ATTACHMENT_PREAMBLE_START));
         assert!(first_text.contains(ATTACHMENT_PREAMBLE_END));
         assert!(first_text.contains(text_attachment_path.to_str().unwrap()));
         assert!(first_text.contains(prompt.trim()));
         assert_eq!(
             input
-                .get(1)
+                .get(2)
                 .and_then(|value| value.get("path"))
                 .and_then(Value::as_str),
             Some(image_attachment_path.to_str().unwrap())
+        );
+        assert_eq!(
+            input
+                .get(1)
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str),
+            Some("skill")
+        );
+        assert_eq!(
+            input
+                .get(1)
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str),
+            Some("imagegen")
         );
 
         let stored_preferences = with_ui_state_read(&state, "default", |ui_state| {
@@ -19694,6 +19939,7 @@ for raw_line in sys.stdin:
             "thread-1",
             "Focus on the queue deduplication race first.",
             Some(&json!(["att-file"])),
+            None,
         )
         .await
         .unwrap();
@@ -20724,17 +20970,32 @@ for raw_line in sys.stdin:
 
         let state = test_state(workspace.clone(), vec![workspace], codex_home);
 
-        let first = enqueue_session_queue_payload(&state, "default", "thread-1", "first", None)
-            .await
-            .unwrap();
+        let queue_skills = json!([
+            {
+                "id": "skill-queue",
+                "name": "openai-docs",
+                "path": "/skills/openai-docs/SKILL.md"
+            }
+        ]);
+        let first = enqueue_session_queue_payload(
+            &state,
+            "default",
+            "thread-1",
+            "first",
+            Some(&queue_skills),
+            None,
+        )
+        .await
+        .unwrap();
         let first_id = first
             .get("enqueueItemId")
             .and_then(Value::as_str)
             .unwrap()
             .to_string();
-        let second = enqueue_session_queue_payload(&state, "default", "thread-1", "second", None)
-            .await
-            .unwrap();
+        let second =
+            enqueue_session_queue_payload(&state, "default", "thread-1", "second", None, None)
+                .await
+                .unwrap();
         let second_id = second
             .get("enqueueItemId")
             .and_then(Value::as_str)
@@ -20766,6 +21027,7 @@ for raw_line in sys.stdin:
             "thread-1",
             &first_id,
             Some("first updated"),
+            Some(&queue_skills),
             Some(&empty_attachments),
         )
         .await
@@ -20783,6 +21045,13 @@ for raw_line in sys.stdin:
         assert_eq!(
             updated_item.get("prompt").and_then(Value::as_str),
             Some("first updated")
+        );
+        assert_eq!(
+            updated_item
+                .get("skills")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
         );
 
         let removed = remove_session_queue_item_payload(&state, "default", "thread-1", &second_id)

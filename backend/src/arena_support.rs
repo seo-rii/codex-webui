@@ -1,5 +1,5 @@
 use super::*;
-use crate::thread_support::read_thread_payload;
+use crate::thread_detail_support::read_thread_payload;
 use crate::turn_support::send_turn_payload;
 
 pub(crate) fn arena_store_path(config: &Config, profile_id: &str) -> PathBuf {
@@ -239,12 +239,14 @@ pub(crate) async fn start_arena_run_payload(
     } else {
         title_source.chars().take(60).collect::<String>()
     };
-    let client = app_server_client(state, profile_id).await.map_err(|error| {
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to connect to codex app-server: {error}"),
-        )
-    })?;
+    let client = app_server_client(state, profile_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to codex app-server: {error}"),
+            )
+        })?;
     let mut arena_contestants = Vec::new();
 
     for (model, label) in &normalized_contestants {

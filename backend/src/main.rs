@@ -68,6 +68,7 @@ mod http_router_support;
 mod queue_runtime_support;
 mod relay_support;
 mod request_cache_support;
+mod rollout_recovery_support;
 mod runtime_env_support;
 mod runtime_notification_support;
 mod session_http_support;
@@ -100,6 +101,7 @@ use http_router_support::*;
 use queue_runtime_support::*;
 use relay_support::*;
 use request_cache_support::*;
+use rollout_recovery_support::*;
 use runtime_env_support::*;
 use runtime_notification_support::*;
 use session_http_support::*;
@@ -693,97 +695,6 @@ async fn normalize_session_preferences_payload(
     );
 
     Ok(Value::Object(next_preferences))
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct RolloutRecoveryInfoPayload {
-    available: bool,
-    issue: Option<String>,
-    total_lines: usize,
-    recoverable_lines: usize,
-    skipped_lines: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RolloutRecoveryPlanPayload {
-    info: RolloutRecoveryInfoPayload,
-    recovered_content: String,
-}
-
-fn normalize_rollout_line(raw_line: &str) -> Option<String> {
-    let trimmed = raw_line
-        .trim_start_matches('\u{feff}')
-        .replace('\0', "")
-        .trim()
-        .to_string();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let mut candidates = vec![trimmed.clone()];
-    if let (Some(first_brace), Some(last_brace)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        let sliced = trimmed[first_brace..=last_brace].trim().to_string();
-        if !sliced.is_empty() && sliced != trimmed {
-            candidates.push(sliced);
-        }
-    }
-
-    for candidate in candidates {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&candidate) {
-            if let Ok(normalized) = serde_json::to_string(&parsed) {
-                return Some(normalized);
-            }
-        }
-    }
-
-    None
-}
-
-fn inspect_rollout_recovery_content(buffer: &[u8]) -> RolloutRecoveryPlanPayload {
-    let mut issue = std::str::from_utf8(buffer)
-        .err()
-        .map(|_| "invalidUtf8".to_string());
-    let decoded = String::from_utf8_lossy(buffer);
-    let mut total_lines = 0_usize;
-    let mut recoverable_lines = 0_usize;
-    let mut skipped_lines = 0_usize;
-    let mut recovered_lines = Vec::new();
-
-    for raw_line in decoded.lines() {
-        if raw_line.trim().is_empty() {
-            continue;
-        }
-
-        total_lines += 1;
-        let Some(normalized) = normalize_rollout_line(raw_line) else {
-            skipped_lines += 1;
-            continue;
-        };
-
-        recoverable_lines += 1;
-        recovered_lines.push(normalized);
-    }
-
-    if issue.is_none() && skipped_lines > 0 {
-        issue = Some("invalidJson".to_string());
-    }
-
-    RolloutRecoveryPlanPayload {
-        info: RolloutRecoveryInfoPayload {
-            available: recoverable_lines > 0
-                && (issue.as_deref() == Some("invalidUtf8") || skipped_lines > 0),
-            issue,
-            total_lines,
-            recoverable_lines,
-            skipped_lines,
-        },
-        recovered_content: if recovered_lines.is_empty() {
-            String::new()
-        } else {
-            format!("{}\n", recovered_lines.join("\n"))
-        },
-    }
 }
 
 async fn handle_http(State(state): State<AppState>, jar: CookieJar, request: Request) -> Response {

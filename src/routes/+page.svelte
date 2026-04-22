@@ -255,6 +255,7 @@
   let isMobileLayout = $state(false);
   let optimisticMessage = $state<OptimisticMessageState | null>(null);
   let optimisticQueuedItemsBySessionId = $state<Record<string, SessionQueueItem[]>>({});
+  let queuedMessageRequestCountsBySessionId = $state<Record<string, number>>({});
   let pendingQueueModeSessionId = $state<string | null>(null);
   let liveTurnCardExpanded = $state(false);
   let sendIntent = $state<"message" | "steer" | "queue" | null>(null);
@@ -785,6 +786,7 @@
       preferences: {
         ...preferences
       },
+      selectedSkills: [],
       attachments: [],
       queue: {
         sessionId: "",
@@ -1276,6 +1278,45 @@
   });
   const queueModeActive = $derived.by(() => canQueueComposerMessage());
   const lastComposerHistoryPrompt = $derived.by(() => lastComposerPromptChip?.prompt ?? "");
+  const composerHasContent = $derived.by(() => draft.trim().length > 0 || draftAttachments.length > 0);
+  const selectedSessionQueuedRequestCount = $derived.by(() => {
+    const sessionId = conversation?.thread.id ?? null;
+    if (!sessionId) {
+      return 0;
+    }
+
+    return queuedMessageRequestCountsBySessionId[sessionId] ?? 0;
+  });
+  const composerQueueActionDisabled = $derived.by(() => {
+    if (readOnlyRole || uploading || submitComposerBusy) {
+      return true;
+    }
+
+    const selectedBinding = getSelectedSessionBinding();
+    return !selectedBinding || !canQueueComposerMessage(selectedBinding.state);
+  });
+  const composerPrimaryActionDisabled = $derived.by(() => {
+    if (!composerHasContent) {
+      return true;
+    }
+
+    if (queueModeActive) {
+      return composerQueueActionDisabled;
+    }
+
+    return readOnlyRole || sending || startingMessage || submitComposerBusy || uploading;
+  });
+  const recentComposerActionDisabled = $derived.by(() => {
+    if (!lastComposerHistoryPrompt) {
+      return true;
+    }
+
+    if (queueModeActive) {
+      return composerQueueActionDisabled;
+    }
+
+    return readOnlyRole || sending || startingMessage || submitComposerBusy || uploading;
+  });
   const selectedSessionSummary = $derived(sessions.find((session) => session.id === selectedSessionId) ?? null);
   const sessionHighlights = $derived.by(() =>
     Object.fromEntries(
@@ -1283,14 +1324,9 @@
     )
   );
   const queuedMessages = $derived.by(() => {
-    const sessionId = conversation?.thread.id ?? null;
-    if (!sessionId) {
-      return [] as SessionQueueItem[];
-    }
-
-    return [...(conversation?.queue.items ?? []), ...(optimisticQueuedItemsBySessionId[sessionId] ?? [])];
+    return conversation?.queue.items ?? ([] as SessionQueueItem[]);
   });
-  const hasOptimisticQueuedMessages = $derived.by(() => queuedMessages.some((item) => isOptimisticQueueItem(item)));
+  const hasPendingQueueRequests = $derived.by(() => selectedSessionQueuedRequestCount > 0);
   const activeTurn = $derived.by(() => getConversationLiveTurn());
   const activeLiveTurnSubagents = $derived.by(() => {
     if (!activeTurn) {
@@ -1645,6 +1681,9 @@
     }
     if (running) {
       return { icon: "autorenew", label: ui.generatingResponse };
+    }
+    if (hasPendingQueueRequests) {
+      return { icon: "schedule_send", label: ui.queueingFollowUp };
     }
     return null;
   });
@@ -2308,15 +2347,6 @@
     if (hasEcho || hasCompletedReplacementTurn) {
       optimisticMessage = null;
     }
-  });
-
-  $effect(() => {
-    const sessionId = conversation?.thread.id ?? null;
-    if (!sessionId) {
-      return;
-    }
-
-    reconcileOptimisticQueuedItems(sessionId, conversation?.queue.items ?? []);
   });
 
   $effect(() => {
@@ -4579,7 +4609,7 @@
     if (!selectedBinding) {
       return;
     }
-    if (sending || uploading || !canQueueComposerMessage(selectedBinding.state)) {
+    if (uploading || !canQueueComposerMessage(selectedBinding.state)) {
       return;
     }
     if (!options?.promptText?.trim() && !draft.trim() && draftAttachments.length === 0) {
@@ -4594,56 +4624,74 @@
     if (!prompt && attachmentSnapshot.length === 0) {
       return;
     }
-    sending = true;
-    sendIntent = "queue";
     errorText = "";
     noticeText = "";
     const selectedSkillsSnapshot = [...selectedBinding.state.selectedSkills];
-    const optimisticQueueId = addOptimisticQueuedItem(sessionId, draftText, selectedSkillsSnapshot, attachmentSnapshot);
+    const attachmentIds = attachmentSnapshot.map((attachment) => attachment.id);
 
-    try {
-      const queue = await api.enqueueSessionMessage(sessionId, {
+    recordComposerHistory(prompt);
+    rememberLastComposerPromptChip(sessionId, prompt);
+    if (!preserveComposer) {
+      draft = "";
+      draftAttachments = [];
+      scheduleComposerTextareaResize();
+      composerSettingsOpen = false;
+      void api.clearSessionDraft(sessionId).catch(() => {});
+    }
+
+    queuedMessageRequestCountsBySessionId = {
+      ...queuedMessageRequestCountsBySessionId,
+      [sessionId]: (queuedMessageRequestCountsBySessionId[sessionId] ?? 0) + 1
+    };
+
+    void api
+      .enqueueSessionMessage(sessionId, {
         prompt: draftText,
         skills: selectedSkillsSnapshot,
-        attachmentIds: attachmentSnapshot.map((attachment) => attachment.id)
-      });
-      if (conversation?.thread.id === sessionId) {
-        conversation = {
-          ...conversation,
-          queue
-        };
-      }
+        attachmentIds
+      })
+      .then((queue) => {
+        const enqueueConfirmed =
+          queue.enqueueAccepted === true &&
+          typeof queue.enqueueItemId === "string" &&
+          queue.enqueueItemId.trim().length > 0;
 
-      const enqueueConfirmed =
-        queue.enqueueAccepted === true &&
-        typeof queue.enqueueItemId === "string" &&
-        queue.items.some((item) => item.id === queue.enqueueItemId);
+        if (enqueueConfirmed) {
+          noticeText = m.queue_notice();
+          return;
+        }
 
-      if (!enqueueConfirmed) {
-        removeOptimisticQueuedItem(sessionId, optimisticQueueId);
+        if (!preserveComposer && selectedSessionId === sessionId && !draft.trim() && draftAttachments.length === 0) {
+          draft = draftText;
+          draftAttachments = attachmentSnapshot;
+          scheduleComposerTextareaResize();
+        }
+        noticeText = "";
         errorText = m.queue_enqueue_failed();
-        return;
-      }
+      })
+      .catch((error) => {
+        if (!preserveComposer && selectedSessionId === sessionId && !draft.trim() && draftAttachments.length === 0) {
+          draft = draftText;
+          draftAttachments = attachmentSnapshot;
+          scheduleComposerTextareaResize();
+        }
+        noticeText = "";
+        errorText = describeError(error);
+      })
+      .finally(() => {
+        const remainingCount = Math.max(0, (queuedMessageRequestCountsBySessionId[sessionId] ?? 1) - 1);
+        if (remainingCount === 0) {
+          const remainingRequests = { ...queuedMessageRequestCountsBySessionId };
+          delete remainingRequests[sessionId];
+          queuedMessageRequestCountsBySessionId = remainingRequests;
+          return;
+        }
 
-      reconcileOptimisticQueuedItems(sessionId, queue.items);
-
-      recordComposerHistory(prompt);
-      rememberLastComposerPromptChip(sessionId, prompt);
-      if (!preserveComposer) {
-        draft = "";
-        draftAttachments = [];
-        scheduleComposerTextareaResize();
-        composerSettingsOpen = false;
-        void api.clearSessionDraft(sessionId).catch(() => {});
-      }
-      noticeText = m.queue_notice();
-    } catch (error) {
-      removeOptimisticQueuedItem(sessionId, optimisticQueueId);
-      errorText = describeError(error);
-    } finally {
-      sending = false;
-      sendIntent = null;
-    }
+        queuedMessageRequestCountsBySessionId = {
+          ...queuedMessageRequestCountsBySessionId,
+          [sessionId]: remainingCount
+        };
+      });
   }
 
   async function sendSteerPrompt(prompt: string, clearComposer = false) {
@@ -4781,7 +4829,7 @@
   }
 
   function startQueueDrag(event: PointerEvent, queueId: string) {
-    if (sending || queueReorderBusy || queuedMessages.length < 2 || hasOptimisticQueuedMessages) {
+    if (sending || queueReorderBusy || queuedMessages.length < 2 || hasPendingQueueRequests) {
       return;
     }
 
@@ -5001,7 +5049,7 @@
   }
 
   async function submitComposer() {
-    if (submitComposerBusy || sending || startingMessage || uploading) {
+    if (composerPrimaryActionDisabled) {
       return;
     }
 
@@ -5032,7 +5080,7 @@
   }
 
   async function resendLastComposerMessage() {
-    if (!lastComposerHistoryPrompt || sending || startingMessage || uploading) {
+    if (recentComposerActionDisabled) {
       return;
     }
 
@@ -8729,7 +8777,6 @@
                       transition:slide|local={{ duration: 220 }}
                     >
                       {#each queuedMessages as item (item.id)}
-                        {@const itemPending = isOptimisticQueueItem(item)}
                         <div
                           class={`relative px-3 py-2 transition-colors ${queueDragState?.queueId === item.id ? "bg-amber-50/60" : ""}`}
                           data-queue-item-id={item.id}
@@ -8743,8 +8790,8 @@
                           <div class="flex items-start gap-2.5">
                             <button
                               aria-label={ui.reorderQueue ?? "Reorder queued message"}
-                              class={`mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-400 transition-colors ${sending || queueReorderBusy || queuedMessages.length < 2 || hasOptimisticQueuedMessages ? "cursor-not-allowed opacity-45" : queueDragState?.queueId === item.id ? "cursor-grabbing border-amber-300 bg-amber-50 text-amber-700 shadow-sm" : "cursor-grab hover:bg-gray-100 hover:text-gray-700"}`}
-                              disabled={sending || queueReorderBusy || queuedMessages.length < 2 || hasOptimisticQueuedMessages}
+                              class={`mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-400 transition-colors ${sending || queueReorderBusy || queuedMessages.length < 2 || hasPendingQueueRequests ? "cursor-not-allowed opacity-45" : queueDragState?.queueId === item.id ? "cursor-grabbing border-amber-300 bg-amber-50 text-amber-700 shadow-sm" : "cursor-grab hover:bg-gray-100 hover:text-gray-700"}`}
+                              disabled={sending || queueReorderBusy || queuedMessages.length < 2 || hasPendingQueueRequests}
                               onlostpointercapture={cancelQueueDrag}
                               onpointercancel={cancelQueueDrag}
                               onpointerdown={(event) => startQueueDrag(event, item.id)}
@@ -8788,12 +8835,6 @@
                                   {:else}
                                     <div class="flex flex-wrap items-center gap-1.5">
                                       <p class="min-w-0 flex-1 text-[12px] leading-4 text-gray-700 break-words sm:truncate">{summarizeQueueItem(item)}</p>
-                                      {#if itemPending}
-                                        <span class="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-amber-700">
-                                          <RefreshCw size={10} class="animate-spin" />
-                                          {m.loading()}
-                                        </span>
-                                      {/if}
                                     </div>
                                     {#if item.attachmentNames.length > 0}
                                       <div class="flex flex-wrap gap-1">
@@ -8807,15 +8848,15 @@
                                 </div>
                                 <div class={`flex flex-wrap items-center gap-1.5 ${editingQueueId === item.id ? "" : "sm:justify-end"}`}>
                                   {#if editingQueueId === item.id}
-                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-emerald-200 bg-emerald-50 px-2 text-[10px] font-bold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50" disabled={sending || queueReorderBusy || itemPending} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.queueSave}</button>
-                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-gray-200 bg-white px-2 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy || itemPending} onclick={cancelQueuedMessageEdit} type="button">{ui.cancel}</button>
+                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-emerald-200 bg-emerald-50 px-2 text-[10px] font-bold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50" disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.queueSave}</button>
+                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-gray-200 bg-white px-2 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={cancelQueuedMessageEdit} type="button">{ui.cancel}</button>
                                   {:else}
-                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-2 text-[10px] font-bold text-amber-700 transition-colors hover:bg-amber-100 disabled:opacity-50" disabled={sending || queueReorderBusy || itemPending} onclick={() => void dispatchQueuedMessage(item.id, "steer")} type="button">{ui.steerNow}</button>
-                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-gray-200 bg-white px-2 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy || itemPending} onclick={() => void dispatchQueuedMessage(item.id, "message")} type="button">{ui.sendNow}</button>
+                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-2 text-[10px] font-bold text-amber-700 transition-colors hover:bg-amber-100 disabled:opacity-50" disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={() => void dispatchQueuedMessage(item.id, "steer")} type="button">{ui.steerNow}</button>
+                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-gray-200 bg-white px-2 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={() => void dispatchQueuedMessage(item.id, "message")} type="button">{ui.sendNow}</button>
                                     <button
                                       aria-label={ui.edit}
                                       class="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-gray-200 bg-white p-0 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:opacity-50"
-                                      disabled={sending || queueReorderBusy || itemPending}
+                                      disabled={sending || queueReorderBusy || hasPendingQueueRequests}
                                       onclick={() => beginQueuedMessageEdit(item)}
                                       title={ui.edit}
                                       type="button"
@@ -8823,7 +8864,7 @@
                                       <Pencil size={14} />
                                     </button>
                                   {/if}
-                                  <button class="inline-flex h-7 w-7 items-center justify-center rounded-lg p-0 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:opacity-50" aria-label={m.remove_queued_message()} disabled={sending || queueReorderBusy || itemPending} onclick={() => void removeQueuedMessage(item.id)} type="button"><Trash2 size={14} /></button>
+                                  <button class="inline-flex h-7 w-7 items-center justify-center rounded-lg p-0 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:opacity-50" aria-label={m.remove_queued_message()} disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={() => void removeQueuedMessage(item.id)} type="button"><Trash2 size={14} /></button>
                                 </div>
                               </div>
                             </div>
@@ -9003,7 +9044,7 @@
                     </button>
                     <button
                       class="surface-contrast-button ui-animated-button ui-animated-button--soft flex h-8 shrink-0 items-center gap-1.5 rounded-xl px-3 text-[10px] font-bold shadow-sm"
-                      disabled={readOnlyRole || sending || startingMessage || uploading}
+                      disabled={recentComposerActionDisabled}
                       onclick={() => void resendLastComposerMessage()}
                       title={queueModeActive ? ui.queue : ui.send}
                       type="button"
@@ -9111,7 +9152,7 @@
                         <button class="ui-animated-button ui-animated-button--soft inline-flex h-8 items-center justify-center rounded-xl px-3 text-[11px] font-bold text-red-600 transition-all hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:px-4 sm:text-xs" disabled={readOnlyRole} onclick={interruptTurn} type="button">{ui.stop}</button>
                         <button class="ui-animated-button ui-animated-button--soft inline-flex h-8 items-center justify-center rounded-xl border border-amber-200 bg-amber-50 px-3 text-[11px] font-bold text-amber-700 transition-all hover:bg-amber-100 disabled:opacity-50 sm:h-9 sm:px-4 sm:text-xs" disabled={readOnlyRole || sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
                       {/if}
-                      <button class="surface-contrast-button ui-animated-button ui-animated-button--strong inline-flex h-8 items-center justify-center rounded-xl bg-gray-900 px-4 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:h-9 sm:px-6 sm:text-xs" disabled={readOnlyRole || sending || startingMessage || submitComposerBusy || (!draft.trim() && draftAttachments.length === 0)} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
+                      <button class="surface-contrast-button ui-animated-button ui-animated-button--strong inline-flex h-8 items-center justify-center rounded-xl bg-gray-900 px-4 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:h-9 sm:px-6 sm:text-xs" disabled={composerPrimaryActionDisabled} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
                     </div>
                   </div>
                 </form>

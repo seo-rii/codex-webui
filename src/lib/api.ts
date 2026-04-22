@@ -70,7 +70,7 @@ async function request<T>(input: string, init?: RequestInit) {
 
   const response = await fetch(input, {
     ...init,
-    credentials: init?.credentials ?? "include",
+    credentials: "include",
     headers
   });
 

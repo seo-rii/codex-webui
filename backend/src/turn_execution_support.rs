@@ -1,5 +1,5 @@
 use super::*;
-use crate::thread_detail_support::{
+use crate::thread_read_support::{
     active_turn_id_from_turns, emit_session_notification, read_thread_payload,
 };
 use crate::thread_listing_support::emit_session_summary_updated;

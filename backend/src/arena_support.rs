@@ -1,5 +1,5 @@
 use super::*;
-use crate::thread_detail_support::read_thread_payload;
+use crate::thread_read_support::read_thread_payload;
 use crate::turn_execution_support::send_turn_payload;
 
 pub(crate) fn arena_store_path(config: &Config, profile_id: &str) -> PathBuf {

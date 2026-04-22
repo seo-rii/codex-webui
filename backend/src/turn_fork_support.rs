@@ -1,5 +1,5 @@
 use super::*;
-use crate::thread_detail_support::read_thread_payload;
+use crate::thread_read_support::read_thread_payload;
 use crate::thread_listing_support::{
     build_session_summary_from_thread_payload, create_session_payload, emit_session_summary_updated,
 };

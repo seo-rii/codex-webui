@@ -283,6 +283,65 @@ pub(crate) async fn read_thread_payload(
     Ok(normalize_thread_payload(&thread))
 }
 
+pub(crate) async fn read_thread_metadata_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Value> {
+    match read_thread_payload(state, profile_id, session_id, false).await {
+        Ok(thread) => Ok(thread),
+        Err(read_error) => {
+            let client = match app_server_client(state, profile_id).await {
+                Ok(client) => client,
+                Err(_) => return Err(read_error),
+            };
+
+            for archived in [false, true] {
+                let mut cursor: Option<String> = None;
+                loop {
+                    let response = match client
+                        .request(
+                            "thread/list",
+                            json!({
+                                "limit": 200,
+                                "archived": archived,
+                                "cursor": cursor.clone()
+                            }),
+                        )
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(_) => return Err(read_error),
+                    };
+                    let batch = response
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(thread) = batch
+                        .iter()
+                        .find(|thread| thread.get("id").and_then(Value::as_str) == Some(session_id))
+                    {
+                        return Ok(normalize_thread_payload(thread));
+                    }
+
+                    cursor = response
+                        .get("nextCursor")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string);
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+            }
+
+            Err(read_error)
+        }
+    }
+}
+
 pub(crate) fn resolve_rollout_path(
     state: &AppState,
     profile_id: &str,

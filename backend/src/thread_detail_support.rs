@@ -1,5 +1,27 @@
 use super::*;
 
+async fn clear_completed_session_highlight_on_open(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) {
+    let has_completed_highlight = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("highlightsByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get(session_id))
+            .and_then(|highlight| highlight.get("kind"))
+            .and_then(Value::as_str)
+            == Some("completed"))
+    })
+    .await
+    .unwrap_or(false);
+
+    if has_completed_highlight {
+        set_session_highlight(state, profile_id, session_id, None).await;
+    }
+}
+
 async fn session_pending_requests_payload(
     state: &AppState,
     profile_id: &str,
@@ -48,16 +70,81 @@ pub(crate) async fn session_detail_payload(
     session_id: &str,
     limit: u64,
 ) -> ApiResult<Value> {
-    let thread = read_thread_payload(state, profile_id, session_id, true).await?;
+    let (
+        thread,
+        visible_turns,
+        total_turns,
+        start,
+        hydration_state,
+        hydration_message,
+        hydration_recovery,
+    ) = match read_thread_payload(state, profile_id, session_id, true).await {
+        Ok(thread) => {
+            let turns = thread
+                .get("turns")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let total_turns = turns.len();
+            let window_size = limit.clamp(1, 200) as usize;
+            let start = total_turns.saturating_sub(window_size);
+            (
+                thread,
+                turns[start..].to_vec(),
+                total_turns,
+                start,
+                "complete",
+                Value::Null,
+                json!({
+                    "available": false,
+                    "issue": Value::Null,
+                    "totalLines": Value::Null,
+                    "recoverableLines": Value::Null,
+                    "skippedLines": Value::Null
+                }),
+            )
+        }
+        Err(error) => {
+            let thread = read_thread_metadata_payload(state, profile_id, session_id)
+                .await
+                .map_err(|_| error.clone())?;
+            let rollout_path = resolve_rollout_path(state, profile_id, session_id, &thread)
+                .ok_or_else(|| error.clone())?;
+            let rollout_buffer = tokio_fs::read(&rollout_path)
+                .await
+                .map_err(|_| error.clone())?;
+            let plan = inspect_rollout_recovery_content(&rollout_buffer);
+            if !plan.info.available
+                || plan.info.recoverable_lines == 0
+                || plan.recovered_content.trim().is_empty()
+            {
+                return Err(error);
+            }
+
+            let turns = thread
+                .get("turns")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let total_turns = turns.len();
+            let window_size = limit.clamp(1, 200) as usize;
+            let start = total_turns.saturating_sub(window_size);
+            (
+                thread,
+                turns[start..].to_vec(),
+                total_turns,
+                start,
+                "error",
+                Value::String(error.message),
+                json!(plan.info),
+            )
+        }
+    };
     let turns = thread
         .get("turns")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let total_turns = turns.len();
-    let window_size = limit.clamp(1, 200) as usize;
-    let start = total_turns.saturating_sub(window_size);
-    let visible_turns = turns[start..].to_vec();
     let active_turn_id = state
         .active_turns
         .lock()
@@ -87,6 +174,7 @@ pub(crate) async fn session_detail_payload(
         )))
     })
     .await?;
+    clear_completed_session_highlight_on_open(state, profile_id, session_id).await;
 
     Ok(json!({
         "thread": {
@@ -110,18 +198,12 @@ pub(crate) async fn session_detail_payload(
         "activeTurnId": active_turn_id,
         "tokenUsage": thread.get("tokenUsage").cloned().unwrap_or(Value::Null),
         "hydration": {
-            "state": "complete",
+            "state": hydration_state,
             "loadedTurns": total_turns.saturating_sub(start),
             "totalTurns": total_turns,
             "remainingTurns": start,
-            "message": Value::Null,
-            "recovery": {
-                "available": false,
-                "issue": Value::Null,
-                "totalLines": Value::Null,
-                "recoverableLines": Value::Null,
-                "skippedLines": Value::Null
-            }
+            "message": hydration_message,
+            "recovery": hydration_recovery
         }
     }))
 }

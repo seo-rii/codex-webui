@@ -238,12 +238,30 @@ for raw_line in sys.stdin:
             "agentRole": None,
             "turns": []
         })
-        write({
-            "id": request_id,
-            "result": {
-                "thread": thread
-            }
-        })
+        read_error = thread.get("readError")
+        if isinstance(read_error, dict) and str(read_error.get("message", "")).strip():
+            write({
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": str(read_error.get("message"))
+                }
+            })
+        elif isinstance(read_error, str) and read_error.strip():
+            write({
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": read_error.strip()
+                }
+            })
+        else:
+            write({
+                "id": request_id,
+                "result": {
+                    "thread": thread
+                }
+            })
     elif method == "thread/list":
         archived = bool(params.get("archived", False))
         limit = max(1, min(int(params.get("limit", 20) or 20), 200))

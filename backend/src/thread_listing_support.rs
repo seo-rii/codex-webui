@@ -349,7 +349,7 @@ pub(crate) async fn build_session_summary_payload(
     session_id: &str,
     preferences_override: Option<Value>,
 ) -> ApiResult<Value> {
-    let thread = read_thread_payload(state, profile_id, session_id, false).await?;
+    let thread = read_thread_metadata_payload(state, profile_id, session_id).await?;
     let snapshot = read_session_summary_ui_snapshot(state, profile_id).await?;
     let summary =
         build_session_summary_from_thread_payload(&thread, &snapshot, preferences_override)?;

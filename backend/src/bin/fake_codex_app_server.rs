@@ -191,12 +191,40 @@ fn main() {
                         "turns": []
                     })
                 });
-                print_message(&json!({
-                    "id": id,
-                    "result": {
-                        "thread": thread
-                    }
-                }));
+                let read_error = thread.get("readError").cloned().unwrap_or(Value::Null);
+                if let Some(message) = read_error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    print_message(&json!({
+                        "id": id,
+                        "error": {
+                            "code": -32000,
+                            "message": message
+                        }
+                    }));
+                } else if let Some(message) = read_error
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    print_message(&json!({
+                        "id": id,
+                        "error": {
+                            "code": -32000,
+                            "message": message
+                        }
+                    }));
+                } else {
+                    print_message(&json!({
+                        "id": id,
+                        "result": {
+                            "thread": thread
+                        }
+                    }));
+                }
             }
             Some("thread/list") => {
                 let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));

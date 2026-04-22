@@ -116,6 +116,20 @@ pub(crate) async fn ensure_stream_relay(
     Ok(sender)
 }
 
+pub(crate) async fn session_stream_has_subscribers(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> bool {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    state
+        .relays
+        .lock()
+        .await
+        .get(&session_relay_key(resolved_profile_id, session_id))
+        .is_some_and(|relay| relay.receiver_count() > 0)
+}
+
 pub(crate) async fn ensure_global_relay(
     state: &AppState,
     profile_id: &str,

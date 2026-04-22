@@ -56,6 +56,7 @@ mod arena_support;
 mod attachment_support;
 mod audit_support;
 mod auth_support;
+mod auth_transport_support;
 mod automation_support;
 mod autostart_support;
 mod aux_http_support;
@@ -63,9 +64,12 @@ mod catalog_support;
 mod codex_runtime_support;
 mod config_http_support;
 mod config_support;
+mod constants_support;
 mod event_mapping_support;
-mod git_repository_support;
-mod git_support;
+mod git_discovery_support;
+mod git_read_support;
+mod git_worktree_support;
+mod git_write_support;
 mod github_support;
 mod http_entry_support;
 mod http_router_support;
@@ -81,33 +85,39 @@ mod session_attachment_http_support;
 mod session_draft_state_support;
 mod session_http_support;
 mod session_mutation_http_support;
+mod session_preferences_support;
 mod session_preset_state_support;
+mod session_queue_dispatch_support;
 mod session_queue_http_support;
-mod session_queue_state_support;
+mod session_queue_mutation_support;
+mod session_queue_support;
 mod session_route_dispatch_support;
 mod session_summary_support;
 mod session_transcript_http_support;
 mod shared_types_support;
 mod shutdown_queue_support;
 mod static_support;
+mod stream_transport_support;
 mod system_support;
 mod terminal_support;
 mod thread_detail_support;
 mod thread_listing_support;
 mod thread_read_support;
 mod thread_support;
-mod transport_http_support;
 mod turn_execution_support;
 mod turn_fork_support;
 mod ui_state_support;
 mod workspace_support;
 mod ws_dispatch_support;
+mod ws_method_support;
+mod ws_transport_support;
 
 use app_util_support::*;
 use arena_support::*;
 use attachment_support::*;
 use audit_support::*;
 use auth_support::*;
+use auth_transport_support::*;
 use automation_support::*;
 use autostart_support::*;
 use aux_http_support::*;
@@ -115,9 +125,12 @@ use catalog_support::*;
 use codex_runtime_support::*;
 use config_http_support::*;
 use config_support::*;
+use constants_support::*;
 use event_mapping_support::*;
-use git_repository_support::*;
-use git_support::*;
+use git_discovery_support::*;
+use git_read_support::*;
+use git_worktree_support::*;
+use git_write_support::*;
 use github_support::*;
 use http_entry_support::*;
 use http_router_support::*;
@@ -133,60 +146,32 @@ use session_attachment_http_support::*;
 use session_draft_state_support::*;
 use session_http_support::*;
 use session_mutation_http_support::*;
+use session_preferences_support::*;
 use session_preset_state_support::*;
+use session_queue_dispatch_support::*;
 use session_queue_http_support::*;
-use session_queue_state_support::*;
+use session_queue_mutation_support::*;
+use session_queue_support::*;
 use session_route_dispatch_support::*;
 use session_summary_support::*;
 use session_transcript_http_support::*;
 use shared_types_support::*;
 use shutdown_queue_support::*;
 use static_support::*;
+use stream_transport_support::*;
 use system_support::*;
 use terminal_support::*;
 use thread_detail_support::*;
 use thread_listing_support::*;
 use thread_read_support::*;
 use thread_support::*;
-use transport_http_support::*;
 use turn_execution_support::*;
 use turn_fork_support::*;
 use ui_state_support::*;
 use workspace_support::*;
 use ws_dispatch_support::*;
-
-const AUTH_COOKIE: &str = "codex_webui_auth";
-const PROFILE_COOKIE: &str = "codex_webui_profile";
-const LOGIN_WINDOW_MS: u128 = 10 * 60 * 1000;
-const LOGIN_MAX_ATTEMPTS: usize = 8;
-const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
-const GLOBAL_RELAY_KEY: &str = "__global__";
-const CODEX_NPM_PACKAGE: &str = "@openai/codex";
-const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
-const CODEX_USAGE_USER_AGENT: &str = "codex_cli_rs/0.120.0 (Codex Web UI)";
-const NPM_VIEW_TIMEOUT: Duration = Duration::from_millis(2500);
-const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
-const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
-const CATALOG_CACHE_TTL: Duration = Duration::from_secs(10);
-const GIT_REPOSITORY_CACHE_TTL: Duration = Duration::from_secs(5);
-const QUOTA_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
-const DEFAULT_NOTIFICATION_LIMIT: usize = 80;
-const DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT: usize = 40;
-const TERMINAL_BUFFER_LIMIT: usize = 500_000;
-const TERMINAL_RELAY_PREFIX: &str = "__terminal__:";
-const STATIC_BASE_PLACEHOLDER: &str = "/__CODEX_WEBUI_BASE__";
-const RUNTIME_ERROR_LOG_NAME: &str = "runtime-errors.jsonl";
-const AUTOSTART_LABEL: &str = "dev.seorii.codex-webui";
-const WINDOWS_STARTUP_SCRIPT: &str = "codex-webui.vbs";
-const MACOS_LAUNCH_AGENT: &str = "dev.seorii.codex-webui.plist";
-const LINUX_SYSTEMD_SERVICE: &str = "codex-webui-autostart.service";
-const LINUX_DESKTOP_ENTRY: &str = "codex-webui.desktop";
-const ATTACHMENT_PREAMBLE_START: &str = "[[codex-webui-attachments]]";
-const ATTACHMENT_PREAMBLE_END: &str = "[[/codex-webui-attachments]]";
-
-tokio::task_local! {
-    static ACTIVE_PROFILE_ID: String;
-}
+use ws_method_support::*;
+use ws_transport_support::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -271,53 +256,5 @@ async fn main() -> Result<()> {
 
     result
 }
-
-async fn normalize_session_preferences_payload(
-    state: &AppState,
-    profile_id: &str,
-    preferences: Value,
-) -> ApiResult<Value> {
-    let defaults = session_preferences_defaults_payload(state, profile_id)
-        .await
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    let mut next_preferences = defaults;
-    if let Some(overrides) = preferences.as_object() {
-        for (key, value) in overrides {
-            next_preferences.insert(key.clone(), value.clone());
-        }
-    }
-
-    let cwd = next_preferences
-        .get("cwd")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    next_preferences.insert(
-        "cwd".to_string(),
-        Value::String(resolve_allowed_directory(state, &cwd).await?),
-    );
-    let normalized_git_repo_path = normalize_git_repo_path(
-        state,
-        next_preferences.get("gitRepoPath").unwrap_or(&Value::Null),
-    )
-    .await?;
-    next_preferences.insert("gitRepoPath".to_string(), normalized_git_repo_path);
-    next_preferences.insert(
-        "personality".to_string(),
-        Value::String(
-            next_preferences
-                .get("personality")
-                .and_then(Value::as_str)
-                .filter(|value| matches!(*value, "none" | "friendly" | "pragmatic"))
-                .unwrap_or("pragmatic")
-                .to_string(),
-        ),
-    );
-
-    Ok(Value::Object(next_preferences))
-}
-
 #[cfg(test)]
 mod main_tests;

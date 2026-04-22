@@ -113,7 +113,7 @@ pub(crate) async fn handle_session_recovery_api_http(
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
-    let thread = match read_thread_payload(&state, &auth.profile_id, session_id, false).await {
+    let thread = match read_thread_metadata_payload(&state, &auth.profile_id, session_id).await {
         Ok(thread) => thread,
         Err(error) => return json_error(error.status, &error.message),
     };

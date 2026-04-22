@@ -340,6 +340,54 @@ async fn runtime_notifications_emit_global_events_without_internal_sse() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_runtime_notification_skips_highlight_when_session_is_open() {
+    let sandbox = unique_test_dir("completion-highlight-open-session");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let relay = ensure_stream_relay(&state, "default", "thread-1")
+        .await
+        .expect("session relay should initialize");
+    let _receiver = relay.subscribe();
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "turn/completed".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": []
+                }
+            }),
+        },
+    )
+    .await;
+
+    let highlight = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state
+            .get("highlightsByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get("thread-1"))
+            .cloned()
+            .unwrap_or(Value::Null))
+    })
+    .await
+    .unwrap();
+    assert!(highlight.is_null());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test]
 async fn arena_list_falls_back_to_stored_runs_when_sessions_cannot_be_loaded() {
     let sandbox = unique_test_dir("arena-list");
@@ -588,6 +636,91 @@ async fn queue_write_helpers_mutate_queue_state() {
     assert_eq!(
         removed.get("items").and_then(Value::as_array).map(Vec::len),
         Some(1)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enqueue_session_queue_payload_auto_dispatches_when_session_is_idle() {
+    let sandbox = unique_test_dir("queue-auto-dispatch");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5.4"
+        }),
+        None,
+        Some("Queue auto dispatch"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let queued = enqueue_session_queue_payload(
+        &state,
+        "default",
+        &session_id,
+        "Continue the work after the browser disconnects.",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        queued.get("enqueueAccepted").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        queued
+            .get("enqueueItemId")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    );
+
+    let queue_after = get_session_queue_payload(&state, "default", &session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue_after
+            .get("items")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let thread = read_thread_payload(&state, "default", &session_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        thread.get("status").and_then(Value::as_str),
+        Some("running")
+    );
+    let last_turn_start = thread.get("lastTurnStart").cloned().unwrap_or(Value::Null);
+    let input = last_turn_start
+        .get("input")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        input
+            .first()
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str),
+        Some("Continue the work after the browser disconnects.")
     );
 
     let _ = fs::remove_dir_all(sandbox);

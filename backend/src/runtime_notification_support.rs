@@ -255,16 +255,20 @@ pub(crate) async fn handle_profile_runtime_notification(
                 }),
             )
             .await;
-            set_session_highlight(
-                state,
-                profile_id,
-                &session_id,
-                Some(json!({
-                    "kind": "completed",
-                    "at": now_unix_ms()
-                })),
-            )
-            .await;
+            if session_stream_has_subscribers(state, profile_id, &session_id).await {
+                set_session_highlight(state, profile_id, &session_id, None).await;
+            } else {
+                set_session_highlight(
+                    state,
+                    profile_id,
+                    &session_id,
+                    Some(json!({
+                        "kind": "completed",
+                        "at": now_unix_ms()
+                    })),
+                )
+                .await;
+            }
         }
         "thread/status/changed" => {
             let status = normalized_thread_status(notification.params.get("status"))

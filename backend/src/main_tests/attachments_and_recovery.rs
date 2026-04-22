@@ -409,6 +409,191 @@ async fn session_recovery_http_handler_recovers_rollout_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_detail_payload_surfaces_rollout_recovery_when_thread_read_fails() {
+    let sandbox = unique_test_dir("session-detail-recovery-fallback");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let created_at = time::OffsetDateTime::now_utc().unix_timestamp();
+    let created_date = time::OffsetDateTime::from_unix_timestamp(created_at)
+        .unwrap()
+        .date();
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join(created_date.year().to_string())
+        .join(format!("{:02}", u8::from(created_date.month())))
+        .join(format!("{:02}", created_date.day()));
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join("2026-04-21-thread-1.jsonl");
+    fs::write(&rollout_path, b"{\"step\":1}\n\xff\n{\"step\":2}\n").unwrap();
+
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-1",
+                    "name": "Recover rollout",
+                    "preview": "Recover rollout",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": created_at,
+                    "updatedAt": created_at,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": [],
+                    "readError": {
+                        "message": format!(
+                            "failed to load rollout `{}` for thread thread-1: stream did not contain valid UTF-8",
+                            rollout_path.display()
+                        )
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let payload = session_detail_payload(&state, "default", "thread-1", 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        payload
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(Value::as_str),
+        Some("thread-1")
+    );
+    assert_eq!(
+        payload
+            .get("hydration")
+            .and_then(|hydration| hydration.get("state"))
+            .and_then(Value::as_str),
+        Some("error")
+    );
+    assert_eq!(
+        payload
+            .get("hydration")
+            .and_then(|hydration| hydration.get("recovery"))
+            .and_then(|recovery| recovery.get("available"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        payload
+            .get("hydration")
+            .and_then(|hydration| hydration.get("recovery"))
+            .and_then(|recovery| recovery.get("issue"))
+            .and_then(Value::as_str),
+        Some("invalidUtf8")
+    );
+    assert_eq!(
+        payload
+            .get("hydration")
+            .and_then(|hydration| hydration.get("recovery"))
+            .and_then(|recovery| recovery.get("recoverableLines"))
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_recovery_http_handler_uses_thread_list_metadata_when_thread_read_fails() {
+    let sandbox = unique_test_dir("session-recovery-thread-list-fallback");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let created_at = time::OffsetDateTime::now_utc().unix_timestamp();
+    let created_date = time::OffsetDateTime::from_unix_timestamp(created_at)
+        .unwrap()
+        .date();
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join(created_date.year().to_string())
+        .join(format!("{:02}", u8::from(created_date.month())))
+        .join(format!("{:02}", created_date.day()));
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join("2026-04-21-thread-1.jsonl");
+    fs::write(&rollout_path, b"{\"step\":1}\n\xff\n{\"step\":2}\n").unwrap();
+
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-1",
+                    "name": "Recover rollout",
+                    "preview": "Recover rollout",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": created_at,
+                    "updatedAt": created_at,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": [],
+                    "readError": {
+                        "message": format!(
+                            "failed to load rollout `{}` for thread thread-1: stream did not contain valid UTF-8",
+                            rollout_path.display()
+                        )
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .body(Body::empty())
+        .unwrap();
+    let response = handle_session_recovery_api_http(
+        state.clone(),
+        request,
+        AuthContext {
+            role: UserRole::Admin,
+            profile_id: "default".to_string(),
+        },
+        "thread-1",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        fs::read_to_string(&rollout_path).unwrap(),
+        "{\"step\":1}\n{\"step\":2}\n"
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_config_payload_uses_rust_state_and_app_server_metadata() {
     let sandbox = unique_test_dir("config-rust");
     let workspace = sandbox.join("workspace");

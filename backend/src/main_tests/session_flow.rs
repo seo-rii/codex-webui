@@ -481,6 +481,93 @@ async fn session_detail_and_turn_search_payloads_use_rust_thread_reads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_detail_payload_clears_completed_highlight_on_open() {
+    let sandbox = unique_test_dir("session-detail-highlight-clear");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-1",
+                    "name": "Investigate bug",
+                    "preview": "Investigate websocket bug",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "completed",
+                    "isSubagent": false,
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "completed",
+                            "error": Value::Null,
+                            "startedAt": 10,
+                            "completedAt": 20,
+                            "durationMs": 10,
+                            "items": [
+                                {
+                                    "id": "item-1",
+                                    "type": "agentMessage",
+                                    "text": "Done"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    with_ui_state_write(&state, "default", |ui_state| {
+        let highlights = ui_state
+            .get_mut("highlightsByThreadId")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "missing highlight state")
+            })?;
+        highlights.insert(
+            "thread-1".to_string(),
+            json!({
+                "kind": "completed",
+                "at": now_unix_ms()
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    session_detail_payload(&state, "default", "thread-1", 20)
+        .await
+        .unwrap();
+
+    let highlight_after = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state
+            .get("highlightsByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get("thread-1"))
+            .cloned()
+            .unwrap_or(Value::Null))
+    })
+    .await
+    .unwrap();
+    assert!(highlight_after.is_null());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_turn_payload_uses_app_server_and_updates_session_state() {
     let sandbox = unique_test_dir("turn-send-rust");
     let workspace = sandbox.join("workspace");

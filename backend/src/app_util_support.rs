@@ -1,5 +1,28 @@
 use super::*;
 
+pub(crate) fn session_relay_key(profile_id: &str, session_id: &str) -> String {
+    format!("profile::{profile_id}::session::{session_id}")
+}
+
+pub(crate) fn global_relay_key(profile_id: &str) -> String {
+    format!("profile::{profile_id}::{GLOBAL_RELAY_KEY}")
+}
+
+pub(crate) fn request_cache_key(profile_id: &str, request_id: &str) -> String {
+    format!("profile::{profile_id}::request::{request_id}")
+}
+
+pub(crate) fn runtime_session_key(profile_id: &str, session_id: &str) -> String {
+    format!("profile::{profile_id}::session-runtime::{session_id}")
+}
+
+pub(crate) fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
+    ApiError {
+        status,
+        message: message.into(),
+    }
+}
+
 pub(crate) fn trim_terminal_buffer(buffer: &mut String) {
     if buffer.len() <= TERMINAL_BUFFER_LIMIT {
         return;
@@ -140,6 +163,70 @@ pub(crate) fn require_string(params: &Value, key: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| anyhow!("{key} is required"))
+}
+
+pub(crate) fn query_param_value(query: Option<&str>, key: &str) -> Option<String> {
+    query?.split('&').find_map(|entry| {
+        let (raw_key, raw_value) = entry.split_once('=').unwrap_or((entry, ""));
+        if raw_key != key {
+            return None;
+        }
+        let decoded = raw_value.replace('+', "%20");
+        urlencoding::decode(&decoded)
+            .ok()
+            .map(|value| value.into_owned())
+    })
+}
+
+pub(crate) fn query_param_values(query: Option<&str>, key: &str) -> Vec<String> {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|entry| {
+            let (raw_key, raw_value) = entry.split_once('=').unwrap_or((entry, ""));
+            if raw_key != key {
+                return None;
+            }
+            let decoded = raw_value.replace('+', "%20");
+            urlencoding::decode(&decoded)
+                .ok()
+                .map(|value| value.into_owned())
+        })
+        .collect()
+}
+
+pub(crate) fn selected_skills_from_value(value: Option<&Value>) -> Vec<Value> {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut seen = HashSet::new();
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let name = object.get("name").and_then(Value::as_str)?.trim();
+            let path = object.get("path").and_then(Value::as_str)?.trim();
+            if name.is_empty() || path.is_empty() {
+                return None;
+            }
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(path);
+            let key = format!("{name}\u{0}{path}");
+            if !seen.insert(key) {
+                return None;
+            }
+            Some(json!({
+                "id": id,
+                "name": name,
+                "path": path
+            }))
+        })
+        .collect()
 }
 
 pub(crate) enum NormalizedPath {

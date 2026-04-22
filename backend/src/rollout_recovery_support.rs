@@ -16,6 +16,45 @@ pub(crate) struct RolloutRecoveryPlanPayload {
     pub(crate) recovered_content: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RolloutRecoveryActionError {
+    pub(crate) status: StatusCode,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+}
+
+impl RolloutRecoveryActionError {
+    pub(crate) fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn into_http_response(self) -> Response {
+        let mut response = Json(json!({
+            "code": self.code,
+            "message": self.message,
+            "status": self.status.as_u16()
+        }))
+        .into_response();
+        *response.status_mut() = self.status;
+        response
+    }
+
+    pub(crate) fn into_ws_error(self) -> anyhow::Error {
+        anyhow!(
+            json!({
+                "code": self.code,
+                "message": self.message,
+                "status": self.status.as_u16()
+            })
+            .to_string()
+        )
+    }
+}
+
 fn normalize_rollout_line(raw_line: &str) -> Option<String> {
     let trimmed = raw_line
         .trim_start_matches('\u{feff}')
@@ -89,4 +128,111 @@ pub(crate) fn inspect_rollout_recovery_content(buffer: &[u8]) -> RolloutRecovery
             format!("{}\n", recovered_lines.join("\n"))
         },
     }
+}
+
+pub(crate) async fn recover_session_rollout_payload(
+    state: &AppState,
+    profile_id: &str,
+    role: UserRole,
+    session_id: &str,
+) -> Result<Value, RolloutRecoveryActionError> {
+    if role != UserRole::Admin {
+        return Err(RolloutRecoveryActionError::new(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN_ROLE",
+            "This action requires an admin role.",
+        ));
+    }
+
+    let thread = read_thread_metadata_payload(state, profile_id, session_id)
+        .await
+        .map_err(|error| {
+            RolloutRecoveryActionError::new(
+                error.status,
+                if error.status == StatusCode::NOT_FOUND {
+                    "SESSION_NOT_FOUND"
+                } else {
+                    "SESSION_METADATA_READ_FAILED"
+                },
+                error.message,
+            )
+        })?;
+
+    let Some(rollout_path) = resolve_rollout_path(state, profile_id, session_id, &thread) else {
+        return Err(RolloutRecoveryActionError::new(
+            StatusCode::NOT_FOUND,
+            "SESSION_ROLLOUT_NOT_FOUND",
+            "No persisted rollout file was found for this session.",
+        ));
+    };
+
+    let rollout_buffer = tokio_fs::read(&rollout_path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            RolloutRecoveryActionError::new(
+                StatusCode::NOT_FOUND,
+                "SESSION_ROLLOUT_NOT_FOUND",
+                "No persisted rollout file was found for this session.",
+            )
+        } else {
+            RolloutRecoveryActionError::new(
+                StatusCode::BAD_GATEWAY,
+                "SESSION_ROLLOUT_READ_FAILED",
+                error.to_string(),
+            )
+        }
+    })?;
+
+    let plan = inspect_rollout_recovery_content(&rollout_buffer);
+    if !plan.info.available
+        || plan.info.recoverable_lines == 0
+        || plan.recovered_content.trim().is_empty()
+    {
+        return Err(RolloutRecoveryActionError::new(
+            StatusCode::CONFLICT,
+            "SESSION_ROLLOUT_NOT_RECOVERABLE",
+            "This session history could not be recovered automatically.",
+        ));
+    }
+
+    let backup_path = PathBuf::from(format!("{}.bak-{}", rollout_path.display(), now_unix_ms()));
+    tokio_fs::copy(&rollout_path, &backup_path)
+        .await
+        .map_err(|error| {
+            RolloutRecoveryActionError::new(
+                StatusCode::BAD_GATEWAY,
+                "SESSION_ROLLOUT_BACKUP_FAILED",
+                error.to_string(),
+            )
+        })?;
+    tokio_fs::write(&rollout_path, plan.recovered_content.as_bytes())
+        .await
+        .map_err(|error| {
+            RolloutRecoveryActionError::new(
+                StatusCode::BAD_GATEWAY,
+                "SESSION_ROLLOUT_WRITE_FAILED",
+                error.to_string(),
+            )
+        })?;
+
+    append_runtime_error_log(
+        &state.config,
+        "rust-gateway",
+        "recovered corrupted rollout",
+        json!({
+            "threadId": session_id,
+            "rolloutPath": rollout_path.display().to_string(),
+            "backupPath": backup_path.display().to_string(),
+            "recovery": plan.info
+        }),
+    );
+
+    Ok(json!({
+        "ok": true,
+        "sessionId": session_id,
+        "backupPath": backup_path.display().to_string(),
+        "recoveredAt": now_unix_ms(),
+        "totalLines": plan.info.total_lines,
+        "recoveredLines": plan.info.recoverable_lines,
+        "skippedLines": plan.info.skipped_lines
+    }))
 }

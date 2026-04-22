@@ -364,7 +364,7 @@ async function promptConfig(existing = null) {
 
 function buildUrl(config) {
   const basePath = config.basePath === "/" ? "" : config.basePath;
-  return `http://${config.host}:${config.port}${basePath}/login`;
+  return `http://${config.host}:${config.port}${basePath}/`;
 }
 
 function buildBaseUrl(config) {
@@ -851,7 +851,7 @@ async function startServer(config) {
       PORT: String(config.port),
       CODEX_WEBUI_BASE_PATH: String(config.basePath),
       CODEX_WEBUI_CODEX_BIN: String(config.codexBin),
-      CODEX_WEBUI_CODEX_HOME: String(defaultProfile.codexHome),
+      CODEX_HOME: String(defaultProfile.codexHome),
       CODEX_WEBUI_DATA_DIR: String(config.dataDir),
       CODEX_WEBUI_DEFAULT_PROFILE_ID: String(config.defaultProfileId),
       CODEX_WEBUI_PROFILES_JSON: JSON.stringify(

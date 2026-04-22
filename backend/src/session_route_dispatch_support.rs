@@ -391,19 +391,6 @@ pub(crate) async fn handle_session_route_http(
         );
     }
 
-    if route_path.starts_with("/api/sessions/") && route_path.ends_with("/stream") {
-        let auth = match session_auth_or_response(&state, jar, cors_origin, requested_headers) {
-            Ok(auth) => auth,
-            Err(response) => return response,
-        };
-        let session_id = session_id_from_suffix(route_path, "/stream");
-        return apply_route_cors(
-            handle_session_stream_api_http(state, request, auth, &session_id).await,
-            cors_origin,
-            requested_headers,
-        );
-    }
-
     if auth_context(&state.config, jar).is_none() {
         unauthorized_route_response(cors_origin, requested_headers)
     } else {

@@ -25,12 +25,14 @@ test("builds only the static shell artifacts used by the rust gateway", async ()
   const projectRoot = process.cwd();
   const staticDir = path.join(projectRoot, "build", "static");
 
-  for (const htmlName of ["index.html", "200.html", "login.html"]) {
+  for (const htmlName of ["index.html", "200.html"]) {
     const htmlPath = path.join(staticDir, htmlName);
     expect(fs.existsSync(htmlPath)).toBeTruthy();
     expect(fs.readFileSync(htmlPath, "utf8")).not.toContain("%lang%");
     expect(fs.readFileSync(htmlPath, "utf8")).not.toContain("%dir%");
   }
+
+  expect(fs.existsSync(path.join(staticDir, "login.html"))).toBeFalsy();
 
   expect(fs.existsSync(path.join(projectRoot, "build", "internal", "index.js"))).toBeFalsy();
   expect(fs.existsSync(path.join(projectRoot, ".svelte-kit", "output", "server", "entries", "endpoints"))).toBeFalsy();

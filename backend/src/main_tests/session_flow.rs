@@ -316,6 +316,122 @@ async fn rust_session_list_and_search_use_app_server_threads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_session_cache_validation_returns_not_modified_for_matching_versions() {
+    let sandbox = unique_test_dir("session-cache-validation-rust");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({ "cwd": workspace.display().to_string() }),
+        None,
+        Some("Cached thread"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let auth = AuthContext {
+        role: UserRole::Admin,
+        profile_id: "default".to_string(),
+    };
+
+    let list_payload = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "sessions/list",
+        json!({
+            "archived": false,
+            "limit": 20
+        }),
+    )
+    .await
+    .unwrap();
+    let list_version = list_payload
+        .get("cacheVersion")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let list_not_modified = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "sessions/list",
+        json!({
+            "archived": false,
+            "limit": 20,
+            "knownVersion": list_version
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        list_not_modified
+            .get("notModified")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(list_not_modified.get("sessions").is_none());
+
+    let detail_payload = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "session/get",
+        json!({
+            "sessionId": session_id,
+            "limit": 20
+        }),
+    )
+    .await
+    .unwrap();
+    let detail_version = detail_payload
+        .get("cacheVersion")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let detail_not_modified = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "session/get",
+        json!({
+            "sessionId": session_id,
+            "limit": 20,
+            "knownVersion": detail_version
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        detail_not_modified
+            .get("notModified")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(detail_not_modified.get("thread").is_none());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_turn_payload_uses_known_active_turn() {
     let sandbox = unique_test_dir("abort-turn-rust");
     let workspace = sandbox.join("workspace");

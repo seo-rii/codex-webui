@@ -1,4 +1,5 @@
 use super::*;
+use sha2::Digest;
 
 pub(crate) fn session_relay_key(profile_id: &str, session_id: &str) -> String {
     format!("profile::{profile_id}::session::{session_id}")
@@ -155,6 +156,33 @@ pub(crate) fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+pub(crate) fn payload_cache_version(payload: &Value) -> String {
+    let encoded = serde_json::to_vec(payload).unwrap_or_else(|_| payload.to_string().into_bytes());
+    let mut hasher = Sha256::new();
+    hasher.update(encoded);
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+pub(crate) fn cacheable_payload_response(payload: Value, known_version: Option<&str>) -> Value {
+    let version = payload_cache_version(&payload);
+    if known_version
+        .map(str::trim)
+        .is_some_and(|candidate| !candidate.is_empty() && candidate == version)
+    {
+        return json!({
+            "cacheVersion": version,
+            "notModified": true
+        });
+    }
+
+    let mut next_payload = payload;
+    if let Some(payload_object) = next_payload.as_object_mut() {
+        payload_object.insert("cacheVersion".to_string(), Value::String(version));
+        payload_object.insert("notModified".to_string(), Value::Bool(false));
+    }
+    next_payload
 }
 
 pub(crate) fn require_string(params: &Value, key: &str) -> Result<String> {

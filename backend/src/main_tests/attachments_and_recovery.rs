@@ -409,6 +409,99 @@ async fn session_recovery_http_handler_recovers_rollout_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_recovery_ws_method_recovers_rollout_file() {
+    let sandbox = unique_test_dir("session-recovery-ws");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let created_at = time::OffsetDateTime::now_utc().unix_timestamp();
+    let created_date = time::OffsetDateTime::from_unix_timestamp(created_at)
+        .unwrap()
+        .date();
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join(created_date.year().to_string())
+        .join(format!("{:02}", u8::from(created_date.month())))
+        .join(format!("{:02}", created_date.day()));
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join("2026-04-21-thread-1.jsonl");
+    fs::write(&rollout_path, b"{\"step\":1}\n\xff\n{\"step\":2}\n").unwrap();
+
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-1",
+                    "name": "Recover rollout",
+                    "preview": "Recover rollout",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": created_at,
+                    "updatedAt": created_at,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let payload = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &AuthContext {
+            role: UserRole::Admin,
+            profile_id: "default".to_string(),
+        },
+        "session/recovery",
+        json!({
+            "sessionId": "thread-1"
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        payload.get("recoveredLines").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(payload.get("skippedLines").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        fs::read_to_string(&rollout_path).unwrap(),
+        "{\"step\":1}\n{\"step\":2}\n"
+    );
+    assert!(
+        Path::new(
+            payload
+                .get("backupPath")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        )
+        .exists()
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_detail_payload_surfaces_rollout_recovery_when_thread_read_fails() {
     let sandbox = unique_test_dir("session-detail-recovery-fallback");
     let workspace = sandbox.join("workspace");

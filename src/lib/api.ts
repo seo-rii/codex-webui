@@ -31,10 +31,11 @@ import type {
   SavedSessionFilter,
   SelectedSkill,
   SessionDetailPayload,
+  SessionDetailResponse,
   SessionDraftPayload,
   SessionItemDetailPayload,
   SessionForkPayload,
-  SessionListPayload,
+  SessionListResponse,
   SessionPreferences,
   SessionRolloutRecoveryPayload,
   SessionSearchScope,
@@ -254,8 +255,14 @@ export const api = {
     return ws.request<CodexRuntimeActionPayload>("runtime/update");
   },
 
-  getSessions(archived = false, cursor: string | null = null, limit = 20, filter: SessionSummaryFilter | null = null) {
-    return ws.request<SessionListPayload>("sessions/list", { archived, cursor, limit, filter });
+  getSessions(
+    archived = false,
+    cursor: string | null = null,
+    limit = 20,
+    filter: SessionSummaryFilter | null = null,
+    knownVersion: string | null = null
+  ) {
+    return ws.request<SessionListResponse>("sessions/list", { archived, cursor, limit, filter, knownVersion });
   },
 
   searchSessions(
@@ -264,24 +271,22 @@ export const api = {
     archived = false,
     cursor: string | null = null,
     limit = 20,
-    filter: SessionSummaryFilter | null = null
+    filter: SessionSummaryFilter | null = null,
+    knownVersion: string | null = null
   ) {
-    return ws.request<SessionListPayload>("sessions/search", { query, scope, archived, cursor, limit, filter });
+    return ws.request<SessionListResponse>("sessions/search", { query, scope, archived, cursor, limit, filter, knownVersion });
   },
 
   createSession(preferences: Partial<SessionPreferences>, name: string | null = null, selectedSkills: SelectedSkill[] = []) {
     return ws.request<SessionSummary>("session/create", { preferences, name, selectedSkills });
   },
 
-  getSession(sessionId: string, limit = 20) {
-    return ws.request<SessionDetailPayload>("session/get", { sessionId, limit });
+  getSession(sessionId: string, limit = 20, knownVersion: string | null = null) {
+    return ws.request<SessionDetailResponse>("session/get", { sessionId, limit, knownVersion });
   },
 
   recoverSessionRollout(sessionId: string) {
-    return request<SessionRolloutRecoveryPayload>(apiPath(`/sessions/${sessionId}/recovery`), {
-      method: "POST",
-      body: JSON.stringify({})
-    });
+    return ws.request<SessionRolloutRecoveryPayload>("session/recovery", { sessionId });
   },
 
   forkSession(

@@ -95,7 +95,7 @@ The CLI starts the Rust gateway as a detached background process and injects the
 
 - `CODEX_WEBUI_BASE_PATH`
 - `CODEX_WEBUI_CODEX_BIN`
-- `CODEX_WEBUI_CODEX_HOME`
+- `CODEX_HOME`
 - `CODEX_WEBUI_DATA_DIR`
 - `CODEX_WEBUI_DEFAULT_PROFILE_ID`
 - `CODEX_WEBUI_PROFILES_JSON`
@@ -113,7 +113,7 @@ At runtime the public base path is owned by Rust, not baked permanently into the
 - Rust rewrites the placeholder in HTML, JS, and CSS responses to the configured `CODEX_WEBUI_BASE_PATH`
 - session, Git, and runtime APIs are served directly by the Rust gateway
 
-`CODEX_WEBUI_CODEX_HOME` remains the default-profile convenience value for compatibility, while `CODEX_WEBUI_PROFILES_JSON` is the authoritative multi-profile runtime description.
+`CODEX_HOME` provides the default-profile home path at launch time, while `CODEX_WEBUI_PROFILES_JSON` remains the authoritative multi-profile runtime description.
 
 The CLI also accepts transient launch overrides:
 
@@ -123,7 +123,7 @@ The CLI also accepts transient launch overrides:
 
 Prefer the YAML config or environment variables for the secret key in long-lived deployments, because shell history and process inspection can expose command-line secrets.
 
-The CLI currently prints a URL ending in `/login`; that route redirects to the workspace root, so either URL is acceptable for end users.
+The CLI prints the workspace root URL, and the login experience is handled inline by the workspace shell.
 
 When system shutdown support is enabled, the actual armed and scheduled state is still runtime data rather than static CLI config:
 

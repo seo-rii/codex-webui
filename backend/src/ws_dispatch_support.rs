@@ -124,15 +124,22 @@ pub(crate) async fn execute_ws_method(
                 .get("archived")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let known_version = params
+                .get("knownVersion")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
             let cursor = params
                 .get("cursor")
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty());
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
             let filter = session_filter_from_value(params.get("filter"));
-            list_sessions_payload(state, &auth.profile_id, archived, cursor, limit, &filter)
-                .await
-                .map_err(anyhow::Error::from)
+            let payload =
+                list_sessions_payload(state, &auth.profile_id, archived, cursor, limit, &filter)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+            Ok(cacheable_payload_response(payload, known_version))
         }
         "sessions/search" => {
             let archived = params
@@ -140,6 +147,11 @@ pub(crate) async fn execute_ws_method(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let query_raw = require_string(&params, "query")?;
+            let known_version = params
+                .get("knownVersion")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
             let scope = if params.get("scope").and_then(Value::as_str) == Some("full") {
                 "full"
             } else {
@@ -151,7 +163,7 @@ pub(crate) async fn execute_ws_method(
                 .filter(|value| !value.is_empty());
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
             let filter = session_filter_from_value(params.get("filter"));
-            search_sessions_payload(
+            let payload = search_sessions_payload(
                 state,
                 &auth.profile_id,
                 &query_raw,
@@ -162,7 +174,8 @@ pub(crate) async fn execute_ws_method(
                 &filter,
             )
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(anyhow::Error::from)?;
+            Ok(cacheable_payload_response(payload, known_version))
         }
         "session/create" => create_session_payload(
             state,
@@ -211,9 +224,21 @@ pub(crate) async fn execute_ws_method(
         "session/get" => {
             let session_id = require_string(&params, "sessionId")?;
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
-            session_detail_payload(state, &auth.profile_id, &session_id, limit)
+            let known_version = params
+                .get("knownVersion")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let payload = session_detail_payload(state, &auth.profile_id, &session_id, limit)
                 .await
-                .map_err(anyhow::Error::from)
+                .map_err(anyhow::Error::from)?;
+            Ok(cacheable_payload_response(payload, known_version))
+        }
+        "session/recovery" => {
+            let session_id = require_string(&params, "sessionId")?;
+            recover_session_rollout_payload(state, &auth.profile_id, auth.role, &session_id)
+                .await
+                .map_err(RolloutRecoveryActionError::into_ws_error)
         }
         "session/fork" => {
             let session_id = require_string(&params, "sessionId")?;

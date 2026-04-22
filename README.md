@@ -130,7 +130,7 @@ pnpm verify:static-build
 pnpm verify:api-parity
 ```
 
-The printed URL may still end in `/login` for compatibility, but that route redirects to the main workspace and the login experience is handled inline by the workspace shell.
+The CLI prints the workspace root URL and the login experience is handled inline by the workspace shell.
 
 ## Using The Published CLI
 
@@ -265,7 +265,7 @@ The Rust gateway honors a focused set of `CODEX_WEBUI_*` environment variables. 
 - `CODEX_WEBUI_BASE_PATH`
 - `CODEX_WEBUI_DATA_DIR`
 - `CODEX_WEBUI_CODEX_BIN`
-- `CODEX_WEBUI_CODEX_HOME`
+- `CODEX_HOME`
 - `CODEX_WEBUI_DEFAULT_PROFILE_ID`
 - `CODEX_WEBUI_PROFILES_JSON`
 - `CODEX_WEBUI_MAX_UPLOAD_MB`

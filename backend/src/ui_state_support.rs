@@ -17,6 +17,7 @@ fn default_ui_state_value() -> Value {
     json!({
         "global": {
             "shutdownAfterQueueCompletes": false,
+            "shutdownAfterQueueCompletesPrimed": false,
             "scheduledShutdown": Value::Null
         },
         "notifications": {
@@ -52,9 +53,22 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
             "global".to_string(),
             json!({
                 "shutdownAfterQueueCompletes": false,
+                "shutdownAfterQueueCompletesPrimed": false,
                 "scheduledShutdown": Value::Null
             }),
         );
+    }
+
+    if let Some(global) = root.get_mut("global").and_then(Value::as_object_mut) {
+        if !global
+            .get("shutdownAfterQueueCompletesPrimed")
+            .is_some_and(Value::is_boolean)
+        {
+            global.insert(
+                "shutdownAfterQueueCompletesPrimed".to_string(),
+                json!(false),
+            );
+        }
     }
 
     if !root.get("notifications").is_some_and(Value::is_object) {

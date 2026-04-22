@@ -76,6 +76,46 @@ fn maps_session_item_notifications_for_stream_clients() {
     );
 }
 
+#[test]
+fn maps_session_item_notifications_use_item_id_when_payload_omits_item_id() {
+    let mapped = map_app_server_session_notification(&AppServerNotification {
+        method: "item/started".to_string(),
+        params: json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-42",
+            "item": {
+                "type": "commandExecution",
+                "command": ["rg", "-n", "queue", "src/routes/+page.svelte"],
+                "cwd": "/tmp/project"
+            }
+        }),
+    })
+    .expect("notification should map");
+
+    assert_eq!(
+        mapped,
+        json!({
+            "kind": "notification",
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-42",
+                "item": {
+                    "id": "item-42",
+                    "type": "commandExecution",
+                    "command": ["rg", "-n", "queue", "src/routes/+page.svelte"],
+                    "cwd": "/tmp/project",
+                    "title": "Command",
+                    "detailState": "deferred",
+                    "detailPreview": "rg -n queue src/routes/+page.svelte"
+                }
+            }
+        })
+    );
+}
+
 #[tokio::test]
 async fn lists_only_directories_within_allowed_root() {
     let sandbox = unique_test_dir("directories");

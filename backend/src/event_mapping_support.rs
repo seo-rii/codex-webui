@@ -194,9 +194,20 @@ pub(crate) fn map_app_server_session_notification(
                 .get("turnId")
                 .and_then(Value::as_str)
                 .unwrap_or("turn-0");
-            let item = mapped.get("item").cloned().unwrap_or_else(
+            let mut item = mapped.get("item").cloned().unwrap_or_else(
                 || json!({ "id": mapped.get("itemId").cloned().unwrap_or(Value::Null) }),
             );
+            if let Some(item_object) = item.as_object_mut() {
+                let needs_id = item_object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty());
+                if needs_id {
+                    if let Some(item_id) = mapped.get("itemId").cloned() {
+                        item_object.insert("id".to_string(), item_id);
+                    }
+                }
+            }
             mapped.insert(
                 "item".to_string(),
                 prepare_session_stream_item_payload(&item, turn_id),

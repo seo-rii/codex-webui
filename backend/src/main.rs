@@ -1,11 +1,9 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    convert::Infallible,
     env, fs,
     future::Future,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
-    pin::Pin,
     process::Stdio,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -97,7 +95,6 @@ mod session_transcript_http_support;
 mod shared_types_support;
 mod shutdown_queue_support;
 mod static_support;
-mod stream_transport_support;
 mod system_support;
 mod terminal_support;
 mod thread_detail_support;
@@ -158,7 +155,6 @@ use session_transcript_http_support::*;
 use shared_types_support::*;
 use shutdown_queue_support::*;
 use static_support::*;
-use stream_transport_support::*;
 use system_support::*;
 use terminal_support::*;
 use thread_detail_support::*;

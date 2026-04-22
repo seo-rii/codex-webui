@@ -610,7 +610,8 @@ pub(crate) async fn run_automation_payload(
         let schedule_state = state.clone();
         let schedule_profile_id = profile_id.to_string();
         tokio::spawn(async move {
-            schedule_automation_timer(schedule_state, schedule_profile_id, updated_automation).await;
+            schedule_automation_timer(schedule_state, schedule_profile_id, updated_automation)
+                .await;
         });
 
         let run = with_ui_state_read(state, profile_id, |ui_state| {
@@ -706,8 +707,12 @@ pub(crate) async fn run_automation_payload(
                 let schedule_state = state.clone();
                 let schedule_profile_id = profile_id.to_string();
                 tokio::spawn(async move {
-                    schedule_automation_timer(schedule_state, schedule_profile_id, updated_automation)
-                        .await;
+                    schedule_automation_timer(
+                        schedule_state,
+                        schedule_profile_id,
+                        updated_automation,
+                    )
+                    .await;
                 });
                 emit_profile_automations_updated(state, profile_id).await;
             }

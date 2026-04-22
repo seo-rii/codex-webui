@@ -312,12 +312,17 @@ pub(crate) async fn handle_profile_runtime_notification(
 }
 
 async fn restore_persisted_shutdown_state(state: &AppState, profile_id: &str) -> ApiResult<()> {
-    let (shutdown_after_queue_completes, scheduled_shutdown) =
+    let (shutdown_after_queue_completes, shutdown_primed, scheduled_shutdown) =
         with_ui_state_read(state, profile_id, |ui_state| {
             Ok((
                 ui_state
                     .get("global")
                     .and_then(|value| value.get("shutdownAfterQueueCompletes"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                ui_state
+                    .get("global")
+                    .and_then(|value| value.get("shutdownAfterQueueCompletesPrimed"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 ui_state
@@ -339,11 +344,31 @@ async fn restore_persisted_shutdown_state(state: &AppState, profile_id: &str) ->
                 ));
             };
             global.insert("shutdownAfterQueueCompletes".to_string(), json!(false));
+            global.insert(
+                "shutdownAfterQueueCompletesPrimed".to_string(),
+                json!(false),
+            );
             global.insert("scheduledShutdown".to_string(), Value::Null);
             Ok(())
         })
         .await?;
         return Ok(());
+    }
+
+    let has_work_now = has_outstanding_queued_work(state, profile_id).await
+        || has_active_work_across_threads(state, profile_id).await;
+    if shutdown_after_queue_completes && !shutdown_primed && has_work_now {
+        with_ui_state_write(state, profile_id, |ui_state| {
+            let Some(global) = ui_state.get_mut("global").and_then(Value::as_object_mut) else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "global state is missing",
+                ));
+            };
+            global.insert("shutdownAfterQueueCompletesPrimed".to_string(), json!(true));
+            Ok(())
+        })
+        .await?;
     }
 
     if scheduled_shutdown

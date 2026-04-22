@@ -28,11 +28,15 @@ async function main() {
     throw new Error("build/static is missing. Run `pnpm build` first.");
   }
 
-  for (const htmlName of ["index.html", "200.html", "login.html"]) {
+  for (const htmlName of ["index.html", "200.html"]) {
     const htmlPath = path.join(buildStaticDir, htmlName);
     if (await exists(htmlPath)) {
       await assertFileContainsNoPlaceholders(htmlPath);
     }
+  }
+
+  if (await exists(path.join(buildStaticDir, "login.html"))) {
+    throw new Error("deprecated build/static/login.html still exists");
   }
 
   if (await exists(buildInternalEntry)) {

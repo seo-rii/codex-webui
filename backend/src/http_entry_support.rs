@@ -211,30 +211,6 @@ pub(crate) async fn handle_http(
                 .await;
             }
 
-            if route_path == "/api/events/stream" {
-                let Some(auth) = auth_context(&state.config, &jar) else {
-                    let mut response =
-                        json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
-                    if let Some(origin_value) = cors_origin {
-                        apply_cors_headers(
-                            response.headers_mut(),
-                            &origin_value,
-                            requested_headers.as_deref(),
-                        );
-                    }
-                    return response;
-                };
-                let mut response = handle_events_stream_http(state, request, auth).await;
-                if let Some(origin_value) = cors_origin {
-                    apply_cors_headers(
-                        response.headers_mut(),
-                        &origin_value,
-                        requested_headers.as_deref(),
-                    );
-                }
-                return response;
-            }
-
             if route_path.starts_with("/api/") {
                 if auth_context(&state.config, &jar).is_none() {
                     let mut response =

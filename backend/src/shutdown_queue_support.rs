@@ -1,5 +1,7 @@
 use super::*;
 
+const SHUTDOWN_AFTER_QUEUE_COMPLETES_PRIMED_KEY: &str = "shutdownAfterQueueCompletesPrimed";
+
 pub(crate) async fn has_outstanding_queued_work(state: &AppState, profile_id: &str) -> bool {
     with_ui_state_read(state, profile_id, |ui_state| {
         Ok(ui_state
@@ -106,15 +108,47 @@ pub(crate) async fn clear_scheduled_shutdown(state: &AppState, profile_id: &str)
 }
 
 pub(crate) async fn cancel_scheduled_shutdown_for_activity(state: &AppState, profile_id: &str) {
-    let scheduled = with_ui_state_read(state, profile_id, |ui_state| {
-        Ok(ui_state
-            .get("global")
-            .and_then(|value| value.get("scheduledShutdown"))
-            .cloned()
-            .unwrap_or(Value::Null))
+    let (should_prime, scheduled) = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok((
+            ui_state
+                .get("global")
+                .and_then(Value::as_object)
+                .is_some_and(|global| {
+                    global
+                        .get("shutdownAfterQueueCompletes")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        && !global
+                            .get(SHUTDOWN_AFTER_QUEUE_COMPLETES_PRIMED_KEY)
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                }),
+            ui_state
+                .get("global")
+                .and_then(|value| value.get("scheduledShutdown"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        ))
     })
     .await
-    .unwrap_or(Value::Null);
+    .unwrap_or((false, Value::Null));
+
+    if should_prime {
+        let _ = with_ui_state_write(state, profile_id, |ui_state| {
+            let Some(global) = ui_state.get_mut("global").and_then(Value::as_object_mut) else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "global state is missing",
+                ));
+            };
+            global.insert(
+                SHUTDOWN_AFTER_QUEUE_COMPLETES_PRIMED_KEY.to_string(),
+                json!(true),
+            );
+            Ok(())
+        })
+        .await;
+    }
 
     if !scheduled.is_null() {
         clear_scheduled_shutdown(state, profile_id).await;
@@ -224,16 +258,16 @@ pub(crate) async fn maybe_schedule_global_shutdown(
         return;
     }
 
-    let (available, _) = system_shutdown_capability(&state.config).await;
-    if !available {
-        return;
-    }
-
     let existing_scheduled = with_ui_state_read(state, profile_id, |ui_state| {
         Ok((
             ui_state
                 .get("global")
                 .and_then(|value| value.get("shutdownAfterQueueCompletes"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            ui_state
+                .get("global")
+                .and_then(|value| value.get(SHUTDOWN_AFTER_QUEUE_COMPLETES_PRIMED_KEY))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             ui_state
@@ -244,12 +278,23 @@ pub(crate) async fn maybe_schedule_global_shutdown(
         ))
     })
     .await;
-    let Ok((shutdown_after_queue_completes, scheduled_shutdown)) = existing_scheduled else {
+    let Ok((shutdown_after_queue_completes, shutdown_primed, scheduled_shutdown)) =
+        existing_scheduled
+    else {
         return;
     };
     if !shutdown_after_queue_completes {
         return;
     }
+    if !shutdown_primed {
+        return;
+    }
+
+    let (available, _) = system_shutdown_capability(&state.config).await;
+    if !available {
+        return;
+    }
+
     if scheduled_shutdown
         .get("scheduledFor")
         .and_then(Value::as_u64)

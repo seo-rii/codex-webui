@@ -20,7 +20,13 @@ pub(crate) async fn session_preferences_defaults_payload(
     profile_id: &str,
 ) -> Value {
     let (_, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
-    let codex_defaults = read_codex_toml_defaults(&profile.codex_home);
+    let codex_home = profile.codex_home.clone();
+    let codex_defaults = tokio::task::spawn_blocking(move || read_codex_toml_defaults(&codex_home))
+        .await
+        .unwrap_or_else(|_| CodexTomlDefaults {
+            service_tier: "auto".to_string(),
+            ..CodexTomlDefaults::default()
+        });
     let allowed_roots = resolved_allowed_roots(&state.config).await;
     let default_cwd = allowed_roots
         .first()
@@ -71,6 +77,10 @@ pub(crate) async fn session_preferences_defaults_payload(
             .ok()
             .map(Value::String)
             .or_else(|| codex_defaults.model.clone().map(Value::String))
+            .unwrap_or(Value::Null),
+        "modelContextWindow": codex_defaults
+            .model_context_window
+            .map(Value::from)
             .unwrap_or(Value::Null),
         "effort": effort,
         "speed": speed,
@@ -211,30 +221,100 @@ pub(crate) async fn get_config_payload(state: &AppState, profile_id: &str) -> Ap
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
         .0
         .to_string();
-    let defaults = session_preferences_defaults_payload(state, profile_id).await;
-    let allowed_roots = list_directories_payload(state, None)
-        .await?
-        .get("allowedRoots")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let notifications =
-        get_notifications_payload(state, profile_id, DEFAULT_NOTIFICATION_LIMIT).await?;
-    let autostart = get_autostart_state(&state.config)
-        .await
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let theme_override = read_stored_theme_settings(&state.config, profile_id)
-        .await
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let (
+        defaults,
+        allowed_roots_result,
+        notifications_result,
+        autostart_result,
+        theme_override_result,
+        models_result,
+        collaboration_modes_result,
+        account_state_result,
+        shutdown_capability,
+        paused_queues_result,
+        ui_state_result,
+    ) = tokio::join!(
+        session_preferences_defaults_payload(state, profile_id),
+        async {
+            Ok::<Value, ApiError>(
+                list_directories_payload(state, None)
+                    .await?
+                    .get("allowedRoots")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            )
+        },
+        get_notifications_payload(state, profile_id, DEFAULT_NOTIFICATION_LIMIT),
+        async {
+            get_autostart_state(&state.config)
+                .await
+                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+        },
+        async {
+            read_stored_theme_settings(&state.config, profile_id)
+                .await
+                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+        },
+        config_models_payload(state, profile_id),
+        config_collaboration_modes_payload(state, profile_id),
+        async {
+            get_account_state(state, profile_id)
+                .await
+                .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))
+        },
+        system_shutdown_capability(&state.config),
+        async {
+            Ok::<Value, ApiError>(
+                list_resume_pending_queues_payload(state, profile_id)
+                    .await
+                    .unwrap_or_else(|_| json!([])),
+            )
+        },
+        with_ui_state_read(state, profile_id, |ui_state| {
+            let notification_settings = ui_state
+                .get("notifications")
+                .and_then(Value::as_object)
+                .and_then(|notifications| notifications.get("settings"))
+                .map(|value| normalize_notification_settings_value(Some(value)))
+                .unwrap_or_else(default_notification_settings_value);
+
+            Ok((
+                ui_state
+                    .get("savedSessionFilters")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+                known_tags_from_ui_state(ui_state),
+                sorted_prompt_presets_from_ui_state(ui_state),
+                sorted_automations_from_ui_state(ui_state),
+                recent_automation_runs_from_ui_state(
+                    ui_state,
+                    DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT,
+                ),
+                notification_settings,
+                ui_state
+                    .get("global")
+                    .and_then(|value| value.get("shutdownAfterQueueCompletes"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                ui_state
+                    .get("global")
+                    .and_then(|value| value.get("scheduledShutdown"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ))
+        }),
+    );
+
+    let allowed_roots = allowed_roots_result?;
+    let notifications = notifications_result?;
+    let autostart = autostart_result?;
+    let theme_override = theme_override_result?;
     let theme = theme_override.unwrap_or_else(|| json!({}));
-    let models = config_models_payload(state, profile_id).await?;
-    let collaboration_modes = config_collaboration_modes_payload(state, profile_id).await?;
-    let account_state = get_account_state(state, profile_id)
-        .await
-        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
-    let (shutdown_available, _) = system_shutdown_capability(&state.config).await;
-    let paused_queues = list_resume_pending_queues_payload(state, profile_id)
-        .await
-        .unwrap_or_else(|_| json!([]));
+    let models = models_result?;
+    let collaboration_modes = collaboration_modes_result?;
+    let account_state = account_state_result?;
+    let (shutdown_available, _) = shutdown_capability;
+    let paused_queues = paused_queues_result?;
     let (
         saved_filters,
         known_tags,
@@ -244,37 +324,7 @@ pub(crate) async fn get_config_payload(state: &AppState, profile_id: &str) -> Ap
         notification_settings,
         shutdown_after_queue_completes,
         scheduled_shutdown,
-    ) = with_ui_state_read(state, profile_id, |ui_state| {
-        let notification_settings = ui_state
-            .get("notifications")
-            .and_then(Value::as_object)
-            .and_then(|notifications| notifications.get("settings"))
-            .map(|value| normalize_notification_settings_value(Some(value)))
-            .unwrap_or_else(default_notification_settings_value);
-
-        Ok((
-            ui_state
-                .get("savedSessionFilters")
-                .cloned()
-                .unwrap_or_else(|| json!([])),
-            known_tags_from_ui_state(ui_state),
-            sorted_prompt_presets_from_ui_state(ui_state),
-            sorted_automations_from_ui_state(ui_state),
-            recent_automation_runs_from_ui_state(ui_state, DEFAULT_AUTOMATION_RUN_HISTORY_LIMIT),
-            notification_settings,
-            ui_state
-                .get("global")
-                .and_then(|value| value.get("shutdownAfterQueueCompletes"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            ui_state
-                .get("global")
-                .and_then(|value| value.get("scheduledShutdown"))
-                .cloned()
-                .unwrap_or(Value::Null),
-        ))
-    })
-    .await?;
+    ) = ui_state_result?;
 
     let next_scheduled_shutdown = if shutdown_available
         && scheduled_shutdown
@@ -405,6 +455,12 @@ pub(crate) async fn update_config_payload(
         .and_then(|value| value.get("armed"))
         .and_then(Value::as_bool)
     {
+        let shutdown_primed = if armed {
+            has_outstanding_queued_work(state, profile_id).await
+                || has_active_work_across_threads(state, profile_id).await
+        } else {
+            false
+        };
         with_ui_state_write(state, profile_id, |ui_state| {
             let Some(global) = ui_state.get_mut("global").and_then(Value::as_object_mut) else {
                 return Err(api_error(
@@ -413,9 +469,11 @@ pub(crate) async fn update_config_payload(
                 ));
             };
             global.insert("shutdownAfterQueueCompletes".to_string(), json!(armed));
-            if !armed {
-                global.insert("scheduledShutdown".to_string(), Value::Null);
-            }
+            global.insert(
+                "shutdownAfterQueueCompletesPrimed".to_string(),
+                json!(shutdown_primed),
+            );
+            global.insert("scheduledShutdown".to_string(), Value::Null);
             Ok(())
         })
         .await?;

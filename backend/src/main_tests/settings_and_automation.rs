@@ -207,6 +207,98 @@ async fn theme_settings_round_trip_through_rust_store() {
 }
 
 #[tokio::test]
+async fn arming_shutdown_while_idle_waits_for_future_activity() {
+    let sandbox = unique_test_dir("shutdown-idle-arming");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    config.system_shutdown_enabled = true;
+    state.config = Arc::new(config);
+
+    let updated = update_config_payload(
+        &state,
+        "default",
+        json!({
+            "systemShutdown": {
+                "armed": true
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        updated
+            .get("systemShutdown")
+            .and_then(|value| value.get("armed"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        updated
+            .get("startup")
+            .and_then(|value| value.get("scheduledShutdown"))
+            .is_some_and(Value::is_null)
+    );
+
+    let idle_state = with_ui_state_read(&state, "default", |ui_state| {
+        Ok((
+            ui_state
+                .get("global")
+                .and_then(|value| value.get("shutdownAfterQueueCompletes"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            ui_state
+                .get("global")
+                .and_then(|value| value.get("shutdownAfterQueueCompletesPrimed"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            ui_state
+                .get("global")
+                .and_then(|value| value.get("scheduledShutdown"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        ))
+    })
+    .await
+    .unwrap();
+    assert_eq!(idle_state.0, true);
+    assert_eq!(idle_state.1, false);
+    assert!(idle_state.2.is_null());
+
+    maybe_schedule_global_shutdown(&state, "default", None).await;
+
+    let after_schedule_attempt = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state
+            .get("global")
+            .and_then(|value| value.get("scheduledShutdown"))
+            .cloned()
+            .unwrap_or(Value::Null))
+    })
+    .await
+    .unwrap();
+    assert!(after_schedule_attempt.is_null());
+
+    cancel_scheduled_shutdown_for_activity(&state, "default").await;
+
+    let primed_state = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state
+            .get("global")
+            .and_then(|value| value.get("shutdownAfterQueueCompletesPrimed"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    })
+    .await
+    .unwrap();
+    assert!(primed_state);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn syncs_codex_toml_with_preferences_for_plan_mode() {
     let sandbox = unique_test_dir("sync-codex-toml");
     let codex_home = sandbox.join("codex-home");
@@ -216,6 +308,7 @@ async fn syncs_codex_toml_with_preferences_for_plan_mode() {
         &codex_home,
         &json!({
             "model": "gpt-5.4",
+            "modelContextWindow": 100000000,
             "approvalPolicy": "on-request",
             "sandboxMode": "workspace-write",
             "speed": "fast",
@@ -229,12 +322,37 @@ async fn syncs_codex_toml_with_preferences_for_plan_mode() {
 
     let raw = fs::read_to_string(config_toml_path(&codex_home)).unwrap();
     assert!(raw.contains("model = \"gpt-5.4\""));
+    assert!(raw.contains("model_context_window = 100000000"));
     assert!(raw.contains("approval_policy = \"on-request\""));
     assert!(raw.contains("sandbox_mode = \"workspace-write\""));
     assert!(raw.contains("service_tier = \"fast\""));
     assert!(raw.contains("plan_mode_reasoning_effort = \"high\""));
     assert!(raw.contains("[sandbox_workspace_write]"));
     assert!(raw.contains("network_access = true"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn session_preferences_defaults_include_model_context_window_from_codex_toml() {
+    let sandbox = unique_test_dir("defaults-model-context-window");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(
+        config_toml_path(&codex_home),
+        format!("{CONFIG_SCHEMA_HEADER}\nmodel_context_window = 100000000\n"),
+    )
+    .unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let defaults = session_preferences_defaults_payload(&state, "default").await;
+
+    assert_eq!(
+        defaults.get("modelContextWindow").and_then(Value::as_i64),
+        Some(100000000)
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }

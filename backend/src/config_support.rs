@@ -154,8 +154,7 @@ impl Config {
             static_dir,
             public_host,
             public_port,
-            codex_bin: env::var("CODEX_WEBUI_CODEX_BIN")
-                .unwrap_or_else(|_| "codex".to_string()),
+            codex_bin: env::var("CODEX_WEBUI_CODEX_BIN").unwrap_or_else(|_| "codex".to_string()),
             max_upload_bytes,
             git_discovery_depth,
             system_shutdown_enabled: env::var("CODEX_WEBUI_ENABLE_SYSTEM_SHUTDOWN")
@@ -276,19 +275,21 @@ pub(crate) fn parse_runtime_profiles(
                     id.clone()
                 }
             });
-        profiles.entry(id.clone()).or_insert_with(|| RuntimeProfile {
-            label,
-            codex_home: entry
-                .codex_home
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| default_codex_home.clone()),
-            data_dir: entry
-                .data_dir
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| root_data_dir.join("profiles").join(&id)),
-        });
+        profiles
+            .entry(id.clone())
+            .or_insert_with(|| RuntimeProfile {
+                label,
+                codex_home: entry
+                    .codex_home
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| default_codex_home.clone()),
+                data_dir: entry
+                    .data_dir
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| root_data_dir.join("profiles").join(&id)),
+            });
     }
 
     if profiles.is_empty() {
@@ -390,6 +391,7 @@ pub(crate) const CONFIG_SCHEMA_HEADER: &str =
 #[derive(Default)]
 pub(crate) struct CodexTomlDefaults {
     pub(crate) model: Option<String>,
+    pub(crate) model_context_window: Option<i64>,
     pub(crate) model_reasoning_effort: Option<String>,
     pub(crate) plan_mode_reasoning_effort: Option<String>,
     pub(crate) personality: Option<String>,
@@ -486,6 +488,14 @@ fn parse_toml_bool_value(value: Option<String>) -> Option<bool> {
     }
 }
 
+fn parse_toml_integer_value(value: Option<String>) -> Option<i64> {
+    value?
+        .replace('_', "")
+        .trim()
+        .parse::<i64>()
+        .ok()
+}
+
 pub(crate) fn read_codex_toml_defaults(codex_home: &Path) -> CodexTomlDefaults {
     let file_path = config_toml_path(codex_home);
     let Ok(raw) = fs::read_to_string(file_path) else {
@@ -501,6 +511,12 @@ pub(crate) fn read_codex_toml_defaults(codex_home: &Path) -> CodexTomlDefaults {
 
     CodexTomlDefaults {
         model: parse_toml_string_value(get_toml_value(&raw, None, "model")),
+        model_context_window: parse_toml_integer_value(get_toml_value(
+            &raw,
+            None,
+            "model_context_window",
+        ))
+        .filter(|value| *value > 0),
         model_reasoning_effort: parse_toml_string_value(get_toml_value(
             &raw,
             None,
@@ -546,6 +562,19 @@ fn stringify_toml_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+pub(crate) fn preferences_model_context_window(preferences: &Value) -> Option<i64> {
+    preferences
+        .get("modelContextWindow")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+}
+
+pub(crate) fn preferences_model_context_config(preferences: &Value) -> Value {
+    preferences_model_context_window(preferences)
+        .map(|value| json!({ "model_context_window": value }))
+        .unwrap_or(Value::Null)
+}
+
 pub(crate) fn upsert_toml_value(
     raw: &str,
     section: Option<&str>,
@@ -554,7 +583,11 @@ pub(crate) fn upsert_toml_value(
 ) -> String {
     let mut lines = normalize_toml_lines(raw);
     let mut current_section: Option<String> = None;
-    let mut section_start = if section.is_none() { Some(0usize) } else { None };
+    let mut section_start = if section.is_none() {
+        Some(0usize)
+    } else {
+        None
+    };
     let mut section_end = lines.len();
     let mut replaced = false;
 
@@ -643,6 +676,12 @@ pub(crate) async fn sync_codex_toml_with_preferences(
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .map(stringify_toml_string),
+    );
+    raw = upsert_toml_value(
+        &raw,
+        None,
+        "model_context_window",
+        preferences_model_context_window(preferences).map(|value| value.to_string()),
     );
     raw = upsert_toml_value(
         &raw,
@@ -779,15 +818,12 @@ fn parse_cors_origins(value: Option<String>) -> Result<Vec<String>> {
     raw.split([',', '\n'])
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
-        .map(|entry| {
-            normalize_origin(entry).ok_or_else(|| anyhow!("Invalid CORS origin: {entry}"))
-        })
+        .map(|entry| normalize_origin(entry).ok_or_else(|| anyhow!("Invalid CORS origin: {entry}")))
         .collect()
 }
 
 fn resolve_codex_home() -> Result<PathBuf> {
-    if let Some(value) = env::var_os("CODEX_WEBUI_CODEX_HOME").or_else(|| env::var_os("CODEX_HOME"))
-    {
+    if let Some(value) = env::var_os("CODEX_HOME") {
         return Ok(PathBuf::from(value));
     }
 
@@ -795,9 +831,7 @@ fn resolve_codex_home() -> Result<PathBuf> {
         return Ok(PathBuf::from(home).join(".codex"));
     }
 
-    Err(anyhow!(
-        "Could not determine CODEX_HOME. Set CODEX_WEBUI_CODEX_HOME or CODEX_HOME."
-    ))
+    Err(anyhow!("Could not determine CODEX_HOME. Set CODEX_HOME."))
 }
 
 fn load_dotenv(cwd: &PathBuf) {

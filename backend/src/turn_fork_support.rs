@@ -135,6 +135,7 @@ pub(crate) async fn fork_session_payload(
                     "cwd": preferences.get("cwd").cloned().unwrap_or(Value::Null),
                     "approvalPolicy": preferences.get("approvalPolicy").cloned().unwrap_or_else(|| json!("on-request")),
                     "sandbox": preferences.get("sandboxMode").cloned().unwrap_or_else(|| json!("workspace-write")),
+                    "config": preferences_model_context_config(&preferences),
                     "serviceTier": match preferences.get("speed").and_then(Value::as_str) {
                         Some("fast") => Value::String("fast".to_string()),
                         Some("flex") => Value::String("flex".to_string()),

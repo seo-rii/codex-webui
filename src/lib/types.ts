@@ -30,6 +30,7 @@ export type AuthSessionPayload = {
 export type SessionPreferences = {
   cwd: string;
   model: string | null;
+  modelContextWindow: number | null;
   effort: ReasoningEffort | null;
   speed: ServiceSpeed;
   personality: Personality;
@@ -134,7 +135,16 @@ export type SessionSummaryHighlight = {
 export type SessionListPayload = {
   sessions: SessionSummary[];
   nextCursor: string | null;
+  cacheVersion: string;
+  notModified?: false;
 };
+
+export type CacheValidationPayload = {
+  cacheVersion: string;
+  notModified: true;
+};
+
+export type SessionListResponse = SessionListPayload | CacheValidationPayload;
 
 export type AttachmentRecord = {
   id: string;
@@ -400,7 +410,11 @@ export type SessionDetailPayload = {
       skippedLines: number | null;
     };
   };
+  cacheVersion: string;
+  notModified?: false;
 };
+
+export type SessionDetailResponse = SessionDetailPayload | CacheValidationPayload;
 
 export type SessionRolloutRecoveryPayload = {
   ok: true;

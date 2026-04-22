@@ -4,7 +4,7 @@
 
   import { api } from "$lib/api";
   import MarkdownMessage from "$lib/components/MarkdownMessage.svelte";
-  import MonacoDiffEditor from "$lib/components/MonacoDiffEditor.svelte";
+  import LazyMonacoDiffEditor from "$lib/components/LazyMonacoDiffEditor.svelte";
   import MonacoTextEditor from "$lib/components/MonacoTextEditor.svelte";
   import { localeSignal } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
@@ -1271,12 +1271,12 @@
                 {#if groupedFile.isBinary}
                   <div class="placeholder-card">{ui.binaryDiffNotPreviewable}</div>
                 {:else}
-                <MonacoDiffEditor
+                <LazyMonacoDiffEditor
                   height={320}
                   modified={groupedFile.modifiedContent}
-                    original={groupedFile.originalContent}
-                    path={groupedFile.filePath}
-                  />
+                  original={groupedFile.originalContent}
+                  path={groupedFile.filePath}
+                />
                 {/if}
               </section>
             {/each}
@@ -1303,7 +1303,7 @@
                   <h3>{ui.diff}</h3>
                   <span>{filePayload.status?.stagedLabel ?? "clean"} / {filePayload.status?.unstagedLabel ?? "clean"}</span>
                 </div>
-                <MonacoDiffEditor height={340} modified={editorValue} original={filePayload.originalContent} path={filePayload.filePath} />
+                <LazyMonacoDiffEditor height={340} modified={editorValue} original={filePayload.originalContent} path={filePayload.filePath} />
               </section>
 
               <section class="panel">

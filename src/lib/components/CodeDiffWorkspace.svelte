@@ -2,7 +2,7 @@
   import { X } from "lucide-svelte";
 
   import { m } from "$lib/paraglide/messages.js";
-  import MonacoDiffEditor from "$lib/components/MonacoDiffEditor.svelte";
+  import LazyMonacoDiffEditor from "$lib/components/LazyMonacoDiffEditor.svelte";
 
   type FileChangeView = {
     path: string;
@@ -51,7 +51,7 @@
 
           <div class="p-0">
             {#if change.renderable}
-              <MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />
+              <LazyMonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />
             {:else}
               <pre class="overflow-x-auto bg-gray-50/50 p-6 text-xs font-mono text-gray-600">{change.diff}</pre>
             {/if}

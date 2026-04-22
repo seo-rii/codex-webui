@@ -41,7 +41,7 @@
     selectedSessionSummary,
     readOnly,
     tokenCountLabel,
-    contextUsageLabel,
+    contextUsage,
     selectedSessionId,
     activeWorkspaceTabId,
     searchTriggerElement = $bindable(),
@@ -70,7 +70,11 @@
     selectedSessionSummary: SessionSummary | null;
     readOnly: boolean;
     tokenCountLabel: string | null;
-    contextUsageLabel: string | null;
+    contextUsage: {
+      label: string;
+      percent: number;
+      tooltip: string;
+    } | null;
     selectedSessionId: string | null;
     activeWorkspaceTabId: string;
     searchTriggerElement?: HTMLButtonElement | undefined;
@@ -155,15 +159,36 @@
   </div>
 
   <div class="app-header-actions flex min-w-0 shrink-0 items-center gap-1 sm:gap-1.5">
-    {#if tokenCountLabel}
-      <div class="mr-1.5 hidden items-center gap-1.5 xl:flex">
-        <span class="rounded-md border border-gray-100 bg-gray-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-tight text-gray-500">
-          {tokenCountLabel}
-        </span>
-        {#if contextUsageLabel}
-          <span class="rounded-md border border-amber-100 bg-amber-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-tight text-amber-700">
-            {contextUsageLabel}
+    {#if tokenCountLabel || contextUsage}
+      <div class="mr-1.5 hidden items-center gap-1.5 lg:flex">
+        {#if tokenCountLabel}
+          <span class="rounded-md border border-gray-100 bg-gray-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-tight text-gray-500">
+            {tokenCountLabel}
           </span>
+        {/if}
+        {#if contextUsage}
+          <div class="group relative">
+            <div
+              aria-label={contextUsage.tooltip}
+              class="inline-flex items-center gap-1.5 rounded-full border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-tight"
+              style="border-color: var(--line); background: var(--panel-soft); color: var(--muted);"
+              title={contextUsage.tooltip}
+            >
+              <span
+                class="inline-flex h-4 w-4 items-center justify-center rounded-full p-[2px]"
+                style={`background: conic-gradient(var(--accent) 0 ${contextUsage.percent}%, var(--line) ${contextUsage.percent}% 100%);`}
+              >
+                <span class="h-full w-full rounded-full" style="background: var(--panel-strong);"></span>
+              </span>
+              <span>{contextUsage.label}</span>
+            </div>
+            <div
+              class="pointer-events-none absolute right-0 top-full z-[82] mt-2 hidden whitespace-nowrap rounded-xl border px-2.5 py-2 text-[11px] font-semibold shadow-2xl group-hover:block group-focus-within:block"
+              style="border-color: var(--line); background: var(--panel-strong); color: var(--ink-strong);"
+            >
+              {contextUsage.tooltip}
+            </div>
+          </div>
         {/if}
       </div>
     {/if}

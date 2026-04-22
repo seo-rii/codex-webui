@@ -210,6 +210,7 @@ pub(crate) async fn send_turn_payload(
                 "thread/resume",
                 json!({
                     "threadId": session_id,
+                    "config": preferences_model_context_config(&next_preferences),
                     "persistExtendedHistory": true
                 }),
             )

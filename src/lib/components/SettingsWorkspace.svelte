@@ -44,6 +44,7 @@
     | "automations"
     | "plugins"
     | "skills";
+  const HUNDRED_M_CONTEXT_WINDOW = 100_000_000;
 
   let {
     codexHome,
@@ -130,6 +131,7 @@
   let auditLoadedForAdmin = $state(false);
   let activeTab = $state<SettingsTabId>("config");
   const dirty = $derived(Boolean(configFile && editorValue !== configFile.content));
+  const configModelContextWindow = $derived.by(() => parseTomlIntegerSetting(editorValue, "model_context_window"));
   const themeDirty = $derived(themeBaseFingerprint !== JSON.stringify(themeDraft));
   const notificationDirty = $derived.by(() => {
     const current = notificationSettings;
@@ -192,6 +194,7 @@
       reload: m.reload(),
       saving: m.saving(),
       saveConfig: m.save_config_toml(),
+      speedAuto: m.speed_auto(),
       failedLoad: m.failed_to_load_settings_workspace(),
       failedSave: m.failed_to_save_config_toml(),
       loadingWorkspace: m.loading_settings_workspace(),
@@ -553,6 +556,53 @@
     } finally {
       saving = false;
     }
+  }
+
+  function parseTomlIntegerSetting(raw: string, key: string) {
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = raw.match(new RegExp(`^\\s*${escapedKey}\\s*=\\s*([0-9_]+)\\s*(?:#.*)?$`, "mu"));
+    if (!match?.[1]) {
+      return null;
+    }
+    const value = Number.parseInt(match[1].replaceAll("_", ""), 10);
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+
+  function upsertTomlIntegerSetting(raw: string, key: string, value: number | null) {
+    const normalized = raw.replace(/\r\n/gu, "\n");
+    const lines = normalized.split("\n");
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const keyPattern = new RegExp(`^\\s*${escapedKey}\\s*=`);
+    const nextLines = lines.filter((line) => !keyPattern.test(line));
+    if (nextLines.length === 1 && nextLines[0] === "") {
+      nextLines.pop();
+    }
+
+    if (value !== null) {
+      const firstSectionIndex = nextLines.findIndex((line) => /^\s*\[.+\]\s*$/u.test(line));
+      const insertIndex = firstSectionIndex >= 0 ? firstSectionIndex : nextLines.length;
+      nextLines.splice(insertIndex, 0, `${key} = ${value}`);
+    }
+
+    while (nextLines.length > 1 && nextLines.at(-1) === "") {
+      nextLines.pop();
+    }
+    return `${nextLines.join("\n")}\n`;
+  }
+
+  function setConfigModelContextWindow(value: number | null) {
+    editorValue = upsertTomlIntegerSetting(
+      editorValue,
+      "model_context_window",
+      typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : null
+    );
+  }
+
+  function formatInteger(value: number | null | undefined) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      return ui.speedAuto;
+    }
+    return new Intl.NumberFormat("en-US").format(value);
   }
 
   function getThemeSurfaceLabel(surface: ThemeSurface) {
@@ -917,6 +967,45 @@
             <div class="meta-card">
               <span>{ui.account}</span>
               <strong>{webRole === "viewer" ? ui.roleViewer : ui.roleAdmin}</strong>
+            </div>
+          </div>
+          <div class="config-context-card">
+            <div class="config-context-card__header">
+              <div>
+                <span>model_context_window</span>
+                <strong>{formatInteger(configModelContextWindow)}</strong>
+              </div>
+              {#if configModelContextWindow === HUNDRED_M_CONTEXT_WINDOW}
+                <span class="meta-pill subtle">100M</span>
+              {/if}
+            </div>
+            <div class="config-context-card__controls">
+              <input
+                class="config-context-card__input"
+                disabled={readOnly}
+                id="settings-model-context-window"
+                inputmode="numeric"
+                min="1"
+                placeholder={ui.speedAuto}
+                step="1"
+                type="number"
+                value={configModelContextWindow ? String(configModelContextWindow) : ""}
+                oninput={(event) => {
+                  const nextValue = (event.currentTarget as HTMLInputElement).value.trim();
+                  setConfigModelContextWindow(nextValue ? Number.parseInt(nextValue, 10) : null);
+                }}
+              />
+              <button class="config-context-card__button" disabled={readOnly} onclick={() => setConfigModelContextWindow(null)} type="button">
+                {ui.speedAuto}
+              </button>
+              <button
+                class={`config-context-card__button ${configModelContextWindow === HUNDRED_M_CONTEXT_WINDOW ? "config-context-card__button--active" : ""}`}
+                disabled={readOnly}
+                onclick={() => setConfigModelContextWindow(HUNDRED_M_CONTEXT_WINDOW)}
+                type="button"
+              >
+                100M
+              </button>
             </div>
           </div>
           {#if readOnly}
@@ -1855,6 +1944,94 @@
     color: var(--ink-strong);
     font-size: 0.92rem;
     word-break: break-all;
+  }
+
+  .config-context-card {
+    display: grid;
+    gap: 0.9rem;
+    border: 1px solid var(--line);
+    border-radius: 1rem;
+    background: var(--panel-strong);
+    padding: 0.95rem 1rem;
+  }
+
+  .config-context-card__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+
+  .config-context-card__header > div {
+    display: grid;
+    gap: 0.28rem;
+    min-width: 0;
+  }
+
+  .config-context-card__header span {
+    color: var(--muted);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .config-context-card__header strong {
+    color: var(--ink-strong);
+    font-size: 0.95rem;
+  }
+
+  .config-context-card__controls {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 0.55rem;
+  }
+
+  .config-context-card__input {
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: 0.85rem;
+    background: var(--panel-soft);
+    color: var(--ink-strong);
+    padding: 0.72rem 0.85rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+  }
+
+  .config-context-card__input::placeholder {
+    color: var(--muted);
+  }
+
+  .config-context-card__button {
+    border: 1px solid var(--line);
+    border-radius: 0.85rem;
+    background: var(--panel-soft);
+    color: var(--muted);
+    padding: 0.72rem 0.95rem;
+    font-size: 0.82rem;
+    font-weight: 700;
+    transition:
+      transform 160ms ease,
+      border-color 160ms ease,
+      background-color 160ms ease,
+      color 160ms ease;
+  }
+
+  .config-context-card__button:hover:not(:disabled) {
+    transform: translateY(-1px);
+    border-color: rgba(245, 158, 11, 0.24);
+    color: var(--ink-strong);
+  }
+
+  .config-context-card__button--active {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  .config-context-card__input:disabled,
+  .config-context-card__button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
   }
 
   .catalog-card {

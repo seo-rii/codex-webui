@@ -45,19 +45,21 @@
   import { extractAttachmentPaths, stripAttachmentPreamble } from "$lib/attachments";
   import { api } from "$lib/api";
   import { applyStreamEvent, createConversationState, mergeConversationState, type ConversationState } from "$lib/chat-state";
-  import ArenaWorkspace from "$lib/components/ArenaWorkspace.svelte";
   import AuthLoginOverlay from "$lib/components/AuthLoginOverlay.svelte";
-  import CodeDiffWorkspace from "$lib/components/CodeDiffWorkspace.svelte";
   import FolderBrowserDialog from "$lib/components/FolderBrowserDialog.svelte";
-  import GitWorkspace from "$lib/components/GitWorkspace.svelte";
+  import LazyMonacoDiffEditor from "$lib/components/LazyMonacoDiffEditor.svelte";
   import MarkdownMessage from "$lib/components/MarkdownMessage.svelte";
-  import MonacoDiffEditor from "$lib/components/MonacoDiffEditor.svelte";
+  import {
+    clearSessionBrowserCache,
+    readSessionDetailCache,
+    readSessionListCache,
+    writeSessionDetailCache,
+    writeSessionListCache
+  } from "$lib/session-browser-cache";
   import SessionRecoveryModal from "$lib/components/SessionRecoveryModal.svelte";
   import SessionSidebar from "$lib/components/SessionSidebar.svelte";
   import SessionTurnSearchPopover from "$lib/components/SessionTurnSearchPopover.svelte";
-  import SettingsWorkspace from "$lib/components/SettingsWorkspace.svelte";
   import StartupAlertModal from "$lib/components/StartupAlertModal.svelte";
-  import TerminalWorkspace from "$lib/components/TerminalWorkspace.svelte";
   import WorkspaceHeader from "$lib/components/WorkspaceHeader.svelte";
   import WorkspaceTabStrip from "$lib/components/WorkspaceTabStrip.svelte";
   import { describeUiError } from "$lib/ui-errors";
@@ -95,7 +97,9 @@
     SavedSessionFilter,
     SelectedSkill,
     SessionListPayload,
+    SessionListResponse,
     SessionDetailPayload,
+    SessionDetailResponse,
     SessionPreferences,
     SessionQueueItem,
     SessionRolloutRecoveryPayload,
@@ -158,6 +162,12 @@
     skippedLines: number | null;
     busy: boolean;
   };
+  type ArenaWorkspaceComponent = typeof import("$lib/components/ArenaWorkspace.svelte").default;
+  type CodeDiffWorkspaceComponent = typeof import("$lib/components/CodeDiffWorkspace.svelte").default;
+  type GitWorkspaceComponent = typeof import("$lib/components/GitWorkspace.svelte").default;
+  type SettingsWorkspaceComponent = typeof import("$lib/components/SettingsWorkspace.svelte").default;
+  type TerminalWorkspaceComponent = typeof import("$lib/components/TerminalWorkspace.svelte").default;
+  type LazyWorkspaceKind = "arena" | "codeDiff" | "git" | "settings" | "terminal";
   type SlashSuggestion = {
     key: string;
     command: string;
@@ -173,6 +183,7 @@
       platform: string;
     }>;
   };
+  const HUNDRED_M_CONTEXT_WINDOW = 100_000_000;
 
   let config = $state<AppConfigPayload | null>(null);
   let catalog = $state<CatalogPayload | null>(null);
@@ -185,6 +196,7 @@
   let sessionsLoadingMore = $state(false);
   let conversation = $state<ConversationState | null>(null);
   let selectedSessionId = $state<string | null>(null);
+  let activeProfileId = $state<string | null>(null);
   let authenticated = $state<boolean | null>(null);
   let webRole = $state<UserRole | null>(null);
   let loading = $state(true);
@@ -249,6 +261,11 @@
   let olderTurnsAutoTriggerTimestamps = $state<number[]>([]);
   let terminals = $state<TerminalSummary[]>([]);
   let activeWorkspaceTabId = $state<WorkspaceTabId>("chat");
+  let ArenaWorkspaceView = $state<ArenaWorkspaceComponent | null>(null);
+  let CodeDiffWorkspaceView = $state<CodeDiffWorkspaceComponent | null>(null);
+  let GitWorkspaceView = $state<GitWorkspaceComponent | null>(null);
+  let SettingsWorkspaceView = $state<SettingsWorkspaceComponent | null>(null);
+  let TerminalWorkspaceView = $state<TerminalWorkspaceComponent | null>(null);
   let workspaceMenuOpen = $state(false);
   let tasksTabOpen = $state(false);
   let gitTabOpen = $state(false);
@@ -303,6 +320,9 @@
   let pwaInstalled = $state(false);
   let pwaInstallBusy = $state(false);
   let pwaManualInstallOnly = $state(false);
+  let sessionListCacheKey = $state<string | null>(null);
+  let sessionListCacheVersion = $state<string | null>(null);
+  let sessionDetailCacheVersion = $state<string | null>(null);
   const readOnlyRole = $derived(webRole === "viewer");
 
   $effect(() => {
@@ -820,6 +840,8 @@
           skippedLines: null
         }
       },
+      cacheVersion: "",
+      notModified: false,
       livePlans: {},
       liveDiffs: {}
     };
@@ -1154,8 +1176,11 @@
   let hydrationRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let selectedSessionDetailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let sessionListCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
+  let sessionDetailCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionListRequestVersion = 0;
   const itemDetailRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const lazyWorkspaceLoads = new Map<LazyWorkspaceKind, Promise<void>>();
   let transcriptElement = $state<HTMLDivElement | undefined>(undefined);
   let transcriptContentElement = $state<HTMLDivElement | undefined>(undefined);
   let transcriptDockElement = $state<HTMLDivElement | undefined>(undefined);
@@ -1568,6 +1593,9 @@
     if (sessionsLoadingMore) {
       return "sessionsMore";
     }
+    if (loadingDetail && conversation) {
+      return "sessionRefresh";
+    }
     if (loadingDetail && !conversation) {
       return "sessionDetail";
     }
@@ -1589,6 +1617,9 @@
     }
     if (sessionsLoadingMore) {
       return ui.loadingMoreSessions;
+    }
+    if (loadingDetail && conversation) {
+      return ui.sessionResyncing;
     }
     if (loadingDetail && !conversation) {
       return ui.loadingSessionBasics;
@@ -1798,6 +1829,106 @@
         ? getConversationDisplayTitle(conversation) || getDefaultThreadTitle()
         : startupScheduledShutdown.sessionId);
     return ui.startupAlertShutdownThread(sessionName);
+  });
+
+  async function ensureLazyWorkspaceLoaded(kind: LazyWorkspaceKind) {
+    if (kind === "arena" && ArenaWorkspaceView) {
+      return;
+    }
+    if (kind === "codeDiff" && CodeDiffWorkspaceView) {
+      return;
+    }
+    if (kind === "git" && GitWorkspaceView) {
+      return;
+    }
+    if (kind === "settings" && SettingsWorkspaceView) {
+      return;
+    }
+    if (kind === "terminal" && TerminalWorkspaceView) {
+      return;
+    }
+
+    const existing = lazyWorkspaceLoads.get(kind);
+    if (existing) {
+      await existing;
+      return;
+    }
+
+    const pending = (async () => {
+      if (kind === "arena") {
+        const module = await import("$lib/components/ArenaWorkspace.svelte");
+        ArenaWorkspaceView = module.default;
+        return;
+      }
+      if (kind === "codeDiff") {
+        const module = await import("$lib/components/CodeDiffWorkspace.svelte");
+        CodeDiffWorkspaceView = module.default;
+        return;
+      }
+      if (kind === "git") {
+        const module = await import("$lib/components/GitWorkspace.svelte");
+        GitWorkspaceView = module.default;
+        return;
+      }
+      if (kind === "settings") {
+        const module = await import("$lib/components/SettingsWorkspace.svelte");
+        SettingsWorkspaceView = module.default;
+        return;
+      }
+
+      const module = await import("$lib/components/TerminalWorkspace.svelte");
+      TerminalWorkspaceView = module.default;
+    })()
+      .catch((error) => {
+        errorText = describeError(error);
+      })
+      .finally(() => {
+        lazyWorkspaceLoads.delete(kind);
+      });
+
+    lazyWorkspaceLoads.set(kind, pending);
+    await pending;
+  }
+
+  function getWorkspaceLoadingLabel() {
+    if (activeWorkspaceTabId === "tasks") {
+      return ui.taskCenter;
+    }
+    if (activeWorkspaceTabId === "settings") {
+      return ui.settings;
+    }
+    if (activeWorkspaceTabId === "git" || activeGitDiffTab) {
+      return ui.gitWorkspace;
+    }
+    if (activeCodeDiffTab) {
+      return ui.aggregatedDiff;
+    }
+    if (activeWorkspaceTabId.startsWith("terminal:")) {
+      return ui.newTerminal;
+    }
+    return m.loading();
+  }
+
+  $effect(() => {
+    if (activeWorkspaceTabId === "tasks") {
+      void ensureLazyWorkspaceLoaded("arena");
+      return;
+    }
+    if (activeWorkspaceTabId === "settings") {
+      void ensureLazyWorkspaceLoaded("settings");
+      return;
+    }
+    if (activeWorkspaceTabId === "git" || Boolean(activeGitDiffTab)) {
+      void ensureLazyWorkspaceLoaded("git");
+      return;
+    }
+    if (activeCodeDiffTab) {
+      void ensureLazyWorkspaceLoaded("codeDiff");
+      return;
+    }
+    if (activeWorkspaceTabId.startsWith("terminal:")) {
+      void ensureLazyWorkspaceLoaded("terminal");
+    }
   });
 
   function dismissFeedbackSnackbar() {
@@ -2456,6 +2587,7 @@
       sessionsInitial: 78,
       sessionsRefresh: 84,
       sessionsMore: 90,
+      sessionRefresh: 76,
       sessionDetail: 72,
       sessionHydration: 88
     };
@@ -2464,6 +2596,7 @@
       sessionsInitial: 14,
       sessionsRefresh: 28,
       sessionsMore: 42,
+      sessionRefresh: 22,
       sessionDetail: 20,
       sessionHydration: 24
     };
@@ -2854,6 +2987,115 @@
     return getTranscriptNow() <= transcriptUserScrollIntentUntil;
   }
 
+  function isCacheValidationResponse(
+    payload: SessionListResponse | SessionDetailResponse
+  ): payload is { cacheVersion: string; notModified: true } {
+    return payload.notModified === true;
+  }
+
+  function clonePayloadForCache<T>(payload: T): T {
+    if (typeof structuredClone === "function") {
+      return structuredClone(payload);
+    }
+    return JSON.parse(JSON.stringify(payload)) as T;
+  }
+
+  function buildSessionListBrowserCacheKey(cursor: string | null = null) {
+    if (!activeProfileId) {
+      return null;
+    }
+
+    return JSON.stringify({
+      profileId: activeProfileId,
+      archived: showArchivedSessions,
+      cursor,
+      limit: sessionPageSize,
+      query: sessionSearchQuery.trim(),
+      scope: sessionSearchScope,
+      filter: {
+        pinnedOnly: sessionFilter.pinnedOnly,
+        runningOnly: sessionFilter.runningOnly,
+        queuedOnly: sessionFilter.queuedOnly,
+        highlight: sessionFilter.highlight,
+        tags: [...sessionFilter.tags].sort()
+      }
+    });
+  }
+
+  function buildSessionDetailBrowserCacheKey(sessionId: string) {
+    if (!activeProfileId) {
+      return null;
+    }
+
+    return JSON.stringify({
+      profileId: activeProfileId,
+      sessionId
+    });
+  }
+
+  function conversationToSessionDetailPayload(state: ConversationState): SessionDetailPayload {
+    const { livePlans, liveDiffs, ...detail } = state;
+    return {
+      ...clonePayloadForCache(detail),
+      cacheVersion: sessionDetailCacheVersion ?? detail.cacheVersion ?? "",
+      notModified: false
+    };
+  }
+
+  function currentSessionListPayload(): SessionListPayload {
+    return {
+      sessions: clonePayloadForCache(sessions),
+      nextCursor: sessionsCursor,
+      cacheVersion: sessionListCacheVersion ?? "",
+      notModified: false
+    };
+  }
+
+  function scheduleSessionListCachePersist(version: string | null = sessionListCacheVersion) {
+    const cacheKey = sessionListCacheKey;
+    if (!cacheKey || typeof window === "undefined") {
+      return;
+    }
+
+    if (sessionListCachePersistTimer) {
+      clearTimeout(sessionListCachePersistTimer);
+    }
+
+    sessionListCachePersistTimer = setTimeout(() => {
+      sessionListCachePersistTimer = null;
+      void writeSessionListCache(cacheKey, currentSessionListPayload(), version);
+    }, 120);
+  }
+
+  function scheduleSessionDetailCachePersist(version: string | null = sessionDetailCacheVersion) {
+    const sessionId = selectedSessionId;
+    if (!sessionId || !conversation || conversation.thread.id !== sessionId || typeof window === "undefined") {
+      return;
+    }
+
+    const cacheKey = buildSessionDetailBrowserCacheKey(sessionId);
+    if (!cacheKey) {
+      return;
+    }
+
+    if (sessionDetailCachePersistTimer) {
+      clearTimeout(sessionDetailCachePersistTimer);
+    }
+
+    sessionDetailCachePersistTimer = setTimeout(() => {
+      sessionDetailCachePersistTimer = null;
+      if (!conversation || conversation.thread.id !== sessionId) {
+        return;
+      }
+      void writeSessionDetailCache(cacheKey, conversationToSessionDetailPayload(conversation), version);
+    }, 120);
+  }
+
+  function markConversationCacheDirty() {
+    sessionDetailCacheVersion = null;
+    scheduleSessionDetailCachePersist(null);
+  }
+
   function mergeSessionPage(payload: SessionListPayload, pinnedSession: SessionSummary | null, append = false) {
     const visiblePayloadSessions = payload.sessions.filter((session) => !isSubagentSessionSummary(session));
     const baseSessions = append ? sessions : [];
@@ -2868,6 +3110,12 @@
     sessions = sortSessions(deduped);
     sessionsCursor = payload.nextCursor;
     sessionsHasMore = Boolean(payload.nextCursor);
+    if (!append) {
+      sessionListCacheVersion = payload.cacheVersion ?? null;
+      sessionListCacheKey = buildSessionListBrowserCacheKey();
+    } else {
+      sessionListCacheVersion = null;
+    }
   }
 
   function shouldPinSession(session: SessionSummary | null) {
@@ -2880,12 +3128,20 @@
     );
   }
 
-  function upsertSessionSummary(summary: SessionSummary) {
+  function upsertSessionSummary(summary: SessionSummary, cacheDirty = true) {
     if (isSubagentSessionSummary(summary)) {
       sessions = sortSessions(sessions.filter((session) => session.id !== summary.id));
+      if (cacheDirty) {
+        sessionListCacheVersion = null;
+        scheduleSessionListCachePersist(null);
+      }
       return;
     }
     sessions = sortSessions([summary, ...sessions.filter((session) => session.id !== summary.id)]);
+    if (cacheDirty) {
+      sessionListCacheVersion = null;
+      scheduleSessionListCachePersist(null);
+    }
   }
 
   function applySessionSummaryUpdate(summary: SessionSummary) {
@@ -2893,6 +3149,8 @@
       const nextSessions = sessions.filter((session) => session.id !== summary.id);
       if (nextSessions.length !== sessions.length) {
         sessions = sortSessions(nextSessions);
+        sessionListCacheVersion = null;
+        scheduleSessionListCachePersist(null);
       }
       return;
     }
@@ -2906,6 +3164,8 @@
       const nextSessions = sessions.filter((session) => session.id !== summary.id);
       if (nextSessions.length !== sessions.length) {
         sessions = sortSessions(nextSessions);
+        sessionListCacheVersion = null;
+        scheduleSessionListCachePersist(null);
       }
       return;
     }
@@ -2914,6 +3174,8 @@
       const nextSessions = sessions.filter((session) => session.id !== summary.id);
       if (nextSessions.length !== sessions.length) {
         sessions = sortSessions(nextSessions);
+        sessionListCacheVersion = null;
+        scheduleSessionListCachePersist(null);
       }
       return;
     }
@@ -3034,6 +3296,14 @@
       clearTimeout(selectedSessionDetailRefreshTimer);
       selectedSessionDetailRefreshTimer = null;
     }
+    if (sessionListCachePersistTimer) {
+      clearTimeout(sessionListCachePersistTimer);
+      sessionListCachePersistTimer = null;
+    }
+    if (sessionDetailCachePersistTimer) {
+      clearTimeout(sessionDetailCachePersistTimer);
+      sessionDetailCachePersistTimer = null;
+    }
     if (saveTimer) {
       clearTimeout(saveTimer);
       saveTimer = null;
@@ -3050,8 +3320,11 @@
     sessionsCursor = null;
     sessionsHasMore = false;
     sessionsLoadingMore = false;
+    sessionListCacheKey = null;
+    sessionListCacheVersion = null;
     conversation = null;
     selectedSessionId = null;
+    sessionDetailCacheVersion = null;
     loadingDetail = false;
     sessionsBusy = false;
     sending = false;
@@ -3118,6 +3391,7 @@
   function clearWorkspaceForLoggedOut() {
     resetWorkspaceState();
     authenticated = false;
+    activeProfileId = null;
     webRole = null;
     viewerGitRepoPath = null;
     runtime = null;
@@ -3159,6 +3433,7 @@
 
     try {
       const authSession = await api.getAuthSession();
+      activeProfileId = authSession.activeProfileId ?? "default";
       loginHcaptcha = authSession.hcaptcha ?? { enabled: false, siteKey: null };
       if (!authSession.authenticated) {
         clearWorkspaceForLoggedOut();
@@ -3178,14 +3453,14 @@
       }
 
       const requestedSessionId = getRequestedSessionIdFromUrl();
-      config = await api.getConfig();
-      syncConfiguredTheme(config);
-      syncStartupAlertModal(config);
-      await refreshNotifications();
-      await refreshSessions();
-      await refreshTerminals();
+      const [nextConfig] = await Promise.all([api.getConfig(), refreshSessions()]);
+      config = nextConfig;
+      syncConfiguredTheme(nextConfig);
+      syncStartupAlertModal(nextConfig);
       void refreshQuota(false);
       void refreshAccountState(false);
+      void refreshNotifications();
+      void refreshTerminals();
       loading = false;
 
       if (requestedSessionId) {
@@ -3214,17 +3489,46 @@
     const requestVersion = ++sessionListRequestVersion;
     sessionsBusy = true;
     sessionsLoadingMore = false;
+    const query = sessionSearchQuery.trim();
+    const listCacheKey = buildSessionListBrowserCacheKey();
+    let knownVersion: string | null = sessionListCacheKey === listCacheKey ? sessionListCacheVersion : null;
+    const shouldHydrateListFromBrowserCache =
+      Boolean(listCacheKey) && (sessionListCacheKey !== listCacheKey || sessions.length === 0);
 
     try {
-      const response = sessionSearchQuery.trim()
-        ? await api.searchSessions(sessionSearchQuery.trim(), sessionSearchScope, showArchivedSessions, null, sessionPageSize, sessionFilter)
-        : await api.getSessions(showArchivedSessions, null, sessionPageSize, sessionFilter);
+      if (!knownVersion && listCacheKey && shouldHydrateListFromBrowserCache) {
+        const cachedEntry = await readSessionListCache(listCacheKey);
+        if (requestVersion !== sessionListRequestVersion) {
+          return;
+        }
+        if (cachedEntry) {
+          mergeSessionPage(cachedEntry.payload, pinnedSession, false);
+          sessionListCacheKey = listCacheKey;
+          sessionListCacheVersion = cachedEntry.version;
+          knownVersion = cachedEntry.version;
+        }
+      }
+
+      const response = query
+        ? await api.searchSessions(query, sessionSearchScope, showArchivedSessions, null, sessionPageSize, sessionFilter, knownVersion)
+        : await api.getSessions(showArchivedSessions, null, sessionPageSize, sessionFilter, knownVersion);
 
       if (requestVersion !== sessionListRequestVersion) {
         return;
       }
 
+      if (isCacheValidationResponse(response)) {
+        sessionListCacheKey = listCacheKey;
+        sessionListCacheVersion = response.cacheVersion;
+        return;
+      }
+
       mergeSessionPage(response, pinnedSession, false);
+      if (listCacheKey) {
+        sessionListCacheKey = listCacheKey;
+        sessionListCacheVersion = response.cacheVersion;
+        void writeSessionListCache(listCacheKey, response, response.cacheVersion);
+      }
     } catch (error) {
       if (requestVersion === sessionListRequestVersion) {
         errorText = describeError(error);
@@ -3319,7 +3623,12 @@
         return;
       }
 
+      if (isCacheValidationResponse(response)) {
+        return;
+      }
+
       mergeSessionPage(response, shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null, true);
+      scheduleSessionListCachePersist(null);
     } catch (error) {
       if (requestVersion === sessionListRequestVersion) {
         errorText = describeError(error);
@@ -3394,6 +3703,7 @@
     olderTurnsAutoLoadPaused = false;
     olderTurnsAutoTriggerTimestamps = [];
     loadingOlderTurns = false;
+    sessionDetailCacheVersion = null;
     pendingSteerResume = null;
     optimisticMessage = null;
     sendIntent = null;
@@ -3407,7 +3717,26 @@
     connectStream(sessionId);
 
     try {
-      const nextConversation = await refreshSelectedSessionState(sessionId, olderTurnPageSize, true);
+      const detailCacheKey = buildSessionDetailBrowserCacheKey(sessionId);
+      let knownVersion: string | null = null;
+      let turnLimit = olderTurnPageSize;
+
+      if (detailCacheKey) {
+        const cachedEntry = await readSessionDetailCache(detailCacheKey);
+        if (selectedSessionId !== sessionId) {
+          return false;
+        }
+        if (cachedEntry) {
+          sessionDetailCacheVersion = cachedEntry.version;
+          applyLoadedSessionDetail(sessionId, cachedEntry.payload);
+          knownVersion = cachedEntry.version;
+          turnLimit = Math.max(olderTurnPageSize, cachedEntry.payload.thread.turns.length);
+          stickTranscriptToBottom = true;
+          forceTranscriptScroll = true;
+        }
+      }
+
+      const nextConversation = await refreshSelectedSessionState(sessionId, turnLimit, true, knownVersion);
       if (selectedSessionId !== sessionId || !nextConversation) {
         return false;
       }
@@ -3496,6 +3825,8 @@
         }
 
         conversation = normalizeConversationExecutionState(applyStreamEvent(conversation, payload));
+        sessionDetailCacheVersion = null;
+        scheduleSessionDetailCachePersist(null);
         if (
           pendingQueueModeSessionId === sessionId &&
           payload.kind === "notification" &&
@@ -3612,7 +3943,7 @@
     upsertSessionSummary({
       ...buildSessionSummaryFromConversation(nextConversation),
       updatedAt: Math.max(nextConversation.thread.updatedAt, existingSummary?.updatedAt ?? 0)
-    });
+    }, false);
     clearHydrationRefresh();
     clearStaleSessionCatchup();
     updateSessionRecoveryPrompt(sessionId, nextConversation);
@@ -3698,13 +4029,31 @@
     }
   }
 
-  async function refreshSelectedSessionState(sessionId: string, turnLimit: number, loadDraft = false) {
-    const detail = await api.getSession(sessionId, turnLimit);
+  async function refreshSelectedSessionState(sessionId: string, turnLimit: number, loadDraft = false, knownVersion: string | null = sessionDetailCacheVersion) {
+    const detail = await api.getSession(sessionId, turnLimit, knownVersion);
+    if (isCacheValidationResponse(detail)) {
+      sessionDetailCacheVersion = detail.cacheVersion;
+      if (selectedSessionId !== sessionId || !conversation || conversation.thread.id !== sessionId) {
+        return null;
+      }
+      if (loadDraft) {
+        await loadSavedDraft(sessionId, conversation.activeTurnId, conversation.preferences.steeringResumeMode);
+      }
+      stickTranscriptToBottom = true;
+      forceTranscriptScroll = true;
+      return conversation;
+    }
+
     if (selectedSessionId !== detail.thread.id) {
       return null;
     }
 
     const nextConversation = applyLoadedSessionDetail(detail.thread.id, detail);
+    sessionDetailCacheVersion = detail.cacheVersion;
+    const detailCacheKey = buildSessionDetailBrowserCacheKey(detail.thread.id);
+    if (detailCacheKey) {
+      void writeSessionDetailCache(detailCacheKey, detail, detail.cacheVersion);
+    }
     if (loadDraft) {
       await loadSavedDraft(detail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
     }
@@ -3720,6 +4069,7 @@
 
     try {
       const authSession = await api.getAuthSession();
+      activeProfileId = authSession.activeProfileId ?? activeProfileId ?? "default";
       loginHcaptcha = authSession.hcaptcha ?? { enabled: false, siteKey: null };
       if (!authSession.authenticated) {
         clearWorkspaceForLoggedOut();
@@ -4128,7 +4478,11 @@
     activateDraftSession(config.defaults);
   }
 
-  function setPreference<Key extends keyof SessionPreferences>(key: Key, value: SessionPreferences[Key]) {
+  function isHundredMContextEnabled(preferences: SessionPreferences | null | undefined) {
+    return preferences?.modelContextWindow === HUNDRED_M_CONTEXT_WINDOW;
+  }
+
+  function setPreferencesPatch(patch: Partial<SessionPreferences>) {
     if (readOnlyRole) {
       errorText = m.error_forbidden_role();
       return;
@@ -4141,10 +4495,37 @@
       ...conversation,
       preferences: {
         ...conversation.preferences,
-        [key]: value
+        ...patch
       }
     };
+    markConversationCacheDirty();
     schedulePreferenceSave();
+  }
+
+  function setPreference<Key extends keyof SessionPreferences>(key: Key, value: SessionPreferences[Key]) {
+    setPreferencesPatch({
+      [key]: value
+    } as Partial<SessionPreferences>);
+  }
+
+  function setSpeedPreference(speed: SessionPreferences["speed"]) {
+    setPreferencesPatch({
+      speed,
+      modelContextWindow:
+        speed === "fast" && isHundredMContextEnabled(conversation?.preferences)
+          ? null
+          : (conversation?.preferences.modelContextWindow ?? null)
+    });
+  }
+
+  function setHundredMContextEnabled(enabled: boolean) {
+    setPreferencesPatch({
+      modelContextWindow: enabled ? HUNDRED_M_CONTEXT_WINDOW : null,
+      speed:
+        enabled && (conversation?.preferences.speed ?? "auto") === "fast"
+          ? "auto"
+          : (conversation?.preferences.speed ?? "auto")
+    });
   }
 
   function normalizeSelectedSkills(skills: Array<SelectedSkill | SkillCatalogEntry>) {
@@ -4196,6 +4577,7 @@
         ...conversation,
         selectedSkills: nextSkills
       };
+      markConversationCacheDirty();
       void api.saveSessionSkills(selectedSessionId, nextSkills).catch((error) => {
         errorText = describeError(error);
       });
@@ -4238,6 +4620,7 @@
             ...conversation,
             preferences: saved
           };
+          markConversationCacheDirty();
         }
         config = nextConfig;
         syncConfiguredTheme(nextConfig);
@@ -4362,6 +4745,7 @@
             name: nextTitle
           }
         };
+        markConversationCacheDirty();
       }
       titleDraft = nextTitle;
       return;
@@ -4397,6 +4781,7 @@
             name: nextTitle
           }
         };
+        markConversationCacheDirty();
       }
       scheduleSessionRefresh(80);
     } catch (error) {
@@ -4800,6 +5185,7 @@
           ...conversation,
           queue
         };
+        markConversationCacheDirty();
       }
       scheduleSessionRefresh(80);
       scheduleSelectedSessionStateRefresh(sessionId, 80);
@@ -4918,6 +5304,7 @@
           ...conversation,
           queue
         };
+        markConversationCacheDirty();
       }
     } catch (error) {
       errorText = describeError(error);
@@ -4959,6 +5346,7 @@
           ...conversation,
           queue
         };
+        markConversationCacheDirty();
       }
       if (editingQueueId === queueId) {
         editingQueueId = null;
@@ -5018,6 +5406,7 @@
           ...conversation,
           queue
         };
+        markConversationCacheDirty();
       }
       noticeText = m.queued_followup_updated();
       cancelQueuedMessageEdit();
@@ -5056,6 +5445,7 @@
           ...conversation,
           queue
         };
+        markConversationCacheDirty();
       }
       dismissedQueueResumeBySessionId = {
         ...dismissedQueueResumeBySessionId,
@@ -5332,6 +5722,7 @@
     try {
       await api.logout();
     } finally {
+      void clearSessionBrowserCache();
       loginPassword = "";
       loginMessage = "";
       clearWorkspaceForLoggedOut();
@@ -5803,6 +6194,7 @@
         ...conversation,
         attachments: [...nextAttachments, ...conversation.attachments.filter((attachment) => !nextAttachments.some((nextAttachment) => nextAttachment.id === attachment.id))]
       };
+      markConversationCacheDirty();
     }
 
     activeWorkspaceTabId = "chat";
@@ -6040,6 +6432,7 @@
           ...conversation,
           pendingRequests: conversation.pendingRequests.filter((pending) => pending.id !== request.id)
         };
+        markConversationCacheDirty();
       }
     } catch (error) {
       errorText = describeError(error);
@@ -6360,22 +6753,19 @@
     return new Intl.NumberFormat("en-US").format(value);
   }
 
-  function formatContextUsage() {
+  function getContextUsageIndicator() {
     const tokenUsage = conversation?.tokenUsage;
     if (!tokenUsage?.modelContextWindow || tokenUsage.modelContextWindow <= 0) {
       return null;
     }
 
-    if (tokenUsage.total.totalTokens <= 0 || tokenUsage.total.totalTokens >= tokenUsage.modelContextWindow) {
-      return null;
-    }
-
-    const percent = Math.min(99, Math.round((tokenUsage.total.totalTokens / tokenUsage.modelContextWindow) * 100));
-    if (percent <= 0) {
-      return null;
-    }
-
-    return `${percent}% of context`;
+    const usedTokens = Math.max(0, tokenUsage.total.totalTokens ?? 0);
+    const percent = Math.max(0, Math.min(100, Math.round((usedTokens / tokenUsage.modelContextWindow) * 100)));
+    return {
+      label: `${percent}%`,
+      percent,
+      tooltip: `${formatTokenCount(usedTokens)} / ${formatTokenCount(tokenUsage.modelContextWindow)} · ${percent}%`
+    };
   }
 
   function summarizeQueueItem(item: SessionQueueItem) {
@@ -7189,6 +7579,7 @@
         )
       }
     };
+    markConversationCacheDirty();
   }
 
   function replaceConversationTurn(turnId: string, nextTurn: CodexTurn) {
@@ -7203,6 +7594,7 @@
         turns: conversation.thread.turns.map((turn) => (turn.id === turnId ? nextTurn : turn))
       }
     };
+    markConversationCacheDirty();
   }
 
   function isTurnLoading(turnId: string) {
@@ -7281,6 +7673,7 @@
         remainingTurns: response.remainingTurns
       }
     };
+    markConversationCacheDirty();
 
     await tick();
     if (transcriptElement) {
@@ -8295,7 +8688,7 @@
       bind:titleDraft={titleDraft}
       bind:titleInputElement={titleInputElement}
       bind:workspaceMenuOpen={workspaceMenuOpen}
-      contextUsageLabel={formatContextUsage()}
+      contextUsage={getContextUsageIndicator()}
       {isMobileLayout}
       {running}
       {selectedSessionId}
@@ -8362,6 +8755,17 @@
     {/if}
 
     <div class="flex-1 overflow-hidden relative">
+      {#if showTopLoadBar}
+        <div class="pointer-events-none absolute inset-x-0 top-0 z-20">
+          <div class="top-load-bar-track">
+            <div class="top-load-bar-fill" style={`width:${Math.max(6, Math.min(100, topLoadPercent))}%`}></div>
+          </div>
+          <div class="top-load-pill">
+            <RefreshCw size={11} class={topLoadKind === "sessionHydration" ? "" : "animate-spin"} />
+            <span>{topLoadLabel}</span>
+          </div>
+        </div>
+      {/if}
       {#if activeWorkspaceTabId === "chat"}
         <div class="h-full flex flex-col relative bg-white">
           <div
@@ -8371,7 +8775,7 @@
             style={`padding-bottom: calc(${transcriptDockReservePx}px + env(safe-area-inset-bottom));`}
           >
             <div bind:this={transcriptContentElement} class="max-w-3xl mx-auto px-6 space-y-12">
-              {#if loading || loadingDetail}
+              {#if loading || (loadingDetail && !conversation)}
                 <div class="space-y-6 animate-pulse mt-8">
                   <div class="h-4 bg-gray-100 rounded w-1/3"></div>
                   <div class="space-y-3">
@@ -8510,7 +8914,7 @@
                                         {#if isFileChangeEntryExpanded(turn.id, `live-diff:${turn.id}`, change)}
                                           <div class="turn-card-expand border-t border-gray-100 bg-gray-50" transition:slide|local={{ duration: 180 }}>
                                             {#if change.renderable}
-                                              <MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />
+                                              <LazyMonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />
                                             {:else}
                                               <pre class="p-4 text-xs font-mono overflow-x-auto text-gray-600">{change.diff}</pre>
                                             {/if}
@@ -8605,16 +9009,16 @@
               {/if}
 
               {#if showQueueResumeBanner && conversation}
-                <div class="queue-resume-banner p-4 bg-gray-900 text-white rounded-2xl shadow-xl flex flex-col md:flex-row items-center gap-4 animate-in slide-in-from-bottom-8 duration-500">
-                  <div class="flex-1"><p class="text-sm font-bold flex items-center gap-2"><RefreshCw size={16} /> {ui.queuedWorkPaused}</p><p class="text-xs opacity-80 mt-0.5">{m.tasks_waiting({ count: String(conversation.queue.items.length) })}</p></div>
-                  <div class="flex gap-2"><button class="px-4 py-1.5 bg-amber-600 text-white rounded-lg text-xs font-bold hover:bg-amber-700 shadow-sm" onclick={() => void resumeQueuedMessages()}>{ui.resumeQueue}</button><button class="queue-resume-ignore px-4 py-1.5 bg-gray-800 hover:bg-gray-700 text-white rounded-lg text-xs font-bold transition-colors" onclick={() => { if (!selectedSessionId) return; dismissedQueueResumeBySessionId = { ...dismissedQueueResumeBySessionId, [selectedSessionId]: true }; }}>{ui.ignore}</button></div>
+                <div class="queue-resume-banner flex flex-col items-center gap-3 rounded-xl bg-gray-900 p-3 text-white shadow-xl animate-in slide-in-from-bottom-8 duration-500 md:flex-row">
+                  <div class="flex-1"><p class="flex items-center gap-2 text-[13px] font-bold"><RefreshCw size={15} /> {ui.queuedWorkPaused}</p><p class="mt-0.5 text-[11px] opacity-80">{m.tasks_waiting({ count: String(conversation.queue.items.length) })}</p></div>
+                  <div class="flex gap-1.5"><button class="rounded-lg bg-amber-600 px-3 py-1.25 text-[11px] font-bold text-white shadow-sm hover:bg-amber-700" onclick={() => void resumeQueuedMessages()}>{ui.resumeQueue}</button><button class="queue-resume-ignore rounded-lg bg-gray-800 px-3 py-1.25 text-[11px] font-bold text-white transition-colors hover:bg-gray-700" onclick={() => { if (!selectedSessionId) return; dismissedQueueResumeBySessionId = { ...dismissedQueueResumeBySessionId, [selectedSessionId]: true }; }}>{ui.ignore}</button></div>
                 </div>
               {/if}
 
               {#if queuedMessages.length > 0}
-                <div class="border border-gray-200 rounded-2xl bg-gray-50/80 shadow-sm overflow-hidden">
+                <div class="overflow-hidden rounded-xl border border-gray-200 bg-gray-50/80 shadow-sm">
                   <button
-                    class={`flex w-full items-center justify-between gap-3 bg-white/80 px-3 py-2 text-left transition-colors hover:bg-white ${queuedFollowupsExpanded ? "border-b border-gray-200" : ""}`}
+                    class={`flex w-full items-center justify-between gap-2.5 bg-white/80 px-2.5 py-1.5 text-left transition-colors hover:bg-white ${queuedFollowupsExpanded ? "border-b border-gray-200" : ""}`}
                     onclick={() => (queuedFollowupsExpanded = !queuedFollowupsExpanded)}
                     type="button"
                   >
@@ -8638,7 +9042,7 @@
                     >
                       {#each queuedMessages as item (item.id)}
                         <div
-                          class={`relative px-3 py-2 transition-colors ${queueDragState?.queueId === item.id ? "bg-amber-50/60" : ""}`}
+                          class={`relative px-2.5 py-1.5 transition-colors ${queueDragState?.queueId === item.id ? "bg-amber-50/60" : ""}`}
                           data-queue-item-id={item.id}
                         >
                           {#if showQueueDropIndicator(item.id, "before")}
@@ -8647,10 +9051,10 @@
                           {#if showQueueDropIndicator(item.id, "after")}
                             <div class="pointer-events-none absolute inset-x-3 bottom-0 h-0.5 rounded-full bg-amber-400 shadow-[0_0_0_1px_rgba(251,191,36,0.18)]"></div>
                           {/if}
-                          <div class="flex items-start gap-2.5">
+                          <div class="flex items-start gap-2">
                             <button
                               aria-label={ui.reorderQueue ?? "Reorder queued message"}
-                              class={`mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-400 transition-colors ${sending || queueReorderBusy || queuedMessages.length < 2 || hasPendingQueueRequests ? "cursor-not-allowed opacity-45" : queueDragState?.queueId === item.id ? "cursor-grabbing border-amber-300 bg-amber-50 text-amber-700 shadow-sm" : "cursor-grab hover:bg-gray-100 hover:text-gray-700"}`}
+                              class={`mt-0.5 inline-flex h-6.5 w-6.5 shrink-0 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-400 transition-colors ${sending || queueReorderBusy || queuedMessages.length < 2 || hasPendingQueueRequests ? "cursor-not-allowed opacity-45" : queueDragState?.queueId === item.id ? "cursor-grabbing border-amber-300 bg-amber-50 text-amber-700 shadow-sm" : "cursor-grab hover:bg-gray-100 hover:text-gray-700"}`}
                               disabled={sending || queueReorderBusy || queuedMessages.length < 2 || hasPendingQueueRequests}
                               onlostpointercapture={cancelQueueDrag}
                               onpointercancel={cancelQueueDrag}
@@ -8661,16 +9065,16 @@
                               title={ui.reorderQueue ?? "Reorder queued message"}
                               type="button"
                             >
-                              <GripVertical size={13} />
+                              <GripVertical size={12} />
                             </button>
                             <div class="min-w-0 flex-1">
-                              <div class={`grid min-w-0 gap-2 ${editingQueueId === item.id ? "grid-cols-1" : "sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"}`}>
-                                <div class="min-w-0 space-y-1">
+                              <div class={`grid min-w-0 gap-1.5 ${editingQueueId === item.id ? "grid-cols-1" : "sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"}`}>
+                                <div class="min-w-0 space-y-0.75">
                                   {#if editingQueueId === item.id}
-                                    <div class="space-y-2">
+                                    <div class="space-y-1.5">
                                       <textarea
                                         bind:value={editingQueuePrompt}
-                                        class="w-full min-h-[4.25rem] rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 shadow-sm focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-100"
+                                        class="w-full min-h-[3.5rem] rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-[13px] text-gray-700 shadow-sm focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-100"
                                         onkeydown={(event) => {
                                           if (event.key === "Escape") {
                                             event.preventDefault();
@@ -8684,38 +9088,38 @@
                                         placeholder={m.edit_queued_followup()}
                                       ></textarea>
                                       {#if item.attachmentNames.length > 0}
-                                        <div class="flex flex-wrap gap-1.5">
+                                        <div class="flex flex-wrap gap-1">
                                           {#each item.attachmentNames as attachmentName}
-                                            <span class="rounded-full border border-gray-200 bg-white px-2 py-1 text-[11px] text-gray-500">{attachmentName}</span>
+                                            <span class="rounded-full border border-gray-200 bg-white px-1.75 py-0.5 text-[10px] text-gray-500">{attachmentName}</span>
                                           {/each}
                                         </div>
                                       {/if}
-                                      <p class="text-[11px] text-gray-400">{m.attached_files_stay()}</p>
+                                      <p class="text-[10px] text-gray-400">{m.attached_files_stay()}</p>
                                     </div>
                                   {:else}
                                     <div class="flex flex-wrap items-center gap-1.5">
-                                      <p class="min-w-0 flex-1 text-[12px] leading-4 text-gray-700 break-words sm:truncate">{summarizeQueueItem(item)}</p>
+                                      <p class="min-w-0 flex-1 text-[11px] leading-4 text-gray-700 break-words sm:truncate">{summarizeQueueItem(item)}</p>
                                     </div>
                                     {#if item.attachmentNames.length > 0}
                                       <div class="flex flex-wrap gap-1">
-                                        <span class="inline-flex items-center gap-1 rounded-full border border-gray-200 bg-white px-2 py-1 text-[10px] font-semibold text-gray-500">
-                                          <Paperclip size={10} />
+                                        <span class="inline-flex items-center gap-1 rounded-full border border-gray-200 bg-white px-1.75 py-0.5 text-[9px] font-semibold text-gray-500">
+                                          <Paperclip size={9} />
                                           <span>{m.attached_files_count({ count: String(item.attachmentNames.length) })}</span>
                                         </span>
                                       </div>
                                     {/if}
                                   {/if}
                                 </div>
-                                <div class={`flex flex-wrap items-center gap-1.5 ${editingQueueId === item.id ? "" : "sm:justify-end"}`}>
+                                <div class={`flex flex-wrap items-center gap-1 ${editingQueueId === item.id ? "" : "sm:justify-end"}`}>
                                   {#if editingQueueId === item.id}
-                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-emerald-200 bg-emerald-50 px-2 text-[10px] font-bold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50" disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.queueSave}</button>
-                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-gray-200 bg-white px-2 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={cancelQueuedMessageEdit} type="button">{ui.cancel}</button>
+                                    <button class="inline-flex h-6.5 items-center justify-center rounded-md border border-emerald-200 bg-emerald-50 px-1.75 text-[10px] font-bold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50" disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={() => void saveQueuedMessage(item.id)} type="button">{ui.queueSave}</button>
+                                    <button class="inline-flex h-6.5 items-center justify-center rounded-md border border-gray-200 bg-white px-1.75 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={cancelQueuedMessageEdit} type="button">{ui.cancel}</button>
                                   {:else}
-                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-2 text-[10px] font-bold text-amber-700 transition-colors hover:bg-amber-100 disabled:opacity-50" disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={() => void dispatchQueuedMessage(item.id, "steer")} type="button">{ui.steerNow}</button>
-                                    <button class="inline-flex h-7 items-center justify-center rounded-lg border border-gray-200 bg-white px-2 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={() => void dispatchQueuedMessage(item.id, "message")} type="button">{ui.sendNow}</button>
+                                    <button class="inline-flex h-6.5 items-center justify-center rounded-md border border-amber-200 bg-amber-50 px-1.75 text-[10px] font-bold text-amber-700 transition-colors hover:bg-amber-100 disabled:opacity-50" disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={() => void dispatchQueuedMessage(item.id, "steer")} type="button">{ui.steerNow}</button>
+                                    <button class="inline-flex h-6.5 items-center justify-center rounded-md border border-gray-200 bg-white px-1.75 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-100 disabled:opacity-50" disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={() => void dispatchQueuedMessage(item.id, "message")} type="button">{ui.sendNow}</button>
                                     <button
                                       aria-label={ui.edit}
-                                      class="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-gray-200 bg-white p-0 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:opacity-50"
+                                      class="inline-flex h-6.5 w-6.5 items-center justify-center rounded-md border border-gray-200 bg-white p-0 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:opacity-50"
                                       disabled={sending || queueReorderBusy || hasPendingQueueRequests}
                                       onclick={() => beginQueuedMessageEdit(item)}
                                       title={ui.edit}
@@ -8724,7 +9128,7 @@
                                       <Pencil size={14} />
                                     </button>
                                   {/if}
-                                  <button class="inline-flex h-7 w-7 items-center justify-center rounded-lg p-0 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:opacity-50" aria-label={m.remove_queued_message()} disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={() => void removeQueuedMessage(item.id)} type="button"><Trash2 size={14} /></button>
+                                  <button class="inline-flex h-6.5 w-6.5 items-center justify-center rounded-md p-0 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:opacity-50" aria-label={m.remove_queued_message()} disabled={sending || queueReorderBusy || hasPendingQueueRequests} onclick={() => void removeQueuedMessage(item.id)} type="button"><Trash2 size={13} /></button>
                                 </div>
                               </div>
                             </div>
@@ -8793,7 +9197,7 @@
                                   {#if isFileChangeEntryExpanded(activeLiveTurnId, "live-diff:active", change)}
                                     <div class="turn-card-expand border-t border-gray-100 bg-gray-50" transition:slide|local={{ duration: 180 }}>
                                       {#if change.renderable}
-                                        <MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />
+                                        <LazyMonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />
                                       {:else}
                                         <pre class="overflow-x-auto p-3 text-[11px] leading-relaxed text-gray-600">{change.diff}</pre>
                                       {/if}
@@ -8883,9 +9287,9 @@
 
               <div class="relative group">
                 {#if lastComposerHistoryPrompt}
-                  <div class="mb-2 flex items-center gap-2 px-1">
+                  <div class="mb-1.5 flex items-center gap-1.5 px-0.5">
                     <button
-                      class="ui-animated-button ui-animated-button--soft flex min-w-0 flex-1 items-center gap-2 rounded-2xl border border-gray-200/80 bg-white/80 px-3 py-1.5 text-left text-[11px] text-gray-500 shadow-sm backdrop-blur-sm transition-colors hover:border-amber-200 hover:bg-amber-50/70 hover:text-gray-700"
+                      class="ui-animated-button ui-animated-button--soft flex min-w-0 flex-1 items-center gap-1.5 rounded-xl border border-gray-200/80 bg-white/80 px-2.5 py-1.25 text-left text-[10px] text-gray-500 shadow-sm backdrop-blur-sm transition-colors hover:border-amber-200 hover:bg-amber-50/70 hover:text-gray-700"
                       onclick={reuseLastComposerMessage}
                       title={ui.editInComposer}
                       type="button"
@@ -8895,7 +9299,7 @@
                     </button>
                     <button
                       aria-label={ui.close}
-                      class="ui-animated-button ui-animated-button--icon flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-gray-200/80 bg-white/80 text-gray-400 shadow-sm transition-colors hover:border-gray-300 hover:bg-gray-50 hover:text-gray-600"
+                      class="ui-animated-button ui-animated-button--icon flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-gray-200/80 bg-white/80 text-gray-400 shadow-sm transition-colors hover:border-gray-300 hover:bg-gray-50 hover:text-gray-600"
                       onclick={dismissLastComposerPromptChip}
                       title={ui.close}
                       type="button"
@@ -8903,7 +9307,7 @@
                       <X size={14} />
                     </button>
                     <button
-                      class="surface-contrast-button ui-animated-button ui-animated-button--soft flex h-8 shrink-0 items-center gap-1.5 rounded-xl px-3 text-[10px] font-bold shadow-sm"
+                      class="surface-contrast-button ui-animated-button ui-animated-button--soft flex h-7 shrink-0 items-center gap-1.25 rounded-lg px-2.5 text-[10px] font-bold shadow-sm"
                       disabled={recentComposerActionDisabled}
                       onclick={() => void resendLastComposerMessage()}
                       title={queueModeActive ? ui.queue : ui.send}
@@ -8915,10 +9319,10 @@
                   </div>
                 {/if}
                 {#if slashSuggestions.length > 0}
-                  <div class="mb-2 grid gap-1 rounded-2xl border border-amber-100 bg-white/90 p-2 shadow-sm">
+                  <div class="mb-1.5 grid gap-1 rounded-xl border border-amber-100 bg-white/90 p-1.5 shadow-sm">
                     {#each slashSuggestions as suggestion (suggestion.key)}
                       <button
-                        class="ui-animated-button ui-animated-button--soft flex items-start justify-between gap-3 rounded-xl px-3 py-2 text-left transition-colors hover:bg-amber-50/70"
+                        class="ui-animated-button ui-animated-button--soft flex items-start justify-between gap-2.5 rounded-lg px-2.5 py-1.5 text-left transition-colors hover:bg-amber-50/70"
                         onclick={() => applySlashSuggestion(suggestion)}
                         type="button"
                       >
@@ -8937,20 +9341,20 @@
                   <textarea bind:this={composerTextareaElement} bind:value={draft} class="composer-textarea w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 outline-none transition-colors duration-150 focus:outline-none focus:ring-0 focus:placeholder:text-amber-500/70 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} readonly={readOnlyRole} rows="1"></textarea>
                   
                   {#if draftAttachments.length > 0}
-                    <div class="px-4 pb-2 flex flex-wrap gap-2">
-                      {#each draftAttachments as attachment (attachment.id)}<button class="px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-xl text-[11px] font-bold text-gray-600 hover:bg-red-50 hover:text-red-600 hover:border-red-200 transition-all flex items-center gap-2 group disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} onclick={() => void removeDraftAttachment(attachment.id)} type="button"><FileText size={12} /><span>{attachment.originalName}</span><X size={12} class="opacity-0 group-hover:opacity-100 transition-opacity" /></button>{/each}
+                    <div class="flex flex-wrap gap-1.5 px-3.5 pb-1.5">
+                      {#each draftAttachments as attachment (attachment.id)}<button class="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-gray-50 px-2.5 py-1 text-[10px] font-bold text-gray-600 transition-all hover:border-red-200 hover:bg-red-50 hover:text-red-600 group disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} onclick={() => void removeDraftAttachment(attachment.id)} type="button"><FileText size={11} /><span>{attachment.originalName}</span><X size={11} class="opacity-0 transition-opacity group-hover:opacity-100" /></button>{/each}
                     </div>
                   {/if}
 
-                  <div bind:this={composerToolbarElement} class={`composer-toolbar flex items-center gap-2 border-t border-gray-100 bg-gray-50/80 px-3 py-2.5 transition-colors duration-200 group-focus-within:border-amber-100 group-focus-within:bg-[linear-gradient(180deg,rgba(255,251,235,0.9),rgba(255,255,255,0.98))] sm:px-4 sm:py-3 ${composerToolbarCompact ? "flex-wrap" : "flex-nowrap"}`}>
-                    <div class={`flex min-w-0 items-center gap-1.5 sm:gap-2 ${composerToolbarCompact ? "basis-full flex-1" : "flex-1"}`}>
+                  <div bind:this={composerToolbarElement} class={`composer-toolbar flex items-center gap-1.5 border-t border-gray-100 bg-gray-50/80 px-2.5 py-2 transition-colors duration-200 group-focus-within:border-amber-100 group-focus-within:bg-[linear-gradient(180deg,rgba(255,251,235,0.9),rgba(255,255,255,0.98))] sm:px-3 sm:py-2.5 ${composerToolbarCompact ? "flex-wrap" : "flex-nowrap"}`}>
+                    <div class={`flex min-w-0 items-center gap-1.25 sm:gap-1.5 ${composerToolbarCompact ? "basis-full flex-1" : "flex-1"}`}>
                       <input bind:this={filePickerElement} disabled={readOnlyRole || uploading} hidden multiple onchange={(event) => void uploadFiles((event.currentTarget as HTMLInputElement).files)} type="file" />
-                      <button class="ui-animated-button ui-animated-button--icon inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl p-0 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 group-focus-within:bg-white/90 group-focus-within:text-amber-700 disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9" disabled={readOnlyRole || uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={16} class="animate-spin" />{:else}<Paperclip size={16} />{/if}</button>
+                      <button class="ui-animated-button ui-animated-button--icon inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg p-0 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 group-focus-within:bg-white/90 group-focus-within:text-amber-700 disabled:cursor-not-allowed disabled:opacity-50 sm:h-8 sm:w-8" disabled={readOnlyRole || uploading} onclick={promptAttachmentPicker} title={ui.addAttachments} type="button">{#if uploading}<RefreshCw size={15} class="animate-spin" />{:else}<Paperclip size={15} />{/if}</button>
                       {#if conversation}
                         <div class="mx-0.5 hidden h-4 w-px bg-gray-200 sm:block"></div>
                         <button
                           bind:this={composerSettingsTriggerElement}
-                          class={`composer-compact-trigger ui-animated-button ui-animated-button--soft flex h-8 min-w-0 max-w-[10.5rem] items-center gap-1.5 rounded-xl border px-2.5 text-[10px] font-bold transition-all group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:h-9 sm:max-w-[13.5rem] sm:gap-2 sm:px-3 sm:text-[11px] ${
+                          class={`composer-compact-trigger ui-animated-button ui-animated-button--soft flex h-7 min-w-0 max-w-[10rem] items-center gap-1.25 rounded-lg border px-2 text-[10px] font-bold transition-all group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:h-8 sm:max-w-[12.5rem] sm:gap-1.5 sm:px-2.5 sm:text-[11px] ${
                             composerSettingsOpen && composerSettingsAnchor === "session"
                               ? "border-amber-200 bg-white text-gray-900 shadow-sm"
                               : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-white hover:text-gray-900"
@@ -8984,7 +9388,7 @@
                         </button>
                         <button
                           bind:this={composerSecurityTriggerElement}
-                          class={`composer-compact-trigger ui-animated-button ui-animated-button--soft flex h-8 shrink-0 items-center gap-1.5 rounded-xl border px-2.5 text-[10px] font-bold transition-all group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:h-9 sm:gap-2 sm:px-3 sm:text-[11px] ${
+                          class={`composer-compact-trigger ui-animated-button ui-animated-button--soft flex h-7 shrink-0 items-center gap-1.25 rounded-lg border px-2 text-[10px] font-bold transition-all group-focus-within:border-amber-100 group-focus-within:bg-white/90 group-focus-within:text-gray-700 sm:h-8 sm:gap-1.5 sm:px-2.5 sm:text-[11px] ${
                             composerSettingsOpen && composerSettingsTab === "security"
                               ? "border-sky-200 bg-white text-sky-800 shadow-sm"
                               : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-white hover:text-gray-900"
@@ -9007,12 +9411,12 @@
                         </button>
                       {/if}
                     </div>
-                    <div class={`flex items-center justify-end gap-1.5 sm:gap-2 ${composerToolbarCompact ? "basis-full" : "shrink-0"}`}>
+                    <div class={`flex items-center justify-end gap-1.25 sm:gap-1.5 ${composerToolbarCompact ? "basis-full" : "shrink-0"}`}>
                       {#if running}
-                        <button class="ui-animated-button ui-animated-button--soft inline-flex h-8 items-center justify-center rounded-xl px-3 text-[11px] font-bold text-red-600 transition-all hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:px-4 sm:text-xs" disabled={readOnlyRole} onclick={interruptTurn} type="button">{ui.stop}</button>
-                        <button class="ui-animated-button ui-animated-button--soft inline-flex h-8 items-center justify-center rounded-xl border border-amber-200 bg-amber-50 px-3 text-[11px] font-bold text-amber-700 transition-all hover:bg-amber-100 disabled:opacity-50 sm:h-9 sm:px-4 sm:text-xs" disabled={readOnlyRole || sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
+                        <button class="ui-animated-button ui-animated-button--soft inline-flex h-7 items-center justify-center rounded-lg px-2.5 text-[10px] font-bold text-red-600 transition-all hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 sm:h-8 sm:px-3 sm:text-[11px]" disabled={readOnlyRole} onclick={interruptTurn} type="button">{ui.stop}</button>
+                        <button class="ui-animated-button ui-animated-button--soft inline-flex h-7 items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-2.5 text-[10px] font-bold text-amber-700 transition-all hover:bg-amber-100 disabled:opacity-50 sm:h-8 sm:px-3 sm:text-[11px]" disabled={readOnlyRole || sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
                       {/if}
-                      <button class="surface-contrast-button ui-animated-button ui-animated-button--strong inline-flex h-8 items-center justify-center rounded-xl bg-gray-900 px-4 text-[11px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:h-9 sm:px-6 sm:text-xs" disabled={composerPrimaryActionDisabled} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.5 sm:gap-2"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={14} /></div></button>
+                      <button class="surface-contrast-button ui-animated-button ui-animated-button--strong inline-flex h-7 items-center justify-center rounded-lg bg-gray-900 px-3 text-[10px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:h-8 sm:px-4 sm:text-[11px]" disabled={composerPrimaryActionDisabled} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.25 sm:gap-1.5"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={13} /></div></button>
                     </div>
                   </div>
                 </form>
@@ -9101,6 +9505,43 @@
                           </select>
                         </div>
                         <div class="space-y-1">
+                          <div class="flex items-center justify-between gap-2 px-1">
+                            <span class="text-[10px] font-bold uppercase tracking-widest text-gray-400">model_context_window</span>
+                            <span class="text-[10px] font-semibold text-gray-400">{isHundredMContextEnabled(conversation.preferences) ? "100M" : ui.speedAuto}</span>
+                          </div>
+                          <div class="composer-settings-segmented grid w-full grid-cols-2 gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
+                            <button
+                              class={`composer-settings-segmented__button ui-animated-button ui-animated-button--soft flex h-8 w-full items-center justify-center gap-1 rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                                !isHundredMContextEnabled(conversation.preferences)
+                                  ? "border-gray-900 bg-gray-900 text-white shadow-sm"
+                                  : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
+                              }`}
+                              data-selected={!isHundredMContextEnabled(conversation.preferences)}
+                              data-tone="auto"
+                              disabled={readOnlyRole}
+                              onclick={() => setHundredMContextEnabled(false)}
+                              type="button"
+                            >
+                              <span class="truncate">{ui.speedAuto}</span>
+                            </button>
+                            <button
+                              class={`composer-settings-segmented__button ui-animated-button ui-animated-button--soft flex h-8 w-full items-center justify-center gap-1 rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                                isHundredMContextEnabled(conversation.preferences)
+                                  ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
+                                  : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
+                              }`}
+                              data-selected={isHundredMContextEnabled(conversation.preferences)}
+                              data-tone="context"
+                              disabled={readOnlyRole}
+                              onclick={() => setHundredMContextEnabled(!isHundredMContextEnabled(conversation?.preferences))}
+                              title="100,000,000"
+                              type="button"
+                            >
+                              <span class="truncate">100M</span>
+                            </button>
+                          </div>
+                        </div>
+                        <div class="space-y-1">
                           <label class="px-1 text-[10px] font-bold uppercase tracking-widest text-gray-400" for="composer-effort-select">{m.reasoning()}</label>
                           <select class="w-full rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm transition-all focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/10 disabled:cursor-not-allowed disabled:opacity-60" disabled={readOnlyRole} id="composer-effort-select" onchange={(event) => setPreference("effort", (event.currentTarget as HTMLSelectElement).value as SessionPreferences["effort"])} value={conversation.preferences.effort ?? (reasoningOptions[0] ?? "medium")}>
                             {#each reasoningOptions as option (option)}
@@ -9125,8 +9566,8 @@
                             </select>
                           </div>
                         {/if}
-                        <div class="composer-settings-card flex items-center justify-between gap-2 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
-                          <div class="flex min-w-0 items-center gap-2">
+                        <div class="composer-settings-card flex flex-col gap-2.5 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
+                          <div class="flex min-w-0 items-start gap-2">
                             <span class={`composer-settings-card__icon inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border ${
                               conversation.preferences.sendOnEnter
                                 ? "border-amber-200 bg-amber-100 text-amber-700"
@@ -9134,39 +9575,46 @@
                             }`} data-active={conversation.preferences.sendOnEnter}>
                               <Keyboard size={12} />
                             </span>
-                            <div class="min-w-0">
+                            <div class="min-w-0 space-y-0.5">
                               <p class="composer-settings-card__eyebrow text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.sendShortcut}</p>
-                              <p class="composer-settings-card__value truncate text-[11px] text-gray-500">{conversation.preferences.sendOnEnter ? ui.sendShortcutEnter : ui.sendShortcutCtrlEnter}</p>
+                              <p class="composer-settings-card__value text-[11px] text-gray-500">{conversation.preferences.sendOnEnter ? ui.sendShortcutEnter : ui.sendShortcutCtrlEnter}</p>
+                              <p class="text-[10px] leading-4 text-gray-400">{ui.sendShortcutDescription}</p>
                             </div>
                           </div>
-                          <div class="composer-settings-segmented grid shrink-0 grid-cols-2 gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
+                          <div class="grid w-full grid-cols-1 gap-2 sm:grid-cols-2">
                             <button
-                              class={`composer-settings-segmented__button ui-animated-button ui-animated-button--soft flex h-8 min-w-[5.2rem] items-center justify-center rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                              class={`ui-animated-button ui-animated-button--soft flex min-h-[2.75rem] w-full items-center justify-between gap-3 rounded-xl border px-3 py-2 text-left text-[11px] font-bold transition-all ${
                                 !conversation.preferences.sendOnEnter
                                   ? "border-gray-900 bg-gray-900 text-white shadow-sm"
                                   : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
                               }`}
-                              data-selected={!conversation.preferences.sendOnEnter}
-                              data-tone="default"
                               disabled={readOnlyRole}
                               onclick={() => setPreference("sendOnEnter", false)}
                               type="button"
                             >
-                              <span>{ui.sendShortcutCtrlEnter}</span>
+                              <span class="truncate">{ui.sendShortcutCtrlEnter}</span>
+                              <span class={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                                !conversation.preferences.sendOnEnter
+                                  ? "bg-white/15 text-white"
+                                  : "bg-gray-100 text-gray-500"
+                              }`}>{ui.send}</span>
                             </button>
                             <button
-                              class={`composer-settings-segmented__button ui-animated-button ui-animated-button--soft flex h-8 min-w-[5.2rem] items-center justify-center rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                              class={`ui-animated-button ui-animated-button--soft flex min-h-[2.75rem] w-full items-center justify-between gap-3 rounded-xl border px-3 py-2 text-left text-[11px] font-bold transition-all ${
                                 conversation.preferences.sendOnEnter
                                   ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
                                   : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
                               }`}
-                              data-selected={conversation.preferences.sendOnEnter}
-                              data-tone="fast"
                               disabled={readOnlyRole}
                               onclick={() => setPreference("sendOnEnter", true)}
                               type="button"
                             >
-                              <span>{ui.sendShortcutEnter}</span>
+                              <span class="truncate">{ui.sendShortcutEnter}</span>
+                              <span class={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                                conversation.preferences.sendOnEnter
+                                  ? "bg-amber-100 text-amber-700"
+                                  : "bg-gray-100 text-gray-500"
+                              }`}>{ui.send}</span>
                             </button>
                           </div>
                         </div>
@@ -9196,8 +9644,8 @@
                             </button>
                           </div>
                         </div>
-                        <div class="composer-settings-card flex items-center justify-between gap-2 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
-                          <div class="flex min-w-0 items-center gap-2">
+                        <div class="composer-settings-card flex flex-col gap-2.5 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
+                          <div class="flex min-w-0 items-start gap-2">
                             <span class={`composer-settings-card__icon inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border ${
                               isFastSpeedMode(conversation.preferences.speed)
                                 ? "border-amber-200 bg-amber-100 text-amber-700"
@@ -9211,41 +9659,55 @@
                             </span>
                             <div class="min-w-0">
                               <p class="composer-settings-card__eyebrow text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.speed}</p>
-                              <p class="composer-settings-card__value truncate text-[11px] text-gray-500">{getSpeedOptionLabel(conversation.preferences.speed ?? "auto")}</p>
+                              <p class="composer-settings-card__value text-[11px] text-gray-500">{getSpeedOptionLabel(conversation.preferences.speed ?? "auto")}</p>
                             </div>
                           </div>
-                          <div class="composer-settings-segmented grid shrink-0 grid-cols-3 gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
-                            {#each speedOptions as option (option)}
-                              <button
-                                class={`composer-settings-segmented__button ui-animated-button ui-animated-button--soft flex h-8 min-w-[4.1rem] items-center justify-center gap-1 rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
-                                  (conversation.preferences.speed ?? "auto") === option
-                                    ? option === "fast"
-                                      ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
-                                      : option === "flex"
+                          <label class:checkbox-card--disabled={readOnlyRole || !speedOptions.includes("fast")} class="checkbox-card checkbox-card--compact w-full">
+                            <input
+                              checked={isFastSpeedMode(conversation.preferences.speed)}
+                              class="checkbox-input"
+                              disabled={readOnlyRole || !speedOptions.includes("fast")}
+                              onchange={(event) => {
+                                const target = event.currentTarget as HTMLInputElement;
+                                setSpeedPreference(target.checked ? "fast" : "auto");
+                              }}
+                              type="checkbox"
+                            />
+                            <span class="checkbox-control"></span>
+                            <span class="checkbox-copy min-w-0">
+                              <span class="checkbox-title">{ui.speedFast}</span>
+                              <span class="checkbox-description">
+                                {isFastSpeedMode(conversation.preferences.speed)
+                                  ? ui.speedFast
+                                  : ui.speedAuto}
+                              </span>
+                            </span>
+                          </label>
+                          {#if speedOptions.includes("flex") && !isFastSpeedMode(conversation.preferences.speed)}
+                            <div class="composer-settings-segmented grid w-full grid-cols-2 gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
+                              {#each ["auto", "flex"] as option (option)}
+                                <button
+                                  class={`composer-settings-segmented__button ui-animated-button ui-animated-button--soft flex h-8 w-full items-center justify-center gap-1 rounded-lg border px-2 text-[10px] font-bold transition-all sm:text-[11px] ${
+                                    (conversation.preferences.speed ?? "auto") === option
+                                      ? option === "flex"
                                         ? "border-sky-200 bg-sky-50 text-sky-700 shadow-sm"
                                         : "border-gray-900 bg-gray-900 text-white shadow-sm"
-                                    : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
-                                }`}
-                                data-selected={(conversation.preferences.speed ?? "auto") === option}
-                                data-tone={option}
-                                disabled={readOnlyRole}
-                                onclick={() => {
-                                  if (!conversation) {
-                                    return;
-                                  }
-                                  setPreference("speed", option as SessionPreferences["speed"]);
-                                }}
-                                type="button"
-                              >
-                                {#if option === "fast"}
-                                  <Zap size={12} class="shrink-0" />
-                                {:else}
-                                  <Cpu size={12} class="shrink-0 opacity-80" />
-                                {/if}
-                                <span class="truncate">{getSpeedOptionLabel(option as SessionPreferences["speed"])}</span>
-                              </button>
-                            {/each}
-                          </div>
+                                      : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
+                                  }`}
+                                  data-selected={(conversation.preferences.speed ?? "auto") === option}
+                                  data-tone={option}
+                                  disabled={readOnlyRole}
+                                  onclick={() => setSpeedPreference(option as SessionPreferences["speed"])}
+                                  type="button"
+                                >
+                                  {#if option === "flex"}
+                                    <Cpu size={12} class="shrink-0 opacity-80" />
+                                  {/if}
+                                  <span class="truncate">{getSpeedOptionLabel(option as SessionPreferences["speed"])}</span>
+                                </button>
+                              {/each}
+                            </div>
+                          {/if}
                         </div>
                       </div>
                     {:else if composerSettingsTab === "skills"}
@@ -9362,21 +9824,28 @@
         <div class="h-full overflow-y-auto bg-gray-50/30 p-8">
           <div class="max-w-4xl mx-auto space-y-8">
             <div class="flex items-end justify-between border-b border-gray-200 pb-6"><div><h2 class="text-2xl font-bold text-gray-900">{ui.taskCenter}</h2><p class="text-sm text-gray-500 mt-1">{ui.subagentActivities}</p></div><div class="px-3 py-1 bg-white border border-gray-200 rounded-lg text-xs font-bold text-gray-500 uppercase tracking-widest shadow-sm">{subagentTasks.length} {ui.tasks}</div></div>
-            <ArenaWorkspace
-              currentPreferences={conversation?.preferences ?? config?.defaults ?? null}
-              models={config?.models ?? []}
-              readOnly={readOnlyRole}
-              onOpenSession={async (sessionId) => {
-                activeWorkspaceTabId = "chat";
-                await selectSession(sessionId);
-              }}
-              onUseResponse={async (contestant) => {
-                activeWorkspaceTabId = "chat";
-                draft = contestant.response ?? "";
-                await tick();
-                composerTextareaElement?.focus();
-              }}
-            />
+            {#if ArenaWorkspaceView}
+              <ArenaWorkspaceView
+                currentPreferences={conversation?.preferences ?? config?.defaults ?? null}
+                models={config?.models ?? []}
+                readOnly={readOnlyRole}
+                onOpenSession={async (sessionId) => {
+                  activeWorkspaceTabId = "chat";
+                  await selectSession(sessionId);
+                }}
+                onUseResponse={async (contestant) => {
+                  activeWorkspaceTabId = "chat";
+                  draft = contestant.response ?? "";
+                  await tick();
+                  composerTextareaElement?.focus();
+                }}
+              />
+            {:else}
+              <div class="workspace-loading-card">
+                <RefreshCw size={16} class="animate-spin text-gray-300" />
+                <span>{getWorkspaceLoadingLabel()}</span>
+              </div>
+            {/if}
             <section class="space-y-4">
               <div class="flex items-center justify-between">
                 <h3 class="text-sm font-bold uppercase tracking-[0.22em] text-gray-500">{ui.subagentActivities}</h3>
@@ -9390,83 +9859,118 @@
       {:else if activeWorkspaceTabId === "settings"}
         <div class="h-full overflow-y-auto bg-gray-50/30 p-5 sm:p-8">
           <div class="mx-auto w-full max-w-7xl">
-            <SettingsWorkspace
-              codexHome={config?.paths.codexHome ?? ""}
-              configFilePath={config?.paths.configFilePath ?? ""}
-              autostart={config?.autostart ?? null}
-              notificationSettings={config?.notifications.settings ?? null}
-              promptPresets={config?.promptPresets ?? []}
-              automations={config?.automations.items ?? []}
-              automationRuns={config?.automations.recentRuns ?? []}
-              themeSettings={(config as ThemedConfigPayload | null)?.theme ?? null}
-              themeMode={themeMode}
-              resolvedTheme={resolvedTheme}
-              webRole={webRole}
-              readOnly={readOnlyRole}
-              onConfigSaved={async () => {
-                config = await api.getConfig();
-                syncConfiguredTheme(config);
-                syncStartupAlertModal(config);
-              }}
-              onAutostartSaved={async (enabled) => {
-                await saveAutostartEnabled(enabled);
-              }}
-              onSaveThemeSettings={async (theme) => {
-                await saveThemeSettings(theme);
-              }}
-              onNotificationSettingsSaved={async (settings) => {
-                await saveNotificationSettings(settings);
-              }}
-              onSavePromptPreset={async (preset) => {
-                await savePromptPreset(preset);
-              }}
-              onDeletePromptPreset={async (presetId) => {
-                await deletePromptPreset(presetId);
-              }}
-              onSaveAutomation={async (automation) => {
-                await saveAutomation(automation);
-              }}
-              onDeleteAutomation={async (automationId) => {
-                await deleteAutomation(automationId);
-              }}
-              onRunAutomation={async (automationId) => {
-                await runAutomation(automationId);
-              }}
-              onOpenSession={async (sessionId) => {
-                activeWorkspaceTabId = "chat";
-                await selectSession(sessionId);
-              }}
-            />
+            {#if SettingsWorkspaceView}
+              <SettingsWorkspaceView
+                codexHome={config?.paths.codexHome ?? ""}
+                configFilePath={config?.paths.configFilePath ?? ""}
+                autostart={config?.autostart ?? null}
+                notificationSettings={config?.notifications.settings ?? null}
+                promptPresets={config?.promptPresets ?? []}
+                automations={config?.automations.items ?? []}
+                automationRuns={config?.automations.recentRuns ?? []}
+                themeSettings={(config as ThemedConfigPayload | null)?.theme ?? null}
+                themeMode={themeMode}
+                resolvedTheme={resolvedTheme}
+                webRole={webRole}
+                readOnly={readOnlyRole}
+                onConfigSaved={async () => {
+                  config = await api.getConfig();
+                  syncConfiguredTheme(config);
+                  syncStartupAlertModal(config);
+                }}
+                onAutostartSaved={async (enabled) => {
+                  await saveAutostartEnabled(enabled);
+                }}
+                onSaveThemeSettings={async (theme) => {
+                  await saveThemeSettings(theme);
+                }}
+                onNotificationSettingsSaved={async (settings) => {
+                  await saveNotificationSettings(settings);
+                }}
+                onSavePromptPreset={async (preset) => {
+                  await savePromptPreset(preset);
+                }}
+                onDeletePromptPreset={async (presetId) => {
+                  await deletePromptPreset(presetId);
+                }}
+                onSaveAutomation={async (automation) => {
+                  await saveAutomation(automation);
+                }}
+                onDeleteAutomation={async (automationId) => {
+                  await deleteAutomation(automationId);
+                }}
+                onRunAutomation={async (automationId) => {
+                  await runAutomation(automationId);
+                }}
+                onOpenSession={async (sessionId) => {
+                  activeWorkspaceTabId = "chat";
+                  await selectSession(sessionId);
+                }}
+              />
+            {:else}
+              <div class="workspace-loading-card">
+                <RefreshCw size={16} class="animate-spin text-gray-300" />
+                <span>{getWorkspaceLoadingLabel()}</span>
+              </div>
+            {/if}
           </div>
         </div>
       {:else if activeWorkspaceTabId === "git"}
-        <GitWorkspace
-          onOpenCommitDiff={openGitCommitDiffTab}
-          onOpenDiffTab={openGitDiffTab}
-          onSelectRepo={handleRepoSelect}
-          readOnly={readOnlyRole}
-          selectedRepoPath={readOnlyRole ? (viewerGitRepoPath ?? conversation?.preferences.gitRepoPath ?? null) : (conversation?.preferences.gitRepoPath ?? null)}
-        />
+        {#if GitWorkspaceView}
+          <GitWorkspaceView
+            onOpenCommitDiff={openGitCommitDiffTab}
+            onOpenDiffTab={openGitDiffTab}
+            onSelectRepo={handleRepoSelect}
+            readOnly={readOnlyRole}
+            selectedRepoPath={readOnlyRole ? (viewerGitRepoPath ?? conversation?.preferences.gitRepoPath ?? null) : (conversation?.preferences.gitRepoPath ?? null)}
+          />
+        {:else}
+          <div class="workspace-loading-card h-full">
+            <RefreshCw size={16} class="animate-spin text-gray-300" />
+            <span>{getWorkspaceLoadingLabel()}</span>
+          </div>
+        {/if}
       {:else if activeGitDiffTab}
-        <GitWorkspace
-          onOpenCommitDiff={openGitCommitDiffTab}
-          onOpenDiffTab={openGitDiffTab}
-          onSelectRepo={(repoPath) => handleGitDiffTabRepoSelect(activeGitDiffTab.id, repoPath)}
-          openRequest={activeGitDiffTab.request}
-          readOnly={readOnlyRole}
-          selectedRepoPath={activeGitDiffTab.repoPath}
-        />
+        {#if GitWorkspaceView}
+          <GitWorkspaceView
+            onOpenCommitDiff={openGitCommitDiffTab}
+            onOpenDiffTab={openGitDiffTab}
+            onSelectRepo={(repoPath) => handleGitDiffTabRepoSelect(activeGitDiffTab.id, repoPath)}
+            openRequest={activeGitDiffTab.request}
+            readOnly={readOnlyRole}
+            selectedRepoPath={activeGitDiffTab.repoPath}
+          />
+        {:else}
+          <div class="workspace-loading-card h-full">
+            <RefreshCw size={16} class="animate-spin text-gray-300" />
+            <span>{getWorkspaceLoadingLabel()}</span>
+          </div>
+        {/if}
       {:else if activeCodeDiffTab}
-        <CodeDiffWorkspace onClose={() => closeCodeDiffTab(activeCodeDiffTab.id)} title={activeCodeDiffTab.title} views={activeCodeDiffTab.views} />
+        {#if CodeDiffWorkspaceView}
+          <CodeDiffWorkspaceView onClose={() => closeCodeDiffTab(activeCodeDiffTab.id)} title={activeCodeDiffTab.title} views={activeCodeDiffTab.views} />
+        {:else}
+          <div class="workspace-loading-card h-full">
+            <RefreshCw size={16} class="animate-spin text-gray-300" />
+            <span>{getWorkspaceLoadingLabel()}</span>
+          </div>
+        {/if}
       {:else}
-        <TerminalWorkspace
-          terminalId={activeWorkspaceTabId.replace(/^terminal:/u, "")}
-          selectedSessionId={selectedSessionId}
-          readOnly={readOnlyRole}
-          onAttachContext={(payload) => {
-            attachTerminalContext(payload);
-          }}
-        />
+        {#if TerminalWorkspaceView}
+          <TerminalWorkspaceView
+            terminalId={activeWorkspaceTabId.replace(/^terminal:/u, "")}
+            selectedSessionId={selectedSessionId}
+            readOnly={readOnlyRole}
+            onAttachContext={(payload) => {
+              attachTerminalContext(payload);
+            }}
+          />
+        {:else}
+          <div class="workspace-loading-card h-full">
+            <RefreshCw size={16} class="animate-spin text-gray-300" />
+            <span>{getWorkspaceLoadingLabel()}</span>
+          </div>
+        {/if}
       {/if}
     </div>
   </main>
@@ -9544,19 +10048,23 @@
 {/if}
 
 <style>
-  @keyframes thinking-shimmer {
+  @keyframes thinking-chip-sheen {
     0% {
-      background-position: 200% 50%;
-      opacity: 0.72;
+      transform: translateX(-132%);
+      opacity: 0;
     }
 
-    50% {
-      opacity: 1;
+    18% {
+      opacity: 0.34;
+    }
+
+    58% {
+      opacity: 0.18;
     }
 
     100% {
-      background-position: -15% 50%;
-      opacity: 0.78;
+      transform: translateX(168%);
+      opacity: 0;
     }
   }
 
@@ -9579,16 +10087,29 @@
   }
 
   .thinking-indicator {
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
     backdrop-filter: blur(10px);
   }
 
+  .thinking-indicator::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    width: 42%;
+    background: linear-gradient(90deg, rgba(255, 255, 255, 0), rgba(251, 191, 36, 0.18), rgba(255, 255, 255, 0));
+    transform: translateX(-132%);
+    animation: thinking-chip-sheen 2.6s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+    pointer-events: none;
+    z-index: 0;
+  }
+
   .thinking-indicator__label {
-    background-image: linear-gradient(90deg, rgba(107, 114, 128, 0.62) 0%, rgba(17, 24, 39, 0.96) 32%, rgba(217, 119, 6, 0.88) 52%, rgba(17, 24, 39, 0.96) 70%, rgba(107, 114, 128, 0.62) 100%);
-    background-size: 220% 100%;
-    background-clip: text;
-    -webkit-background-clip: text;
-    color: transparent;
-    animation: thinking-shimmer 1.9s linear infinite;
+    position: relative;
+    z-index: 1;
+    color: rgba(17, 24, 39, 0.92);
+    letter-spacing: -0.01em;
   }
 
   .diff-loading-bar {
@@ -9637,6 +10158,60 @@
   .ui-animated-button:disabled {
     transform: none;
     box-shadow: none;
+  }
+
+  .workspace-loading-card {
+    display: flex;
+    min-height: 14rem;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 1.5rem;
+    background: color-mix(in srgb, var(--panel) 92%, transparent);
+    color: rgba(100, 116, 139, 0.95);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.38);
+  }
+
+  .top-load-bar-track {
+    height: 0.18rem;
+    width: 100%;
+    overflow: hidden;
+    background: color-mix(in srgb, var(--panel-soft) 72%, transparent);
+  }
+
+  .top-load-bar-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, color-mix(in srgb, var(--brand) 76%, white 6%), color-mix(in srgb, var(--brand) 54%, var(--ink) 10%));
+    transition: width 180ms cubic-bezier(0.22, 1, 0.36, 1);
+    box-shadow: 0 0 20px color-mix(in srgb, var(--brand) 24%, transparent);
+  }
+
+  .top-load-pill {
+    position: absolute;
+    top: 0.75rem;
+    right: 1rem;
+    display: inline-flex;
+    max-width: min(22rem, calc(100vw - 2rem));
+    align-items: center;
+    gap: 0.45rem;
+    border: 1px solid color-mix(in srgb, var(--panel-line) 78%, transparent);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--panel) 92%, transparent);
+    color: color-mix(in srgb, var(--ink) 76%, transparent);
+    padding: 0.38rem 0.7rem;
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    box-shadow: 0 18px 40px -34px rgba(15, 23, 42, 0.42);
+    backdrop-filter: blur(14px);
+  }
+
+  .top-load-pill span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .transcript-dock {
@@ -9801,6 +10376,20 @@
   :global(:root[data-theme="dark"]) .search-popover__close:hover {
     background: rgba(51, 65, 85, 0.78) !important;
     color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .thinking-indicator {
+    border-color: rgba(71, 85, 105, 0.44) !important;
+    background: rgba(15, 23, 42, 0.88) !important;
+    box-shadow: 0 18px 42px -30px rgba(2, 6, 23, 0.84) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .thinking-indicator::after {
+    background: linear-gradient(90deg, rgba(255, 255, 255, 0), rgba(251, 191, 36, 0.2), rgba(255, 255, 255, 0));
+  }
+
+  :global(:root[data-theme="dark"]) .thinking-indicator__label {
+    color: rgba(248, 250, 252, 0.94);
   }
 
   :global(:root[data-theme="dark"]) .auth-dialog-card {
@@ -10088,6 +10677,13 @@
     box-shadow: 0 14px 24px -20px rgba(14, 116, 144, 0.52) !important;
   }
 
+  :global(:root[data-theme="dark"]) .composer-settings-segmented__button[data-selected="true"][data-tone="context"] {
+    border-color: rgba(245, 158, 11, 0.34) !important;
+    background: linear-gradient(180deg, rgba(146, 64, 14, 0.3), rgba(120, 53, 15, 0.42)) !important;
+    color: #fcd34d !important;
+    box-shadow: 0 14px 24px -20px rgba(146, 64, 14, 0.62) !important;
+  }
+
   :global(:root[data-theme="dark"]) .surface-contrast-button {
     background: linear-gradient(180deg, rgba(51, 65, 85, 0.96), rgba(30, 41, 59, 0.98)) !important;
     color: #f8fafc !important;
@@ -10169,9 +10765,8 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .thinking-indicator__label {
-      animation-duration: 0.01ms;
-      animation-iteration-count: 1;
+    .thinking-indicator::after {
+      animation: none;
     }
 
     .ui-animated-button,
@@ -10315,9 +10910,9 @@
     </div>
   {:else if ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"].includes(item.type)}
     <div class="turn-card-shell border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm hover:shadow-md transition-shadow">
-      <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-3 px-4 py-3 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel} onclick={() => void toggleToolItem(turnId, item.id)}>
-        <div class="flex min-w-0 flex-1 items-center gap-3">
-          <div class="shrink-0 rounded-xl bg-gray-100 p-2 text-gray-500">
+      <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-2.5 px-3 py-2.25 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel} onclick={() => void toggleToolItem(turnId, item.id)}>
+        <div class="flex min-w-0 flex-1 items-center gap-2.5">
+          <div class="shrink-0 rounded-lg bg-gray-100 p-1.5 text-gray-500">
             {#if item.type === 'commandExecution'}
               <Terminal size={14} />
             {:else if item.type === 'fileChange'}
@@ -10329,11 +10924,11 @@
             {/if}
           </div>
           <div class="min-w-0 flex-1 text-left">
-            <h4 class="truncate text-xs font-bold leading-tight text-gray-900">{getToolItemLabel(item)}</h4>
+            <h4 class="truncate text-[11px] font-bold leading-tight text-gray-900">{getToolItemLabel(item)}</h4>
             <p class="mt-0.5 truncate text-[10px] font-medium text-gray-500">{getToolItemSummary(item) || ui.executing}</p>
           </div>
         </div>
-        <div class="flex shrink-0 items-center gap-3">
+        <div class="flex shrink-0 items-center gap-2">
           {#if item.type === "commandExecution" && item.exitCode !== null}
             <span class="px-1.5 py-0.5 bg-gray-100 text-[9px] font-bold text-gray-500 rounded uppercase tracking-tighter">Exit {item.exitCode}</span>
           {/if}
@@ -10346,23 +10941,23 @@
             {#if item.type === "fileChange"}
               {@render renderDiffLoadingCard(ui.computingDiffs)}
             {:else}
-              <div class="p-8 flex items-center justify-center gap-2 text-gray-400 text-xs italic"><RefreshCw size={16} class="animate-spin" />{ui.fetching}</div>
+              <div class="flex items-center justify-center gap-2 p-6 text-xs italic text-gray-400"><RefreshCw size={15} class="animate-spin" />{ui.fetching}</div>
             {/if}
           {:else if getItemDetailError(turnId, item.id)}<div class="p-4 bg-red-50 text-red-600 text-xs border-t border-red-100">{getItemDetailError(turnId, item.id)}</div>
           {:else if item.type === "fileChange" && getFileChangeViews(item).length > 0}
-            <div class="p-0 space-y-0">{#each getFileChangeViews(item) as change}<div class="border-b border-gray-100 last:border-0"><button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-5 py-2 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel + 1} onclick={() => toggleFileChangeEntry(turnId, item.id, change)}><div class="flex items-center gap-2"><span class="text-[10px] font-mono font-bold text-gray-600">{change.path}</span><span class="px-1.5 py-0.5 bg-gray-100 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{change.kind}</span></div><ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turnId, item.id, change) ? 'rotate-180' : ''} transition-transform" /></button>{#if isFileChangeEntryExpanded(turnId, item.id, change)}<div class="turn-card-expand bg-gray-50 p-0 border-t border-gray-100" transition:slide|local={{ duration: 180 }}>{#if change.renderable}<MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-4 text-[10px] font-mono text-gray-600 overflow-x-auto">{change.diff}</pre>{/if}</div>{/if}</div>{/each}</div>
-          {:else if getDeferredToolBody(item)}<pre class="p-4 bg-gray-50 text-[11px] font-mono text-gray-700 overflow-x-auto leading-relaxed">{getDeferredToolBody(item)}</pre>
+            <div class="p-0 space-y-0">{#each getFileChangeViews(item) as change}<div class="border-b border-gray-100 last:border-0"><button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-4 py-1.75 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel + 1} onclick={() => toggleFileChangeEntry(turnId, item.id, change)}><div class="flex items-center gap-2"><span class="text-[10px] font-mono font-bold text-gray-600">{change.path}</span><span class="px-1.5 py-0.5 bg-gray-100 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{change.kind}</span></div><ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turnId, item.id, change) ? 'rotate-180' : ''} transition-transform" /></button>{#if isFileChangeEntryExpanded(turnId, item.id, change)}<div class="turn-card-expand bg-gray-50 p-0 border-t border-gray-100" transition:slide|local={{ duration: 180 }}>{#if change.renderable}<LazyMonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-3 text-[10px] font-mono text-gray-600 overflow-x-auto">{change.diff}</pre>{/if}</div>{/if}</div>{/each}</div>
+          {:else if getDeferredToolBody(item)}<pre class="bg-gray-50 p-3 text-[11px] font-mono leading-relaxed text-gray-700 overflow-x-auto">{getDeferredToolBody(item)}</pre>
           {:else}<div class="p-4 text-gray-400 text-xs italic text-center">{ui.noAdditionalOutput}</div>{/if}
         </div>
       {/if}
     </div>
   {:else if item.type === "collabAgentToolCall"}
     <div class="turn-card-shell border border-amber-200 rounded-2xl bg-white overflow-hidden shadow-sm group">
-      <div class="turn-card-header turn-card-header--amber px-4 py-3 flex items-center justify-between gap-4" data-sticky-level={stickyLevel}>
-        <div class="flex items-center gap-3"><div class="p-2 bg-white border border-amber-200 text-amber-600 rounded-xl group-hover:bg-amber-600 group-hover:text-white transition-all shadow-sm"><Bot size={16} /></div><div><h4 class="text-xs font-bold text-gray-900 leading-tight">{ui.subagentInvocation}</h4><div class="flex items-center gap-2 mt-0.5"><span class="text-[10px] font-bold text-amber-600 uppercase tracking-widest">{item.tool}</span><span class="w-1 h-1 rounded-full bg-amber-200"></span><span class="text-[10px] text-gray-500 font-medium uppercase tracking-tighter">{item.status}</span></div></div></div>
-        {#if getPrimarySubagentThreadId(item)}<button class="px-3 py-1.5 bg-white border border-amber-200 rounded-lg text-[10px] font-bold text-amber-700 hover:bg-amber-600 hover:text-white transition-all shadow-sm" onclick={() => void openSubagentThread(getPrimarySubagentThreadId(item) ?? "")}>{ui.viewThread}</button>{/if}
+      <div class="turn-card-header turn-card-header--amber flex items-center justify-between gap-3 px-3 py-2.25" data-sticky-level={stickyLevel}>
+        <div class="flex items-center gap-2.5"><div class="rounded-lg border border-amber-200 bg-white p-1.5 text-amber-600 shadow-sm transition-all group-hover:bg-amber-600 group-hover:text-white"><Bot size={15} /></div><div><h4 class="text-[11px] font-bold leading-tight text-gray-900">{ui.subagentInvocation}</h4><div class="mt-0.5 flex items-center gap-1.5"><span class="text-[10px] font-bold uppercase tracking-widest text-amber-600">{item.tool}</span><span class="h-1 w-1 rounded-full bg-amber-200"></span><span class="text-[10px] font-medium uppercase tracking-tighter text-gray-500">{item.status}</span></div></div></div>
+        {#if getPrimarySubagentThreadId(item)}<button class="rounded-md border border-amber-200 bg-white px-2.5 py-1 text-[10px] font-bold text-amber-700 shadow-sm transition-all hover:bg-amber-600 hover:text-white" onclick={() => void openSubagentThread(getPrimarySubagentThreadId(item) ?? "")}>{ui.viewThread}</button>{/if}
       </div>
-      {#if item.prompt}<div class="p-4 border-t border-amber-100 bg-white"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">{ui.instructions}</p><pre class="text-[11px] font-mono text-gray-600 leading-relaxed whitespace-pre-wrap italic">{String(item.prompt)}</pre></div>{/if}
+      {#if item.prompt}<div class="border-t border-amber-100 bg-white p-3"><p class="mb-1.5 text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.instructions}</p><pre class="text-[11px] font-mono italic leading-relaxed text-gray-600 whitespace-pre-wrap">{String(item.prompt)}</pre></div>{/if}
     </div>
   {/if}
 {/snippet}
@@ -10371,19 +10966,19 @@
   {#if entry.kind === "item"}{@render renderTurnItem(turnId, entry.item, stickyLevel)}
   {:else if entry.kind === "readGroup"}
     <div class="turn-card-shell border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm">
-      <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-3 px-4 py-3 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel} onclick={() => void toggleReadOnlyCommandGroup(turnId, entry.key, entry.items)}><div class="flex min-w-0 flex-1 items-center gap-3"><div class="shrink-0 rounded-xl bg-gray-100 p-2 text-gray-400">{#if getReadOnlyCommandGroupKind(entry.items) === "git"}<GitBranch size={14} />{:else}<Search size={14} />{/if}</div><div class="min-w-0 flex-1 text-left"><h4 class="truncate text-xs font-bold leading-tight text-gray-900">{getReadOnlyCommandGroupLabel(entry.items)}</h4><p class="mt-0.5 truncate text-[10px] font-medium text-gray-500">{summarizeReadOnlyCommandGroup(entry.items)}</p></div></div><div class="flex shrink-0 items-center gap-3"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{ui.opsCount(entry.items.length)}</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
+      <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-2.5 px-3 py-2.25 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel} onclick={() => void toggleReadOnlyCommandGroup(turnId, entry.key, entry.items)}><div class="flex min-w-0 flex-1 items-center gap-2.5"><div class="shrink-0 rounded-lg bg-gray-100 p-1.5 text-gray-400">{#if getReadOnlyCommandGroupKind(entry.items) === "git"}<GitBranch size={14} />{:else}<Search size={14} />{/if}</div><div class="min-w-0 flex-1 text-left"><h4 class="truncate text-[11px] font-bold leading-tight text-gray-900">{getReadOnlyCommandGroupLabel(entry.items)}</h4><p class="mt-0.5 truncate text-[10px] font-medium text-gray-500">{summarizeReadOnlyCommandGroup(entry.items)}</p></div></div><div class="flex shrink-0 items-center gap-2"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{ui.opsCount(entry.items.length)}</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
       {#if isItemExpanded(turnId, entry.key)}
-        <div class="turn-card-expand border-t border-gray-100 bg-gray-50/30" transition:slide|local={{ duration: 220 }}>{#if isItemDetailLoading(turnId, entry.key)}<div class="p-6 flex justify-center text-gray-400 italic text-xs animate-pulse">{ui.readingFileData}</div>
-          {:else}<div class="p-0">{#each entry.items as commandItem}<div class="p-4 border-b border-gray-100 last:border-0"><div class="flex items-center justify-between mb-2"><span class="text-[10px] font-bold text-gray-500 uppercase tracking-widest">{summarizeCommand(commandItem)}</span>{#if commandItem.exitCode !== null}<span class="text-[9px] font-mono text-gray-400">Exit {commandItem.exitCode}</span>{/if}</div><pre class="p-3 bg-white border border-gray-200 rounded-lg text-[10px] font-mono text-gray-600 overflow-x-auto max-h-60 leading-relaxed">{String(commandItem.aggregatedOutput ?? "")}</pre></div>{/each}</div>{/if}</div>
+        <div class="turn-card-expand border-t border-gray-100 bg-gray-50/30" transition:slide|local={{ duration: 220 }}>{#if isItemDetailLoading(turnId, entry.key)}<div class="flex justify-center p-5 text-xs italic text-gray-400 animate-pulse">{ui.readingFileData}</div>
+          {:else}<div class="p-0">{#each entry.items as commandItem}<div class="border-b border-gray-100 p-3 last:border-0"><div class="mb-1.5 flex items-center justify-between"><span class="text-[10px] font-bold uppercase tracking-widest text-gray-500">{summarizeCommand(commandItem)}</span>{#if commandItem.exitCode !== null}<span class="text-[9px] font-mono text-gray-400">Exit {commandItem.exitCode}</span>{/if}</div><pre class="max-h-60 overflow-x-auto rounded-lg border border-gray-200 bg-white p-2.5 text-[10px] font-mono leading-relaxed text-gray-600">{String(commandItem.aggregatedOutput ?? "")}</pre></div>{/each}</div>{/if}</div>
       {/if}
     </div>
   {:else}
     <div class="turn-card-shell border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm">
       <div class="turn-card-header turn-card-header--neutral flex items-center gap-2 pr-3" data-sticky-level={stickyLevel}>
-        <button class="min-w-0 flex-1 flex items-center justify-between px-4 py-3 hover:bg-gray-50 transition-colors" onclick={() => void toggleFileChangeGroup(turnId, entry.key, entry.items)} type="button"><div class="flex items-center gap-3 min-w-0"><div class="p-2 bg-gray-100 text-gray-400 rounded-xl shrink-0"><FileDiff size={14} /></div><div class="text-left min-w-0"><h4 class="text-xs font-bold text-gray-900 leading-tight">{getFileChangeGroupLabel(entry.items)}</h4><p class="text-[10px] text-gray-500 mt-0.5 font-medium truncate">{summarizeFileChangeGroup(entry.items)}</p></div></div><div class="flex items-center gap-3 shrink-0"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{getFileChangeGroupSummaryEntries(entry.items).length} Files</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
+        <button class="min-w-0 flex-1 flex items-center justify-between px-3 py-2.25 hover:bg-gray-50 transition-colors" onclick={() => void toggleFileChangeGroup(turnId, entry.key, entry.items)} type="button"><div class="flex min-w-0 items-center gap-2.5"><div class="shrink-0 rounded-lg bg-gray-100 p-1.5 text-gray-400"><FileDiff size={14} /></div><div class="min-w-0 text-left"><h4 class="text-[11px] font-bold leading-tight text-gray-900">{getFileChangeGroupLabel(entry.items)}</h4><p class="mt-0.5 truncate text-[10px] font-medium text-gray-500">{summarizeFileChangeGroup(entry.items)}</p></div></div><div class="flex shrink-0 items-center gap-2"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{getFileChangeGroupSummaryEntries(entry.items).length} Files</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
         {#if getFileChangeGroupViews(entry.items).length > 0}
           <button
-            class="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-[10px] font-bold text-gray-700 hover:bg-gray-50 transition-colors shrink-0"
+            class="shrink-0 rounded-md border border-gray-200 bg-white px-2.5 py-1 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-50"
             onclick={(event) => {
               event.stopPropagation();
               openFileChangeGroupInTab(getFileChangeGroupViews(entry.items), `group:${turnId}:${entry.key}`, getFileChangeGroupLabel(entry.items));
@@ -10396,7 +10991,7 @@
       </div>
       {#if isItemExpanded(turnId, entry.key)}
         <div class="turn-card-expand border-t border-gray-100" transition:slide|local={{ duration: 220 }}>{#if isItemDetailLoading(turnId, entry.key)}{@render renderDiffLoadingCard(ui.computingDiffs)}
-          {:else}<div class="p-0">{#each getFileChangeGroupViews(entry.items) as change}<div class="border-b border-gray-100 last:border-0"><button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-5 py-2 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel + 1} onclick={() => toggleFileChangeEntry(turnId, entry.key, change)}><span class="text-[10px] font-mono font-bold text-gray-600">{change.path}</span><ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turnId, entry.key, change) ? 'rotate-180' : ''} transition-transform" /></button>{#if isFileChangeEntryExpanded(turnId, entry.key, change)}<div class="turn-card-expand bg-gray-50 border-t border-gray-100" transition:slide|local={{ duration: 180 }}>{#if change.renderable}<MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-4 text-[10px] font-mono text-gray-600 overflow-x-auto">{change.diff}</pre>{/if}</div>{/if}</div>{/each}</div>{/if}</div>
+          {:else}<div class="p-0">{#each getFileChangeGroupViews(entry.items) as change}<div class="border-b border-gray-100 last:border-0"><button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-5 py-2 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel + 1} onclick={() => toggleFileChangeEntry(turnId, entry.key, change)}><span class="text-[10px] font-mono font-bold text-gray-600">{change.path}</span><ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turnId, entry.key, change) ? 'rotate-180' : ''} transition-transform" /></button>{#if isFileChangeEntryExpanded(turnId, entry.key, change)}<div class="turn-card-expand bg-gray-50 border-t border-gray-100" transition:slide|local={{ duration: 180 }}>{#if change.renderable}<LazyMonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-4 text-[10px] font-mono text-gray-600 overflow-x-auto">{change.diff}</pre>{/if}</div>{/if}</div>{/each}</div>{/if}</div>
       {/if}
     </div>
   {/if}

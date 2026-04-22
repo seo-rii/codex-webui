@@ -273,6 +273,7 @@ pub(crate) async fn start_arena_run_payload(
                     "approvalPolicy": session_preferences.get("approvalPolicy").cloned().unwrap_or_else(|| json!("on-request")),
                     "sandbox": session_preferences.get("sandboxMode").cloned().unwrap_or_else(|| json!("workspace-write")),
                     "personality": session_preferences.get("personality").cloned().unwrap_or(Value::Null),
+                    "config": preferences_model_context_config(&Value::Object(session_preferences.clone())),
                     "serviceTier": match session_preferences.get("speed").and_then(Value::as_str) {
                         Some("fast") => Value::String("fast".to_string()),
                         Some("flex") => Value::String("flex".to_string()),

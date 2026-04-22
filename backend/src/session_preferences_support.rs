@@ -43,6 +43,12 @@ pub(crate) async fn normalize_session_preferences_payload(
                 .to_string(),
         ),
     );
+    next_preferences.insert(
+        "modelContextWindow".to_string(),
+        preferences_model_context_window(&Value::Object(next_preferences.clone()))
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
 
     Ok(Value::Object(next_preferences))
 }

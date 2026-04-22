@@ -46,12 +46,20 @@
   import { api } from "$lib/api";
   import { applyStreamEvent, createConversationState, mergeConversationState, type ConversationState } from "$lib/chat-state";
   import ArenaWorkspace from "$lib/components/ArenaWorkspace.svelte";
+  import AuthLoginOverlay from "$lib/components/AuthLoginOverlay.svelte";
+  import CodeDiffWorkspace from "$lib/components/CodeDiffWorkspace.svelte";
+  import FolderBrowserDialog from "$lib/components/FolderBrowserDialog.svelte";
   import GitWorkspace from "$lib/components/GitWorkspace.svelte";
   import MarkdownMessage from "$lib/components/MarkdownMessage.svelte";
   import MonacoDiffEditor from "$lib/components/MonacoDiffEditor.svelte";
+  import SessionRecoveryModal from "$lib/components/SessionRecoveryModal.svelte";
   import SessionSidebar from "$lib/components/SessionSidebar.svelte";
+  import SessionTurnSearchPopover from "$lib/components/SessionTurnSearchPopover.svelte";
   import SettingsWorkspace from "$lib/components/SettingsWorkspace.svelte";
+  import StartupAlertModal from "$lib/components/StartupAlertModal.svelte";
   import TerminalWorkspace from "$lib/components/TerminalWorkspace.svelte";
+  import WorkspaceHeader from "$lib/components/WorkspaceHeader.svelte";
+  import WorkspaceTabStrip from "$lib/components/WorkspaceTabStrip.svelte";
   import { describeUiError } from "$lib/ui-errors";
   import { activeLocale, localeOptions, localeSignal, updateLocale } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
@@ -75,6 +83,7 @@
     CodexItem,
     CodexQuotaStatus,
     CodexRuntimeStatus,
+    CodexTurn,
     DirectoryPayload,
     GitCommit,
     GitOpenRequest,
@@ -1778,6 +1787,18 @@
   const startupShutdownRemainingSeconds = $derived.by(() =>
     startupScheduledShutdown ? Math.max(0, Math.ceil((startupScheduledShutdown.scheduledFor - startupAlertNow) / 1000)) : null
   );
+  const startupScheduledShutdownThreadLabel = $derived.by(() => {
+    if (!startupScheduledShutdown?.sessionId) {
+      return null;
+    }
+
+    const sessionName =
+      sessions.find((session) => session.id === startupScheduledShutdown.sessionId)?.name ||
+      (conversation?.thread.id === startupScheduledShutdown.sessionId
+        ? getConversationDisplayTitle(conversation) || getDefaultThreadTitle()
+        : startupScheduledShutdown.sessionId);
+    return ui.startupAlertShutdownThread(sessionName);
+  });
 
   function dismissFeedbackSnackbar() {
     errorText = "";
@@ -7170,6 +7191,20 @@
     };
   }
 
+  function replaceConversationTurn(turnId: string, nextTurn: CodexTurn) {
+    if (!conversation) {
+      return;
+    }
+
+    conversation = {
+      ...conversation,
+      thread: {
+        ...conversation.thread,
+        turns: conversation.thread.turns.map((turn) => (turn.id === turnId ? nextTurn : turn))
+      }
+    };
+  }
+
   function isTurnLoading(turnId: string) {
     return Boolean(loadingTurns[turnId]);
   }
@@ -7183,6 +7218,7 @@
       return;
     }
 
+    const sessionId = selectedSessionId;
     const turn = conversation.thread.turns.find((candidate) => candidate.id === turnId);
     if (!turn || turn.detailState === "full" || loadingTurns[turnId]) {
       return;
@@ -7198,24 +7234,24 @@
     };
 
     try {
-      const response = await api.getSessionTurn(selectedSessionId, turnId);
-      if (!conversation || conversation.thread.id !== selectedSessionId) {
+      const response = await api.getSessionTurn(sessionId, turnId);
+      if (!conversation || conversation.thread.id !== sessionId) {
         return;
       }
 
-      conversation = {
-        ...conversation,
-        thread: {
-          ...conversation.thread,
-          turns: conversation.thread.turns.map((candidate) => (candidate.id === turnId ? response.turn : candidate))
-        }
-      };
+      replaceConversationTurn(turnId, response.turn);
     } catch (error) {
+      if (!conversation || conversation.thread.id !== sessionId) {
+        return;
+      }
       turnLoadErrors = {
         ...turnLoadErrors,
         [turnId]: describeError(error)
       };
     } finally {
+      if (!conversation || conversation.thread.id !== sessionId) {
+        return;
+      }
       loadingTurns = {
         ...loadingTurns,
         [turnId]: false
@@ -7426,6 +7462,7 @@
       return;
     }
 
+    const sessionId = selectedSessionId;
     const itemKey = getItemKey(turnId, itemId);
     const turn = conversation.thread.turns.find((candidate) => candidate.id === turnId);
     const item = turn?.items.find((candidate) => candidate.id === itemId);
@@ -7447,14 +7484,50 @@
     };
 
     try {
-      const response = await api.getSessionItemDetail(selectedSessionId, turnId, itemId);
+      const response = await api.getSessionItemDetail(sessionId, turnId, itemId);
+      if (!conversation || conversation.thread.id !== sessionId) {
+        return;
+      }
       updateConversationItem(turnId, itemId, response.item);
     } catch (error) {
+      const message =
+        error instanceof Error ? error.message : typeof error === "string" ? error : "";
+      if (
+        message.includes("Transcript item detail not found.") &&
+        conversation &&
+        conversation.thread.id === sessionId
+      ) {
+        try {
+          const response = await api.getSessionTurn(sessionId, turnId);
+          if (!conversation || conversation.thread.id !== sessionId) {
+            return;
+          }
+          replaceConversationTurn(turnId, response.turn);
+          expandedItems = {
+            ...expandedItems,
+            [itemKey]: false
+          };
+          itemDetailErrors = {
+            ...itemDetailErrors,
+            [itemKey]: ""
+          };
+          return;
+        } catch {
+          // Fall through to surface the original detail error.
+        }
+      }
+
+      if (!conversation || conversation.thread.id !== sessionId) {
+        return;
+      }
       itemDetailErrors = {
         ...itemDetailErrors,
         [itemKey]: describeError(error)
       };
     } finally {
+      if (!conversation || conversation.thread.id !== sessionId) {
+        return;
+      }
       loadingItemDetails = {
         ...loadingItemDetails,
         [itemKey]: false
@@ -7476,8 +7549,9 @@
   }
 
   function scheduleExpandedItemRefresh(turnId: string, itemId: string) {
+    const sessionId = selectedSessionId;
     const itemKey = getItemKey(turnId, itemId);
-    if (!expandedItems[itemKey] || itemDetailRefreshTimers.has(itemKey)) {
+    if (!sessionId || !expandedItems[itemKey] || itemDetailRefreshTimers.has(itemKey)) {
       return;
     }
 
@@ -7485,6 +7559,9 @@
       itemKey,
       setTimeout(() => {
         itemDetailRefreshTimers.delete(itemKey);
+        if (selectedSessionId !== sessionId) {
+          return;
+        }
         void loadItemDetail(turnId, itemId, true);
       }, 240)
     );
@@ -8005,76 +8082,19 @@
     </div>
 
     {#if authenticated === false}
-      <div class="ui-scrim ui-scrim--soft absolute inset-0"></div>
-      <div class="absolute inset-0 z-10 flex items-center justify-center p-4 sm:p-6">
-        <div class="auth-dialog-card w-full max-w-xl rounded-[2rem] border border-white/70 bg-white/92 p-6 shadow-[0_32px_90px_rgba(15,23,42,0.24)] backdrop-blur-2xl sm:p-8">
-          <div class="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
-            <div class="space-y-3">
-              <p class="text-[11px] font-bold uppercase tracking-[0.28em] text-amber-700">{ui.privateGateway}</p>
-              <div>
-                <h1 class="text-3xl font-semibold tracking-tight text-gray-950 sm:text-4xl">{ui.appTitle}</h1>
-                <p class="mt-3 max-w-md text-sm leading-7 text-gray-500">{ui.loginLede}</p>
-              </div>
-            </div>
-            <label class="flex min-w-[12rem] flex-col gap-1.5">
-              <span class="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">{ui.language}</span>
-              <div class="relative">
-                <select
-                  aria-label={ui.language}
-                  class="auth-dialog-select w-full appearance-none rounded-2xl border border-gray-200 bg-white px-3.5 py-2.5 pr-9 text-sm font-semibold text-gray-700 shadow-sm outline-none transition focus:border-amber-400 focus:ring-4 focus:ring-amber-100"
-                  onchange={(event) =>
-                    updateLocale((event.currentTarget as HTMLSelectElement).value as (typeof localeOptions)[number]["value"])}
-                  value={$activeLocale}
-                >
-                  {#each localeOptions as option (option.value)}
-                    <option value={option.value}>{option.label}</option>
-                  {/each}
-                </select>
-                <div class="pointer-events-none absolute inset-y-0 right-3 flex items-center text-gray-400">
-                  <ChevronDown size={16} />
-                </div>
-              </div>
-            </label>
-          </div>
-
-          <form class="mt-8 space-y-5" data-testid="login-form" onsubmit={(event) => {
-            event.preventDefault();
-            void handleLogin();
-          }}>
-            <label class="block space-y-2">
-              <span class="text-sm font-semibold text-gray-700">{ui.password}</span>
-              <input
-                bind:value={loginPassword}
-                autocomplete="current-password"
-                class="auth-dialog-input w-full rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-900 shadow-sm outline-none transition focus:border-amber-500 focus:ring-4 focus:ring-amber-100"
-                data-testid="login-password"
-                placeholder={ui.password}
-                type="password"
-              />
-            </label>
-
-            {#if loginHcaptcha.enabled && loginHcaptcha.siteKey}
-              <div
-                bind:this={loginHcaptchaContainer}
-                class="auth-dialog-hcaptcha min-h-[82px] overflow-hidden rounded-2xl border border-gray-200 bg-white px-3 py-3 shadow-sm"
-              ></div>
-            {/if}
-
-            <button
-              class="inline-flex min-w-32 items-center justify-center rounded-2xl bg-amber-600 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-amber-200/70 transition hover:bg-amber-700 disabled:cursor-not-allowed disabled:bg-amber-300"
-              data-testid="login-submit"
-              disabled={loginBusy || (loginHcaptcha.enabled && !loginHcaptchaToken)}
-              type="submit"
-            >
-              {loginBusy ? ui.signingIn : ui.signIn}
-            </button>
-          </form>
-
-          {#if loginMessage}
-            <p class="auth-dialog-message mt-4 rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">{loginMessage}</p>
-          {/if}
-        </div>
-      </div>
+      <AuthLoginOverlay
+        activeLocale={$activeLocale}
+        bind:loginHcaptchaContainer={loginHcaptchaContainer}
+        bind:loginPassword={loginPassword}
+        {localeOptions}
+        {loginBusy}
+        {loginHcaptcha}
+        {loginHcaptchaToken}
+        {loginMessage}
+        {ui}
+        onLocaleChange={(locale) => updateLocale(locale as (typeof localeOptions)[number]["value"])}
+        onSubmit={() => void handleLogin()}
+      />
     {:else if errorText}
       <div class="pointer-events-none absolute inset-x-0 bottom-0 z-10 flex justify-center px-4 pb-5 sm:px-6">
         <p class="auth-dialog-message pointer-events-auto max-w-xl rounded-2xl border border-red-100 bg-red-50/95 px-4 py-3 text-sm text-red-700 shadow-lg shadow-red-100/70">
@@ -8269,236 +8289,76 @@
 
   <!-- Main Content -->
   <main class="flex-1 flex flex-col h-full min-w-0 bg-white relative">
-    <header class="flex items-center justify-between px-6 py-3 border-b border-gray-100 bg-white/80 backdrop-blur-md z-40 sticky top-0">
-      <div class="flex items-center gap-4 min-w-0">
-        {#if isMobileLayout}
-          <button class="p-2 -ml-2 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors" onclick={openMobileSidebar}>
-            <Menu size={20} />
-          </button>
-        {/if}
-        
-        <div class="flex flex-col min-w-0">
-          <div class="flex min-w-0 items-center gap-2">
-            <input
-              bind:this={titleInputElement}
-              bind:value={titleDraft}
-              class="text-sm font-semibold bg-transparent border-none p-0 focus:ring-0 placeholder-gray-400 truncate w-full max-w-md"
-              onblur={saveTitle}
-              onkeydown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  void saveTitle();
-                }
-              }}
-              placeholder={ui.threadTitle}
-              readonly={readOnlyRole}
-            />
-            {#if running}
-              <span
-                aria-label={ui.generatingResponse}
-                class="inline-flex h-2.5 w-2.5 shrink-0 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.45)] animate-pulse"
-                title={ui.generatingResponse}
-              ></span>
-            {/if}
-          </div>
-          {#if selectedSessionSummary}
-            <div class="mt-1.5 flex flex-wrap items-center gap-1.5">
-              {#if selectedSessionSummary.pinned}
-                <span class="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-700">
-                  <Pin size={10} />
-                  {m.pinned_only()}
-                </span>
-              {/if}
-              {#each selectedSessionSummary.tags as tag (tag)}
-                <span class="inline-flex items-center rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[10px] font-semibold text-gray-500">
-                  {tag}
-                </span>
-              {/each}
-              <button
-                class="ui-animated-button ui-animated-button--soft inline-flex items-center gap-1 rounded-full border border-gray-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-gray-500 hover:text-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={readOnlyRole}
-                onclick={() => void editSelectedSessionTags()}
-                type="button"
-              >
-                <Pencil size={10} />
-                <span>{m.edit_tags()}</span>
-              </button>
-            </div>
-          {/if}
-        </div>
-      </div>
-
-      <div class="app-header-actions flex min-w-0 shrink-0 items-center gap-1 sm:gap-1.5">
-        {#if conversation?.tokenUsage}
-          <div class="hidden xl:flex items-center gap-1.5 mr-1.5">
-            <span class="rounded-md border border-gray-100 bg-gray-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-tight text-gray-500">
-              {formatTokenCount(conversation.tokenUsage.total.totalTokens)} tok
-            </span>
-            {#if formatContextUsage()}
-              <span class="rounded-md border border-amber-100 bg-amber-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-tight text-amber-700">
-                {formatContextUsage()}
-              </span>
-            {/if}
-          </div>
-        {/if}
-
-        {#if selectedSessionId && activeWorkspaceTabId === "chat"}
-          <button
-            bind:this={sessionTurnSearchTriggerElement}
-            class={`ui-animated-button ui-animated-button--icon inline-flex h-8 w-8 items-center justify-center rounded-lg p-0 transition-all sm:h-9 sm:w-9 ${
-              sessionTurnSearchOpen ? "bg-amber-50 text-amber-600 hover:bg-amber-100" : "text-gray-400 hover:text-amber-600 hover:bg-amber-50"
-            }`}
-            onclick={toggleSessionTurnSearch}
-            title={sessionSearchCopy.openSearch}
-            type="button"
-          >
-            <Search size={18} />
-          </button>
-          <button
-            class="ui-animated-button ui-animated-button--icon inline-flex h-8 w-8 items-center justify-center rounded-lg p-0 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9"
-            disabled={readOnlyRole}
-            onclick={() => void forkCurrentThread("handoff")}
-            title={ui.handoffToNewThread}
-            type="button"
-          >
-            <ArrowRightLeft size={18} />
-          </button>
-          <button
-            class={`ui-animated-button ui-animated-button--icon inline-flex h-8 w-8 items-center justify-center rounded-lg p-0 transition-all sm:h-9 sm:w-9 ${
-              selectedSessionSummary?.pinned
-                ? "bg-amber-50 text-amber-600 hover:bg-amber-100"
-                : "text-gray-400 hover:text-amber-600 hover:bg-amber-50"
-            }`}
-            disabled={readOnlyRole}
-            onclick={() => {
-              if (selectedSessionSummary) {
-                void toggleSessionPinned(selectedSessionSummary);
-              }
-            }}
-            title={selectedSessionSummary?.pinned ? m.unpin_thread() : m.pin_thread()}
-            type="button"
-          >
-            <Pin size={18} />
-          </button>
-          <button
-            class="ui-animated-button ui-animated-button--icon inline-flex h-8 w-8 items-center justify-center rounded-lg p-0 text-gray-400 transition-all hover:bg-amber-50 hover:text-amber-600 disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9"
-            disabled={readOnlyRole}
-            onclick={() => {
-              if (showArchivedSessions) void unarchiveCurrentSession();
-              else void archiveCurrentSession();
-            }}
-            title={showArchivedSessions ? ui.restoreThread : ui.archiveThread}
-            type="button"
-          >
-            {#if showArchivedSessions}<RotateCcw size={18} />{:else}<Archive size={18} />{/if}
-          </button>
-        {/if}
-
-        <div class="mx-0.5 h-4 w-px bg-gray-200"></div>
-
-        <div class="relative">
-          <button 
-            class="surface-contrast-button ui-animated-button ui-animated-button--strong flex h-8 shrink-0 items-center gap-1 rounded-lg bg-gray-900 px-2.5 text-[11px] font-bold text-white whitespace-nowrap transition-all hover:bg-gray-800 shadow-sm active:scale-95 sm:h-9 sm:px-3 sm:text-xs"
-            onclick={() => (workspaceMenuOpen = !workspaceMenuOpen)}
-            title={ui.open}
-          >
-            <Plus size={14} />
-            <span class="hidden xl:inline">{ui.open}</span>
-            <ChevronDown size={12} class={workspaceMenuOpen ? 'rotate-180' : ''} />
-          </button>
-
-          {#if workspaceMenuOpen}
-            <div class="absolute top-10 right-0 z-[72] w-56 rounded-xl border border-gray-200 bg-white p-1 shadow-2xl">
-              {#if isMobileLayout}
-                <button
-                  class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group disabled:cursor-not-allowed disabled:opacity-50"
-                  disabled={readOnlyRole}
-                  onclick={() => {
-                    workspaceMenuOpen = false;
-                    void createSession();
-                  }}
-                  type="button"
-                >
-                  <MessageSquare size={16} class="text-gray-400 group-hover:text-amber-600" />
-                  <span>{ui.newThread}</span>
-                </button>
-                <div class="mx-2 my-1 h-px bg-gray-100"></div>
-              {/if}
-              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" onclick={openTasksTab} type="button">
-                <History size={16} class="text-gray-400 group-hover:text-amber-600" />
-                <span>{ui.tasks}</span>
-              </button>
-              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" onclick={() => { openGitTab(); workspaceMenuOpen = false; }} type="button">
-                <GitBranch size={16} class="text-gray-400 group-hover:text-amber-600" />
-                <span>{ui.gitWorkspace}</span>
-              </button>
-              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group" onclick={() => { openSettingsTab(); workspaceMenuOpen = false; }} type="button">
-                <Settings size={16} class="text-gray-400 group-hover:text-amber-600" />
-                <span>{ui.settingsSkills}</span>
-              </button>
-              <button class="ui-animated-button ui-animated-button--soft w-full flex items-center gap-3 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg transition-colors group disabled:cursor-not-allowed disabled:opacity-50" disabled={readOnlyRole} onclick={() => { void createTerminalTab(); workspaceMenuOpen = false; }} type="button">
-                <Terminal size={16} class="text-gray-400 group-hover:text-amber-600" />
-                <span>{ui.newTerminal}</span>
-              </button>
-            </div>
-          {/if}
-        </div>
-      </div>
-    </header>
+    <WorkspaceHeader
+      activeWorkspaceTabId={activeWorkspaceTabId}
+      bind:searchTriggerElement={sessionTurnSearchTriggerElement}
+      bind:titleDraft={titleDraft}
+      bind:titleInputElement={titleInputElement}
+      bind:workspaceMenuOpen={workspaceMenuOpen}
+      contextUsageLabel={formatContextUsage()}
+      {isMobileLayout}
+      {running}
+      {selectedSessionId}
+      {selectedSessionSummary}
+      searchOpenLabel={sessionSearchCopy.openSearch}
+      sessionSearchOpen={sessionTurnSearchOpen}
+      showArchivedSessions={showArchivedSessions}
+      tokenCountLabel={conversation?.tokenUsage ? `${formatTokenCount(conversation.tokenUsage.total.totalTokens)} tok` : null}
+      readOnly={readOnlyRole}
+      {ui}
+      onCreateSession={() => void createSession()}
+      onCreateTerminalTab={() => void createTerminalTab()}
+      onEditTags={() => void editSelectedSessionTags()}
+      onForkHandoff={() => void forkCurrentThread("handoff")}
+      onOpenGitTab={openGitTab}
+      onOpenMobileSidebar={openMobileSidebar}
+      onOpenSettingsTab={openSettingsTab}
+      onOpenTasksTab={openTasksTab}
+      onSaveTitle={() => void saveTitle()}
+      onToggleArchive={() => {
+        if (showArchivedSessions) void unarchiveCurrentSession();
+        else void archiveCurrentSession();
+      }}
+      onTogglePinned={() => {
+        if (selectedSessionSummary) {
+          void toggleSessionPinned(selectedSessionSummary);
+        }
+      }}
+      onToggleSearch={toggleSessionTurnSearch}
+    />
 
     <!-- Workspace Tabs -->
     {#if workspaceTabs.length > 1}
-      <div class="workspace-tab-strip flex items-center gap-1 px-4 py-1.5 bg-gray-50 border-b border-gray-200 overflow-x-auto scrollbar-none">
-        {#each workspaceTabs as tab (tab.id)}
-          <button
-            class="ui-animated-button ui-animated-button--soft flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all {activeWorkspaceTabId === tab.id ? 'bg-white text-gray-900 shadow-sm border border-gray-200' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100/50'}"
-            onclick={() => activateTab(tab.id)}
-            type="button"
-          >
-            {#if tab.kind === 'chat'}<MessageSquare size={14} />
-            {:else if tab.kind === 'tasks'}<History size={14} />
-            {:else if tab.kind === 'git'}<GitBranch size={14} />
-            {:else if tab.kind === 'settings'}<Settings size={14} />
-            {:else if tab.kind === 'git-diff'}<FileDiff size={14} />
-            {:else if tab.kind === 'code-diff'}<Layout size={14} />
-            {:else if tab.kind === 'terminal'}<Terminal size={14} />
-            {/if}
-            <span>{tab.label}</span>
-            {#if tab.id !== 'chat'}
-              <span
-                aria-label={`Close ${tab.label}`}
-                class="ml-1 p-0.5 hover:bg-gray-200 rounded transition-colors"
-                onclick={(event) => {
-                  event.stopPropagation();
-                  if (tab.kind === "tasks") closeTasksTab();
-                  else if (tab.kind === "git") closeGitTab();
-                  else if (tab.kind === "settings") closeSettingsTab();
-                  else if (tab.kind === "git-diff") closeGitDiffTab(tab.id);
-                  else if (tab.kind === "code-diff") closeCodeDiffTab(tab.id);
-                  else if (tab.kind === "terminal") void closeTerminalTab(tab.id.replace(/^terminal:/u, ""));
-                }}
-                onkeydown={(event) => {
-                  if (event.key !== "Enter" && event.key !== " ") {
-                    return;
-                  }
-                  event.preventDefault();
-                  event.stopPropagation();
-                  if (tab.kind === "tasks") closeTasksTab();
-                  else if (tab.kind === "git") closeGitTab();
-                  else if (tab.kind === "settings") closeSettingsTab();
-                  else if (tab.kind === "git-diff") closeGitDiffTab(tab.id);
-                  else if (tab.kind === "code-diff") closeCodeDiffTab(tab.id);
-                  else if (tab.kind === "terminal") void closeTerminalTab(tab.id.replace(/^terminal:/u, ""));
-                }}
-                role="button"
-                tabindex="0"
-              >
-                <X size={10} />
-              </span>
-            {/if}
-          </button>
-        {/each}
-      </div>
+      <WorkspaceTabStrip
+        activeTabId={activeWorkspaceTabId}
+        tabs={workspaceTabs}
+        onActivate={(tabId) => activateTab(tabId as WorkspaceTabId)}
+        onClose={(tabId, kind) => {
+          if (kind === "tasks") {
+            closeTasksTab();
+            return;
+          }
+          if (kind === "git") {
+            closeGitTab();
+            return;
+          }
+          if (kind === "settings") {
+            closeSettingsTab();
+            return;
+          }
+          if (kind === "git-diff") {
+            closeGitDiffTab(tabId as `git-diff:${string}`);
+            return;
+          }
+          if (kind === "code-diff") {
+            closeCodeDiffTab(tabId as `code-diff:${string}`);
+            return;
+          }
+          if (kind === "terminal") {
+            void closeTerminalTab(tabId.replace(/^terminal:/u, ""));
+          }
+        }}
+      />
     {/if}
 
     <div class="flex-1 overflow-hidden relative">
@@ -9597,7 +9457,7 @@
           selectedRepoPath={activeGitDiffTab.repoPath}
         />
       {:else if activeCodeDiffTab}
-        <div class="h-full overflow-y-auto bg-gray-50/30 p-8"><div class="max-w-5xl mx-auto space-y-8"><div class="flex items-end justify-between"><div><h2 class="text-2xl font-bold text-gray-900">{activeCodeDiffTab.title}</h2><p class="text-sm text-gray-500 mt-1">{m.files_count({ count: String(activeCodeDiffTab.views.length) })}</p></div><button class="p-2 text-gray-400 hover:text-red-600 rounded-xl transition-all" onclick={() => closeCodeDiffTab(activeCodeDiffTab.id)}><X size={20} /></button></div><div class="space-y-6">{#each activeCodeDiffTab.views as change}<div class="bg-white border border-gray-200 rounded-2xl overflow-hidden shadow-sm"><div class="px-5 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between"><div class="flex items-center gap-3"><span class="text-sm font-bold text-gray-900">{change.path}</span><span class="px-2 py-0.5 bg-amber-100 text-[10px] font-bold text-amber-700 rounded uppercase tracking-widest">{change.kind}</span></div></div><div class="p-0">{#if change.renderable}<MonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-6 text-xs font-mono text-gray-600 bg-gray-50/50 overflow-x-auto">{change.diff}</pre>{/if}</div></div>{/each}</div></div></div>
+        <CodeDiffWorkspace onClose={() => closeCodeDiffTab(activeCodeDiffTab.id)} title={activeCodeDiffTab.title} views={activeCodeDiffTab.views} />
       {:else}
         <TerminalWorkspace
           terminalId={activeWorkspaceTabId.replace(/^terminal:/u, "")}
@@ -9613,324 +9473,50 @@
 </div>
 
 {#if selectedSessionId && activeWorkspaceTabId === "chat" && sessionTurnSearchOpen}
-  <div
-    bind:this={sessionTurnSearchPopoverElement}
-    class="composer-popover search-popover fixed z-[72] overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl"
+  <SessionTurnSearchPopover
+    bind:inputElement={sessionTurnSearchInputElement}
+    bind:popoverElement={sessionTurnSearchPopoverElement}
+    busy={sessionTurnSearchBusy}
+    closeLabel={ui.close}
+    contextCompressionLabel={ui.contextCompression}
+    cursor={sessionTurnSearchCursor}
+    error={sessionTurnSearchError}
+    jumpingTurnId={sessionTurnSearchJumpingTurnId}
+    loadingMore={sessionTurnSearchLoadingMore}
+    onInput={() => scheduleSessionTurnSearch(true)}
+    onJump={jumpToSessionSearchResult}
+    onLoadMore={loadMoreSessionTurnSearchResults}
+    onReset={resetSessionTurnSearch}
+    planModeLabel={ui.planMode}
+    bind:query={sessionTurnSearchQuery}
+    results={sessionTurnSearchResults}
+    searchCopy={sessionSearchCopy}
     style={sessionTurnSearchPopoverStyle || "opacity:0;pointer-events:none;"}
-  >
-    <div class="search-popover__header flex items-center gap-2 border-b border-gray-100 px-3 py-2.5">
-      <Search size={14} class="shrink-0 text-gray-400" />
-      <input
-        bind:this={sessionTurnSearchInputElement}
-        bind:value={sessionTurnSearchQuery}
-        class="search-popover__input w-full border-none bg-transparent p-0 text-sm text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-0"
-        oninput={() => scheduleSessionTurnSearch(true)}
-        onkeydown={(event) => {
-          if (event.key === "Escape") {
-            event.preventDefault();
-            resetSessionTurnSearch();
-          }
-          if (event.key === "Enter" && sessionTurnSearchResults.length > 0) {
-            event.preventDefault();
-            void jumpToSessionSearchResult(sessionTurnSearchResults[0]);
-          }
-        }}
-        placeholder={sessionSearchCopy.placeholder}
-        type="search"
-      />
-      {#if sessionTurnSearchBusy}
-        <RefreshCw size={14} class="shrink-0 animate-spin text-gray-400" />
-      {:else if sessionTurnSearchQuery.trim()}
-        <span class="search-popover__meta shrink-0 text-[10px] font-bold uppercase tracking-widest text-gray-400">
-          {sessionTurnSearchTotalMatches} {sessionSearchCopy.results}
-        </span>
-      {/if}
-      <button
-        class="search-popover__close ui-animated-button ui-animated-button--icon rounded-lg p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700"
-        onclick={() => resetSessionTurnSearch()}
-        title={ui.close}
-        type="button"
-      >
-        <X size={14} />
-      </button>
-    </div>
-    <div class="max-h-72 overflow-y-auto overscroll-contain">
-      {#if sessionTurnSearchError}
-        <div class="search-popover__empty px-3 py-3 text-xs text-red-600">{sessionTurnSearchError}</div>
-      {:else if !sessionTurnSearchQuery.trim()}
-        <div class="search-popover__empty px-3 py-3 text-xs leading-relaxed text-gray-500">{sessionSearchCopy.hint}</div>
-      {:else if !sessionTurnSearchBusy && sessionTurnSearchResults.length === 0}
-        <div class="search-popover__empty px-3 py-3 text-xs text-gray-500">{sessionSearchCopy.noResults}</div>
-      {:else}
-        <div class="search-popover__list divide-y divide-gray-100">
-          {#each sessionTurnSearchResults as result (`${result.turnId}:${result.itemId ?? 'turn'}:${result.preview}`)}
-            <button
-              class="search-popover__item ui-animated-button ui-animated-button--soft flex w-full items-start justify-between gap-3 px-3 py-3 text-left transition-colors hover:bg-amber-50/60"
-              disabled={sessionTurnSearchJumpingTurnId === result.turnId}
-              onclick={() => void jumpToSessionSearchResult(result)}
-              type="button"
-            >
-              <div class="min-w-0 flex-1">
-                <div class="flex flex-wrap items-center gap-1.5">
-                  <span class="search-popover__badge rounded-full bg-gray-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-gray-500">
-                    {sessionSearchCopy.turn} {result.turnIndex + 1}
-                  </span>
-                  <span class="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-amber-700">
-                    {result.itemType === "userMessage"
-                      ? "User"
-                      : result.itemType === "agentMessage"
-                        ? "Assistant"
-                        : result.itemType === "reasoning"
-                          ? m.reasoning()
-                          : result.itemType === "plan"
-                            ? ui.planMode
-                            : result.itemType === "commandExecution"
-                              ? m.run_command()
-                              : result.itemType === "fileChange"
-                                ? m.files_changed_fallback()
-                                : result.itemType === "webSearch"
-                                  ? m.web_search()
-                                  : result.itemType === "mcpToolCall"
-                                    ? m.mcp_call()
-                                    : result.itemType === "dynamicToolCall"
-                                      ? m.tool_call()
-                                      : result.itemType === "contextCompaction"
-                                        ? ui.contextCompression
-                                        : result.itemType ?? "Item"}
-                  </span>
-                </div>
-                <p class="mt-2 line-clamp-2 text-sm leading-5 text-gray-700">{result.preview}</p>
-              </div>
-              {#if sessionTurnSearchJumpingTurnId === result.turnId}
-                <RefreshCw size={14} class="mt-1 shrink-0 animate-spin text-gray-400" />
-              {:else}
-                <ChevronDown size={14} class="-rotate-90 shrink-0 text-gray-300" />
-              {/if}
-            </button>
-          {/each}
-        </div>
-        {#if sessionTurnSearchCursor}
-          <div class="border-t border-gray-100 px-3 py-2.5">
-            <button
-              class="ui-animated-button ui-animated-button--soft flex w-full items-center justify-center gap-2 rounded-xl border border-gray-200 bg-white px-3 py-2 text-xs font-bold text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
-              disabled={sessionTurnSearchLoadingMore}
-              onclick={() => void loadMoreSessionTurnSearchResults()}
-              type="button"
-            >
-              {#if sessionTurnSearchLoadingMore}
-                <RefreshCw size={13} class="animate-spin" />
-              {/if}
-              <span>{sessionSearchCopy.loadMore}</span>
-            </button>
-          </div>
-        {/if}
-      {/if}
-    </div>
-  </div>
+    totalMatches={sessionTurnSearchTotalMatches}
+  />
 {/if}
 
 {#if sessionRecoveryPrompt}
-  <div
-    aria-labelledby="session-recovery-title"
-    aria-modal="true"
-    class="ui-scrim ui-scrim--modal fixed inset-0 z-[116] overflow-y-auto"
-    role="dialog"
-  >
-    <div class="flex min-h-full items-center justify-center p-4 sm:p-8">
-      <div class="auth-dialog-card w-full max-w-2xl rounded-[2rem] border border-white/70 bg-white/92 p-6 shadow-[0_32px_90px_rgba(15,23,42,0.24)] backdrop-blur-2xl sm:p-8">
-        <div class="flex items-start justify-between gap-4">
-          <div class="space-y-3">
-            <div class="inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-amber-100 text-amber-700 shadow-sm">
-              <AlertCircle size={18} />
-            </div>
-            <div>
-              <h2 id="session-recovery-title" class="text-xl font-bold tracking-tight text-gray-950">
-                {m.session_history_recovery_title()}
-              </h2>
-              <p class="mt-2 text-sm leading-relaxed text-gray-600">
-                {m.session_history_recovery_description()}
-              </p>
-            </div>
-          </div>
-          <button
-            aria-label={m.close()}
-            class="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-gray-200 text-gray-500 transition-colors hover:bg-gray-50 hover:text-gray-900"
-            onclick={dismissSessionRecoveryPrompt}
-            type="button"
-          >
-            <X size={18} />
-          </button>
-        </div>
-
-        <div class="mt-6 rounded-3xl border border-amber-200 bg-amber-50/80 p-4">
-          <p class="text-sm font-semibold text-amber-900">
-            {getSessionRecoveryIssueLabel(sessionRecoveryPrompt.issue)}
-          </p>
-          <p class="mt-2 text-sm leading-relaxed text-amber-800/90">
-            {sessionRecoveryPrompt.message || m.session_history_recovery_generic_message()}
-          </p>
-        </div>
-
-        <div class="mt-4 grid gap-3 sm:grid-cols-3">
-          <div class="rounded-2xl border border-gray-200 bg-gray-50/80 px-4 py-3">
-            <div class="text-[11px] font-bold uppercase tracking-[0.18em] text-gray-400">{m.session_history_recovery_total_lines()}</div>
-            <div class="mt-1 text-lg font-semibold text-gray-900">{sessionRecoveryPrompt.totalLines ?? "—"}</div>
-          </div>
-          <div class="rounded-2xl border border-gray-200 bg-gray-50/80 px-4 py-3">
-            <div class="text-[11px] font-bold uppercase tracking-[0.18em] text-gray-400">{m.session_history_recovery_recoverable_lines()}</div>
-            <div class="mt-1 text-lg font-semibold text-gray-900">{sessionRecoveryPrompt.recoverableLines ?? "—"}</div>
-          </div>
-          <div class="rounded-2xl border border-gray-200 bg-gray-50/80 px-4 py-3">
-            <div class="text-[11px] font-bold uppercase tracking-[0.18em] text-gray-400">{m.session_history_recovery_skipped_lines()}</div>
-            <div class="mt-1 text-lg font-semibold text-gray-900">{sessionRecoveryPrompt.skippedLines ?? "—"}</div>
-          </div>
-        </div>
-
-        <p class="mt-4 text-sm leading-relaxed text-gray-600">
-          {m.session_history_recovery_backup_notice()}
-        </p>
-
-        <div class="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
-          <button
-            class="ui-animated-button ui-animated-button--soft inline-flex items-center justify-center rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-sm font-semibold text-gray-700 shadow-sm transition-colors hover:bg-gray-50"
-            onclick={dismissSessionRecoveryPrompt}
-            type="button"
-          >
-            {m.not_now()}
-          </button>
-          <button
-            class="ui-animated-button inline-flex items-center justify-center gap-2 rounded-2xl bg-amber-600 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-amber-500/20 transition-colors hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-60"
-            disabled={sessionRecoveryPrompt.busy}
-            onclick={() => void recoverSessionHistoryPrompt()}
-            type="button"
-          >
-            {#if sessionRecoveryPrompt.busy}
-              <RefreshCw size={15} class="animate-spin" />
-            {/if}
-            <span>{m.session_history_recovery_action()}</span>
-          </button>
-        </div>
-      </div>
-    </div>
-  </div>
+  <SessionRecoveryModal
+    getIssueLabel={getSessionRecoveryIssueLabel}
+    onDismiss={dismissSessionRecoveryPrompt}
+    onRecover={recoverSessionHistoryPrompt}
+    prompt={sessionRecoveryPrompt}
+  />
 {/if}
 
 {#if startupAlertModalOpen && config && (startupPausedQueues.length > 0 || startupScheduledShutdown)}
-  <div
-    aria-labelledby="startup-alert-title"
-    aria-modal="true"
-    class="ui-scrim ui-scrim--modal fixed inset-0 z-[115] overflow-y-auto"
-    role="dialog"
-  >
-    <div class="flex min-h-full items-center justify-center p-4 sm:p-8">
-      <div class="startup-alert-card w-full max-w-4xl overflow-hidden rounded-[2rem] border border-white/10 bg-white shadow-2xl">
-        <div class="startup-alert-card__hero border-b border-gray-200 bg-gradient-to-br from-amber-50 via-white to-white px-6 py-6 sm:px-8">
-          <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-            <div class="space-y-2">
-              <div class="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-amber-100 text-amber-700 shadow-sm">
-                <AlertCircle size={18} />
-              </div>
-              <div>
-                <h2 id="startup-alert-title" class="text-2xl font-bold tracking-tight text-gray-950">
-                  {ui.startupAlertTitle}
-                </h2>
-                <p class="mt-2 max-w-2xl text-sm leading-relaxed text-gray-600">
-                  {ui.startupAlertDescription}
-                </p>
-              </div>
-            </div>
-            <button
-              class="inline-flex items-center justify-center rounded-2xl border border-gray-200 px-4 py-2 text-sm font-semibold text-gray-700 transition-colors hover:bg-gray-50"
-              onclick={dismissStartupAlertModal}
-              type="button"
-            >
-              {ui.startupAlertContinue}
-            </button>
-          </div>
-        </div>
-
-        <div class="grid gap-6 p-6 sm:p-8 {(startupPausedQueues.length > 0 && startupScheduledShutdown) ? 'sm:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]' : ''}">
-          {#if startupPausedQueues.length > 0}
-            <div class="space-y-4">
-              <div class="startup-alert-card__section rounded-3xl border border-gray-200 bg-gray-50/70 p-5 shadow-sm">
-                <div class="flex items-start justify-between gap-4">
-                  <div>
-                    <h3 class="text-sm font-bold text-gray-900">{ui.startupAlertPausedQueues}</h3>
-                    <p class="mt-1 text-sm leading-relaxed text-gray-500">
-                      {ui.startupAlertPausedQueuesDescription}
-                    </p>
-                  </div>
-                  <span class="inline-flex items-center rounded-full bg-amber-100 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.2em] text-amber-700">
-                    {startupPausedQueues.length}
-                  </span>
-                </div>
-
-                <div class="mt-5 space-y-3">
-                  {#each startupPausedQueues as queueAlert (queueAlert.sessionId)}
-                    <div class="startup-alert-card__queue rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-                      <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                        <div class="min-w-0">
-                          <div class="truncate text-sm font-semibold text-gray-900">
-                            {queueAlert.name || getDefaultThreadTitle()}
-                          </div>
-                          <div class="mt-1 text-xs text-gray-500">
-                            {ui.startupAlertPendingTasks(queueAlert.pendingCount)}
-                          </div>
-                          <div class="mt-2 truncate text-[11px] text-gray-400">
-                            {queueAlert.cwd}
-                          </div>
-                        </div>
-                        <button
-                          class="inline-flex items-center justify-center rounded-2xl border border-amber-200 bg-amber-50 px-4 py-2 text-sm font-semibold text-amber-700 transition-colors hover:bg-amber-100"
-                          onclick={() => void openStartupAlertSession(queueAlert.sessionId)}
-                          type="button"
-                        >
-                          {ui.startupAlertOpenThread}
-                        </button>
-                      </div>
-                    </div>
-                  {/each}
-                </div>
-              </div>
-            </div>
-          {/if}
-
-          {#if startupScheduledShutdown}
-            <div class="space-y-4">
-              <div class="startup-alert-card__section startup-alert-card__section--accent rounded-3xl border border-amber-200 bg-gradient-to-br from-amber-50 to-white p-5 shadow-sm">
-                <div class="flex items-center gap-3">
-                  <div class="flex h-10 w-10 items-center justify-center rounded-2xl bg-amber-100 text-amber-700">
-                    <Clock size={18} />
-                  </div>
-                  <div>
-                    <h3 class="text-sm font-bold text-gray-900">{ui.startupAlertScheduledShutdown}</h3>
-                    {#if startupShutdownRemainingSeconds !== null}
-                      <p class="mt-1 text-sm text-gray-600">
-                        {ui.startupAlertShutdownCountdown(startupShutdownRemainingSeconds)}
-                      </p>
-                    {/if}
-                  </div>
-                </div>
-                {#if startupScheduledShutdown.sessionId}
-                  <div class="startup-alert-card__callout mt-4 rounded-2xl border border-white/80 bg-white/80 px-4 py-3 text-sm text-gray-600 shadow-sm">
-                    {ui.startupAlertShutdownThread(
-                      sessions.find((session) => session.id === startupScheduledShutdown.sessionId)?.name ||
-                        (conversation?.thread.id === startupScheduledShutdown.sessionId
-                          ? getConversationDisplayTitle(conversation) || getDefaultThreadTitle()
-                          : startupScheduledShutdown.sessionId)
-                    )}
-                  </div>
-                {/if}
-                <p class="mt-4 text-xs leading-relaxed text-gray-500">
-                  {m.shutdown_wait_description({ seconds: String(config.systemShutdown.delaySeconds) })}
-                </p>
-              </div>
-            </div>
-          {/if}
-        </div>
-      </div>
-    </div>
-  </div>
+  <StartupAlertModal
+    fallbackThreadTitle={getDefaultThreadTitle()}
+    onDismiss={dismissStartupAlertModal}
+    onOpenSession={openStartupAlertSession}
+    pausedQueues={startupPausedQueues}
+    scheduledShutdown={startupScheduledShutdown}
+    scheduledShutdownThreadLabel={startupScheduledShutdownThreadLabel}
+    shutdownDelaySeconds={config.systemShutdown.delaySeconds}
+    shutdownRemainingSeconds={startupShutdownRemainingSeconds}
+    {ui}
+  />
 {/if}
 
 {#if isMobileLayout && mobileSidebarOpen}
@@ -9943,27 +9529,17 @@
 {/if}
 
 {#if browserOpen}
-  <div class="fixed inset-0 z-[100] flex items-center justify-center p-6">
-    <button
-      aria-label="Close folder picker"
-      class="ui-scrim ui-scrim--strong absolute inset-0"
-      onclick={() => (browserOpen = false)}
-      type="button"
-    ></button>
-    <div class="folder-dialog-card relative bg-white rounded-3xl shadow-2xl w-full max-w-2xl max-h-[80vh] overflow-hidden flex flex-col">
-      <header class="folder-dialog-card__header px-8 py-6 border-b border-gray-100 flex items-center justify-between"><div><h2 class="text-xl font-bold text-gray-900">Select working folder</h2><p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mt-1">Allowed root paths</p></div><button class="p-2 text-gray-400 hover:text-gray-900 hover:bg-gray-100 rounded-xl transition-all" onclick={() => (browserOpen = false)}><X size={20} /></button></header>
-      <div class="flex-1 overflow-y-auto p-6">
-        {#if browserBusy}<div class="py-24 flex flex-col items-center gap-4 text-gray-400"><RefreshCw size={32} class="animate-spin" /><p class="text-sm font-medium">Scanning...</p></div>
-        {:else if directoryPayload}
-          <div class="space-y-4">
-            <div class="flex items-center gap-2 mb-6"><button class="p-2 bg-gray-100 text-gray-600 rounded-lg hover:bg-gray-200 disabled:opacity-30 transition-all" disabled={!directoryPayload?.parentPath} onclick={() => directoryPayload?.parentPath && void browseTo(directoryPayload.parentPath)}><ChevronUp size={18} /></button><div class="flex-1 px-4 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-mono text-gray-600 truncate">{directoryPayload.currentPath}</div></div>
-            <div class="grid grid-cols-1 gap-1">{#each directoryPayload.entries as entry (entry.path)}<button class="flex items-center justify-between p-3 rounded-xl hover:bg-gray-50 transition-all text-left group" onclick={() => void browseTo(entry.path)}><div class="flex items-center gap-3"><div class="p-2 bg-amber-50 text-amber-600 rounded-lg group-hover:bg-amber-100"><Layout size={16} /></div><div><span class="text-sm font-semibold text-gray-700">{entry.name}</span><p class="text-[10px] text-gray-400 font-mono mt-0.5">{entry.path}</p></div></div><ChevronDown size={14} class="-rotate-90 text-gray-300 group-hover:text-gray-500" /></button>{/each}</div>
-          </div>
-        {/if}
-      </div>
-      <div class="folder-dialog-card__footer px-8 py-4 bg-gray-50 border-t border-gray-100 flex items-center justify-end"><button class="px-6 py-2 bg-amber-600 text-white rounded-xl text-xs font-bold hover:bg-amber-700 shadow-md transition-all active:scale-95" onclick={() => (browserOpen = false)}>{ui.selectFolder}</button></div>
-    </div>
-  </div>
+  <FolderBrowserDialog
+    busy={browserBusy}
+    closeLabel="Close folder picker"
+    confirmLabel={ui.selectFolder}
+    {directoryPayload}
+    loadingLabel="Scanning..."
+    onBrowse={browseTo}
+    onClose={() => (browserOpen = false)}
+    subtitle="Allowed root paths"
+    title="Select working folder"
+  />
 {/if}
 {/if}
 
@@ -10233,7 +9809,6 @@
     box-shadow: 0 34px 84px -42px rgba(2, 6, 23, 0.95) !important;
   }
 
-  :global(:root[data-theme="dark"]) .auth-dialog-card h1,
   :global(:root[data-theme="dark"]) .auth-dialog-card .text-gray-950 {
     color: #f8fafc !important;
   }

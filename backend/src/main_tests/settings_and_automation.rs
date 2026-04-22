@@ -1,0 +1,558 @@
+use super::*;
+
+#[tokio::test]
+async fn writes_and_reads_editable_files_inside_profile_home() {
+    let sandbox = unique_test_dir("editor");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home.clone());
+    let config_path = codex_home.join("config.toml");
+    let saved: EditableFilePayload = serde_json::from_value(
+        write_editable_file_payload(
+            &state,
+            "default",
+            config_path.to_str().unwrap(),
+            "model = 'gpt-5.4'\n",
+        )
+        .await
+        .expect("save should succeed"),
+    )
+    .expect("payload should deserialize");
+    let loaded: EditableFilePayload = serde_json::from_value(
+        read_editable_file_payload(&state, "default", config_path.to_str().unwrap())
+            .await
+            .expect("read should succeed"),
+    )
+    .expect("payload should deserialize");
+
+    assert_eq!(saved.path, config_path.display().to_string());
+    assert_eq!(saved.language, "ini");
+    assert_eq!(loaded.content, "model = 'gpt-5.4'\n");
+    assert!(loaded.writable);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn rejects_editable_files_outside_allowed_roots() {
+    let sandbox = unique_test_dir("editor-outside");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let outside = sandbox.join("outside").join("secret.txt");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let error = resolve_editable_file_path(&state, "default", outside.to_str().unwrap())
+        .await
+        .expect_err("outside paths must be rejected");
+
+    assert_eq!(error.status, StatusCode::FORBIDDEN);
+    assert_eq!(error.message, "This file is outside editable roots.");
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn notification_helpers_update_ui_state_and_counts() {
+    let sandbox = unique_test_dir("notifications");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &ui_state_path,
+        serde_json::to_vec_pretty(&json!({
+            "global": {
+                "shutdownAfterQueueCompletes": false,
+                "scheduledShutdown": Value::Null
+            },
+            "notifications": {
+                "items": [
+                    {
+                        "id": "n1",
+                        "type": "sessionCompleted",
+                        "createdAt": 20,
+                        "readAt": Value::Null,
+                        "sessionId": "s1",
+                        "sessionName": "One",
+                        "payload": {}
+                    },
+                    {
+                        "id": "n2",
+                        "type": "sessionAttention",
+                        "createdAt": 10,
+                        "readAt": Value::Null,
+                        "sessionId": "s2",
+                        "sessionName": "Two",
+                        "payload": {}
+                    }
+                ],
+                "settings": {
+                    "enabledEventTypes": ["sessionCompleted"],
+                    "slackWebhookUrl": "",
+                    "webhookUrl": Value::Null
+                }
+            },
+            "sessionMetaByThreadId": {},
+            "savedSessionFilters": [],
+            "promptPresets": [],
+            "automations": [],
+            "automationRuns": [],
+            "preferencesByThreadId": {},
+            "draftsByThreadId": {},
+            "queuesByThreadId": {},
+            "highlightsByThreadId": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let listed = get_notifications_payload(&state, "default", 80)
+        .await
+        .unwrap();
+    assert_eq!(listed.get("unreadCount").and_then(Value::as_u64), Some(2));
+
+    let marked = mark_notifications_read_payload(&state, "default", Some(vec!["n1".to_string()]))
+        .await
+        .unwrap();
+    assert_eq!(marked.get("unreadCount").and_then(Value::as_u64), Some(1));
+
+    let settings = update_notification_settings_payload(
+        &state,
+        "default",
+        json!({
+            "enabledEventTypes": ["sessionAttention", "invalid"],
+            "slackWebhookUrl": " https://hooks.slack.test/one ",
+            "webhookUrl": ""
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        settings
+            .get("settings")
+            .and_then(|value| value.get("enabledEventTypes"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        vec![json!("sessionAttention")]
+    );
+    assert_eq!(
+        settings
+            .get("settings")
+            .and_then(|value| value.get("slackWebhookUrl"))
+            .and_then(Value::as_str),
+        Some("https://hooks.slack.test/one")
+    );
+    assert!(
+        settings
+            .get("settings")
+            .and_then(|value| value.get("webhookUrl"))
+            .is_some_and(Value::is_null)
+    );
+
+    let cleared = clear_notifications_payload(&state, "default")
+        .await
+        .unwrap();
+    assert_eq!(cleared.get("unreadCount").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        cleared
+            .get("notifications")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn theme_settings_round_trip_through_rust_store() {
+    let sandbox = unique_test_dir("theme-settings");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let expected = json!({
+        "light": {
+            "bg": "#fffef7",
+            "sidebar": "#f8f1de"
+        },
+        "dark": {
+            "bg": "#181713",
+            "sidebar": "#12110d"
+        }
+    });
+
+    write_stored_theme_settings(&state.config, "default", &expected)
+        .await
+        .expect("theme settings should save");
+    let restored = read_stored_theme_settings(&state.config, "default")
+        .await
+        .expect("theme settings should load");
+
+    assert_eq!(restored, Some(expected));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn syncs_codex_toml_with_preferences_for_plan_mode() {
+    let sandbox = unique_test_dir("sync-codex-toml");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&codex_home).unwrap();
+
+    sync_codex_toml_with_preferences(
+        &codex_home,
+        &json!({
+            "model": "gpt-5.4",
+            "approvalPolicy": "on-request",
+            "sandboxMode": "workspace-write",
+            "speed": "fast",
+            "mode": "plan",
+            "effort": "high",
+            "networkAccess": true
+        }),
+    )
+    .await
+    .expect("config.toml should sync");
+
+    let raw = fs::read_to_string(config_toml_path(&codex_home)).unwrap();
+    assert!(raw.contains("model = \"gpt-5.4\""));
+    assert!(raw.contains("approval_policy = \"on-request\""));
+    assert!(raw.contains("sandbox_mode = \"workspace-write\""));
+    assert!(raw.contains("service_tier = \"fast\""));
+    assert!(raw.contains("plan_mode_reasoning_effort = \"high\""));
+    assert!(raw.contains("[sandbox_workspace_write]"));
+    assert!(raw.contains("network_access = true"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn updates_session_organization_and_known_tags() {
+    let sandbox = unique_test_dir("session-organization");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &ui_state_path,
+        serde_json::to_vec_pretty(&json!({
+            "global": {
+                "shutdownAfterQueueCompletes": false,
+                "scheduledShutdown": Value::Null
+            },
+            "notifications": {
+                "items": [],
+                "settings": default_notification_settings_value()
+            },
+            "sessionMetaByThreadId": {
+                "session-1": {
+                    "pinned": false,
+                    "tags": ["alpha"]
+                }
+            },
+            "savedSessionFilters": [],
+            "promptPresets": [],
+            "automations": [],
+            "automationRuns": [],
+            "preferencesByThreadId": {},
+            "draftsByThreadId": {},
+            "queuesByThreadId": {},
+            "highlightsByThreadId": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let payload = update_session_organization_payload(
+        &state,
+        "default",
+        "session-1",
+        json!({
+            "pinned": true,
+            "tags": ["beta", "alpha", "beta", " "]
+        }),
+    )
+    .await
+    .expect("session organization should update");
+
+    assert_eq!(
+        payload.get("meta"),
+        Some(&json!({
+            "pinned": true,
+            "tags": ["alpha", "beta"]
+        }))
+    );
+    assert_eq!(
+        payload
+            .get("knownTags")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        vec![json!("alpha"), json!("beta")]
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn saves_filters_and_prompt_presets_with_normalization() {
+    let sandbox = unique_test_dir("ui-state-saves");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &ui_state_path,
+        serde_json::to_vec_pretty(&json!({
+            "global": {
+                "shutdownAfterQueueCompletes": false,
+                "scheduledShutdown": Value::Null
+            },
+            "notifications": {
+                "items": [],
+                "settings": default_notification_settings_value()
+            },
+            "sessionMetaByThreadId": {
+                "thread-1": {
+                    "pinned": true,
+                    "tags": ["alpha", "beta"]
+                }
+            },
+            "savedSessionFilters": [],
+            "promptPresets": [],
+            "automations": [],
+            "automationRuns": [],
+            "preferencesByThreadId": {},
+            "draftsByThreadId": {},
+            "queuesByThreadId": {},
+            "highlightsByThreadId": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let filters = save_session_filter_payload(
+        &state,
+        "default",
+        json!({
+            "id": "filter-1",
+            "name": "  Important  ",
+            "pinnedOnly": true,
+            "runningOnly": false,
+            "queuedOnly": true,
+            "highlight": "completed",
+            "tags": ["beta", "alpha", "beta", ""]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        filters
+            .get("savedFilters")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("name"))
+            .and_then(Value::as_str),
+        Some("Important")
+    );
+    assert_eq!(
+        filters
+            .get("savedFilters")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("tags"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        vec![json!("alpha"), json!("beta")]
+    );
+    assert_eq!(
+        filters
+            .get("knownTags")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        vec![json!("alpha"), json!("beta")]
+    );
+
+    let presets = save_prompt_preset_payload(
+        &state,
+        "default",
+        json!({
+            "id": "preset-1",
+            "name": "  Draft reply  ",
+            "prompt": "Use the existing repo style.",
+            "createdAt": 5
+        }),
+    )
+    .await
+    .unwrap();
+    let first_preset = presets
+        .get("promptPresets")
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.first())
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        first_preset.get("name").and_then(Value::as_str),
+        Some("Draft reply")
+    );
+    assert_eq!(
+        first_preset.get("createdAt").and_then(Value::as_i64),
+        Some(5)
+    );
+    assert!(
+        first_preset
+            .get("updatedAt")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value >= 5)
+    );
+
+    let deleted_filters = delete_session_filter_payload(&state, "default", "filter-1")
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted_filters
+            .get("savedFilters")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let deleted_presets = delete_prompt_preset_payload(&state, "default", "preset-1")
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted_presets
+            .get("promptPresets")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn saves_and_deletes_automations_with_normalization() {
+    let sandbox = unique_test_dir("automation-saves");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &ui_state_path,
+        serde_json::to_vec_pretty(&json!({
+            "global": {
+                "shutdownAfterQueueCompletes": false,
+                "scheduledShutdown": Value::Null
+            },
+            "notifications": {
+                "items": [],
+                "settings": default_notification_settings_value()
+            },
+            "sessionMetaByThreadId": {},
+            "savedSessionFilters": [],
+            "promptPresets": [],
+            "automations": [],
+            "automationRuns": [],
+            "preferencesByThreadId": {},
+            "draftsByThreadId": {},
+            "queuesByThreadId": {},
+            "highlightsByThreadId": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let saved = save_automation_payload(
+        &state,
+        "default",
+        json!({
+            "id": "auto-1",
+            "name": "  Morning Review  ",
+            "prompt": "Check the repo state.",
+            "enabled": true,
+            "scheduleMode": "interval",
+            "intervalMinutes": 5,
+            "target": "local",
+            "repoPath": "",
+            "cwd": " /tmp/review ",
+            "model": "gpt-5.4",
+            "effort": "high",
+            "speed": "fast",
+            "mode": "plan"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let first_automation = saved
+        .get("automations")
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.first())
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        first_automation.get("name").and_then(Value::as_str),
+        Some("Morning Review")
+    );
+    assert_eq!(
+        first_automation.get("scheduleMode").and_then(Value::as_str),
+        Some("interval")
+    );
+    assert_eq!(
+        first_automation
+            .get("intervalMinutes")
+            .and_then(Value::as_i64),
+        Some(5)
+    );
+    assert_eq!(
+        first_automation.get("cwd").and_then(Value::as_str),
+        Some("/tmp/review")
+    );
+    assert!(
+        first_automation
+            .get("nextRunAt")
+            .and_then(Value::as_i64)
+            .is_some()
+    );
+
+    let deleted = delete_automation_payload(&state, "default", "auto-1")
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted
+            .get("automations")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}

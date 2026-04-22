@@ -1,8 +1,8 @@
 use super::*;
+use crate::thread_listing_support::emit_session_summary_updated;
 use crate::thread_read_support::{
     active_turn_id_from_turns, emit_session_notification, read_thread_payload,
 };
-use crate::thread_listing_support::emit_session_summary_updated;
 use crate::thread_support::rename_session_payload;
 
 async fn resolve_selected_attachment_records(

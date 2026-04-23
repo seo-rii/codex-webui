@@ -226,6 +226,8 @@
   let browserBusy = $state(false);
   let runtimeBusyAction = $state<"install" | "update" | "check" | null>(null);
   let quotaBusy = $state(false);
+  let quotaRefreshPromise: Promise<void> | null = null;
+  let quotaForceRefreshQueued = false;
   let notificationsBusy = $state(false);
   let directoryPayload = $state<DirectoryPayload | null>(null);
   let requestAnswers = $state<Record<string, Record<string, string>>>({});
@@ -3145,6 +3147,66 @@
     return JSON.parse(JSON.stringify(payload)) as T;
   }
 
+  function sanitizeSessionDetailItemForBrowserCache(item: CodexItem) {
+    if (!["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"].includes(item.type)) {
+      return clonePayloadForCache(item);
+    }
+
+    const sanitized = clonePayloadForCache(item) as CodexItem & Record<string, unknown>;
+    delete sanitized.aggregatedOutput;
+    delete sanitized.output;
+    delete sanitized.stdout;
+    delete sanitized.stderr;
+    delete sanitized.logs;
+    delete sanitized.result;
+    delete sanitized.response;
+    delete sanitized.raw;
+    delete sanitized.diff;
+    delete sanitized.original;
+    delete sanitized.modified;
+    delete sanitized.content;
+    delete sanitized.patch;
+
+    if (sanitized.type === "fileChange" && Array.isArray(sanitized.changes)) {
+      sanitized.changes = sanitized.changes.map((change) => {
+        if (!change || typeof change !== "object") {
+          return change;
+        }
+        const record = change as Record<string, unknown>;
+        return {
+          path: typeof record.path === "string" ? record.path : "",
+          kind: record.kind ?? "update"
+        };
+      });
+    }
+
+    if (sanitized.type === "webSearch") {
+      delete sanitized.action;
+    }
+
+    if (sanitized.type === "mcpToolCall" || sanitized.type === "dynamicToolCall") {
+      delete sanitized.action;
+      delete sanitized.invocation;
+    }
+
+    sanitized.detailState = "deferred";
+    return sanitized;
+  }
+
+  function sanitizeSessionDetailForBrowserCache(payload: SessionDetailPayload): SessionDetailPayload {
+    const cloned = clonePayloadForCache(payload);
+    return {
+      ...cloned,
+      thread: {
+        ...cloned.thread,
+        turns: cloned.thread.turns.map((turn) => ({
+          ...turn,
+          items: turn.items.map((item) => sanitizeSessionDetailItemForBrowserCache(item))
+        }))
+      }
+    };
+  }
+
   function buildSessionListBrowserCacheKey(cursor: string | null = null) {
     if (!activeProfileId) {
       return null;
@@ -3195,7 +3257,7 @@
       payload.turnVersions = { ...sessionTurnVersionsById };
       payload.turnIds = state.thread.turns.map((turn) => turn.id);
     }
-    return payload;
+    return sanitizeSessionDetailForBrowserCache(payload);
   }
 
   function currentSessionListPayload(): SessionListPayload {
@@ -4492,7 +4554,11 @@
       const nextConversation = applyLoadedSessionDetail(nextDetail.thread.id, nextDetail);
       const detailCacheKey = buildSessionDetailBrowserCacheKey(nextDetail.thread.id);
       if (detailCacheKey) {
-        void writeSessionDetailCache(detailCacheKey, nextDetail, nextDetail.cacheVersion);
+        void writeSessionDetailCache(
+          detailCacheKey,
+          sanitizeSessionDetailForBrowserCache(nextDetail),
+          nextDetail.cacheVersion
+        );
       }
       if (loadDraft) {
         await loadSavedDraft(nextDetail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
@@ -4509,7 +4575,7 @@
     const nextConversation = applyLoadedSessionDetail(detail.thread.id, detail);
     const detailCacheKey = buildSessionDetailBrowserCacheKey(detail.thread.id);
     if (detailCacheKey) {
-      void writeSessionDetailCache(detailCacheKey, detail, detail.cacheVersion);
+      void writeSessionDetailCache(detailCacheKey, sanitizeSessionDetailForBrowserCache(detail), detail.cacheVersion);
     }
     if (loadDraft) {
       await loadSavedDraft(detail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
@@ -6329,19 +6395,41 @@
   }
 
   async function refreshQuota(force = false) {
-    if (force) {
-      quotaBusy = true;
+    if (quotaRefreshPromise) {
+      quotaForceRefreshQueued = quotaForceRefreshQueued || force;
+      return quotaRefreshPromise;
     }
 
-    try {
-      quota = await api.getQuota(force);
-    } catch (error) {
-      if (force) {
-        errorText = describeError(error);
+    const runForce = force || quotaForceRefreshQueued;
+    quotaForceRefreshQueued = false;
+    if (runForce) {
+      quotaBusy = true;
+    }
+    const quotaProfileId = activeProfileId;
+
+    quotaRefreshPromise = (async () => {
+      try {
+        const nextQuota = await api.getQuota(runForce);
+        if (quotaProfileId === activeProfileId) {
+          quota = nextQuota;
+        }
+      } catch (error) {
+        if (runForce) {
+          errorText = describeError(error);
+        }
+      } finally {
+        if (runForce) {
+          quotaBusy = false;
+        }
       }
+    })();
+
+    try {
+      await quotaRefreshPromise;
     } finally {
-      if (force) {
-        quotaBusy = false;
+      quotaRefreshPromise = null;
+      if (quotaForceRefreshQueued) {
+        void refreshQuota(true);
       }
     }
   }
@@ -10383,6 +10471,7 @@
                 codexHome={config?.paths.codexHome ?? ""}
                 configFilePath={config?.paths.configFilePath ?? ""}
                 autostart={config?.autostart ?? null}
+                runtime={runtime}
                 notificationSettings={config?.notifications.settings ?? null}
                 promptPresets={config?.promptPresets ?? []}
                 automations={config?.automations.items ?? []}

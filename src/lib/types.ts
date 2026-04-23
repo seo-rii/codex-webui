@@ -623,6 +623,12 @@ export type CodexRuntimeStatus = {
   installCommand: string;
   updateCommand: string;
   lastCheckedAt: string | null;
+  webuiVersion: string;
+  webuiBuildVersion: string;
+  webuiBuildCommit: string;
+  webuiBuildCommitShort: string;
+  webuiBuildDirty: boolean;
+  webuiBuildTimestamp: string;
   issues: string[];
 };
 

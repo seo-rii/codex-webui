@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { BellRing, Clock3, History, Palette, Pencil, Play, Plug, Power, RefreshCw, RotateCcw, Save, Settings2, Sparkles, Trash2, Wand2 } from "lucide-svelte";
+  import { BellRing, Clock3, History, Info, Palette, Pencil, Play, Plug, Power, RefreshCw, RotateCcw, Save, Settings2, Sparkles, Trash2, Wand2 } from "lucide-svelte";
   import { fade } from "svelte/transition";
 
   import { api } from "$lib/api";
@@ -26,6 +26,7 @@
     AutostartProvider,
     AppConfigPayload,
     CatalogPayload,
+    CodexRuntimeStatus,
     EditableFilePayload,
     NotificationEventType,
     NotificationSettings,
@@ -50,6 +51,7 @@
     codexHome,
     configFilePath,
     autostart = null,
+    runtime = null,
     notificationSettings = null,
     promptPresets = [],
     automations = [],
@@ -73,6 +75,7 @@
     codexHome: string;
     configFilePath: string;
     autostart?: AppConfigPayload["autostart"] | null;
+    runtime?: CodexRuntimeStatus | null;
     notificationSettings?: NotificationSettings | null;
     promptPresets?: PromptPreset[];
     automations?: AutomationDefinition[];
@@ -133,6 +136,21 @@
   const dirty = $derived(Boolean(configFile && editorValue !== configFile.content));
   const configModelContextWindow = $derived.by(() => parseTomlIntegerSetting(editorValue, "model_context_window"));
   const themeDirty = $derived(themeBaseFingerprint !== JSON.stringify(themeDraft));
+  const webuiBuildTimestampLabel = $derived.by(() => {
+    const _locale = $localeSignal;
+    const value = runtime?.webuiBuildTimestamp;
+    if (!value || value === "unknown") {
+      return null;
+    }
+    const date = new Date(value);
+    if (!Number.isFinite(date.getTime())) {
+      return value;
+    }
+    return new Intl.DateTimeFormat(getLocale(), {
+      dateStyle: "medium",
+      timeStyle: "short"
+    }).format(date);
+  });
   const notificationDirty = $derived.by(() => {
     const current = notificationSettings;
     if (!current) {
@@ -201,6 +219,12 @@
       configTitle: m.codex_config_toml(),
       unsaved: m.unsaved(),
       editableFile: m.editable_file(),
+      webuiRuntime: m.webui_runtime(),
+      webuiVersion: m.webui_version(),
+      webuiBuild: m.webui_build(),
+      webuiCommit: m.webui_commit(),
+      webuiBuiltAt: m.webui_built_at(),
+      webuiDirtyBuild: m.webui_dirty_build(),
       notifications: m.notifications(),
       startup: m.startup(),
       autostartTitle: m.autostart_title(),
@@ -967,6 +991,33 @@
             <div class="meta-card">
               <span>{ui.account}</span>
               <strong>{webRole === "viewer" ? ui.roleViewer : ui.roleAdmin}</strong>
+            </div>
+          </div>
+          <div class="settings-version-card">
+            <div class="settings-version-card__header">
+              <Info size={15} />
+              <strong>{ui.webuiRuntime}</strong>
+              {#if runtime?.webuiBuildDirty}
+                <span class="meta-pill subtle">{ui.webuiDirtyBuild}</span>
+              {/if}
+            </div>
+            <div class="settings-version-grid">
+              <div class="settings-version-item">
+                <span>{ui.webuiVersion}</span>
+                <code>{runtime?.webuiVersion ?? "-"}</code>
+              </div>
+              <div class="settings-version-item">
+                <span>{ui.webuiBuild}</span>
+                <code title={runtime?.webuiBuildVersion ?? ""}>{runtime?.webuiBuildVersion ?? "-"}</code>
+              </div>
+              <div class="settings-version-item">
+                <span>{ui.webuiCommit}</span>
+                <code title={runtime?.webuiBuildCommit ?? ""}>{runtime?.webuiBuildCommitShort ?? "-"}</code>
+              </div>
+              <div class="settings-version-item">
+                <span>{ui.webuiBuiltAt}</span>
+                <code>{webuiBuildTimestampLabel ?? "-"}</code>
+              </div>
             </div>
           </div>
           <div class="config-context-card">
@@ -1944,6 +1995,59 @@
     color: var(--ink-strong);
     font-size: 0.92rem;
     word-break: break-all;
+  }
+
+  .settings-version-card {
+    display: grid;
+    gap: 0.75rem;
+    border: 1px solid var(--line);
+    border-radius: 1rem;
+    background: color-mix(in srgb, var(--panel-strong) 88%, var(--accent) 12%);
+    padding: 0.85rem 1rem;
+  }
+
+  .settings-version-card__header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+    color: var(--ink-strong);
+  }
+
+  .settings-version-card__header strong {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.9rem;
+  }
+
+  .settings-version-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+    gap: 0.55rem;
+  }
+
+  .settings-version-item {
+    display: grid;
+    min-width: 0;
+    gap: 0.25rem;
+  }
+
+  .settings-version-item span {
+    color: var(--muted);
+    font-size: 0.68rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .settings-version-item code {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--ink-strong);
+    font-size: 0.82rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .config-context-card {

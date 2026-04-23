@@ -92,7 +92,7 @@ fn normalize_session_item_type_name(item_type: &str) -> &str {
     }
 }
 
-fn is_internal_session_item_type(item_type: &str) -> bool {
+pub(crate) fn is_internal_session_item_type(item_type: &str) -> bool {
     matches!(
         item_type,
         "task_complete"

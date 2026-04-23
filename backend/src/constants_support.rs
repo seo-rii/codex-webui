@@ -12,6 +12,7 @@ pub(crate) const CODEX_USAGE_USER_AGENT: &str = "codex_cli_rs/0.120.0 (Codex Web
 pub(crate) const NPM_VIEW_TIMEOUT: Duration = Duration::from_millis(2500);
 pub(crate) const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 pub(crate) const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
+pub(crate) const QUOTA_FORCE_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 pub(crate) const CATALOG_CACHE_TTL: Duration = Duration::from_secs(10);
 pub(crate) const GIT_REPOSITORY_CACHE_TTL: Duration = Duration::from_secs(5);
 pub(crate) const QUOTA_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);

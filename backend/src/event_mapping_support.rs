@@ -37,17 +37,42 @@ fn summarize_tool_invocation_payload(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn prepare_session_stream_item_payload(item: &Value, turn_id: &str) -> Value {
-    let mut normalized = normalize_session_item_payload(item, turn_id, 0)
+fn remove_deferred_item_detail_fields(normalized: &mut serde_json::Map<String, Value>) {
+    for key in [
+        "aggregatedOutput",
+        "output",
+        "stdout",
+        "stderr",
+        "logs",
+        "result",
+        "response",
+        "raw",
+        "diff",
+        "original",
+        "modified",
+        "content",
+        "patch",
+    ] {
+        normalized.remove(key);
+    }
+}
+
+pub(crate) fn prepare_session_deferred_item_payload(
+    item: &Value,
+    turn_id: &str,
+    item_index: usize,
+) -> Value {
+    let mut normalized = normalize_session_item_payload(item, turn_id, item_index)
         .as_object()
         .cloned()
         .unwrap_or_default();
     let item_type = normalized
         .get("type")
         .and_then(Value::as_str)
-        .unwrap_or("unknown");
+        .unwrap_or("unknown")
+        .to_string();
 
-    match item_type {
+    match item_type.as_str() {
         "contextCompaction" => {
             normalized.insert("title".to_string(), json!("Context compression"));
             normalized.insert("detailState".to_string(), json!("inline"));
@@ -57,6 +82,7 @@ fn prepare_session_stream_item_payload(item: &Value, turn_id: &str) -> Value {
             );
         }
         "commandExecution" => {
+            remove_deferred_item_detail_fields(&mut normalized);
             normalized.insert("title".to_string(), json!("Command"));
             normalized.insert("detailState".to_string(), json!("deferred"));
             normalized.insert(
@@ -72,6 +98,7 @@ fn prepare_session_stream_item_payload(item: &Value, turn_id: &str) -> Value {
             }
         }
         "fileChange" => {
+            remove_deferred_item_detail_fields(&mut normalized);
             let changes = normalized
                 .get("changes")
                 .and_then(Value::as_array)
@@ -124,17 +151,23 @@ fn prepare_session_stream_item_payload(item: &Value, turn_id: &str) -> Value {
             );
         }
         "webSearch" => {
+            let detail_preview = value_text(normalized.get("query").unwrap_or(&Value::Null))
+                .or_else(|| summarize_tool_invocation_payload(normalized.get("action")));
+            remove_deferred_item_detail_fields(&mut normalized);
+            normalized.remove("action");
             normalized.insert("title".to_string(), json!("Web search"));
             normalized.insert("detailState".to_string(), json!("deferred"));
             normalized.insert(
                 "detailPreview".to_string(),
-                value_text(normalized.get("query").unwrap_or(&Value::Null))
-                    .or_else(|| summarize_tool_invocation_payload(normalized.get("action")))
-                    .map(Value::String)
-                    .unwrap_or(Value::Null),
+                detail_preview.map(Value::String).unwrap_or(Value::Null),
             );
         }
         "mcpToolCall" | "dynamicToolCall" => {
+            let detail_preview = summarize_tool_invocation_payload(normalized.get("invocation"))
+                .or_else(|| value_text(normalized.get("tool").unwrap_or(&Value::Null)));
+            remove_deferred_item_detail_fields(&mut normalized);
+            normalized.remove("action");
+            normalized.remove("invocation");
             normalized.insert(
                 "title".to_string(),
                 Value::String(if item_type == "mcpToolCall" {
@@ -146,10 +179,7 @@ fn prepare_session_stream_item_payload(item: &Value, turn_id: &str) -> Value {
             normalized.insert("detailState".to_string(), json!("deferred"));
             normalized.insert(
                 "detailPreview".to_string(),
-                summarize_tool_invocation_payload(normalized.get("invocation"))
-                    .or_else(|| value_text(normalized.get("tool").unwrap_or(&Value::Null)))
-                    .map(Value::String)
-                    .unwrap_or(Value::Null),
+                detail_preview.map(Value::String).unwrap_or(Value::Null),
             );
         }
         _ => {
@@ -160,6 +190,10 @@ fn prepare_session_stream_item_payload(item: &Value, turn_id: &str) -> Value {
     }
 
     Value::Object(normalized)
+}
+
+fn prepare_session_stream_item_payload(item: &Value, turn_id: &str) -> Value {
+    prepare_session_deferred_item_payload(item, turn_id, 0)
 }
 
 pub(crate) fn map_app_server_session_notification(

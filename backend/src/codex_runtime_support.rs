@@ -6,6 +6,7 @@ pub(crate) async fn codex_runtime_status(state: &AppState, check_latest: bool) -
     let npm_available = command_available(npm_command()).await;
     let install_command = format!("npm install -g {CODEX_NPM_PACKAGE}@latest");
     let update_command = install_command.clone();
+    let webui_build_commit = option_env!("CODEX_WEBUI_BUILD_COMMIT").unwrap_or("unknown");
     let mut issues = Vec::new();
 
     let version = match read_codex_version(state).await {
@@ -50,6 +51,12 @@ pub(crate) async fn codex_runtime_status(state: &AppState, check_latest: bool) -
         "installCommand": install_command,
         "updateCommand": update_command,
         "lastCheckedAt": last_checked_at,
+        "webuiVersion": env!("CARGO_PKG_VERSION"),
+        "webuiBuildVersion": option_env!("CODEX_WEBUI_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+        "webuiBuildCommit": webui_build_commit,
+        "webuiBuildCommitShort": option_env!("CODEX_WEBUI_BUILD_COMMIT_SHORT").unwrap_or(webui_build_commit),
+        "webuiBuildDirty": option_env!("CODEX_WEBUI_BUILD_DIRTY").unwrap_or("false") == "true",
+        "webuiBuildTimestamp": option_env!("CODEX_WEBUI_BUILD_TIMESTAMP").unwrap_or("unknown"),
         "issues": issues,
     }))
 }
@@ -108,10 +115,15 @@ pub(crate) async fn codex_quota_status(
     refresh: bool,
     profile_id: &str,
 ) -> Result<Value> {
-    if !refresh {
+    {
         let cache = state.quota_cache.lock().await;
         if let Some(cached) = cache.get(profile_id) {
-            if cached.created_at.elapsed() < QUOTA_CACHE_TTL {
+            let ttl = if refresh {
+                QUOTA_FORCE_MIN_REFRESH_INTERVAL
+            } else {
+                QUOTA_CACHE_TTL
+            };
+            if cached.created_at.elapsed() < ttl {
                 return Ok(cached.payload.clone());
             }
         }

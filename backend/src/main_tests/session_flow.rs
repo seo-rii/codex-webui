@@ -705,6 +705,13 @@ async fn session_detail_and_turn_search_payloads_use_rust_thread_reads() {
                                         "id": "item-2",
                                         "type": "agentMessage",
                                         "text": "Investigating the websocket bug now"
+                                    },
+                                    {
+                                        "id": "item-command-1",
+                                        "type": "commandExecution",
+                                        "command": ["bash", "-lc", "printf done"],
+                                        "aggregatedOutput": "x".repeat(1024 * 128),
+                                        "exitCode": 0
                                     }
                                 ]
                             },
@@ -757,10 +764,27 @@ async fn session_detail_and_turn_search_payloads_use_rust_thread_reads() {
             .and_then(Value::as_u64),
         Some(1)
     );
-
     let older = session_older_turns_payload(&state, "default", "thread-1", "turn-2", 5)
         .await
         .unwrap();
+    let older_command = older
+        .get("turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| turns.first())
+        .and_then(|turn| turn.get("items"))
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some("item-command-1"))
+        })
+        .unwrap();
+    assert_eq!(
+        older_command.get("detailState").and_then(Value::as_str),
+        Some("deferred")
+    );
+    assert!(older_command.get("aggregatedOutput").is_none());
+
     assert_eq!(
         older.get("turns").and_then(Value::as_array).map(Vec::len),
         Some(1)
@@ -775,6 +799,17 @@ async fn session_detail_and_turn_search_payloads_use_rust_thread_reads() {
             .and_then(Value::as_str),
         Some("turn-1")
     );
+    let full_command = turn
+        .get("turn")
+        .and_then(|value| value.get("items"))
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some("item-command-1"))
+        })
+        .unwrap();
+    assert!(full_command.get("aggregatedOutput").is_some());
 
     let item = session_item_detail_payload(&state, "default", "thread-1", "turn-1", "item-2")
         .await

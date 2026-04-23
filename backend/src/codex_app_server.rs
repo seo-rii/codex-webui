@@ -125,8 +125,8 @@ impl AppServerClient {
         config: AppServerClientConfig,
         controller: Arc<AppServerControllerRuntime>,
     ) -> Self {
-        let (notifications_tx, _) = broadcast::channel(128);
-        let (requests_tx, _) = broadcast::channel(128);
+        let (notifications_tx, _) = broadcast::channel(8192);
+        let (requests_tx, _) = broadcast::channel(1024);
 
         Self {
             inner: Arc::new(AppServerClientInner {

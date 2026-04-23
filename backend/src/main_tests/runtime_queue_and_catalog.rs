@@ -110,6 +110,85 @@ async fn resolve_server_request_payload_returns_not_found_without_pending_reques
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_status_includes_webui_build_metadata() {
+    let sandbox = unique_test_dir("runtime-build-metadata");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let payload = codex_runtime_status(&state, false).await.unwrap();
+    let build_version = payload
+        .get("webuiBuildVersion")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let commit_short = payload
+        .get("webuiBuildCommitShort")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    assert_eq!(
+        payload.get("webuiVersion").and_then(Value::as_str),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert!(!build_version.is_empty());
+    assert!(!commit_short.is_empty());
+    assert!(build_version.contains(commit_short));
+    assert!(
+        payload
+            .get("webuiBuildDirty")
+            .and_then(Value::as_bool)
+            .is_some()
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_quota_status_reuses_recent_cache_for_forced_refresh() {
+    let sandbox = unique_test_dir("runtime-quota-cache");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let cached_payload = json!({
+        "available": true,
+        "source": "cached",
+        "fetchedAt": now_unix_ms(),
+        "account": {
+            "email": "cached@example.com"
+        },
+        "plan": {
+            "type": "pro"
+        },
+        "fiveHour": {
+            "remainingPercent": 90
+        },
+        "weekly": {
+            "remainingPercent": 80
+        },
+        "error": Value::Null
+    });
+    state.quota_cache.lock().await.insert(
+        "default".to_string(),
+        CachedQuota {
+            created_at: Instant::now(),
+            payload: cached_payload.clone(),
+        },
+    );
+
+    let payload = codex_quota_status(&state, true, "default").await.unwrap();
+    assert_eq!(payload, cached_payload);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_notifications_emit_session_stream_events_from_rust_relay() {
     let sandbox = unique_test_dir("session-stream-rust");
     let workspace = sandbox.join("workspace");

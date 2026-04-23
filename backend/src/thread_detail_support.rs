@@ -64,6 +64,62 @@ async fn session_pending_requests_payload(
     requests
 }
 
+fn summarize_session_turn_for_detail_payload(turn: &Value, turn_index: usize) -> Value {
+    let mut summarized = turn.as_object().cloned().unwrap_or_default();
+    let turn_id = summarized
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("turn-{turn_index}"));
+    let items = summarized
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .filter_map(|(item_index, item)| {
+            let normalized = normalize_session_item_payload(item, &turn_id, item_index);
+            let item_type = normalized
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if is_internal_session_item_type(item_type) {
+                return None;
+            }
+            Some(match item_type {
+                "commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall"
+                | "webSearch" => prepare_session_deferred_item_payload(item, &turn_id, item_index),
+                _ => normalized,
+            })
+        })
+        .collect::<Vec<_>>();
+    summarized.insert("id".to_string(), Value::String(turn_id));
+    summarized.insert("items".to_string(), Value::Array(items));
+    summarized.insert(
+        "status".to_string(),
+        Value::String(
+            value_text(summarized.get("status").unwrap_or(&Value::Null))
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+    );
+    summarized
+        .entry("error".to_string())
+        .or_insert_with(|| Value::Null);
+    summarized
+        .entry("startedAt".to_string())
+        .or_insert_with(|| Value::Null);
+    summarized
+        .entry("completedAt".to_string())
+        .or_insert_with(|| Value::Null);
+    summarized
+        .entry("durationMs".to_string())
+        .or_insert_with(|| Value::Null);
+    summarized.insert("detailState".to_string(), Value::String("full".to_string()));
+    summarized.insert("hiddenItemCount".to_string(), Value::from(0));
+    Value::Object(summarized)
+}
+
 pub(crate) async fn session_detail_payload(
     state: &AppState,
     profile_id: &str,
@@ -88,9 +144,16 @@ pub(crate) async fn session_detail_payload(
             let total_turns = turns.len();
             let window_size = limit.clamp(1, 200) as usize;
             let start = total_turns.saturating_sub(window_size);
+            let visible_turns = turns[start..]
+                .iter()
+                .enumerate()
+                .map(|(visible_index, turn)| {
+                    summarize_session_turn_for_detail_payload(turn, start + visible_index)
+                })
+                .collect::<Vec<_>>();
             (
                 thread,
-                turns[start..].to_vec(),
+                visible_turns,
                 total_turns,
                 start,
                 "complete",
@@ -129,9 +192,16 @@ pub(crate) async fn session_detail_payload(
             let total_turns = turns.len();
             let window_size = limit.clamp(1, 200) as usize;
             let start = total_turns.saturating_sub(window_size);
+            let visible_turns = turns[start..]
+                .iter()
+                .enumerate()
+                .map(|(visible_index, turn)| {
+                    summarize_session_turn_for_detail_payload(turn, start + visible_index)
+                })
+                .collect::<Vec<_>>();
             (
                 thread,
-                turns[start..].to_vec(),
+                visible_turns,
                 total_turns,
                 start,
                 "error",
@@ -431,8 +501,15 @@ pub(crate) async fn session_older_turns_payload(
     };
     let window_size = limit.clamp(1, 200) as usize;
     let start = before_index.saturating_sub(window_size);
+    let visible_turns = turns[start..before_index]
+        .iter()
+        .enumerate()
+        .map(|(visible_index, turn)| {
+            summarize_session_turn_for_detail_payload(turn, start + visible_index)
+        })
+        .collect::<Vec<_>>();
     Ok(json!({
-        "turns": turns[start..before_index].to_vec(),
+        "turns": visible_turns,
         "loadedTurns": before_index,
         "totalTurns": turns.len(),
         "remainingTurns": start

@@ -73,7 +73,7 @@ pub(crate) async fn emit_queue_updated(
         }),
     )
     .await;
-    emit_session_summary_updated(state, profile_id, session_id, None).await;
+    emit_session_summary_updated(state, profile_id, session_id, None, None).await;
     emit_runtime_profile_config_updated(state, profile_id).await;
 }
 

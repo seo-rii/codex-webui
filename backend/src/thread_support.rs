@@ -90,7 +90,7 @@ pub(crate) async fn update_session_organization_payload(
         }),
     )
     .await;
-    emit_session_summary_updated(state, profile_id, session_id, None).await;
+    emit_session_summary_updated(state, profile_id, session_id, None, None).await;
 
     Ok(payload)
 }
@@ -150,6 +150,7 @@ pub(crate) async fn save_session_preferences_payload(
         profile_id,
         session_id,
         Some(next_preferences.clone()),
+        None,
     )
     .await;
 
@@ -246,7 +247,7 @@ pub(crate) async fn rename_session_payload(
         }),
     )
     .await;
-    emit_session_summary_updated(state, profile_id, session_id, None).await;
+    emit_session_summary_updated(state, profile_id, session_id, None, None).await;
 
     Ok(json!({
         "ok": true,
@@ -313,7 +314,7 @@ pub(crate) async fn unarchive_session_payload(
         })?;
 
     invalidate_session_lists(state, profile_id).await;
-    let session = build_session_summary_payload(state, profile_id, session_id, None).await?;
+    let session = build_session_summary_payload(state, profile_id, session_id, None, None).await?;
     Ok(json!({
         "ok": true,
         "session": session

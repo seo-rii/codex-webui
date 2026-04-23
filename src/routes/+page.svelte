@@ -701,8 +701,22 @@
       return null;
     }
 
+    let titleSource = normalized;
+    while (true) {
+      const nextWhitespace = titleSource.search(/\s/u);
+      if (nextWhitespace <= 0) {
+        break;
+      }
+      const token = titleSource.slice(0, nextWhitespace).trim();
+      const commandLike = token.match(/^[$/]([A-Za-z0-9_-]+)$/u);
+      if (!commandLike) {
+        break;
+      }
+      titleSource = titleSource.slice(nextWhitespace).trimStart();
+    }
+
     let candidate =
-      normalized.split(/\r?\n/u, 1)[0]?.split(/(?<=[.?!])\s+/u, 1)[0]?.split(/\s[-:|]\s/u, 1)[0]?.trim() ?? normalized;
+      titleSource.split(/\r?\n/u, 1)[0]?.split(/(?<=[.?!])\s+/u, 1)[0]?.split(/\s[-:|]\s/u, 1)[0]?.trim() ?? titleSource;
 
     candidate = candidate
       .replace(/^[#>*`\-.\d()\[\]\s]+/u, "")
@@ -715,7 +729,7 @@
       .trim();
 
     if (!candidate) {
-      candidate = normalized;
+      candidate = titleSource;
     }
 
     return candidate.length > 60 ? `${candidate.slice(0, 60).trimEnd()}...` : candidate;
@@ -3467,6 +3481,12 @@
   function buildSessionSummaryFromConversation(state: ConversationState): SessionSummary {
     const hasLiveTurn = hasConversationLiveTurn(state);
     const preview = deriveConversationSummaryPreview(state.thread.preview, state.thread.turns);
+    const status =
+      hasLiveTurn
+        ? "running"
+        : isLiveConversationStatus(state.thread.status) && state.thread.turns.length > 0
+          ? "completed"
+          : state.thread.status;
 
     return {
       id: state.thread.id,
@@ -3480,7 +3500,7 @@
       archived: selectedSessionSummary?.archived ?? showArchivedSessions,
       createdAt: state.thread.createdAt,
       updatedAt: Math.max(state.thread.updatedAt, Math.floor(Date.now() / 1000)),
-      status: hasLiveTurn ? "running" : state.thread.status,
+      status,
       isSubagent: state.thread.isSubagent,
       agentNickname: state.thread.agentNickname,
       agentRole: state.thread.agentRole,
@@ -4650,6 +4670,23 @@
     if (event.method === "codex-webui/sessionSummaryUpdated") {
       const summary = event.params.session as SessionSummary | undefined;
       if (summary?.id) {
+        if (
+          summary.id === selectedSessionId &&
+          conversation &&
+          conversation.thread.id === summary.id &&
+          !hasConversationLiveTurn(conversation) &&
+          !isLiveConversationStatus(summary.status)
+        ) {
+          conversation = {
+            ...conversation,
+            activeTurnId: null,
+            thread: {
+              ...conversation.thread,
+              status: summary.status
+            }
+          };
+          markConversationCacheDirty();
+        }
         applySessionSummaryUpdate(summary);
       } else {
         scheduleSessionRefresh(60);

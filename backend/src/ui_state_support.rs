@@ -33,7 +33,8 @@ fn default_ui_state_value() -> Value {
         "skillsByThreadId": {},
         "draftsByThreadId": {},
         "queuesByThreadId": {},
-        "highlightsByThreadId": {}
+        "highlightsByThreadId": {},
+        "runtimeStatusByThreadId": {}
     })
 }
 
@@ -101,6 +102,7 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
         ("draftsByThreadId", json!({})),
         ("queuesByThreadId", json!({})),
         ("highlightsByThreadId", json!({})),
+        ("runtimeStatusByThreadId", json!({})),
     ] {
         let is_valid = if default_value.is_array() {
             root.get(key).is_some_and(Value::is_array)

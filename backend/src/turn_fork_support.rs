@@ -221,12 +221,14 @@ pub(crate) async fn fork_session_payload(
             &forked_thread,
             &snapshot,
             Some(preferences.clone()),
+            None,
         )?;
         emit_session_summary_updated(
             state,
             profile_id,
             &forked_session_id,
             Some(preferences.clone()),
+            None,
         )
         .await;
         return Ok(json!({

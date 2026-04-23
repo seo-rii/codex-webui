@@ -39,7 +39,7 @@ pub(crate) async fn enqueue_profile_notification(
     }
 
     let session_name = if let Some(session_id) = session_id {
-        build_session_summary_payload(state, profile_id, session_id, None)
+        build_session_summary_payload(state, profile_id, session_id, None, None)
             .await
             .ok()
             .and_then(|summary| summary.get("name").cloned())
@@ -217,6 +217,20 @@ pub(crate) async fn handle_profile_runtime_notification(
             if let Some(turn_id) = notification_turn_id(&notification.params) {
                 state.active_turns.lock().await.insert(runtime_key, turn_id);
             }
+            let _ = with_ui_state_write(state, profile_id, |ui_state| {
+                let Some(runtime_status_by_thread_id) = ui_state
+                    .get_mut("runtimeStatusByThreadId")
+                    .and_then(Value::as_object_mut)
+                else {
+                    return Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "runtime status state is missing",
+                    ));
+                };
+                runtime_status_by_thread_id.remove(&session_id);
+                Ok(())
+            })
+            .await;
             cancel_scheduled_shutdown_for_activity(state, profile_id).await;
             set_session_highlight(state, profile_id, &session_id, None).await;
         }
@@ -230,6 +244,26 @@ pub(crate) async fn handle_profile_runtime_notification(
                 active_turns.remove(&runtime_key);
             }
             drop(active_turns);
+            let _ = with_ui_state_write(state, profile_id, |ui_state| {
+                let Some(runtime_status_by_thread_id) = ui_state
+                    .get_mut("runtimeStatusByThreadId")
+                    .and_then(Value::as_object_mut)
+                else {
+                    return Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "runtime status state is missing",
+                    ));
+                };
+                runtime_status_by_thread_id.insert(
+                    session_id.clone(),
+                    json!({
+                        "status": "completed",
+                        "updatedAt": now_unix_ms()
+                    }),
+                );
+                Ok(())
+            })
+            .await;
             maybe_drain_queue(state, profile_id, &session_id).await;
             maybe_schedule_global_shutdown(state, profile_id, turn_id.as_deref()).await;
             emit_profile_global_notification(
@@ -273,6 +307,30 @@ pub(crate) async fn handle_profile_runtime_notification(
         "thread/status/changed" => {
             let status = normalized_thread_status(notification.params.get("status"))
                 .unwrap_or_else(|| "unknown".to_string());
+            let _ = with_ui_state_write(state, profile_id, |ui_state| {
+                let Some(runtime_status_by_thread_id) = ui_state
+                    .get_mut("runtimeStatusByThreadId")
+                    .and_then(Value::as_object_mut)
+                else {
+                    return Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "runtime status state is missing",
+                    ));
+                };
+                if is_live_thread_status(&status) {
+                    runtime_status_by_thread_id.remove(&session_id);
+                } else {
+                    runtime_status_by_thread_id.insert(
+                        session_id.clone(),
+                        json!({
+                            "status": status.clone(),
+                            "updatedAt": now_unix_ms()
+                        }),
+                    );
+                }
+                Ok(())
+            })
+            .await;
             if is_live_thread_status(&status) {
                 cancel_scheduled_shutdown_for_activity(state, profile_id).await;
             } else {
@@ -307,11 +365,27 @@ pub(crate) async fn handle_profile_runtime_notification(
         notification.method.as_str(),
         "turn/started" | "turn/completed" | "thread/name/updated" | "thread/status/changed"
     ) {
-        emit_session_summary_updated(state, profile_id, &session_id, None).await;
+        let status_override = match notification.method.as_str() {
+            "turn/started" => Some("running".to_string()),
+            "turn/completed" => Some("completed".to_string()),
+            "thread/status/changed" => normalized_thread_status(notification.params.get("status")),
+            _ => None,
+        };
+        emit_session_summary_updated(
+            state,
+            profile_id,
+            &session_id,
+            None,
+            status_override.as_deref(),
+        )
+        .await;
     }
 }
 
-async fn restore_persisted_shutdown_state(state: &AppState, profile_id: &str) -> ApiResult<()> {
+pub(crate) async fn restore_persisted_shutdown_state(
+    state: &AppState,
+    profile_id: &str,
+) -> ApiResult<()> {
     let (shutdown_after_queue_completes, shutdown_primed, scheduled_shutdown) =
         with_ui_state_read(state, profile_id, |ui_state| {
             Ok((
@@ -377,8 +451,25 @@ async fn restore_persisted_shutdown_state(state: &AppState, profile_id: &str) ->
         .is_some_and(|value| value > now_unix_ms())
     {
         arm_scheduled_shutdown(state, profile_id, scheduled_shutdown).await;
-    } else if shutdown_after_queue_completes {
+    } else if shutdown_after_queue_completes && has_work_now {
         maybe_schedule_global_shutdown(state, profile_id, None).await;
+    } else if shutdown_after_queue_completes && shutdown_primed {
+        with_ui_state_write(state, profile_id, |ui_state| {
+            let Some(global) = ui_state.get_mut("global").and_then(Value::as_object_mut) else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "global state is missing",
+                ));
+            };
+            global.insert(
+                "shutdownAfterQueueCompletesPrimed".to_string(),
+                json!(false),
+            );
+            global.insert("scheduledShutdown".to_string(), Value::Null);
+            Ok(())
+        })
+        .await?;
+        emit_runtime_profile_config_updated(state, profile_id).await;
     }
 
     Ok(())

@@ -10,11 +10,38 @@ pub(crate) fn is_placeholder_thread_name(name: Option<&str>) -> bool {
 }
 
 pub(crate) fn infer_session_display_title(prompt: &str) -> Option<String> {
-    let normalized = normalize_session_title_source(prompt);
+    let trimmed = prompt.trim();
+    let without_attachments =
+        if let Some(rest) = trimmed.strip_prefix(&format!("{ATTACHMENT_PREAMBLE_START}\n")) {
+            if let Some((_, tail)) = rest.split_once(&format!("\n{ATTACHMENT_PREAMBLE_END}")) {
+                tail.trim_start_matches('\n').trim()
+            } else {
+                trimmed
+            }
+        } else {
+            trimmed
+        };
+    let normalized = normalize_session_title_source(without_attachments);
     if normalized.is_empty() {
         return None;
     }
-    let candidate = normalized
+    let mut title_source = normalized.as_str();
+    while let Some((token, remainder)) = title_source.split_once(char::is_whitespace) {
+        let is_command_like = token
+            .strip_prefix('$')
+            .or_else(|| token.strip_prefix('/'))
+            .is_some_and(|value| {
+                !value.is_empty()
+                    && value.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || character == '_' || character == '-'
+                    })
+            });
+        if !is_command_like {
+            break;
+        }
+        title_source = remainder.trim_start();
+    }
+    let candidate = title_source
         .chars()
         .take(60)
         .collect::<String>()
@@ -29,12 +56,6 @@ pub(crate) fn infer_session_display_title(prompt: &str) -> Option<String> {
     } else {
         Some(candidate)
     }
-}
-
-pub(crate) fn infer_persisted_session_title(prompt: &str) -> Option<String> {
-    let normalized = normalize_session_title_source(prompt);
-    let title = infer_session_display_title(prompt)?;
-    (title != normalized).then_some(title)
 }
 
 pub(crate) fn display_thread_name(name: Option<&str>, preview: Option<&str>) -> Option<String> {
@@ -59,7 +80,9 @@ pub(crate) struct SessionSummaryUiSnapshot {
     pub(crate) session_meta_by_thread_id: serde_json::Map<String, Value>,
     pub(crate) preferences_by_thread_id: serde_json::Map<String, Value>,
     pub(crate) highlights_by_thread_id: serde_json::Map<String, Value>,
+    pub(crate) runtime_status_by_thread_id: serde_json::Map<String, Value>,
     pub(crate) queue_counts_by_thread_id: HashMap<String, usize>,
+    pub(crate) active_thread_ids: HashSet<String>,
 }
 
 pub(crate) fn session_filter_from_value(filter: Option<&Value>) -> SessionFilterCriteria {
@@ -425,6 +448,22 @@ pub(crate) async fn read_session_summary_ui_snapshot(
     state: &AppState,
     profile_id: &str,
 ) -> ApiResult<SessionSummaryUiSnapshot> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let active_thread_ids = state
+        .active_turns
+        .lock()
+        .await
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix(&format!(
+                "profile::{resolved_profile_id}::session-runtime::"
+            ))
+            .map(str::to_string)
+        })
+        .collect::<HashSet<_>>();
+
     with_ui_state_read(state, profile_id, |ui_state| {
         let queue_counts_by_thread_id = ui_state
             .get("queuesByThreadId")
@@ -462,7 +501,13 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default(),
+            runtime_status_by_thread_id: ui_state
+                .get("runtimeStatusByThreadId")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
             queue_counts_by_thread_id,
+            active_thread_ids,
         })
     })
     .await

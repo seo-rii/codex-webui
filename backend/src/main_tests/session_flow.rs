@@ -1042,11 +1042,20 @@ async fn send_turn_payload_uses_app_server_and_updates_session_state() {
     assert_eq!(thread.get("resumeCount").and_then(Value::as_u64), Some(1));
     assert_eq!(
         thread.get("name").and_then(Value::as_str),
-        infer_persisted_session_title(prompt).as_deref()
+        Some("New thread")
     );
     assert_eq!(
         thread.get("turns").and_then(Value::as_array).map(Vec::len),
         Some(1)
+    );
+
+    let provisional_summary =
+        build_session_summary_payload(&state, "default", "thread-1", None, None)
+            .await
+            .unwrap();
+    assert_eq!(
+        provisional_summary.get("name").and_then(Value::as_str),
+        infer_session_display_title(prompt).as_deref()
     );
 
     let last_turn_start = thread.get("lastTurnStart").cloned().unwrap_or(Value::Null);
@@ -1091,6 +1100,39 @@ async fn send_turn_payload_uses_app_server_and_updates_session_state() {
             .and_then(|value| value.get("name"))
             .and_then(Value::as_str),
         Some("imagegen")
+    );
+
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/name/set",
+            json!({
+                "threadId": "thread-1",
+                "name": "Investigate duplicate websocket sends"
+            }),
+        )
+        .await
+        .unwrap();
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "thread/name/updated".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "threadName": "Investigate duplicate websocket sends"
+            }),
+        },
+    )
+    .await;
+
+    let ai_summary = build_session_summary_payload(&state, "default", "thread-1", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        ai_summary.get("name").and_then(Value::as_str),
+        Some("Investigate duplicate websocket sends")
     );
 
     let stored_preferences = with_ui_state_read(&state, "default", |ui_state| {

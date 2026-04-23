@@ -3,7 +3,6 @@ use crate::thread_listing_support::emit_session_summary_updated;
 use crate::thread_read_support::{
     active_turn_id_from_turns, emit_session_notification, read_thread_payload,
 };
-use crate::thread_support::rename_session_payload;
 
 async fn resolve_selected_attachment_records(
     state: &AppState,
@@ -193,8 +192,6 @@ pub(crate) async fn send_turn_payload(
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "A working directory is required."))?
         .to_string();
     let thread = read_thread_payload(state, profile_id, session_id, false).await?;
-    let should_backfill_title =
-        is_placeholder_thread_name(thread.get("name").and_then(Value::as_str));
     let next_selected_skills = if requested_selected_skills.is_empty() {
         with_ui_state_read(state, profile_id, |ui_state| {
             Ok(session_selected_skills_from_ui_state(ui_state, session_id))
@@ -364,16 +361,12 @@ pub(crate) async fn send_turn_payload(
     }
 
     clear_session_draft_payload(state, profile_id, session_id).await?;
-    if should_backfill_title {
-        if let Some(title) = infer_persisted_session_title(trimmed_prompt) {
-            let _ = rename_session_payload(state, profile_id, session_id, &title).await;
-        }
-    }
     emit_session_summary_updated(
         state,
         profile_id,
         session_id,
         Some(next_preferences.clone()),
+        None,
     )
     .await;
 

@@ -35,7 +35,7 @@ pub(crate) async fn set_session_highlight(
     .await;
 
     if result.is_ok() {
-        emit_session_summary_updated(state, profile_id, session_id, None).await;
+        emit_session_summary_updated(state, profile_id, session_id, None, None).await;
     }
 }
 

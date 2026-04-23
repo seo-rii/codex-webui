@@ -45,6 +45,7 @@ pub(crate) fn build_session_summary_from_thread_payload(
     thread: &Value,
     snapshot: &SessionSummaryUiSnapshot,
     preferences_override: Option<Value>,
+    status_override: Option<&str>,
 ) -> ApiResult<Value> {
     let session_id = thread.get("id").and_then(Value::as_str).ok_or_else(|| {
         api_error(
@@ -80,6 +81,42 @@ pub(crate) fn build_session_summary_from_thread_payload(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let thread_status = normalized_thread_status(thread.get("status"));
+    let thread_updated_at = thread.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+    let runtime_status_value = snapshot.runtime_status_by_thread_id.get(session_id);
+    let runtime_status =
+        runtime_status_value.and_then(|value| normalized_thread_status(Some(value)));
+    let runtime_status_updated_at = runtime_status_value
+        .and_then(|value| value.get("updatedAt"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let status = status_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            snapshot
+                .active_thread_ids
+                .contains(session_id)
+                .then_some("running".to_string())
+        })
+        .or_else(
+            || match (thread_status.as_deref(), runtime_status.as_deref()) {
+                (Some(thread_status), Some(runtime_status)) => {
+                    if runtime_status_updated_at > 0
+                        && runtime_status_updated_at >= thread_updated_at
+                    {
+                        Some(runtime_status.to_string())
+                    } else {
+                        Some(thread_status.to_string())
+                    }
+                }
+                (Some(thread_status), None) => Some(thread_status.to_string()),
+                (None, Some(runtime_status)) => Some(runtime_status.to_string()),
+                _ => None,
+            },
+        )
+        .unwrap_or_else(|| "unknown".to_string());
 
     Ok(json!({
         "id": session_id,
@@ -99,8 +136,7 @@ pub(crate) fn build_session_summary_from_thread_payload(
         "archived": thread.get("archived").and_then(Value::as_bool).unwrap_or(false),
         "createdAt": thread.get("createdAt").cloned().unwrap_or_else(|| json!(0)),
         "updatedAt": thread.get("updatedAt").cloned().unwrap_or_else(|| json!(0)),
-        "status": normalized_thread_status(thread.get("status"))
-            .unwrap_or_else(|| "unknown".to_string()),
+        "status": status,
         "isSubagent": thread.get("isSubagent").and_then(Value::as_bool).unwrap_or(false),
         "agentNickname": thread.get("agentNickname").cloned().unwrap_or(Value::Null),
         "agentRole": thread.get("agentRole").cloned().unwrap_or(Value::Null),
@@ -225,7 +261,7 @@ async fn collect_session_summaries_payload(
         if thread_is_subagent(&thread) {
             continue;
         }
-        let summary = build_session_summary_from_thread_payload(&thread, &snapshot, None)?;
+        let summary = build_session_summary_from_thread_payload(&thread, &snapshot, None, None)?;
         if session_summary_matches_filter(&summary, filter) {
             summaries.push(summary);
         }
@@ -416,6 +452,7 @@ pub(crate) async fn create_session_payload(
         &thread,
         &snapshot,
         Some(next_preferences.clone()),
+        None,
     )?;
     invalidate_session_listing_cache(state, profile_id, Some(&session_id)).await;
     emit_profile_global_notification(
@@ -439,11 +476,16 @@ pub(crate) async fn build_session_summary_payload(
     profile_id: &str,
     session_id: &str,
     preferences_override: Option<Value>,
+    status_override: Option<&str>,
 ) -> ApiResult<Value> {
     let thread = read_thread_metadata_payload(state, profile_id, session_id).await?;
     let snapshot = read_session_summary_ui_snapshot(state, profile_id).await?;
-    let summary =
-        build_session_summary_from_thread_payload(&thread, &snapshot, preferences_override)?;
+    let summary = build_session_summary_from_thread_payload(
+        &thread,
+        &snapshot,
+        preferences_override,
+        status_override,
+    )?;
     if summary.get("id").and_then(Value::as_str) != Some(session_id) {
         return Err(api_error(
             StatusCode::BAD_GATEWAY,
@@ -458,10 +500,17 @@ pub(crate) async fn emit_session_summary_updated(
     profile_id: &str,
     session_id: &str,
     preferences_override: Option<Value>,
+    status_override: Option<&str>,
 ) {
     invalidate_session_listing_cache(state, profile_id, Some(session_id)).await;
-    let summary =
-        build_session_summary_payload(state, profile_id, session_id, preferences_override).await;
+    let summary = build_session_summary_payload(
+        state,
+        profile_id,
+        session_id,
+        preferences_override,
+        status_override,
+    )
+    .await;
     if let Ok(summary) = summary {
         emit_profile_global_notification(
             state,

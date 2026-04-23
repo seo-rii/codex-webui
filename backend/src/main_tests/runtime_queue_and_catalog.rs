@@ -569,6 +569,27 @@ async fn queue_write_helpers_mutate_queue_state() {
         .and_then(Value::as_str)
         .unwrap()
         .to_string();
+    let duplicate_first = enqueue_session_queue_payload(
+        &state,
+        "default",
+        "thread-1",
+        "first",
+        Some(&queue_skills),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        duplicate_first.get("enqueueItemId").and_then(Value::as_str),
+        Some(first_id.as_str())
+    );
+    assert_eq!(
+        duplicate_first
+            .get("items")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
     let second = enqueue_session_queue_payload(&state, "default", "thread-1", "second", None, None)
         .await
         .unwrap();

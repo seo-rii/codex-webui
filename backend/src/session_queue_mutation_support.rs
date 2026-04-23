@@ -1,5 +1,34 @@
 use super::*;
 
+const QUEUE_DUPLICATE_WINDOW_MS: u64 = 2_000;
+
+fn queue_item_matches_request(
+    item: &Value,
+    prompt: &str,
+    selected_skills: &[Value],
+    attachment_ids: &[String],
+) -> bool {
+    item.get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        == prompt
+        && item
+            .get("skills")
+            .and_then(Value::as_array)
+            .is_some_and(|skills| skills == selected_skills)
+        && item
+            .get("attachmentIds")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .is_some_and(|existing_ids| existing_ids == attachment_ids)
+}
+
 pub(crate) async fn enqueue_session_queue_payload(
     state: &AppState,
     profile_id: &str,
@@ -19,6 +48,7 @@ pub(crate) async fn enqueue_session_queue_payload(
     cancel_scheduled_shutdown_for_activity(state, profile_id).await;
 
     let queue_item_id = Uuid::new_v4().to_string();
+    let mut accepted_queue_item_id = queue_item_id.clone();
     with_ui_state_write(state, profile_id, |ui_state| {
         let Some(queues_by_thread_id) = ui_state
             .get_mut("queuesByThreadId")
@@ -52,6 +82,28 @@ pub(crate) async fn enqueue_session_queue_payload(
                 "queue items are missing",
             ));
         };
+        if let Some(existing_item_id) = items.iter().rev().find_map(|item| {
+            let created_at = item
+                .get("createdAt")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            if updated_at.saturating_sub(created_at) > QUEUE_DUPLICATE_WINDOW_MS {
+                return None;
+            }
+            queue_item_matches_request(
+                item,
+                trimmed_prompt,
+                &next_selected_skills,
+                &resolved_attachment_ids,
+            )
+            .then(|| item.get("id").and_then(Value::as_str).map(str::to_string))
+            .flatten()
+        }) {
+            accepted_queue_item_id = existing_item_id;
+            queue.insert("resumePending".to_string(), json!(false));
+            queue.insert("updatedAt".to_string(), json!(updated_at));
+            return Ok(());
+        }
         items.push(json!({
             "id": queue_item_id,
             "prompt": trimmed_prompt,
@@ -69,7 +121,7 @@ pub(crate) async fn enqueue_session_queue_payload(
     let mut queue = get_session_queue_payload(state, profile_id, session_id).await?;
     if let Some(queue_object) = queue.as_object_mut() {
         queue_object.insert("enqueueAccepted".to_string(), json!(true));
-        queue_object.insert("enqueueItemId".to_string(), json!(queue_item_id));
+        queue_object.insert("enqueueItemId".to_string(), json!(accepted_queue_item_id));
     }
     emit_queue_updated(state, profile_id, session_id, Some(queue.clone())).await;
     maybe_drain_queue(state, profile_id, session_id).await;

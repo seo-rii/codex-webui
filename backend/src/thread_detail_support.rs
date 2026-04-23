@@ -178,7 +178,7 @@ pub(crate) async fn session_detail_payload(
     .await?;
     clear_completed_session_highlight_on_open(state, profile_id, session_id).await;
 
-    Ok(json!({
+    let payload = json!({
         "thread": {
             "id": thread.get("id").cloned().unwrap_or_else(|| json!(session_id)),
             "preview": thread.get("preview").cloned().unwrap_or_else(|| json!("")),
@@ -207,7 +207,202 @@ pub(crate) async fn session_detail_payload(
             "message": hydration_message,
             "recovery": hydration_recovery
         }
-    }))
+    });
+    Ok(augment_session_detail_payload(payload))
+}
+
+fn augment_session_detail_payload(mut payload: Value) -> Value {
+    let turns = payload
+        .get("thread")
+        .and_then(|thread| thread.get("turns"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let (turn_ids, turn_versions) = session_detail_turn_state(&turns);
+    let metadata_version = payload_cache_version(&session_detail_metadata_payload(&payload));
+    let state_hash = session_detail_state_hash(&metadata_version, &turn_ids, &turn_versions);
+
+    if let Some(payload_object) = payload.as_object_mut() {
+        payload_object.insert("turnIds".to_string(), json!(turn_ids));
+        payload_object.insert("turnVersions".to_string(), json!(turn_versions));
+        payload_object.insert(
+            "metadataVersion".to_string(),
+            Value::String(metadata_version),
+        );
+        payload_object.insert("stateHash".to_string(), Value::String(state_hash));
+    }
+    payload
+}
+
+fn session_detail_turn_state(turns: &[Value]) -> (Vec<String>, HashMap<String, String>) {
+    let mut turn_ids = Vec::new();
+    let mut turn_versions = HashMap::new();
+
+    for turn in turns {
+        let Some(turn_id) = turn.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        turn_ids.push(turn_id.to_string());
+        turn_versions.insert(turn_id.to_string(), payload_cache_version(turn));
+    }
+
+    (turn_ids, turn_versions)
+}
+
+fn session_detail_metadata_payload(payload: &Value) -> Value {
+    let mut metadata = payload.clone();
+    if let Some(metadata_object) = metadata.as_object_mut() {
+        for key in [
+            "cacheVersion",
+            "notModified",
+            "turnIds",
+            "turnVersions",
+            "metadataVersion",
+            "stateHash",
+        ] {
+            metadata_object.remove(key);
+        }
+        if let Some(thread_object) = metadata_object
+            .get_mut("thread")
+            .and_then(Value::as_object_mut)
+        {
+            thread_object.insert("turns".to_string(), json!([]));
+        }
+    }
+    metadata
+}
+
+pub(crate) fn session_detail_turn_versions_from_value(
+    value: Option<&Value>,
+) -> Option<HashMap<String, String>> {
+    value.and_then(Value::as_object).map(|versions| {
+        versions
+            .iter()
+            .filter_map(|(turn_id, version)| {
+                version
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|version| (turn_id.clone(), version.to_string()))
+            })
+            .collect::<HashMap<_, _>>()
+    })
+}
+
+pub(crate) fn session_detail_state_hash(
+    metadata_version: &str,
+    turn_ids: &[String],
+    turn_versions: &HashMap<String, String>,
+) -> String {
+    let mut source = format!("metadata={metadata_version}\n");
+    for turn_id in turn_ids {
+        source.push_str(turn_id);
+        source.push('\t');
+        source.push_str(
+            turn_versions
+                .get(turn_id)
+                .map(String::as_str)
+                .unwrap_or_default(),
+        );
+        source.push('\n');
+    }
+    fnv1a32_hex(source.as_bytes())
+}
+
+pub(crate) fn cacheable_session_detail_response(
+    payload: Value,
+    known_version: Option<&str>,
+    known_turn_versions: Option<HashMap<String, String>>,
+    known_state_hash: Option<&str>,
+) -> Value {
+    let version = payload_cache_version(&payload);
+    if known_version
+        .map(str::trim)
+        .is_some_and(|candidate| !candidate.is_empty() && candidate == version)
+    {
+        return json!({
+            "cacheVersion": version,
+            "notModified": true
+        });
+    }
+
+    if known_version.is_some()
+        && known_state_hash
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        && known_turn_versions.is_some()
+    {
+        let known_versions = known_turn_versions.unwrap_or_default();
+        let current_versions = session_detail_turn_versions_from_value(payload.get("turnVersions"))
+            .unwrap_or_default();
+        let turns = payload
+            .get("thread")
+            .and_then(|thread| thread.get("turns"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let turn_ids = payload
+            .get("turnIds")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let current_turn_ids = turn_ids.iter().cloned().collect::<HashSet<_>>();
+        let turn_upserts = turns
+            .into_iter()
+            .filter(|turn| {
+                let Some(turn_id) = turn.get("id").and_then(Value::as_str) else {
+                    return false;
+                };
+                current_versions.get(turn_id) != known_versions.get(turn_id)
+            })
+            .collect::<Vec<_>>();
+        let turn_removes = known_versions
+            .keys()
+            .filter(|turn_id| !current_turn_ids.contains(*turn_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut thread = payload.get("thread").cloned().unwrap_or_else(|| json!({}));
+        if let Some(thread_object) = thread.as_object_mut() {
+            thread_object.insert("turns".to_string(), json!([]));
+        }
+
+        return json!({
+            "cacheVersion": version,
+            "notModified": false,
+            "patch": {
+                "baseCacheVersion": known_version.unwrap_or_default(),
+                "baseStateHash": known_state_hash.unwrap_or_default(),
+                "finalCacheVersion": version,
+                "finalStateHash": payload.get("stateHash").cloned().unwrap_or(Value::Null),
+                "metadataVersion": payload.get("metadataVersion").cloned().unwrap_or(Value::Null),
+                "turnIds": turn_ids,
+                "turnVersions": current_versions,
+                "turnUpserts": turn_upserts,
+                "turnRemoves": turn_removes,
+                "thread": thread,
+                "preferences": payload.get("preferences").cloned().unwrap_or(Value::Null),
+                "selectedSkills": payload.get("selectedSkills").cloned().unwrap_or_else(|| json!([])),
+                "attachments": payload.get("attachments").cloned().unwrap_or_else(|| json!([])),
+                "queue": payload.get("queue").cloned().unwrap_or(Value::Null),
+                "pendingRequests": payload.get("pendingRequests").cloned().unwrap_or_else(|| json!([])),
+                "activeTurnId": payload.get("activeTurnId").cloned().unwrap_or(Value::Null),
+                "tokenUsage": payload.get("tokenUsage").cloned().unwrap_or(Value::Null),
+                "hydration": payload.get("hydration").cloned().unwrap_or(Value::Null)
+            }
+        });
+    }
+
+    let mut next_payload = payload;
+    if let Some(payload_object) = next_payload.as_object_mut() {
+        payload_object.insert("cacheVersion".to_string(), Value::String(version));
+        payload_object.insert("notModified".to_string(), Value::Bool(false));
+    }
+    next_payload
 }
 
 pub(crate) async fn session_older_turns_payload(

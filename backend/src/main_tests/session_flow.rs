@@ -395,6 +395,12 @@ async fn ws_session_cache_validation_returns_not_modified_for_matching_versions(
         .and_then(Value::as_str)
         .unwrap()
         .to_string();
+    let list_summary_versions = list_payload.get("summaryVersions").cloned().unwrap();
+    let list_state_hash = list_payload
+        .get("stateHash")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
     let list_not_modified = execute_ws_method(
         &state,
         &out_tx,
@@ -417,6 +423,55 @@ async fn ws_session_cache_validation_returns_not_modified_for_matching_versions(
     );
     assert!(list_not_modified.get("sessions").is_none());
 
+    let patched_session = create_session_payload(
+        &state,
+        "default",
+        json!({ "cwd": workspace.display().to_string() }),
+        None,
+        Some("Patched thread"),
+    )
+    .await
+    .unwrap();
+    let patched_session_id = patched_session
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let list_patch = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "sessions/list",
+        json!({
+            "archived": false,
+            "limit": 20,
+            "knownVersion": list_version,
+            "knownSummaryVersions": list_summary_versions,
+            "knownStateHash": list_state_hash
+        }),
+    )
+    .await
+    .unwrap();
+    let patch = list_patch.get("patch").unwrap();
+    assert_eq!(
+        patch
+            .get("upserts")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|summary| summary.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        vec![patched_session_id]
+    );
+    assert!(
+        patch
+            .get("finalStateHash")
+            .and_then(Value::as_str)
+            .is_some()
+    );
+    assert!(list_patch.get("sessions").is_none());
+
     let detail_payload = execute_ws_method(
         &state,
         &out_tx,
@@ -432,6 +487,12 @@ async fn ws_session_cache_validation_returns_not_modified_for_matching_versions(
     .unwrap();
     let detail_version = detail_payload
         .get("cacheVersion")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let detail_turn_versions = detail_payload.get("turnVersions").cloned().unwrap();
+    let detail_state_hash = detail_payload
+        .get("stateHash")
         .and_then(Value::as_str)
         .unwrap()
         .to_string();
@@ -456,6 +517,58 @@ async fn ws_session_cache_validation_returns_not_modified_for_matching_versions(
         Some(true)
     );
     assert!(detail_not_modified.get("thread").is_none());
+
+    execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "session/rename",
+        json!({
+            "sessionId": session_id,
+            "name": "Renamed detail thread"
+        }),
+    )
+    .await
+    .unwrap();
+    let detail_patch = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "session/get",
+        json!({
+            "sessionId": session_id,
+            "limit": 20,
+            "knownVersion": detail_version,
+            "knownTurnVersions": detail_turn_versions,
+            "knownStateHash": detail_state_hash
+        }),
+    )
+    .await
+    .unwrap();
+    let patch = detail_patch.get("patch").unwrap();
+    assert_eq!(
+        patch
+            .get("thread")
+            .and_then(|thread| thread.get("name"))
+            .and_then(Value::as_str),
+        Some("Renamed detail thread")
+    );
+    assert_eq!(
+        patch
+            .get("turnUpserts")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    assert!(
+        patch
+            .get("finalStateHash")
+            .and_then(Value::as_str)
+            .is_some()
+    );
+    assert!(detail_patch.get("thread").is_none());
 
     let _ = fs::remove_dir_all(sandbox);
 }

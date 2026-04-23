@@ -256,11 +256,169 @@ pub(crate) fn session_summary_page(
     } else {
         Vec::new()
     };
+    let (session_ids, summary_versions, state_hash) =
+        session_summary_page_state(&page, next_cursor.as_deref());
 
     json!({
         "sessions": page,
-        "nextCursor": next_cursor
+        "nextCursor": next_cursor,
+        "sessionIds": session_ids,
+        "summaryVersions": summary_versions,
+        "stateHash": state_hash
     })
+}
+
+fn session_summary_page_state(
+    sessions: &[Value],
+    next_cursor: Option<&str>,
+) -> (Vec<String>, serde_json::Map<String, Value>, String) {
+    let mut session_ids = Vec::new();
+    let mut summary_versions = serde_json::Map::new();
+
+    for summary in sessions {
+        let Some(session_id) = summary.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        session_ids.push(session_id.to_string());
+        summary_versions.insert(
+            session_id.to_string(),
+            Value::String(payload_cache_version(summary)),
+        );
+    }
+
+    let state_hash = session_summary_list_state_hash(
+        &session_ids,
+        next_cursor,
+        &summary_versions
+            .iter()
+            .filter_map(|(session_id, version)| {
+                version
+                    .as_str()
+                    .map(|version| (session_id.clone(), version.to_string()))
+            })
+            .collect::<HashMap<_, _>>(),
+    );
+
+    (session_ids, summary_versions, state_hash)
+}
+
+pub(crate) fn session_summary_versions_from_value(
+    value: Option<&Value>,
+) -> Option<HashMap<String, String>> {
+    value.and_then(Value::as_object).map(|versions| {
+        versions
+            .iter()
+            .filter_map(|(session_id, version)| {
+                version
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|version| (session_id.clone(), version.to_string()))
+            })
+            .collect::<HashMap<_, _>>()
+    })
+}
+
+pub(crate) fn session_summary_list_state_hash(
+    session_ids: &[String],
+    next_cursor: Option<&str>,
+    summary_versions: &HashMap<String, String>,
+) -> String {
+    let mut source = format!("cursor={}\n", next_cursor.unwrap_or_default());
+    for session_id in session_ids {
+        source.push_str(session_id);
+        source.push('\t');
+        source.push_str(
+            summary_versions
+                .get(session_id)
+                .map(String::as_str)
+                .unwrap_or_default(),
+        );
+        source.push('\n');
+    }
+    fnv1a32_hex(source.as_bytes())
+}
+
+pub(crate) fn cacheable_session_list_response(
+    payload: Value,
+    known_version: Option<&str>,
+    known_summary_versions: Option<HashMap<String, String>>,
+    known_state_hash: Option<&str>,
+) -> Value {
+    let version = payload_cache_version(&payload);
+    if known_version
+        .map(str::trim)
+        .is_some_and(|candidate| !candidate.is_empty() && candidate == version)
+    {
+        return json!({
+            "cacheVersion": version,
+            "notModified": true
+        });
+    }
+
+    if known_version.is_some()
+        && known_state_hash
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        && known_summary_versions.is_some()
+    {
+        let known_versions = known_summary_versions.unwrap_or_default();
+        let current_versions =
+            session_summary_versions_from_value(payload.get("summaryVersions")).unwrap_or_default();
+        let sessions = payload
+            .get("sessions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let session_ids = payload
+            .get("sessionIds")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let current_session_ids = session_ids.iter().cloned().collect::<HashSet<_>>();
+        let upserts = sessions
+            .into_iter()
+            .filter(|summary| {
+                let Some(session_id) = summary.get("id").and_then(Value::as_str) else {
+                    return false;
+                };
+                current_versions.get(session_id) != known_versions.get(session_id)
+            })
+            .collect::<Vec<_>>();
+        let removes = known_versions
+            .keys()
+            .filter(|session_id| !current_session_ids.contains(*session_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        return json!({
+            "cacheVersion": version,
+            "notModified": false,
+            "patch": {
+                "baseCacheVersion": known_version.unwrap_or_default(),
+                "baseStateHash": known_state_hash.unwrap_or_default(),
+                "finalCacheVersion": version,
+                "finalStateHash": payload.get("stateHash").cloned().unwrap_or(Value::Null),
+                "sessionIds": session_ids,
+                "summaryVersions": current_versions,
+                "upserts": upserts,
+                "removes": removes,
+                "nextCursor": payload.get("nextCursor").cloned().unwrap_or(Value::Null)
+            }
+        });
+    }
+
+    let mut next_payload = payload;
+    if let Some(payload_object) = next_payload.as_object_mut() {
+        payload_object.insert("cacheVersion".to_string(), Value::String(version));
+        payload_object.insert("notModified".to_string(), Value::Bool(false));
+    }
+    next_payload
 }
 
 pub(crate) async fn read_session_summary_ui_snapshot(

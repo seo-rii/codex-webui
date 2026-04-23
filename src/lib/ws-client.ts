@@ -190,6 +190,32 @@ export class WebSocketRpcClient {
     };
   }
 
+  reconnectNow() {
+    if (typeof window === "undefined" || !this.hasConnectionDemand()) {
+      return;
+    }
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempt = 0;
+
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.sendPing();
+      this.flushPending();
+      return;
+    }
+
+    if (this.socket?.readyState === WebSocket.CONNECTING) {
+      return;
+    }
+
+    this.socket = null;
+    this.manualClose = false;
+    this.ensureConnected();
+  }
+
   disconnect(message = "WebSocket connection closed.") {
     this.manualClose = true;
     if (this.reconnectTimer) {
@@ -305,15 +331,13 @@ export class WebSocketRpcClient {
     });
 
     socket.addEventListener("close", () => {
-      if (this.socket === socket) {
-        this.socket = null;
+      if (this.socket !== socket) {
+        return;
       }
+      this.socket = null;
       this.stopHeartbeat();
 
-      if (
-        !this.manualClose &&
-        (this.pending.size > 0 || this.sessionHandlers.size > 0 || this.terminalHandlers.size > 0 || this.globalHandlers.size > 0)
-      ) {
+      if (!this.manualClose && this.hasConnectionDemand()) {
         this.setConnectionState("reconnecting");
         this.scheduleReconnect();
       } else {
@@ -327,7 +351,7 @@ export class WebSocketRpcClient {
   }
 
   private scheduleReconnect() {
-    if (this.reconnectTimer) {
+    if (this.reconnectTimer || !this.hasConnectionDemand()) {
       return;
     }
 
@@ -337,6 +361,10 @@ export class WebSocketRpcClient {
       this.reconnectTimer = null;
       this.ensureConnected();
     }, delay);
+  }
+
+  private hasConnectionDemand() {
+    return this.pending.size > 0 || this.sessionHandlers.size > 0 || this.terminalHandlers.size > 0 || this.globalHandlers.size > 0;
   }
 
   private flushPending() {
@@ -385,15 +413,7 @@ export class WebSocketRpcClient {
   private startHeartbeat() {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
-      if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-        return;
-      }
-
-      const payload: ClientEnvelope = {
-        kind: "ping",
-        nonce: makeRequestId()
-      };
-      this.socket.send(JSON.stringify(payload));
+      this.sendPing();
     }, HEARTBEAT_MS);
   }
 
@@ -401,6 +421,24 @@ export class WebSocketRpcClient {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
+    }
+  }
+
+  private sendPing() {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    const payload: ClientEnvelope = {
+      kind: "ping",
+      nonce: makeRequestId()
+    };
+    try {
+      this.socket.send(JSON.stringify(payload));
+      return true;
+    } catch {
+      this.socket.close();
+      return false;
     }
   }
 

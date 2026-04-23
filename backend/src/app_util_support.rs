@@ -165,24 +165,13 @@ pub(crate) fn payload_cache_version(payload: &Value) -> String {
     URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
 
-pub(crate) fn cacheable_payload_response(payload: Value, known_version: Option<&str>) -> Value {
-    let version = payload_cache_version(&payload);
-    if known_version
-        .map(str::trim)
-        .is_some_and(|candidate| !candidate.is_empty() && candidate == version)
-    {
-        return json!({
-            "cacheVersion": version,
-            "notModified": true
-        });
+pub(crate) fn fnv1a32_hex(bytes: &[u8]) -> String {
+    let mut hash = 0x811c9dc5_u32;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
     }
-
-    let mut next_payload = payload;
-    if let Some(payload_object) = next_payload.as_object_mut() {
-        payload_object.insert("cacheVersion".to_string(), Value::String(version));
-        payload_object.insert("notModified".to_string(), Value::Bool(false));
-    }
-    next_payload
+    format!("{hash:08x}")
 }
 
 pub(crate) fn require_string(params: &Value, key: &str) -> Result<String> {

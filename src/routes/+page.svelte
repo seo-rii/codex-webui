@@ -97,7 +97,9 @@
     SavedSessionFilter,
     SelectedSkill,
     SessionListPayload,
+    SessionListPatchPayload,
     SessionListResponse,
+    SessionDetailPatchPayload,
     SessionDetailPayload,
     SessionDetailResponse,
     SessionPreferences,
@@ -322,7 +324,12 @@
   let pwaManualInstallOnly = $state(false);
   let sessionListCacheKey = $state<string | null>(null);
   let sessionListCacheVersion = $state<string | null>(null);
+  let sessionListStateHash = $state<string | null>(null);
+  let sessionSummaryVersionsById = $state<Record<string, string>>({});
   let sessionDetailCacheVersion = $state<string | null>(null);
+  let sessionDetailStateHash = $state<string | null>(null);
+  let sessionDetailMetadataVersion = $state<string | null>(null);
+  let sessionTurnVersionsById = $state<Record<string, string>>({});
   const readOnlyRole = $derived(webRole === "viewer");
 
   $effect(() => {
@@ -2041,6 +2048,20 @@
     const handleDisplayModeChange = () => {
       syncPwaInstallState();
     };
+    let lastForegroundReconnectAt = 0;
+    const requestForegroundReconnect = () => {
+      if (authenticated !== true) {
+        return;
+      }
+
+      const now = Date.now();
+      if (now - lastForegroundReconnectAt < 750) {
+        return;
+      }
+
+      lastForegroundReconnectAt = now;
+      api.reconnectNow();
+    };
     let hiddenStartedAt: number | null = document.hidden ? Date.now() : null;
     const handleVisibilityChange = () => {
       if (document.hidden) {
@@ -2048,6 +2069,7 @@
         return;
       }
 
+      requestForegroundReconnect();
       const lastHiddenAt = hiddenStartedAt;
       hiddenStartedAt = null;
       if (!selectedSessionId || connectionState !== "connected" || lastHiddenAt === null) {
@@ -2111,6 +2133,9 @@
     window.addEventListener("keydown", requestNotificationPermissionFromGesture, true);
     window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
     window.addEventListener("appinstalled", handleAppInstalled);
+    window.addEventListener("focus", requestForegroundReconnect);
+    window.addEventListener("online", requestForegroundReconnect);
+    window.addEventListener("pageshow", requestForegroundReconnect);
     document.addEventListener("visibilitychange", handleVisibilityChange, true);
     void bootstrap();
 
@@ -2173,6 +2198,9 @@
       window.removeEventListener("keydown", requestNotificationPermissionFromGesture, true);
       window.removeEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
       window.removeEventListener("appinstalled", handleAppInstalled);
+      window.removeEventListener("focus", requestForegroundReconnect);
+      window.removeEventListener("online", requestForegroundReconnect);
+      window.removeEventListener("pageshow", requestForegroundReconnect);
       document.removeEventListener("visibilitychange", handleVisibilityChange, true);
       api.disconnect();
     };
@@ -2999,6 +3027,47 @@
     return payload.notModified === true;
   }
 
+  function isSessionListPatchResponse(payload: SessionListResponse): payload is SessionListPatchPayload {
+    return "patch" in payload;
+  }
+
+  function isSessionDetailPatchResponse(payload: SessionDetailResponse): payload is SessionDetailPatchPayload {
+    return "patch" in payload;
+  }
+
+  function fnv1a32Hex(source: string) {
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < source.length; index += 1) {
+      hash ^= source.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, "0");
+  }
+
+  function buildSessionListStateHash(
+    sessionIds: string[],
+    nextCursor: string | null,
+    summaryVersions: Record<string, string>
+  ) {
+    let source = `cursor=${nextCursor ?? ""}\n`;
+    for (const sessionId of sessionIds) {
+      source += `${sessionId}\t${summaryVersions[sessionId] ?? ""}\n`;
+    }
+    return fnv1a32Hex(source);
+  }
+
+  function buildSessionDetailStateHash(
+    metadataVersion: string,
+    turnIds: string[],
+    turnVersions: Record<string, string>
+  ) {
+    let source = `metadata=${metadataVersion}\n`;
+    for (const turnId of turnIds) {
+      source += `${turnId}\t${turnVersions[turnId] ?? ""}\n`;
+    }
+    return fnv1a32Hex(source);
+  }
+
   function clonePayloadForCache<T>(payload: T): T {
     if (typeof structuredClone === "function") {
       return structuredClone(payload);
@@ -3041,20 +3110,39 @@
 
   function conversationToSessionDetailPayload(state: ConversationState): SessionDetailPayload {
     const { livePlans, liveDiffs, ...detail } = state;
-    return {
+    const payload: SessionDetailPayload = {
       ...clonePayloadForCache(detail),
       cacheVersion: sessionDetailCacheVersion ?? detail.cacheVersion ?? "",
       notModified: false
     };
+    if (sessionDetailStateHash) {
+      payload.stateHash = sessionDetailStateHash;
+    }
+    if (sessionDetailMetadataVersion) {
+      payload.metadataVersion = sessionDetailMetadataVersion;
+    }
+    if (Object.keys(sessionTurnVersionsById).length > 0) {
+      payload.turnVersions = { ...sessionTurnVersionsById };
+      payload.turnIds = state.thread.turns.map((turn) => turn.id);
+    }
+    return payload;
   }
 
   function currentSessionListPayload(): SessionListPayload {
-    return {
+    const payload: SessionListPayload = {
       sessions: clonePayloadForCache(sessions),
       nextCursor: sessionsCursor,
+      sessionIds: sessions.map((session) => session.id),
       cacheVersion: sessionListCacheVersion ?? "",
       notModified: false
     };
+    if (sessionListStateHash) {
+      payload.stateHash = sessionListStateHash;
+    }
+    if (Object.keys(sessionSummaryVersionsById).length > 0) {
+      payload.summaryVersions = { ...sessionSummaryVersionsById };
+    }
+    return payload;
   }
 
   function scheduleSessionListCachePersist(version: string | null = sessionListCacheVersion) {
@@ -3099,6 +3187,9 @@
 
   function markConversationCacheDirty() {
     sessionDetailCacheVersion = null;
+    sessionDetailStateHash = null;
+    sessionDetailMetadataVersion = null;
+    sessionTurnVersionsById = {};
     scheduleSessionDetailCachePersist(null);
   }
 
@@ -3118,10 +3209,52 @@
     sessionsHasMore = Boolean(payload.nextCursor);
     if (!append) {
       sessionListCacheVersion = payload.cacheVersion ?? null;
+      sessionListStateHash = payload.stateHash ?? null;
+      sessionSummaryVersionsById = payload.summaryVersions ? { ...payload.summaryVersions } : {};
       sessionListCacheKey = buildSessionListBrowserCacheKey();
     } else {
       sessionListCacheVersion = null;
+      sessionListStateHash = null;
+      sessionSummaryVersionsById = {};
     }
+  }
+
+  function applySessionListPatch(payload: SessionListPatchPayload, pinnedSession: SessionSummary | null) {
+    const patch = payload.patch;
+    const currentById = new Map(sessions.map((session) => [session.id, session]));
+    const upsertsById = new Map(
+      patch.upserts.filter((session) => !isSubagentSessionSummary(session)).map((session) => [session.id, session])
+    );
+    const pageSessions: SessionSummary[] = [];
+
+    for (const sessionId of patch.sessionIds) {
+      const summary = upsertsById.get(sessionId) ?? currentById.get(sessionId);
+      if (!summary || isSubagentSessionSummary(summary)) {
+        return false;
+      }
+      pageSessions.push(summary);
+    }
+
+    const computedHash = buildSessionListStateHash(patch.sessionIds, patch.nextCursor, patch.summaryVersions);
+    if (computedHash !== patch.finalStateHash) {
+      return false;
+    }
+
+    const deduped = pageSessions.filter(
+      (session, index, collection) => collection.findIndex((candidate) => candidate.id === session.id) === index
+    );
+    if (shouldPinSession(pinnedSession) && pinnedSession && !deduped.some((session) => session.id === pinnedSession.id)) {
+      deduped.unshift(pinnedSession);
+    }
+
+    sessions = sortSessions(deduped);
+    sessionsCursor = patch.nextCursor;
+    sessionsHasMore = Boolean(patch.nextCursor);
+    sessionListCacheVersion = payload.cacheVersion;
+    sessionListStateHash = patch.finalStateHash;
+    sessionSummaryVersionsById = { ...patch.summaryVersions };
+    sessionListCacheKey = buildSessionListBrowserCacheKey();
+    return true;
   }
 
   function shouldPinSession(session: SessionSummary | null) {
@@ -3139,6 +3272,8 @@
       sessions = sortSessions(sessions.filter((session) => session.id !== summary.id));
       if (cacheDirty) {
         sessionListCacheVersion = null;
+        sessionListStateHash = null;
+        sessionSummaryVersionsById = {};
         scheduleSessionListCachePersist(null);
       }
       return;
@@ -3146,6 +3281,8 @@
     sessions = sortSessions([summary, ...sessions.filter((session) => session.id !== summary.id)]);
     if (cacheDirty) {
       sessionListCacheVersion = null;
+      sessionListStateHash = null;
+      sessionSummaryVersionsById = {};
       scheduleSessionListCachePersist(null);
     }
   }
@@ -3156,6 +3293,8 @@
       if (nextSessions.length !== sessions.length) {
         sessions = sortSessions(nextSessions);
         sessionListCacheVersion = null;
+        sessionListStateHash = null;
+        sessionSummaryVersionsById = {};
         scheduleSessionListCachePersist(null);
       }
       return;
@@ -3171,6 +3310,8 @@
       if (nextSessions.length !== sessions.length) {
         sessions = sortSessions(nextSessions);
         sessionListCacheVersion = null;
+        sessionListStateHash = null;
+        sessionSummaryVersionsById = {};
         scheduleSessionListCachePersist(null);
       }
       return;
@@ -3181,6 +3322,8 @@
       if (nextSessions.length !== sessions.length) {
         sessions = sortSessions(nextSessions);
         sessionListCacheVersion = null;
+        sessionListStateHash = null;
+        sessionSummaryVersionsById = {};
         scheduleSessionListCachePersist(null);
       }
       return;
@@ -3328,9 +3471,14 @@
     sessionsLoadingMore = false;
     sessionListCacheKey = null;
     sessionListCacheVersion = null;
+    sessionListStateHash = null;
+    sessionSummaryVersionsById = {};
     conversation = null;
     selectedSessionId = null;
     sessionDetailCacheVersion = null;
+    sessionDetailStateHash = null;
+    sessionDetailMetadataVersion = null;
+    sessionTurnVersionsById = {};
     loadingDetail = false;
     sessionsBusy = false;
     sending = false;
@@ -3498,6 +3646,9 @@
     const query = sessionSearchQuery.trim();
     const listCacheKey = buildSessionListBrowserCacheKey();
     let knownVersion: string | null = sessionListCacheKey === listCacheKey ? sessionListCacheVersion : null;
+    let knownSummaryVersions: Record<string, string> | null =
+      knownVersion && sessionListCacheKey === listCacheKey && sessionListStateHash ? { ...sessionSummaryVersionsById } : null;
+    let knownStateHash: string | null = knownVersion && sessionListCacheKey === listCacheKey ? sessionListStateHash : null;
     const shouldHydrateListFromBrowserCache =
       Boolean(listCacheKey) && (sessionListCacheKey !== listCacheKey || sessions.length === 0);
 
@@ -3512,12 +3663,32 @@
           sessionListCacheKey = listCacheKey;
           sessionListCacheVersion = cachedEntry.version;
           knownVersion = cachedEntry.version;
+          knownSummaryVersions = sessionListStateHash ? { ...sessionSummaryVersionsById } : null;
+          knownStateHash = sessionListStateHash;
         }
       }
 
       const response = query
-        ? await api.searchSessions(query, sessionSearchScope, showArchivedSessions, null, sessionPageSize, sessionFilter, knownVersion)
-        : await api.getSessions(showArchivedSessions, null, sessionPageSize, sessionFilter, knownVersion);
+        ? await api.searchSessions(
+            query,
+            sessionSearchScope,
+            showArchivedSessions,
+            null,
+            sessionPageSize,
+            sessionFilter,
+            knownVersion,
+            knownSummaryVersions,
+            knownStateHash
+          )
+        : await api.getSessions(
+            showArchivedSessions,
+            null,
+            sessionPageSize,
+            sessionFilter,
+            knownVersion,
+            knownSummaryVersions,
+            knownStateHash
+          );
 
       if (requestVersion !== sessionListRequestVersion) {
         return;
@@ -3526,6 +3697,29 @@
       if (isCacheValidationResponse(response)) {
         sessionListCacheKey = listCacheKey;
         sessionListCacheVersion = response.cacheVersion;
+        return;
+      }
+
+      if (isSessionListPatchResponse(response)) {
+        if (applySessionListPatch(response, pinnedSession)) {
+          if (listCacheKey) {
+            void writeSessionListCache(listCacheKey, currentSessionListPayload(), response.cacheVersion);
+          }
+          return;
+        }
+
+        const fallback = query
+          ? await api.searchSessions(query, sessionSearchScope, showArchivedSessions, null, sessionPageSize, sessionFilter)
+          : await api.getSessions(showArchivedSessions, null, sessionPageSize, sessionFilter);
+        if (requestVersion !== sessionListRequestVersion || isCacheValidationResponse(fallback) || isSessionListPatchResponse(fallback)) {
+          return;
+        }
+        mergeSessionPage(fallback, pinnedSession, false);
+        if (listCacheKey) {
+          sessionListCacheKey = listCacheKey;
+          sessionListCacheVersion = fallback.cacheVersion;
+          void writeSessionListCache(listCacheKey, fallback, fallback.cacheVersion);
+        }
         return;
       }
 
@@ -3632,6 +3826,9 @@
       if (isCacheValidationResponse(response)) {
         return;
       }
+      if (isSessionListPatchResponse(response)) {
+        return;
+      }
 
       mergeSessionPage(response, shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null, true);
       scheduleSessionListCachePersist(null);
@@ -3710,6 +3907,9 @@
     olderTurnsAutoTriggerTimestamps = [];
     loadingOlderTurns = false;
     sessionDetailCacheVersion = null;
+    sessionDetailStateHash = null;
+    sessionDetailMetadataVersion = null;
+    sessionTurnVersionsById = {};
     pendingSteerResume = null;
     optimisticMessage = null;
     sendIntent = null;
@@ -3831,8 +4031,7 @@
         }
 
         conversation = normalizeConversationExecutionState(applyStreamEvent(conversation, payload));
-        sessionDetailCacheVersion = null;
-        scheduleSessionDetailCachePersist(null);
+        markConversationCacheDirty();
         if (
           pendingQueueModeSessionId === sessionId &&
           payload.kind === "notification" &&
@@ -3933,6 +4132,58 @@
     return queued.reduce((current, event) => applyStreamEvent(current, event), nextConversation);
   }
 
+  function updateSessionDetailSyncState(detail: SessionDetailPayload) {
+    sessionDetailCacheVersion = detail.cacheVersion ?? null;
+    sessionDetailStateHash = detail.stateHash ?? null;
+    sessionDetailMetadataVersion = detail.metadataVersion ?? null;
+    sessionTurnVersionsById = detail.turnVersions ? { ...detail.turnVersions } : {};
+  }
+
+  function applySessionDetailPatch(payload: SessionDetailPatchPayload): SessionDetailPayload | null {
+    if (!conversation) {
+      return null;
+    }
+
+    const patch = payload.patch;
+    const currentTurnsById = new Map(conversation.thread.turns.map((turn) => [turn.id, turn]));
+    const upsertsById = new Map(patch.turnUpserts.map((turn) => [turn.id, turn]));
+    const turns: SessionDetailPayload["thread"]["turns"] = [];
+
+    for (const turnId of patch.turnIds) {
+      const turn = upsertsById.get(turnId) ?? currentTurnsById.get(turnId);
+      if (!turn) {
+        return null;
+      }
+      turns.push(turn);
+    }
+
+    const computedHash = buildSessionDetailStateHash(patch.metadataVersion, patch.turnIds, patch.turnVersions);
+    if (computedHash !== patch.finalStateHash) {
+      return null;
+    }
+
+    return {
+      thread: {
+        ...patch.thread,
+        turns
+      },
+      preferences: patch.preferences,
+      selectedSkills: patch.selectedSkills,
+      attachments: patch.attachments,
+      queue: patch.queue,
+      pendingRequests: patch.pendingRequests,
+      activeTurnId: patch.activeTurnId,
+      tokenUsage: patch.tokenUsage,
+      hydration: patch.hydration,
+      turnIds: patch.turnIds,
+      turnVersions: patch.turnVersions,
+      metadataVersion: patch.metadataVersion,
+      stateHash: patch.finalStateHash,
+      cacheVersion: payload.cacheVersion,
+      notModified: false
+    };
+  }
+
   function applyLoadedSessionDetail(sessionId: string, detail: SessionDetailPayload) {
     let nextConversation =
       conversation && conversation.thread.id === detail.thread.id
@@ -3941,6 +4192,7 @@
     nextConversation = flushPendingSessionEvents(sessionId, nextConversation);
     nextConversation = normalizeConversationExecutionState(nextConversation);
     conversation = nextConversation;
+    updateSessionDetailSyncState(detail);
     if (pendingQueueModeSessionId === sessionId && hasConversationLiveTurn(nextConversation)) {
       pendingQueueModeSessionId = null;
     }
@@ -4036,7 +4288,10 @@
   }
 
   async function refreshSelectedSessionState(sessionId: string, turnLimit: number, loadDraft = false, knownVersion: string | null = sessionDetailCacheVersion) {
-    const detail = await api.getSession(sessionId, turnLimit, knownVersion);
+    const knownTurnVersions =
+      knownVersion && sessionDetailStateHash && conversation?.thread.id === sessionId ? { ...sessionTurnVersionsById } : null;
+    const knownStateHash = knownVersion && conversation?.thread.id === sessionId ? sessionDetailStateHash : null;
+    const detail = await api.getSession(sessionId, turnLimit, knownVersion, knownTurnVersions, knownStateHash);
     if (isCacheValidationResponse(detail)) {
       sessionDetailCacheVersion = detail.cacheVersion;
       if (selectedSessionId !== sessionId || !conversation || conversation.thread.id !== sessionId) {
@@ -4050,12 +4305,37 @@
       return conversation;
     }
 
+    if (isSessionDetailPatchResponse(detail)) {
+      const patchedDetail = applySessionDetailPatch(detail);
+      const fallbackDetail = patchedDetail
+        ? null
+        : await api.getSession(sessionId, turnLimit);
+      const nextDetail = patchedDetail ?? fallbackDetail;
+      if (!nextDetail || isCacheValidationResponse(nextDetail) || isSessionDetailPatchResponse(nextDetail)) {
+        return null;
+      }
+      if (selectedSessionId !== nextDetail.thread.id) {
+        return null;
+      }
+
+      const nextConversation = applyLoadedSessionDetail(nextDetail.thread.id, nextDetail);
+      const detailCacheKey = buildSessionDetailBrowserCacheKey(nextDetail.thread.id);
+      if (detailCacheKey) {
+        void writeSessionDetailCache(detailCacheKey, nextDetail, nextDetail.cacheVersion);
+      }
+      if (loadDraft) {
+        await loadSavedDraft(nextDetail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
+      }
+      stickTranscriptToBottom = true;
+      forceTranscriptScroll = true;
+      return nextConversation;
+    }
+
     if (selectedSessionId !== detail.thread.id) {
       return null;
     }
 
     const nextConversation = applyLoadedSessionDetail(detail.thread.id, detail);
-    sessionDetailCacheVersion = detail.cacheVersion;
     const detailCacheKey = buildSessionDetailBrowserCacheKey(detail.thread.id);
     if (detailCacheKey) {
       void writeSessionDetailCache(detailCacheKey, detail, detail.cacheVersion);

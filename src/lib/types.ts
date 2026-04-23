@@ -135,6 +135,9 @@ export type SessionSummaryHighlight = {
 export type SessionListPayload = {
   sessions: SessionSummary[];
   nextCursor: string | null;
+  sessionIds?: string[];
+  summaryVersions?: Record<string, string>;
+  stateHash?: string;
   cacheVersion: string;
   notModified?: false;
 };
@@ -144,7 +147,23 @@ export type CacheValidationPayload = {
   notModified: true;
 };
 
-export type SessionListResponse = SessionListPayload | CacheValidationPayload;
+export type SessionListPatchPayload = {
+  cacheVersion: string;
+  notModified: false;
+  patch: {
+    baseCacheVersion: string;
+    baseStateHash: string;
+    finalCacheVersion: string;
+    finalStateHash: string;
+    sessionIds: string[];
+    summaryVersions: Record<string, string>;
+    upserts: SessionSummary[];
+    removes: string[];
+    nextCursor: string | null;
+  };
+};
+
+export type SessionListResponse = SessionListPayload | CacheValidationPayload | SessionListPatchPayload;
 
 export type AttachmentRecord = {
   id: string;
@@ -410,11 +429,40 @@ export type SessionDetailPayload = {
       skippedLines: number | null;
     };
   };
+  turnIds?: string[];
+  turnVersions?: Record<string, string>;
+  metadataVersion?: string;
+  stateHash?: string;
   cacheVersion: string;
   notModified?: false;
 };
 
-export type SessionDetailResponse = SessionDetailPayload | CacheValidationPayload;
+export type SessionDetailPatchPayload = {
+  cacheVersion: string;
+  notModified: false;
+  patch: {
+    baseCacheVersion: string;
+    baseStateHash: string;
+    finalCacheVersion: string;
+    finalStateHash: string;
+    metadataVersion: string;
+    turnIds: string[];
+    turnVersions: Record<string, string>;
+    turnUpserts: CodexTurn[];
+    turnRemoves: string[];
+    thread: Omit<CodexThread, "turns"> & { turns: [] };
+    preferences: SessionPreferences;
+    selectedSkills: SelectedSkill[];
+    attachments: AttachmentRecord[];
+    queue: SessionQueuePayload;
+    pendingRequests: PendingServerRequest[];
+    activeTurnId: string | null;
+    tokenUsage: ThreadTokenUsage | null;
+    hydration: SessionDetailPayload["hydration"];
+  };
+};
+
+export type SessionDetailResponse = SessionDetailPayload | CacheValidationPayload | SessionDetailPatchPayload;
 
 export type SessionRolloutRecoveryPayload = {
   ok: true;

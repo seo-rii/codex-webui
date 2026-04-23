@@ -129,6 +129,13 @@ pub(crate) async fn execute_ws_method(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
+            let known_summary_versions =
+                session_summary_versions_from_value(params.get("knownSummaryVersions"));
+            let known_state_hash = params
+                .get("knownStateHash")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
             let cursor = params
                 .get("cursor")
                 .and_then(Value::as_str)
@@ -139,7 +146,12 @@ pub(crate) async fn execute_ws_method(
                 list_sessions_payload(state, &auth.profile_id, archived, cursor, limit, &filter)
                     .await
                     .map_err(anyhow::Error::from)?;
-            Ok(cacheable_payload_response(payload, known_version))
+            Ok(cacheable_session_list_response(
+                payload,
+                known_version,
+                known_summary_versions,
+                known_state_hash,
+            ))
         }
         "sessions/search" => {
             let archived = params
@@ -149,6 +161,13 @@ pub(crate) async fn execute_ws_method(
             let query_raw = require_string(&params, "query")?;
             let known_version = params
                 .get("knownVersion")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let known_summary_versions =
+                session_summary_versions_from_value(params.get("knownSummaryVersions"));
+            let known_state_hash = params
+                .get("knownStateHash")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
@@ -175,7 +194,12 @@ pub(crate) async fn execute_ws_method(
             )
             .await
             .map_err(anyhow::Error::from)?;
-            Ok(cacheable_payload_response(payload, known_version))
+            Ok(cacheable_session_list_response(
+                payload,
+                known_version,
+                known_summary_versions,
+                known_state_hash,
+            ))
         }
         "session/create" => create_session_payload(
             state,
@@ -229,10 +253,22 @@ pub(crate) async fn execute_ws_method(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
+            let known_turn_versions =
+                session_detail_turn_versions_from_value(params.get("knownTurnVersions"));
+            let known_state_hash = params
+                .get("knownStateHash")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
             let payload = session_detail_payload(state, &auth.profile_id, &session_id, limit)
                 .await
                 .map_err(anyhow::Error::from)?;
-            Ok(cacheable_payload_response(payload, known_version))
+            Ok(cacheable_session_detail_response(
+                payload,
+                known_version,
+                known_turn_versions,
+                known_state_hash,
+            ))
         }
         "session/recovery" => {
             let session_id = require_string(&params, "sessionId")?;

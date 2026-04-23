@@ -127,6 +127,10 @@ export const api = {
     return ws.onConnectionState(listener);
   },
 
+  reconnectNow() {
+    ws.reconnectNow();
+  },
+
   listArenaRuns() {
     return ws.request<ArenaListPayload>("arena/list");
   },
@@ -260,9 +264,19 @@ export const api = {
     cursor: string | null = null,
     limit = 20,
     filter: SessionSummaryFilter | null = null,
-    knownVersion: string | null = null
+    knownVersion: string | null = null,
+    knownSummaryVersions: Record<string, string> | null = null,
+    knownStateHash: string | null = null
   ) {
-    return ws.request<SessionListResponse>("sessions/list", { archived, cursor, limit, filter, knownVersion });
+    return ws.request<SessionListResponse>("sessions/list", {
+      archived,
+      cursor,
+      limit,
+      filter,
+      knownVersion,
+      knownSummaryVersions,
+      knownStateHash
+    });
   },
 
   searchSessions(
@@ -272,17 +286,41 @@ export const api = {
     cursor: string | null = null,
     limit = 20,
     filter: SessionSummaryFilter | null = null,
-    knownVersion: string | null = null
+    knownVersion: string | null = null,
+    knownSummaryVersions: Record<string, string> | null = null,
+    knownStateHash: string | null = null
   ) {
-    return ws.request<SessionListResponse>("sessions/search", { query, scope, archived, cursor, limit, filter, knownVersion });
+    return ws.request<SessionListResponse>("sessions/search", {
+      query,
+      scope,
+      archived,
+      cursor,
+      limit,
+      filter,
+      knownVersion,
+      knownSummaryVersions,
+      knownStateHash
+    });
   },
 
   createSession(preferences: Partial<SessionPreferences>, name: string | null = null, selectedSkills: SelectedSkill[] = []) {
     return ws.request<SessionSummary>("session/create", { preferences, name, selectedSkills });
   },
 
-  getSession(sessionId: string, limit = 20, knownVersion: string | null = null) {
-    return ws.request<SessionDetailResponse>("session/get", { sessionId, limit, knownVersion });
+  getSession(
+    sessionId: string,
+    limit = 20,
+    knownVersion: string | null = null,
+    knownTurnVersions: Record<string, string> | null = null,
+    knownStateHash: string | null = null
+  ) {
+    return ws.request<SessionDetailResponse>("session/get", {
+      sessionId,
+      limit,
+      knownVersion,
+      knownTurnVersions,
+      knownStateHash
+    });
   },
 
   recoverSessionRollout(sessionId: string) {

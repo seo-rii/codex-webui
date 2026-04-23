@@ -1,5 +1,14 @@
 use super::*;
 
+const QUEUE_DRAIN_RETRY_DELAYS_MS: [u64; 6] = [250, 750, 1_500, 3_000, 5_000, 10_000];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionTurnActivity {
+    Active,
+    Idle,
+    Unknown,
+}
+
 pub(crate) async fn with_queue_dispatch_guard<T, F>(
     state: &AppState,
     profile_id: &str,
@@ -24,6 +33,61 @@ where
     let result = work.await;
     state.queue_dispatching.lock().await.remove(&key);
     Some(result)
+}
+
+async fn cancel_queue_drain_retry(state: &AppState, profile_id: &str, session_id: &str) {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let key = runtime_session_key(resolved_profile_id, session_id);
+    if let Some(handle) = state.queue_drain_retries.lock().await.remove(&key) {
+        handle.abort();
+    }
+}
+
+fn schedule_queue_drain_retry(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    attempt: usize,
+) {
+    let delay_ms = QUEUE_DRAIN_RETRY_DELAYS_MS
+        .get(attempt)
+        .copied()
+        .unwrap_or_else(|| QUEUE_DRAIN_RETRY_DELAYS_MS[QUEUE_DRAIN_RETRY_DELAYS_MS.len() - 1]);
+    if attempt == QUEUE_DRAIN_RETRY_DELAYS_MS.len() {
+        warn!(
+            profile_id = %profile_id,
+            session_id = %session_id,
+            "queued session drain is still waiting for readable session state"
+        );
+    }
+
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let key = runtime_session_key(&resolved_profile_id, session_id);
+    let state_for_registration = state.clone();
+    let profile_id = profile_id.to_string();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        let mut retries = state_for_registration.queue_drain_retries.lock().await;
+        if retries.contains_key(&key) {
+            return;
+        }
+
+        let state_for_retry = state_for_registration.clone();
+        let retry_key = key.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            state_for_retry
+                .queue_drain_retries
+                .lock()
+                .await
+                .remove(&retry_key);
+            maybe_drain_queue_with_attempt(&state_for_retry, &profile_id, &session_id, attempt + 1)
+                .await;
+        });
+        retries.insert(key, handle);
+    });
 }
 
 pub(crate) async fn remove_session_queue_item_after_dispatch(
@@ -124,27 +188,27 @@ pub(crate) async fn dispatch_queue_item(
     }
 }
 
-pub(crate) async fn session_has_active_turn(
+async fn session_turn_activity(
     state: &AppState,
     profile_id: &str,
     session_id: &str,
-) -> bool {
+) -> SessionTurnActivity {
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
     let runtime_key = runtime_session_key(resolved_profile_id, session_id);
     let cached_active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
 
     let thread = match read_thread_payload(state, profile_id, session_id, true).await {
         Ok(payload) => payload,
-        Err(_) => return true,
+        Err(_) => return SessionTurnActivity::Unknown,
     };
     let Some(thread) = thread.as_object() else {
-        return true;
+        return SessionTurnActivity::Unknown;
     };
     let status =
         normalized_thread_status(thread.get("status")).unwrap_or_else(|| "unknown".to_string());
     if !is_live_thread_status(&status) {
         state.active_turns.lock().await.remove(&runtime_key);
-        return false;
+        return SessionTurnActivity::Idle;
     }
 
     let active_turn_id = thread
@@ -154,17 +218,26 @@ pub(crate) async fn session_has_active_turn(
         .and_then(active_turn_id_from_turns);
     if let Some(turn_id) = active_turn_id {
         state.active_turns.lock().await.insert(runtime_key, turn_id);
-        return true;
+        return SessionTurnActivity::Active;
     }
 
     if cached_active_turn_id.is_some() {
         state.active_turns.lock().await.remove(&runtime_key);
     }
-    false
+    SessionTurnActivity::Idle
 }
 
 pub(crate) async fn maybe_drain_queue(state: &AppState, profile_id: &str, session_id: &str) {
-    let _ = with_queue_dispatch_guard(state, profile_id, session_id, async {
+    maybe_drain_queue_with_attempt(state, profile_id, session_id, 0).await;
+}
+
+async fn maybe_drain_queue_with_attempt(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    attempt: usize,
+) {
+    let guarded = with_queue_dispatch_guard(state, profile_id, session_id, async {
         let queue = match get_session_queue_payload(state, profile_id, session_id).await {
             Ok(queue) => queue,
             Err(_) => return,
@@ -174,6 +247,7 @@ pub(crate) async fn maybe_drain_queue(state: &AppState, profile_id: &str, sessio
             .and_then(Value::as_array)
             .is_none_or(|items| items.is_empty())
         {
+            cancel_queue_drain_retry(state, profile_id, session_id).await;
             maybe_schedule_global_shutdown(state, profile_id, None).await;
             return;
         }
@@ -182,10 +256,16 @@ pub(crate) async fn maybe_drain_queue(state: &AppState, profile_id: &str, sessio
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
+            cancel_queue_drain_retry(state, profile_id, session_id).await;
             return;
         }
-        if session_has_active_turn(state, profile_id, session_id).await {
-            return;
+        match session_turn_activity(state, profile_id, session_id).await {
+            SessionTurnActivity::Active => return,
+            SessionTurnActivity::Unknown => {
+                schedule_queue_drain_retry(state, profile_id, session_id, attempt);
+                return;
+            }
+            SessionTurnActivity::Idle => {}
         }
 
         let queued_item = queue
@@ -241,4 +321,7 @@ pub(crate) async fn maybe_drain_queue(state: &AppState, profile_id: &str, sessio
         }
     })
     .await;
+    if guarded.is_none() {
+        schedule_queue_drain_retry(state, profile_id, session_id, attempt);
+    }
 }

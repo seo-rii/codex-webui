@@ -747,6 +747,126 @@ async fn enqueue_session_queue_payload_auto_dispatches_when_session_is_idle() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_message_retries_after_transient_thread_read_error() {
+    let sandbox = unique_test_dir("queue-auto-dispatch-retry");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-transient-read-error";
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Retry queue dispatch",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "readError": "rollout is settling",
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    enqueue_session_queue_payload(
+        &state,
+        "default",
+        session_id,
+        "Dispatch after the transient read failure clears.",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let queued_before_retry = get_session_queue_payload(&state, "default", session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queued_before_retry
+            .get("items")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Retry queue dispatch",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..20 {
+        let queue = get_session_queue_payload(&state, "default", session_id)
+            .await
+            .unwrap();
+        if queue
+            .get("items")
+            .and_then(Value::as_array)
+            .is_none_or(|items| items.is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let queue_after_retry = get_session_queue_payload(&state, "default", session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue_after_retry
+            .get("items")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let thread = read_thread_payload(&state, "default", session_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        thread.get("turns").and_then(Value::as_array).map(Vec::len),
+        Some(1)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test]
 async fn marks_resume_pending_queues_and_lists_paused_entries() {
     let sandbox = unique_test_dir("queue-resume-pending");

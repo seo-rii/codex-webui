@@ -210,6 +210,7 @@ async fn main() -> Result<()> {
             ui_state_locks: Arc::new(Mutex::new(HashMap::new())),
             automation_timers: Arc::new(Mutex::new(HashMap::new())),
             queue_dispatching: Arc::new(Mutex::new(HashSet::new())),
+            queue_drain_retries: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
             shutdown_timers: Arc::new(Mutex::new(HashMap::new())),

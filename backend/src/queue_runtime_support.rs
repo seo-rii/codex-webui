@@ -290,6 +290,23 @@ async fn maybe_drain_queue_with_attempt(
                 .await;
             }
             Err(error) => {
+                let mut error_params = serde_json::Map::new();
+                error_params.insert("queueId".to_string(), json!(queue_id));
+                if let Some(Value::Object(object)) = structured_error_value(&error.message) {
+                    for (key, value) in object {
+                        error_params.insert(key, value);
+                    }
+                } else {
+                    error_params.insert("code".to_string(), Value::Null);
+                    error_params.insert("message".to_string(), json!(error.message.clone()));
+                }
+                error_params
+                    .entry("code".to_string())
+                    .or_insert(Value::Null);
+                error_params
+                    .entry("message".to_string())
+                    .or_insert_with(|| json!(error.message.clone()));
+                let error_params = Value::Object(error_params);
                 emit_session_notification(
                     state,
                     profile_id,
@@ -297,11 +314,7 @@ async fn maybe_drain_queue_with_attempt(
                     json!({
                         "kind": "notification",
                         "method": "codex-webui/queueDispatchFailed",
-                        "params": {
-                            "queueId": queue_id,
-                            "code": Value::Null,
-                            "message": error.message
-                        }
+                        "params": error_params.clone()
                     }),
                 )
                 .await;
@@ -310,11 +323,7 @@ async fn maybe_drain_queue_with_attempt(
                     profile_id,
                     "queueDispatchFailed",
                     Some(session_id),
-                    json!({
-                        "queueId": queue_id,
-                        "code": Value::Null,
-                        "message": error.message
-                    }),
+                    error_params,
                 )
                 .await;
             }

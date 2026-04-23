@@ -28,6 +28,7 @@
     Download
   } from "lucide-svelte";
 
+  import { describeUiError } from "$lib/ui-errors";
   import { activeLocale, localeOptions, localeSignal, updateLocale } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
   import { getLocale } from "$lib/paraglide/runtime.js";
@@ -416,7 +417,7 @@
       return sessionLabel ? `${sessionLabel} · ${ui.needsInput}` : ui.needsInput;
     }
     if (notification.type === "queueDispatchFailed") {
-      const message = typeof notification.payload.message === "string" ? notification.payload.message.trim() : "";
+      const message = describeUiError(notification.payload).trim();
       return sessionLabel && message ? `${sessionLabel} · ${message}` : sessionLabel || message || ui.notificationQueueFailed;
     }
     const delaySeconds = Number(notification.payload.delaySeconds ?? 0);

@@ -10,11 +10,12 @@ pub(crate) async fn subscribe_session(
     let relay = ensure_stream_relay(&state, &profile_id, &session_id).await?;
     let mut receiver = relay.subscribe();
     let session_key = session_id.clone();
+    let stream_out_tx = out_tx.clone();
     let handle = tokio::spawn(async move {
         loop {
             match receiver.recv().await {
                 Ok(event) => {
-                    let _ = out_tx.send(ServerEnvelope::Event {
+                    let _ = stream_out_tx.send(ServerEnvelope::Event {
                         session_id: session_key.clone(),
                         event,
                     });
@@ -31,6 +32,20 @@ pub(crate) async fn subscribe_session(
     if let Some(existing) = current.insert(session_relay_key(&profile_id, &session_id), handle) {
         existing.abort();
     }
+
+    if let Ok(queue) = get_session_queue_payload(&state, &profile_id, &session_id).await {
+        let _ = out_tx.send(ServerEnvelope::Event {
+            session_id: session_id.clone(),
+            event: json!({
+                "kind": "notification",
+                "method": "codex-webui/queueUpdated",
+                "params": {
+                    "queue": queue
+                }
+            }),
+        });
+    }
+
     Ok(())
 }
 

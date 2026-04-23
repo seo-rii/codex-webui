@@ -88,19 +88,3 @@ pub(crate) async fn handle_session_item_detail_api_http(
         Err(error) => json_error(error.status, &error.message),
     }
 }
-
-pub(crate) async fn handle_session_recovery_api_http(
-    state: AppState,
-    request: Request,
-    auth: AuthContext,
-    session_id: &str,
-) -> Response {
-    if request.method() != Method::POST {
-        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
-    }
-
-    match recover_session_rollout_payload(&state, &auth.profile_id, auth.role, session_id).await {
-        Ok(payload) => Json(payload).into_response(),
-        Err(error) => error.into_http_response(),
-    }
-}

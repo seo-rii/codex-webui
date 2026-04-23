@@ -518,6 +518,68 @@ async fn ws_session_cache_validation_returns_not_modified_for_matching_versions(
     );
     assert!(detail_not_modified.get("thread").is_none());
 
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(queues) = ui_state
+            .get_mut("queuesByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue state is missing",
+            ));
+        };
+        queues.insert(
+            session_id.clone(),
+            json!({
+                "items": [{
+                    "id": "queue-item-1",
+                    "prompt": "queued while detail is cached",
+                    "skills": [],
+                    "attachmentIds": [],
+                    "attachmentNames": [],
+                    "createdAt": now_unix_ms()
+                }],
+                "resumePending": false,
+                "updatedAt": now_unix_ms()
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let queue_detail_patch = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "session/get",
+        json!({
+            "sessionId": session_id,
+            "limit": 20,
+            "knownVersion": detail_version,
+            "knownTurnVersions": detail_turn_versions.clone(),
+            "knownStateHash": detail_state_hash.clone()
+        }),
+    )
+    .await
+    .unwrap();
+    let queue_patch = queue_detail_patch.get("patch").unwrap();
+    assert_eq!(
+        queue_patch
+            .get("queue")
+            .and_then(|queue| queue.get("items"))
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        queue_patch
+            .get("turnUpserts")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
     execute_ws_method(
         &state,
         &out_tx,

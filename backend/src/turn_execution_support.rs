@@ -103,6 +103,43 @@ fn build_turn_input_payload(
     (input, additional_readable_roots)
 }
 
+async fn turn_app_server_error(
+    state: &AppState,
+    profile_id: &str,
+    client: &AppServerClient,
+    context: &str,
+    error: anyhow::Error,
+) -> ApiError {
+    let raw_message = error.to_string();
+    if !usage_limit_error_message(&raw_message) {
+        return api_error(StatusCode::BAD_GATEWAY, format!("{context}: {raw_message}"));
+    }
+
+    let mut retry_at_ms = structured_error_value(&raw_message)
+        .as_ref()
+        .and_then(retry_at_ms_from_value);
+    if retry_at_ms.is_none() {
+        retry_at_ms = client
+            .request("account/rateLimits/read", json!({}))
+            .await
+            .ok()
+            .as_ref()
+            .and_then(retry_at_ms_from_value);
+    }
+    if retry_at_ms.is_none() {
+        retry_at_ms = codex_quota_status(state, true, profile_id)
+            .await
+            .ok()
+            .as_ref()
+            .and_then(retry_at_ms_from_value);
+    }
+
+    api_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        usage_limit_error_payload(&raw_message, retry_at_ms),
+    )
+}
+
 pub(crate) async fn resolve_active_turn_id_payload(
     state: &AppState,
     profile_id: &str,
@@ -267,7 +304,7 @@ pub(crate) async fn send_turn_payload(
         .get("model")
         .cloned()
         .unwrap_or(Value::Null);
-    let response = client
+    let response = match client
         .request(
             "turn/start",
             json!({
@@ -303,12 +340,15 @@ pub(crate) async fn send_turn_payload(
             }),
         )
         .await
-        .map_err(|error| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to start the turn: {error}"),
-            )
-        })?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return Err(
+                turn_app_server_error(state, profile_id, &client, "Failed to start the turn", error)
+                    .await,
+            );
+        }
+    };
 
     if let Some(turn_id) = response
         .get("turn")
@@ -385,7 +425,7 @@ pub(crate) async fn steer_turn_payload(
                 format!("Failed to connect to codex app-server: {error}"),
             )
         })?;
-    client
+    if let Err(error) = client
         .request(
             "turn/steer",
             json!({
@@ -395,12 +435,16 @@ pub(crate) async fn steer_turn_payload(
             }),
         )
         .await
-        .map_err(|error| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to steer the active turn: {error}"),
-            )
-        })?;
+    {
+        return Err(turn_app_server_error(
+            state,
+            profile_id,
+            &client,
+            "Failed to steer the active turn",
+            error,
+        )
+        .await);
+    }
 
     clear_session_draft_payload(state, profile_id, session_id).await?;
     Ok(json!({

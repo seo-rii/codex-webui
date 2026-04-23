@@ -32,17 +32,6 @@ impl RolloutRecoveryActionError {
         }
     }
 
-    pub(crate) fn into_http_response(self) -> Response {
-        let mut response = Json(json!({
-            "code": self.code,
-            "message": self.message,
-            "status": self.status.as_u16()
-        }))
-        .into_response();
-        *response.status_mut() = self.status;
-        response
-    }
-
     pub(crate) fn into_ws_error(self) -> anyhow::Error {
         anyhow!(
             json!({

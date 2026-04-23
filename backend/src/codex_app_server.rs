@@ -3,9 +3,12 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
+        mpsc as std_mpsc,
     },
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -13,8 +16,10 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
+    runtime::{Builder as TokioRuntimeBuilder, Handle as TokioRuntimeHandle},
     sync::{Mutex, broadcast, oneshot},
     task::JoinHandle,
+    time::timeout,
 };
 use tracing::{info, warn};
 
@@ -32,6 +37,8 @@ pub struct AppServerClientConfig {
     pub client_version: String,
     pub stderr_log_path: Option<PathBuf>,
     pub extra_env: HashMap<String, String>,
+    pub controller_threads: usize,
+    pub request_timeout: Duration,
 }
 
 impl Default for AppServerClientConfig {
@@ -43,6 +50,8 @@ impl Default for AppServerClientConfig {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             stderr_log_path: None,
             extra_env: HashMap::new(),
+            controller_threads: default_controller_thread_count(),
+            request_timeout: default_request_timeout(),
         }
     }
 }
@@ -69,11 +78,13 @@ pub struct AppServerClient {
 pub struct AppServerManager {
     config: AppServerClientConfig,
     clients: Arc<Mutex<HashMap<String, AppServerClient>>>,
+    controller: Arc<AppServerControllerRuntime>,
 }
 
 struct AppServerClientInner {
     profile: AppServerProfile,
     config: AppServerClientConfig,
+    controller: Arc<AppServerControllerRuntime>,
     start_lock: Mutex<()>,
     process: Mutex<Option<ProcessState>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
@@ -88,6 +99,11 @@ struct ProcessState {
     join_handle: JoinHandle<()>,
 }
 
+struct AppServerControllerRuntime {
+    handle: TokioRuntimeHandle,
+    shutdown_tx: StdMutex<Option<oneshot::Sender<()>>>,
+}
+
 #[derive(Debug, PartialEq)]
 enum IncomingMessage {
     Response {
@@ -100,6 +116,15 @@ enum IncomingMessage {
 
 impl AppServerClient {
     pub fn new(profile: AppServerProfile, config: AppServerClientConfig) -> Self {
+        let controller = AppServerControllerRuntime::new(config.controller_threads);
+        Self::with_controller(profile, config, controller)
+    }
+
+    fn with_controller(
+        profile: AppServerProfile,
+        config: AppServerClientConfig,
+        controller: Arc<AppServerControllerRuntime>,
+    ) -> Self {
         let (notifications_tx, _) = broadcast::channel(128);
         let (requests_tx, _) = broadcast::channel(128);
 
@@ -107,6 +132,7 @@ impl AppServerClient {
             inner: Arc::new(AppServerClientInner {
                 profile,
                 config,
+                controller,
                 start_lock: Mutex::new(()),
                 process: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
@@ -126,11 +152,53 @@ impl AppServerClient {
     }
 
     pub async fn request(&self, method: impl Into<String>, params: Value) -> Result<Value> {
-        self.ensure_started().await?;
-        self.request_started(method.into(), params).await
+        let client = self.clone();
+        let method = method.into();
+        self.inner
+            .controller
+            .handle
+            .spawn(async move { client.request_on_controller(method, params).await })
+            .await
+            .context("codex app-server controller task failed")?
     }
 
     pub async fn respond(&self, id: Value, result: Value) -> Result<()> {
+        let client = self.clone();
+        self.inner
+            .controller
+            .handle
+            .spawn(async move { client.respond_on_controller(id, result).await })
+            .await
+            .context("codex app-server controller task failed")?
+    }
+
+    pub async fn reject(&self, id: Value, message: impl Into<String>) -> Result<()> {
+        let client = self.clone();
+        let message = message.into();
+        self.inner
+            .controller
+            .handle
+            .spawn(async move { client.reject_on_controller(id, message).await })
+            .await
+            .context("codex app-server controller task failed")?
+    }
+
+    pub async fn close(&self) -> Result<()> {
+        let client = self.clone();
+        self.inner
+            .controller
+            .handle
+            .spawn(async move { client.close_on_controller().await })
+            .await
+            .context("codex app-server controller task failed")?
+    }
+
+    async fn request_on_controller(&self, method: String, params: Value) -> Result<Value> {
+        self.ensure_started().await?;
+        self.request_started(method, params).await
+    }
+
+    async fn respond_on_controller(&self, id: Value, result: Value) -> Result<()> {
         self.ensure_started().await?;
         self.write_message(&json!({
             "id": id,
@@ -139,19 +207,19 @@ impl AppServerClient {
         .await
     }
 
-    pub async fn reject(&self, id: Value, message: impl Into<String>) -> Result<()> {
+    async fn reject_on_controller(&self, id: Value, message: String) -> Result<()> {
         self.ensure_started().await?;
         self.write_message(&json!({
             "id": id,
             "error": {
                 "code": -32000,
-                "message": message.into()
+                "message": message
             }
         }))
         .await
     }
 
-    pub async fn close(&self) -> Result<()> {
+    async fn close_on_controller(&self) -> Result<()> {
         let process = self.inner.process.lock().await.take();
         if let Some(mut process) = process {
             if let Some(shutdown_tx) = process.shutdown_tx.take() {
@@ -201,7 +269,7 @@ impl AppServerClient {
         }
         .await
         {
-            let _ = self.close().await;
+            let _ = self.close_on_controller().await;
             return Err(error);
         }
 
@@ -212,6 +280,7 @@ impl AppServerClient {
         let id = self.inner.next_request_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.inner.pending.lock().await.insert(id, tx);
+        let method_name = method.clone();
 
         if let Err(error) = self
             .write_message(&json!({
@@ -225,12 +294,22 @@ impl AppServerClient {
             return Err(error);
         }
 
-        match rx.await {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(message)) => Err(anyhow!(message)),
-            Err(_) => Err(anyhow!(
-                "codex app-server request channel closed before a response arrived"
-            )),
+        match timeout(self.inner.config.request_timeout, rx).await {
+            Err(_) => {
+                self.inner.pending.lock().await.remove(&id);
+                Err(anyhow!(
+                    "codex app-server request timed out after {}s: {}",
+                    self.inner.config.request_timeout.as_secs(),
+                    method_name
+                ))
+            }
+            Ok(result) => match result {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(message)) => Err(anyhow!(message)),
+                Err(_) => Err(anyhow!(
+                    "codex app-server request channel closed before a response arrived"
+                )),
+            },
         }
     }
 
@@ -304,9 +383,11 @@ impl AppServerClient {
 
 impl AppServerManager {
     pub fn new(config: AppServerClientConfig) -> Self {
+        let controller = AppServerControllerRuntime::new(config.controller_threads);
         Self {
             config,
             clients: Arc::new(Mutex::new(HashMap::new())),
+            controller,
         }
     }
 
@@ -316,7 +397,11 @@ impl AppServerManager {
             return existing.clone();
         }
 
-        let client = AppServerClient::new(profile.clone(), self.config.clone());
+        let client = AppServerClient::with_controller(
+            profile.clone(),
+            self.config.clone(),
+            Arc::clone(&self.controller),
+        );
         clients.insert(profile.id, client.clone());
         client
     }
@@ -343,6 +428,76 @@ impl AppServerManager {
         }
         Ok(())
     }
+}
+
+impl AppServerControllerRuntime {
+    fn new(worker_threads: usize) -> Arc<Self> {
+        let worker_threads = worker_threads.max(1).min(16);
+        let blocking_threads = worker_threads.saturating_mul(8).max(8);
+        let (handle_tx, handle_rx) = std_mpsc::sync_channel(1);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        thread::Builder::new()
+            .name("codex-webui-codex-controller".to_string())
+            .spawn(move || {
+                let runtime = TokioRuntimeBuilder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(worker_threads)
+                    .max_blocking_threads(blocking_threads)
+                    .thread_name("codex-webui-codex-io")
+                    .build()
+                    .expect("failed to build codex app-server controller runtime");
+                let handle = runtime.handle().clone();
+                let _ = handle_tx.send(handle);
+                runtime.block_on(async {
+                    let _ = shutdown_rx.await;
+                });
+            })
+            .expect("failed to start codex app-server controller thread");
+
+        let handle = handle_rx
+            .recv()
+            .expect("codex app-server controller did not start");
+        Arc::new(Self {
+            handle,
+            shutdown_tx: StdMutex::new(Some(shutdown_tx)),
+        })
+    }
+}
+
+impl Drop for AppServerControllerRuntime {
+    fn drop(&mut self) {
+        if let Ok(mut shutdown_tx) = self.shutdown_tx.lock() {
+            if let Some(shutdown_tx) = shutdown_tx.take() {
+                let _ = shutdown_tx.send(());
+            }
+        }
+    }
+}
+
+fn default_controller_thread_count() -> usize {
+    std::env::var("CODEX_WEBUI_CONTROLLER_THREADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(2)
+                .min(4)
+                .max(2)
+        })
+        .clamp(1, 16)
+}
+
+fn default_request_timeout() -> Duration {
+    let seconds = std::env::var("CODEX_WEBUI_APP_SERVER_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30)
+        .clamp(5, 300);
+    Duration::from_secs(seconds)
 }
 
 async fn supervise_process(
@@ -494,11 +649,22 @@ fn classify_incoming_message(line: &str) -> Result<Option<IncomingMessage>> {
     }
 
     if let Some(error) = object.get("error") {
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| "codex app-server returned an unknown error".to_string());
+        let has_structured_error = error.get("codexErrorInfo").is_some()
+            || error.get("additionalDetails").is_some()
+            || error.get("data").is_some_and(|data| {
+                data.get("codexErrorInfo").is_some()
+                    || data.get("additionalDetails").is_some()
+                    || data.get("errorInfo").is_some()
+            });
+        let message = if has_structured_error {
+            error.to_string()
+        } else {
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| "codex app-server returned an unknown error".to_string())
+        };
         return Ok(Some(IncomingMessage::Response {
             id,
             payload: Err(message),
@@ -572,6 +738,28 @@ mod tests {
             Some(IncomingMessage::Response {
                 id: 7,
                 payload: Err("boom".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn preserves_structured_response_errors() {
+        let payload = classify_incoming_message(
+            r#"{"id":7,"error":{"code":-32000,"message":"You've hit your usage limit.","codexErrorInfo":"usageLimitExceeded","additionalDetails":"{\"resetsAt\":1766664000}"}}"#,
+        )
+        .expect("line should parse");
+
+        assert_eq!(
+            payload,
+            Some(IncomingMessage::Response {
+                id: 7,
+                payload: Err(json!({
+                    "code": -32000,
+                    "message": "You've hit your usage limit.",
+                    "codexErrorInfo": "usageLimitExceeded",
+                    "additionalDetails": "{\"resetsAt\":1766664000}"
+                })
+                .to_string()),
             })
         );
     }

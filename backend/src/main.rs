@@ -43,6 +43,7 @@ use tokio::{
     fs as tokio_fs,
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
+    runtime::Builder as TokioRuntimeBuilder,
     sync::{Mutex, broadcast, mpsc},
 };
 use tracing::{error, info, warn};
@@ -169,8 +170,7 @@ use ws_dispatch_support::*;
 use ws_method_support::*;
 use ws_transport_support::*;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let config = Arc::new(Config::from_env()?);
     install_panic_logger(config.clone());
 
@@ -181,6 +181,53 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    let server_threads = runtime_thread_count_from_env(
+        "CODEX_WEBUI_SERVER_THREADS",
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .max(4),
+        2,
+        64,
+    );
+    let blocking_threads = runtime_thread_count_from_env(
+        "CODEX_WEBUI_BLOCKING_THREADS",
+        server_threads.saturating_mul(8).max(32),
+        8,
+        512,
+    );
+
+    info!(
+        server_threads,
+        blocking_threads, "starting codex-webui runtime"
+    );
+
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .worker_threads(server_threads)
+        .max_blocking_threads(blocking_threads)
+        .thread_name("codex-webui-server")
+        .build()
+        .context("failed to build codex-webui server runtime")?;
+
+    runtime.block_on(run_gateway(config))
+}
+
+fn runtime_thread_count_from_env(
+    name: &str,
+    fallback: usize,
+    minimum: usize,
+    maximum: usize,
+) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
+        .clamp(minimum, maximum)
+}
+
+async fn run_gateway(config: Arc<Config>) -> Result<()> {
     let result = async {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())

@@ -334,6 +334,12 @@ function mergePendingRequests(
 }
 
 function mergeQueue(existingQueue: SessionDetailPayload["queue"], incomingQueue: SessionDetailPayload["queue"]) {
+  const existingItemCount = Array.isArray(existingQueue.items) ? existingQueue.items.length : 0;
+  const incomingItemCount = Array.isArray(incomingQueue.items) ? incomingQueue.items.length : 0;
+  if (incomingItemCount === 0 && existingItemCount > 0 && !incomingQueue.resumeRequired) {
+    return incomingQueue;
+  }
+
   const existingUpdatedAt = Number(existingQueue.updatedAt ?? 0);
   const incomingUpdatedAt = Number(incomingQueue.updatedAt ?? 0);
   return existingUpdatedAt > incomingUpdatedAt ? existingQueue : incomingQueue;
@@ -463,7 +469,7 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
   }
 
   if (method === "codex-webui/queueUpdated") {
-    next.queue = (params.queue as SessionDetailPayload["queue"]) ?? next.queue;
+    next.queue = mergeQueue(next.queue, (params.queue as SessionDetailPayload["queue"]) ?? next.queue);
     return next;
   }
 

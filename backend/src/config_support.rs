@@ -489,11 +489,7 @@ fn parse_toml_bool_value(value: Option<String>) -> Option<bool> {
 }
 
 fn parse_toml_integer_value(value: Option<String>) -> Option<i64> {
-    value?
-        .replace('_', "")
-        .trim()
-        .parse::<i64>()
-        .ok()
+    value?.replace('_', "").trim().parse::<i64>().ok()
 }
 
 pub(crate) fn read_codex_toml_defaults(codex_home: &Path) -> CodexTomlDefaults {

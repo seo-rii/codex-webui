@@ -24,6 +24,189 @@ pub(crate) fn api_error(status: StatusCode, message: impl Into<String>) -> ApiEr
     }
 }
 
+pub(crate) const USAGE_LIMIT_EXCEEDED_CODE: &str = "USAGE_LIMIT_EXCEEDED";
+
+pub(crate) fn structured_error_value(message: &str) -> Option<Value> {
+    let trimmed = message.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .filter(Value::is_object)
+}
+
+pub(crate) fn structured_error_message(message: &str) -> Option<String> {
+    let value = structured_error_value(message)?;
+    let mut stack = vec![value];
+    while let Some(current) = stack.pop() {
+        match current {
+            Value::Object(object) => {
+                if let Some(message) = object.get("message").and_then(value_text) {
+                    return Some(message);
+                }
+
+                for value in object.into_values() {
+                    if matches!(value, Value::Object(_) | Value::Array(_)) {
+                        stack.push(value);
+                    }
+                }
+            }
+            Value::Array(entries) => {
+                stack.extend(entries);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(crate) fn usage_limit_error_message(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    if lowered.contains("usagelimitexceeded")
+        || (lowered.contains("usage limit")
+            && (lowered.contains("hit")
+                || lowered.contains("exceeded")
+                || lowered.contains("reached")))
+    {
+        return true;
+    }
+
+    let Some(value) = structured_error_value(message) else {
+        return false;
+    };
+    let mut stack = vec![value];
+    while let Some(current) = stack.pop() {
+        match current {
+            Value::String(text) => {
+                let lowered = text.to_ascii_lowercase();
+                let compact = lowered
+                    .chars()
+                    .filter(|ch| ch.is_ascii_alphanumeric())
+                    .collect::<String>();
+                if compact == "usagelimitexceeded"
+                    || (lowered.contains("usage limit")
+                        && (lowered.contains("hit")
+                            || lowered.contains("exceeded")
+                            || lowered.contains("reached")))
+                {
+                    return true;
+                }
+            }
+            Value::Object(object) => stack.extend(object.into_values()),
+            Value::Array(entries) => stack.extend(entries),
+            _ => {}
+        }
+    }
+    false
+}
+
+pub(crate) fn retry_at_ms_from_value(value: &Value) -> Option<u64> {
+    let now = now_unix_ms();
+    let mut stack = vec![value.clone()];
+    let mut candidates = Vec::new();
+
+    while let Some(current) = stack.pop() {
+        match current {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    let normalized_key = key
+                        .chars()
+                        .filter(|ch| ch.is_ascii_alphanumeric())
+                        .map(|ch| ch.to_ascii_lowercase())
+                        .collect::<String>();
+                    let absolute_retry_key =
+                        matches!(normalized_key.as_str(), "retryat" | "resetat" | "resetsat");
+                    let relative_retry_key = matches!(
+                        normalized_key.as_str(),
+                        "retryafterseconds" | "resetafterseconds"
+                    );
+
+                    if absolute_retry_key || relative_retry_key {
+                        let numeric = match &value {
+                            Value::Number(number) => number.as_f64(),
+                            Value::String(text) => text.trim().parse::<f64>().ok(),
+                            _ => None,
+                        };
+                        if let Some(numeric) =
+                            numeric.filter(|value| value.is_finite() && *value > 0.0)
+                        {
+                            let candidate = if relative_retry_key {
+                                now.saturating_add((numeric * 1000.0).round() as u64)
+                            } else if numeric >= 100_000_000_000.0 {
+                                numeric.round() as u64
+                            } else {
+                                (numeric * 1000.0).round() as u64
+                            };
+                            candidates.push(candidate);
+                        }
+                    }
+
+                    match value {
+                        Value::String(text) if text.trim_start().starts_with('{') => {
+                            if let Ok(parsed) = serde_json::from_str::<Value>(text.trim()) {
+                                stack.push(parsed);
+                            }
+                        }
+                        Value::Object(_) | Value::Array(_) => stack.push(value),
+                        _ => {}
+                    }
+                }
+            }
+            Value::Array(entries) => stack.extend(entries),
+            _ => {}
+        }
+    }
+
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| *candidate >= now)
+        .min()
+        .or_else(|| candidates.into_iter().max())
+}
+
+pub(crate) fn usage_limit_error_payload(message: &str, retry_at_ms: Option<u64>) -> String {
+    let display_message = structured_error_message(message)
+        .unwrap_or_else(|| message.trim().to_string())
+        .trim()
+        .to_string();
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "code".to_string(),
+        Value::String(USAGE_LIMIT_EXCEEDED_CODE.to_string()),
+    );
+    payload.insert(
+        "status".to_string(),
+        json!(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+    );
+    payload.insert(
+        "message".to_string(),
+        Value::String(if display_message.is_empty() {
+            "You've hit your usage limit.".to_string()
+        } else {
+            display_message
+        }),
+    );
+
+    if let Some(retry_at_ms) = retry_at_ms {
+        payload.insert("retryAt".to_string(), json!(retry_at_ms));
+        let now = now_unix_ms();
+        if retry_at_ms > now {
+            payload.insert(
+                "retryAfterSeconds".to_string(),
+                json!((retry_at_ms - now).div_ceil(1000)),
+            );
+        }
+    }
+    if let Some(source) = structured_error_value(message) {
+        payload.insert("appServerError".to_string(), source);
+    }
+
+    Value::Object(payload).to_string()
+}
+
 pub(crate) fn trim_terminal_buffer(buffer: &mut String) {
     if buffer.len() <= TERMINAL_BUFFER_LIMIT {
         return;

@@ -1,11 +1,49 @@
 import { m } from "$lib/paraglide/messages.js";
 
-import { parseAppError } from "$lib/errors";
+import { appErrorRetryAtMs, isUsageLimitErrorPayload, parseAppError } from "$lib/errors";
+
+function formatUsageRetryTime(retryAtMs: number) {
+  const retryAt = new Date(retryAtMs);
+  const now = new Date();
+  const sameDay =
+    retryAt.getFullYear() === now.getFullYear() &&
+    retryAt.getMonth() === now.getMonth() &&
+    retryAt.getDate() === now.getDate();
+
+  return new Intl.DateTimeFormat(undefined, {
+    month: sameDay ? undefined : "short",
+    day: sameDay ? undefined : "numeric",
+    year: sameDay ? undefined : "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(retryAt);
+}
+
+function describeUsageLimitError(value: unknown, message?: string) {
+  const retryAtMs = appErrorRetryAtMs(value);
+  const trimmedMessage = message?.trim() ?? "";
+  const hasRetrySuffix = /try again (at|later)/iu.test(trimmedMessage) || /다시.*(보낼|시도)/u.test(trimmedMessage);
+  if (trimmedMessage && hasRetrySuffix) {
+    return trimmedMessage;
+  }
+
+  if (retryAtMs) {
+    const time = formatUsageRetryTime(retryAtMs);
+    if (trimmedMessage && trimmedMessage !== "You've hit your usage limit.") {
+      return `${trimmedMessage.replace(/\s+$/u, "").replace(/[.。]$/u, "")}. ${m.error_usage_retry_at_suffix({ time })}`;
+    }
+    return m.error_usage_limit_exceeded_retry_at({ time });
+  }
+
+  return trimmedMessage || m.error_usage_limit_exceeded();
+}
 
 export function describeUiError(value: unknown) {
   const parsed = parseAppError(value);
   if (parsed) {
     switch (parsed.code) {
+      case "USAGE_LIMIT_EXCEEDED":
+        return describeUsageLimitError(parsed, parsed.message);
       case "EMPTY_MESSAGE":
         return m.error_empty_message();
       case "FORBIDDEN_ROLE":
@@ -35,6 +73,10 @@ export function describeUiError(value: unknown) {
           return parsed.message.trim();
         }
     }
+  }
+
+  if (isUsageLimitErrorPayload(value)) {
+    return describeUsageLimitError(value, typeof value === "string" ? value : undefined);
   }
 
   if (value instanceof Error) {

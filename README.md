@@ -104,7 +104,6 @@ More detail is in [docs/architecture.md](./docs/architecture.md).
 ```bash
 pnpm install
 pnpm build
-pnpm gateway:build
 node ./bin/codex-webui.mjs
 ```
 
@@ -121,7 +120,7 @@ After setup, running `codex-webui` again starts the background server and prints
 - log path
 - runtime error log path
 
-`pnpm build` produces the public SPA bundle under `build/static`, which the Rust gateway serves directly.
+`pnpm build` produces the public SPA bundle under `build/static`, builds the Rust gateway in release mode, and copies the current-platform gateway binary to `dist/backend/<target>/` for the CLI.
 
 For migration regression checks, run:
 
@@ -304,7 +303,7 @@ pnpm dev
 
 ```bash
 pnpm build
-cargo run --manifest-path backend/Cargo.toml
+node ./bin/codex-webui.mjs
 ```
 
 ### Verification
@@ -368,6 +367,8 @@ Make sure one of these exists:
 - `CODEX_WEBUI_BACKEND_BIN`
 - a matching prebuilt binary under `dist/backend/<target>/`
 - a locally built binary under `backend/target/release/`
+
+When building from source, `pnpm build` creates both the static frontend and the current-platform Rust gateway binary.
 
 ## Repository Docs
 

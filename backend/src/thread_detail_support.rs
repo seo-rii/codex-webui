@@ -145,16 +145,18 @@ pub(crate) async fn session_detail_payload(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let active_turn_id = state
-        .active_turns
-        .lock()
-        .await
-        .get(&runtime_session_key(
-            resolve_runtime_profile_entry(&state.config, profile_id).0,
-            session_id,
-        ))
-        .cloned()
-        .or_else(|| active_turn_id_from_turns(&turns));
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        session_id,
+    );
+    let active_turn_id_from_payload = active_turn_id_from_turns(&turns);
+    let cached_active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
+    let active_turn_id = cached_active_turn_id
+        .filter(|turn_id| active_turn_id_from_payload.as_ref() == Some(turn_id))
+        .or_else(|| active_turn_id_from_payload.clone());
+    if active_turn_id.is_none() {
+        state.active_turns.lock().await.remove(&runtime_key);
+    }
     let preferences = with_ui_state_read(state, profile_id, |ui_state| {
         Ok(ui_state
             .get("preferencesByThreadId")

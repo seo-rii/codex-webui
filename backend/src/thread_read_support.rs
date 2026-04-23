@@ -76,6 +76,33 @@ pub(crate) fn thread_is_subagent(thread: &Value) -> bool {
         || thread_agent_role(thread).is_some()
 }
 
+fn normalize_session_item_type_name(item_type: &str) -> &str {
+    match item_type {
+        "agent_message" | "assistant_message" | "assistantMessage" => "agentMessage",
+        "user_message" => "userMessage",
+        "command_execution" => "commandExecution",
+        "file_change" => "fileChange",
+        "mcp_tool_call" => "mcpToolCall",
+        "dynamic_tool_call" => "dynamicToolCall",
+        "web_search" => "webSearch",
+        "context_compaction" => "contextCompaction",
+        "image_generation" => "imageGeneration",
+        "collab_agent_tool_call" => "collabAgentToolCall",
+        _ => item_type,
+    }
+}
+
+fn is_internal_session_item_type(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "task_complete"
+            | "turn_aborted"
+            | "turn_started"
+            | "turn_completed"
+            | "agent_reasoning_section_break"
+    )
+}
+
 pub(crate) fn normalize_session_item_payload(
     item: &Value,
     turn_id: &str,
@@ -92,13 +119,17 @@ pub(crate) fn normalize_session_item_payload(
             Value::String(format!("{turn_id}:item:{item_index}")),
         );
     }
-    if normalized
+    let normalized_type = normalized
         .get("type")
         .and_then(Value::as_str)
-        .is_none_or(|value| value.trim().is_empty())
-    {
-        normalized.insert("type".to_string(), Value::String("unknown".to_string()));
-    }
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_session_item_type_name)
+        .unwrap_or("unknown");
+    normalized.insert(
+        "type".to_string(),
+        Value::String(normalized_type.to_string()),
+    );
     Value::Object(normalized)
 }
 
@@ -116,7 +147,14 @@ pub(crate) fn normalize_session_turn_payload(turn: &Value, turn_index: usize) ->
         .unwrap_or_default()
         .iter()
         .enumerate()
-        .map(|(item_index, item)| normalize_session_item_payload(item, &turn_id, item_index))
+        .filter_map(|(item_index, item)| {
+            let normalized_item = normalize_session_item_payload(item, &turn_id, item_index);
+            let item_type = normalized_item
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            (!is_internal_session_item_type(item_type)).then_some(normalized_item)
+        })
         .collect::<Vec<_>>();
     normalized.insert("id".to_string(), Value::String(turn_id));
     normalized.insert("items".to_string(), Value::Array(items));

@@ -94,6 +94,8 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
         http: reqwest::Client::new(),
         login_attempts: Arc::new(Mutex::new(HashMap::new())),
         response_cache: Arc::new(Mutex::new(HashMap::new())),
+        session_thread_cache: Arc::new(Mutex::new(HashMap::new())),
+        session_search_text_cache: Arc::new(Mutex::new(HashMap::new())),
         static_asset_cache: Arc::new(Mutex::new(HashMap::new())),
         catalog_cache: Arc::new(Mutex::new(HashMap::new())),
         git_repository_cache: Arc::new(Mutex::new(None)),

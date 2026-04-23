@@ -20,6 +20,8 @@ pub(crate) struct AppState {
     pub(crate) http: reqwest::Client,
     pub(crate) login_attempts: Arc<Mutex<HashMap<String, Vec<u128>>>>,
     pub(crate) response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>,
+    pub(crate) session_thread_cache: Arc<Mutex<HashMap<String, CachedSessionThreads>>>,
+    pub(crate) session_search_text_cache: Arc<Mutex<HashMap<String, CachedSessionSearchText>>>,
     pub(crate) static_asset_cache: Arc<Mutex<HashMap<String, CachedStaticAsset>>>,
     pub(crate) catalog_cache: Arc<Mutex<HashMap<String, CachedCatalog>>>,
     pub(crate) git_repository_cache: Arc<Mutex<Option<CachedGitRepositories>>>,
@@ -42,6 +44,18 @@ pub(crate) struct AppState {
 pub(crate) struct CachedResponse {
     pub(crate) created_at: Instant,
     pub(crate) message: ServerEnvelope,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedSessionThreads {
+    pub(crate) created_at: Instant,
+    pub(crate) threads: Vec<Value>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedSessionSearchText {
+    pub(crate) created_at: Instant,
+    pub(crate) text: String,
 }
 
 #[derive(Clone)]

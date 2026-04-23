@@ -118,6 +118,7 @@ async fn handle_ws_message(
             }
 
             let audit_target = summarize_audit_target(&params);
+            let started_at = Instant::now();
             let message = match execute_ws_method(
                 state,
                 out_tx,
@@ -141,6 +142,19 @@ async fn handle_ws_message(
                     error: Some(error.to_string()),
                 },
             };
+            let elapsed = started_at.elapsed();
+            let response_size = serde_json::to_vec(&message)
+                .map(|bytes| bytes.len())
+                .unwrap_or_default();
+            if elapsed > Duration::from_millis(250) || response_size > 256 * 1024 {
+                warn!(
+                    method = %method,
+                    profile_id = %auth.profile_id,
+                    elapsed_ms = elapsed.as_millis(),
+                    response_bytes = response_size,
+                    "slow websocket request"
+                );
+            }
             if should_audit_ws_method(&method) {
                 let log_config = state.config.clone();
                 let role = auth.role;

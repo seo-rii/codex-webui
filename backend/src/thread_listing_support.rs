@@ -1,5 +1,46 @@
 use super::*;
 
+const SESSION_THREAD_CACHE_TTL: Duration = Duration::from_secs(3);
+const SESSION_SEARCH_TEXT_CACHE_TTL: Duration = Duration::from_secs(45);
+
+fn session_thread_cache_key(profile_id: &str, archived: bool) -> String {
+    format!("{profile_id}:archived={archived}")
+}
+
+fn session_search_text_cache_key(profile_id: &str, session_id: &str) -> String {
+    format!("{profile_id}:{session_id}")
+}
+
+async fn invalidate_session_listing_cache(
+    state: &AppState,
+    profile_id: &str,
+    session_id: Option<&str>,
+) {
+    let thread_prefix = format!("{profile_id}:");
+    state
+        .session_thread_cache
+        .lock()
+        .await
+        .retain(|key, _| !key.starts_with(&thread_prefix));
+
+    match session_id {
+        Some(session_id) => {
+            state
+                .session_search_text_cache
+                .lock()
+                .await
+                .remove(&session_search_text_cache_key(profile_id, session_id));
+        }
+        None => {
+            state
+                .session_search_text_cache
+                .lock()
+                .await
+                .retain(|key, _| !key.starts_with(&thread_prefix));
+        }
+    }
+}
+
 pub(crate) fn build_session_summary_from_thread_payload(
     thread: &Value,
     snapshot: &SessionSummaryUiSnapshot,
@@ -72,6 +113,15 @@ async fn list_app_server_threads(
     profile_id: &str,
     archived: bool,
 ) -> ApiResult<Vec<Value>> {
+    let cache_key = session_thread_cache_key(profile_id, archived);
+    {
+        let mut cache = state.session_thread_cache.lock().await;
+        cache.retain(|_, entry| entry.created_at.elapsed() < SESSION_THREAD_CACHE_TTL);
+        if let Some(cached) = cache.get(&cache_key) {
+            return Ok(cached.threads.clone());
+        }
+    }
+
     let client = app_server_client(state, profile_id)
         .await
         .map_err(|error| {
@@ -117,7 +167,49 @@ async fn list_app_server_threads(
         }
     }
 
+    state.session_thread_cache.lock().await.insert(
+        cache_key,
+        CachedSessionThreads {
+            created_at: Instant::now(),
+            threads: threads.clone(),
+        },
+    );
     Ok(threads)
+}
+
+async fn cached_session_search_text(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<String> {
+    let cache_key = session_search_text_cache_key(profile_id, session_id);
+    {
+        let mut cache = state.session_search_text_cache.lock().await;
+        cache.retain(|_, entry| entry.created_at.elapsed() < SESSION_SEARCH_TEXT_CACHE_TTL);
+        if let Some(cached) = cache.get(&cache_key) {
+            return Ok(cached.text.clone());
+        }
+    }
+
+    let thread = read_thread_payload(state, profile_id, session_id, true).await?;
+    let turns = thread.get("turns").cloned().unwrap_or_else(|| json!([]));
+    let text = tokio::task::spawn_blocking(move || turns.to_string().to_lowercase())
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to index the session for search: {error}"),
+            )
+        })?;
+
+    state.session_search_text_cache.lock().await.insert(
+        cache_key,
+        CachedSessionSearchText {
+            created_at: Instant::now(),
+            text: text.clone(),
+        },
+    );
+    Ok(text)
 }
 
 async fn collect_session_summaries_payload(
@@ -187,17 +279,10 @@ pub(crate) async fn search_sessions_payload(
         let Some(session_id) = summary.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let Ok(thread) = read_thread_payload(state, profile_id, session_id, true).await else {
+        let Ok(full_text) = cached_session_search_text(state, profile_id, session_id).await else {
             continue;
         };
-        if thread
-            .get("turns")
-            .cloned()
-            .unwrap_or_else(|| json!([]))
-            .to_string()
-            .to_lowercase()
-            .contains(&needle)
-        {
+        if full_text.contains(&needle) {
             matched.push(summary);
         }
     }
@@ -266,12 +351,16 @@ pub(crate) async fn create_session_payload(
             "Codex app-server returned an invalid thread payload.",
         )
     })?;
-    let session_id = thread.get("id").and_then(Value::as_str).ok_or_else(|| {
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            "Codex app-server returned a session without an id.",
-        )
-    })?;
+    let session_id = thread
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "Codex app-server returned a session without an id.",
+            )
+        })?;
 
     with_ui_state_write(state, profile_id, |ui_state| {
         let Some(preferences_by_thread_id) = ui_state
@@ -283,7 +372,7 @@ pub(crate) async fn create_session_payload(
                 "preferences state is missing",
             ));
         };
-        preferences_by_thread_id.insert(session_id.to_string(), next_preferences.clone());
+        preferences_by_thread_id.insert(session_id.clone(), next_preferences.clone());
         let Some(skills_by_thread_id) = ui_state
             .get_mut("skillsByThreadId")
             .and_then(Value::as_object_mut)
@@ -293,7 +382,7 @@ pub(crate) async fn create_session_payload(
                 "skills state is missing",
             ));
         };
-        skills_by_thread_id.insert(session_id.to_string(), Value::Array(next_selected_skills));
+        skills_by_thread_id.insert(session_id.clone(), Value::Array(next_selected_skills));
         Ok(())
     })
     .await?;
@@ -306,7 +395,7 @@ pub(crate) async fn create_session_payload(
             .request(
                 "thread/name/set",
                 json!({
-                    "threadId": session_id,
+                    "threadId": session_id.clone(),
                     "name": next_name
                 }),
             )
@@ -328,6 +417,7 @@ pub(crate) async fn create_session_payload(
         &snapshot,
         Some(next_preferences.clone()),
     )?;
+    invalidate_session_listing_cache(state, profile_id, Some(&session_id)).await;
     emit_profile_global_notification(
         state,
         profile_id,
@@ -369,6 +459,7 @@ pub(crate) async fn emit_session_summary_updated(
     session_id: &str,
     preferences_override: Option<Value>,
 ) {
+    invalidate_session_listing_cache(state, profile_id, Some(session_id)).await;
     let summary =
         build_session_summary_payload(state, profile_id, session_id, preferences_override).await;
     if let Ok(summary) = summary {
@@ -388,6 +479,7 @@ pub(crate) async fn emit_session_summary_updated(
 }
 
 pub(crate) async fn invalidate_session_lists(state: &AppState, profile_id: &str) {
+    invalidate_session_listing_cache(state, profile_id, None).await;
     emit_profile_global_notification(
         state,
         profile_id,

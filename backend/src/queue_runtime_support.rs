@@ -130,14 +130,8 @@ pub(crate) async fn session_has_active_turn(
     session_id: &str,
 ) -> bool {
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
-    if state
-        .active_turns
-        .lock()
-        .await
-        .contains_key(&runtime_session_key(resolved_profile_id, session_id))
-    {
-        return true;
-    }
+    let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+    let cached_active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
 
     let thread = match read_thread_payload(state, profile_id, session_id, true).await {
         Ok(payload) => payload,
@@ -146,20 +140,27 @@ pub(crate) async fn session_has_active_turn(
     let Some(thread) = thread.as_object() else {
         return true;
     };
-    if !is_live_thread_status(
-        &normalized_thread_status(thread.get("status")).unwrap_or_else(|| "unknown".to_string()),
-    ) {
+    let status =
+        normalized_thread_status(thread.get("status")).unwrap_or_else(|| "unknown".to_string());
+    if !is_live_thread_status(&status) {
+        state.active_turns.lock().await.remove(&runtime_key);
         return false;
     }
 
-    thread
+    let active_turn_id = thread
         .get("turns")
         .and_then(Value::as_array)
-        .is_some_and(|turns| {
-            turns
-                .iter()
-                .any(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
-        })
+        .map(Vec::as_slice)
+        .and_then(active_turn_id_from_turns);
+    if let Some(turn_id) = active_turn_id {
+        state.active_turns.lock().await.insert(runtime_key, turn_id);
+        return true;
+    }
+
+    if cached_active_turn_id.is_some() {
+        state.active_turns.lock().await.remove(&runtime_key);
+    }
+    false
 }
 
 pub(crate) async fn maybe_drain_queue(state: &AppState, profile_id: &str, session_id: &str) {

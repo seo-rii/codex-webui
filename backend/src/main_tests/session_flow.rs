@@ -280,6 +280,16 @@ async fn rust_session_list_and_search_use_app_server_threads() {
                                         "id": "item-1",
                                         "type": "assistantMessage",
                                         "text": "The websocket duplicate send race originates from optimistic queue replay."
+                                    },
+                                    {
+                                        "id": "item-2",
+                                        "type": "agent_message",
+                                        "message": "Snake case assistant messages are normalized."
+                                    },
+                                    {
+                                        "id": "item-3",
+                                        "type": "turn_aborted",
+                                        "message": "Internal abort marker should not render as a transcript item."
                                     }
                                 ]
                             }
@@ -289,6 +299,7 @@ async fn rust_session_list_and_search_use_app_server_threads() {
             )
             .await
             .unwrap();
+    invalidate_session_lists(&state, "default").await;
 
     let full_text = search_sessions_payload(
         &state,
@@ -310,6 +321,24 @@ async fn rust_session_list_and_search_use_app_server_threads() {
             .and_then(|entry| entry.get("id"))
             .and_then(Value::as_str),
         Some("thread-full")
+    );
+    let normalized_thread = read_thread_payload(&state, "default", "thread-full", true)
+        .await
+        .unwrap();
+    let normalized_items = normalized_thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| turns.first())
+        .and_then(|turn| turn.get("items"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        normalized_items
+            .iter()
+            .filter_map(|item| item.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        vec!["agentMessage", "agentMessage"]
     );
 
     let _ = fs::remove_dir_all(sandbox);

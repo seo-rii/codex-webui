@@ -1,6 +1,7 @@
 import adapterStatic from "@sveltejs/adapter-static";
 import { vitePreprocess } from "@sveltejs/vite-plugin-svelte";
 import { loadEnv } from "vite";
+import { createBuildMetadata } from "./scripts/build-metadata.mjs";
 
 function normalizeBasePath(value) {
   if (!value) {
@@ -19,6 +20,7 @@ function normalizeBasePath(value) {
 const env = loadEnv(process.env.NODE_ENV ?? "development", process.cwd(), "");
 const staticBasePlaceholder = "/__CODEX_WEBUI_BASE__";
 const basePath = normalizeBasePath(process.env.CODEX_WEBUI_BUILD_BASE_PATH ?? staticBasePlaceholder);
+const buildMetadata = createBuildMetadata(process.cwd(), { ...env, ...process.env });
 const trustedOrigins = [
   ...new Set(
     String(process.env.CODEX_WEBUI_CORS_ALLOWED_ORIGINS ?? env.CODEX_WEBUI_CORS_ALLOWED_ORIGINS ?? "")
@@ -41,6 +43,10 @@ const config = {
     paths: {
       base: basePath,
       relative: false
+    },
+    version: {
+      name: buildMetadata.version,
+      pollInterval: 60_000
     },
     csrf: {
       trustedOrigins

@@ -2,9 +2,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
+import { buildMetadataEnv, createBuildMetadata } from "./build-metadata.mjs";
+
 const projectRoot = path.resolve(new URL("..", import.meta.url).pathname);
 const outputRoot = path.join(projectRoot, "dist", "backend");
 const backendManifest = path.join(projectRoot, "backend", "Cargo.toml");
+const buildMetadata = createBuildMetadata(projectRoot);
+const buildEnv = buildMetadataEnv(buildMetadata);
 const targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
@@ -20,6 +24,10 @@ function commandAvailable(command) {
 function run(command, args) {
   const result = spawnSync(command, args, {
     cwd: projectRoot,
+    env: {
+      ...process.env,
+      ...buildEnv
+    },
     stdio: "inherit"
   });
   if (result.status !== 0) {

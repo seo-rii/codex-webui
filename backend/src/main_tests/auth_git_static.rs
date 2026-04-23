@@ -512,7 +512,9 @@ async fn static_asset_handler_rewrites_base_path_and_uses_spa_fallbacks() {
     assert_eq!(root_response.status(), StatusCode::OK);
     assert_eq!(
         root_response.headers().get(header::CACHE_CONTROL),
-        Some(&HeaderValue::from_static("no-cache"))
+        Some(&HeaderValue::from_static(
+            "no-store, max-age=0, must-revalidate"
+        ))
     );
     let root_body = to_bytes(root_response.into_body(), usize::MAX)
         .await
@@ -523,6 +525,12 @@ async fn static_asset_handler_rewrites_base_path_and_uses_spa_fallbacks() {
 
     let session_response = serve_static_asset(state.clone(), "/sessions/thread-1").await;
     assert_eq!(session_response.status(), StatusCode::OK);
+    assert_eq!(
+        session_response.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static(
+            "no-store, max-age=0, must-revalidate"
+        ))
+    );
     let session_body = to_bytes(session_response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -544,6 +552,86 @@ async fn static_asset_handler_rewrites_base_path_and_uses_spa_fallbacks() {
     let asset_text = String::from_utf8(asset_body.to_vec()).unwrap();
     assert!(asset_text.contains("/absproxy/4173"));
     assert!(!asset_text.contains(STATIC_BASE_PLACEHOLDER));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn static_asset_handler_never_memocaches_mutable_versioned_shell_files() {
+    let sandbox = unique_test_dir("static-assets-version-cache");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let static_dir = workspace.join("static");
+    fs::create_dir_all(static_dir.join("_app")).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(static_dir.join("index.html"), "<html>v1</html>").unwrap();
+    fs::write(
+        static_dir.join("service-worker.js"),
+        "const VERSION = 'v1';",
+    )
+    .unwrap();
+    fs::write(static_dir.join("manifest.webmanifest"), "{\"name\":\"v1\"}").unwrap();
+    fs::write(
+        static_dir.join("_app").join("version.json"),
+        "{\"version\":\"v1\"}",
+    )
+    .unwrap();
+
+    let state = test_state_with_static_dir_and_base_path(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home,
+        static_dir.clone(),
+        "",
+    );
+
+    let first_version_response = serve_static_asset(state.clone(), "/_app/version.json").await;
+    assert_eq!(first_version_response.status(), StatusCode::OK);
+    assert_eq!(
+        first_version_response.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static(
+            "no-store, max-age=0, must-revalidate"
+        ))
+    );
+    let first_version_body = to_bytes(first_version_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8(first_version_body.to_vec())
+            .unwrap()
+            .contains("\"v1\"")
+    );
+
+    fs::write(
+        static_dir.join("_app").join("version.json"),
+        "{\"version\":\"v2\"}",
+    )
+    .unwrap();
+    let second_version_response = serve_static_asset(state.clone(), "/_app/version.json").await;
+    let second_version_body = to_bytes(second_version_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8(second_version_body.to_vec())
+            .unwrap()
+            .contains("\"v2\"")
+    );
+
+    let service_worker_response = serve_static_asset(state.clone(), "/service-worker.js").await;
+    assert_eq!(
+        service_worker_response.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static(
+            "no-store, max-age=0, must-revalidate"
+        ))
+    );
+
+    let manifest_response = serve_static_asset(state, "/manifest.webmanifest").await;
+    assert_eq!(
+        manifest_response.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static(
+            "no-cache, max-age=0, must-revalidate"
+        ))
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }

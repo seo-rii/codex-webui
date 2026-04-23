@@ -6,23 +6,28 @@ pub(crate) async fn serve_static_asset(state: AppState, route_path: &str) -> Res
     };
 
     let cache_key = relative_path.to_string_lossy().into_owned();
-    if let Some(cached) = state
-        .static_asset_cache
-        .lock()
-        .await
-        .get(&cache_key)
-        .cloned()
-    {
-        return static_asset_response(cached);
+    let cacheable = static_asset_backend_cacheable(route_path);
+    if cacheable {
+        if let Some(cached) = state
+            .static_asset_cache
+            .lock()
+            .await
+            .get(&cache_key)
+            .cloned()
+        {
+            return static_asset_response(cached);
+        }
     }
 
     let asset_path = state.config.static_dir.join(&relative_path);
     if let Some(asset) = load_static_asset(&state.config, &asset_path, route_path).await {
-        state
-            .static_asset_cache
-            .lock()
-            .await
-            .insert(cache_key, asset.clone());
+        if cacheable {
+            state
+                .static_asset_cache
+                .lock()
+                .await
+                .insert(cache_key, asset.clone());
+        }
         return static_asset_response(asset);
     }
 
@@ -35,24 +40,8 @@ pub(crate) async fn serve_static_asset(state: AppState, route_path: &str) -> Res
     } else {
         "200.html"
     };
-    let fallback_key = format!("__fallback__::{fallback_name}");
-    if let Some(cached) = state
-        .static_asset_cache
-        .lock()
-        .await
-        .get(&fallback_key)
-        .cloned()
-    {
-        return static_asset_response(cached);
-    }
-
     let fallback_path = state.config.static_dir.join(fallback_name);
     if let Some(asset) = load_static_asset(&state.config, &fallback_path, route_path).await {
-        state
-            .static_asset_cache
-            .lock()
-            .await
-            .insert(fallback_key, asset.clone());
         return static_asset_response(asset);
     }
 
@@ -86,6 +75,10 @@ fn looks_like_static_asset(route_path: &str) -> bool {
         .file_name()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.contains('.'))
+}
+
+fn static_asset_backend_cacheable(route_path: &str) -> bool {
+    route_path.starts_with("/_app/immutable/")
 }
 
 async fn load_static_asset(
@@ -167,10 +160,20 @@ fn static_cache_control(route_path: &str, asset_path: &Path) -> &'static str {
             Some("html")
         )
     {
-        "no-cache"
+        "no-store, max-age=0, must-revalidate"
+    } else if route_path == "/service-worker.js"
+        || route_path == "/_app/version.json"
+        || route_path == "/_app/env.js"
+    {
+        "no-store, max-age=0, must-revalidate"
+    } else if matches!(
+        asset_path.file_name().and_then(|value| value.to_str()),
+        Some("manifest.webmanifest")
+    ) {
+        "no-cache, max-age=0, must-revalidate"
     } else if route_path.starts_with("/_app/immutable/") {
         "public, max-age=31536000, immutable"
     } else {
-        "public, max-age=3600"
+        "public, max-age=300, must-revalidate"
     }
 }

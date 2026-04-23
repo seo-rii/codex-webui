@@ -3,6 +3,7 @@
   import { browser } from "$app/environment";
   import { onMount } from "svelte";
 
+  import { startAppVersionGuard } from "$lib/app-cache";
   import { syncLocale, localeSignal } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
   import { initThemeRuntime } from "$lib/theme";
@@ -19,11 +20,13 @@
   onMount(() => {
     initThemeRuntime();
     syncLocale();
+    const stopAppVersionGuard = startAppVersionGuard();
     if (!import.meta.env.DEV && "serviceWorker" in navigator) {
       void navigator.serviceWorker.register(`${base}/service-worker.js`, {
         scope: base ? `${base}/` : "/"
-      }).catch(() => {});
+      }).then((registration) => registration.update()).catch(() => {});
     }
+    return stopAppVersionGuard;
   });
 
   $effect(() => {

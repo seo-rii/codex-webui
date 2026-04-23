@@ -1,4 +1,4 @@
-const CACHE_NAME = "codex-webui-shell-v1";
+const CACHE_NAME = "codex-webui-shell-__CODEX_WEBUI_APP_VERSION__";
 
 function getScopePath() {
   const pathname = new URL(self.registration.scope).pathname.replace(/\/+$/u, "");
@@ -23,7 +23,7 @@ function isStaticAssetRequest(request) {
 }
 
 function isDynamicEndpoint(url) {
-  return url.pathname.includes("/api/") || url.pathname.endsWith("/ws");
+  return url.pathname.includes("/api/") || url.pathname.endsWith("/ws") || url.pathname.endsWith("/_app/version.json");
 }
 
 self.addEventListener("install", (event) => {
@@ -75,7 +75,7 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(
       caches.open(CACHE_NAME).then(async (cache) => {
         try {
-          const response = await fetch(request);
+          const response = await fetch(request, { cache: "no-store" });
           if (response.ok) {
             await cache.put(getAppShellUrl(), response.clone());
           }
@@ -94,10 +94,14 @@ self.addEventListener("fetch", (event) => {
 
   event.respondWith(
     caches.open(CACHE_NAME).then(async (cache) => {
-      const cached = await cache.match(request);
+      const isShellMetadata =
+        url.pathname.endsWith("/service-worker.js") ||
+        url.pathname.endsWith("/manifest.webmanifest") ||
+        url.pathname.endsWith("/_app/env.js");
+      const cached = isShellMetadata ? null : await cache.match(request);
       const networkPromise = fetch(request)
         .then(async (response) => {
-          if (response.ok) {
+          if (response.ok && !isShellMetadata) {
             await cache.put(request, response.clone());
           }
           return response;

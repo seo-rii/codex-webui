@@ -8,8 +8,42 @@ export type ConversationState = SessionDetailPayload & {
 function cloneTurn(turn: CodexTurn): CodexTurn {
   return {
     ...turn,
-    items: [...turn.items]
+    items: turn.items.map((item) => ({ ...item, type: normalizeItemTypeName(item.type) }))
   };
+}
+
+function normalizeItemTypeName(itemType: string) {
+  if (itemType === "agent_message" || itemType === "assistant_message" || itemType === "assistantMessage") {
+    return "agentMessage";
+  }
+  if (itemType === "user_message") {
+    return "userMessage";
+  }
+  if (itemType === "command_execution") {
+    return "commandExecution";
+  }
+  if (itemType === "file_change") {
+    return "fileChange";
+  }
+  if (itemType === "mcp_tool_call") {
+    return "mcpToolCall";
+  }
+  if (itemType === "dynamic_tool_call") {
+    return "dynamicToolCall";
+  }
+  if (itemType === "web_search") {
+    return "webSearch";
+  }
+  if (itemType === "context_compaction") {
+    return "contextCompaction";
+  }
+  if (itemType === "image_generation") {
+    return "imageGeneration";
+  }
+  if (itemType === "collab_agent_tool_call") {
+    return "collabAgentToolCall";
+  }
+  return itemType;
 }
 
 function ensureTurn(state: ConversationState, turnId: string, seed?: Partial<CodexTurn>) {
@@ -112,32 +146,40 @@ function preferRicherArray<T>(existing: unknown, incoming: unknown): T[] | undef
 }
 
 function mergeItem(existingItem: CodexItem | undefined, incomingItem: CodexItem): CodexItem {
+  const normalizedIncomingItem: CodexItem = {
+    ...incomingItem,
+    type: normalizeItemTypeName(incomingItem.type)
+  };
   if (!existingItem) {
-    return { ...incomingItem };
+    return normalizedIncomingItem;
   }
-
-  const merged: CodexItem = {
+  const normalizedExistingItem: CodexItem = {
     ...existingItem,
-    ...incomingItem
+    type: normalizeItemTypeName(existingItem.type)
   };
 
-  if (existingItem.detailState === "loaded" && incomingItem.detailState !== "loaded") {
+  const merged: CodexItem = {
+    ...normalizedExistingItem,
+    ...normalizedIncomingItem
+  };
+
+  if (normalizedExistingItem.detailState === "loaded" && normalizedIncomingItem.detailState !== "loaded") {
     merged.detailState = "loaded";
-  } else if (existingItem.detailState === "inline" && incomingItem.detailState === "deferred") {
+  } else if (normalizedExistingItem.detailState === "inline" && normalizedIncomingItem.detailState === "deferred") {
     merged.detailState = "inline";
   }
 
   merged.detailPreview =
-    typeof incomingItem.detailPreview === "string" && incomingItem.detailPreview.trim()
-      ? incomingItem.detailPreview
-      : (existingItem.detailPreview ?? null);
+    typeof normalizedIncomingItem.detailPreview === "string" && normalizedIncomingItem.detailPreview.trim()
+      ? normalizedIncomingItem.detailPreview
+      : (normalizedExistingItem.detailPreview ?? null);
   merged.title =
-    typeof incomingItem.title === "string" && incomingItem.title.trim()
-      ? incomingItem.title
-      : (existingItem.title ?? null);
+    typeof normalizedIncomingItem.title === "string" && normalizedIncomingItem.title.trim()
+      ? normalizedIncomingItem.title
+      : (normalizedExistingItem.title ?? null);
 
-  if ("text" in existingItem || "text" in incomingItem) {
-    merged.text = preferProgressiveString(existingItem.text, incomingItem.text);
+  if ("text" in normalizedExistingItem || "text" in normalizedIncomingItem) {
+    merged.text = preferProgressiveString(normalizedExistingItem.text, normalizedIncomingItem.text);
   }
   if ("aggregatedOutput" in existingItem || "aggregatedOutput" in incomingItem) {
     merged.aggregatedOutput = preferProgressiveString(existingItem.aggregatedOutput, incomingItem.aggregatedOutput);

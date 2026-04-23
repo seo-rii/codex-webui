@@ -1219,6 +1219,7 @@
   let lastComposerPromptChip = $state<{ sessionId: string; prompt: string } | null>(null);
   let notificationPermissionRequested = false;
   const handledResumeDraftKeys = new Set<string>();
+  const pendingComposerMutationSignatures = new Set<string>();
   let lastLoadedConversationId = $state<string | null>(null);
   let lastActiveLiveTurnId = $state<string | null>(null);
 
@@ -4946,6 +4947,7 @@
     startingMessage = true;
     errorText = "";
     noticeText = "";
+    let mutationSignature: string | null = null;
 
     try {
       const materialized = await ensureSessionForComposer();
@@ -4959,6 +4961,11 @@
       const attachmentIds = attachmentSnapshot.map((attachment) => attachment.id);
       const selectedSkillsSnapshot = [...(activeConversation.selectedSkills ?? [])];
       const preferences = activeConversation.preferences;
+      mutationSignature = buildComposerMutationSignature("message", sessionId, prompt, selectedSkillsSnapshot, attachmentIds);
+      if (!beginComposerMutation(mutationSignature)) {
+        startingMessage = false;
+        return;
+      }
       setOptimisticMessageState(sessionId, prompt, selectedSkillsSnapshot, attachmentNames, activeConversation);
       pendingQueueModeSessionId = sessionId;
       recordComposerHistory(prompt);
@@ -4994,9 +5001,11 @@
           errorText = describeError(error);
         })
         .finally(() => {
+          finishComposerMutation(mutationSignature);
           startingMessage = false;
         });
     } catch (error) {
+      finishComposerMutation(mutationSignature);
       errorText = describeError(error);
       startingMessage = false;
     }
@@ -5034,6 +5043,10 @@
     noticeText = "";
     const selectedSkillsSnapshot = [...selectedBinding.state.selectedSkills];
     const attachmentIds = attachmentSnapshot.map((attachment) => attachment.id);
+    const mutationSignature = buildComposerMutationSignature("queue", sessionId, prompt, selectedSkillsSnapshot, attachmentIds);
+    if (!beginComposerMutation(mutationSignature)) {
+      return;
+    }
 
     recordComposerHistory(prompt);
     rememberLastComposerPromptChip(sessionId, prompt);
@@ -5085,6 +5098,7 @@
         errorText = describeError(error);
       })
       .finally(() => {
+        finishComposerMutation(mutationSignature);
         const remainingCount = Math.max(0, (queuedMessageRequestCountsBySessionId[sessionId] ?? 1) - 1);
         if (remainingCount === 0) {
           const remainingRequests = { ...queuedMessageRequestCountsBySessionId };
@@ -5114,6 +5128,12 @@
     const normalizedPrompt = prompt.trim();
     const steerAttachmentSnapshot =
       clearComposer || draft.trim() === normalizedPrompt ? [...draftAttachments] : [];
+    const attachmentIds = steerAttachmentSnapshot.map((attachment) => attachment.id);
+    const selectedSkillsSnapshot = [...selectedBinding.state.selectedSkills];
+    const mutationSignature = buildComposerMutationSignature("steer", sessionId, normalizedPrompt, selectedSkillsSnapshot, attachmentIds);
+    if (!beginComposerMutation(mutationSignature)) {
+      return;
+    }
     sending = true;
     sendIntent = "steer";
     errorText = "";
@@ -5121,7 +5141,7 @@
     setOptimisticMessageState(
       sessionId,
       normalizedPrompt,
-      [...selectedBinding.state.selectedSkills],
+      selectedSkillsSnapshot,
       steerAttachmentSnapshot.map((attachment) => attachment.originalName),
       selectedBinding.state
     );
@@ -5129,8 +5149,8 @@
       await api.steerTurn(
         sessionId,
         normalizedPrompt,
-        steerAttachmentSnapshot.map((attachment) => attachment.id),
-        [...selectedBinding.state.selectedSkills]
+        attachmentIds,
+        selectedSkillsSnapshot
       );
       scheduleSessionRefresh(80);
       scheduleSelectedSessionStateRefresh(sessionId, 80);
@@ -5147,6 +5167,7 @@
       clearOptimisticMessageState(sessionId, normalizedPrompt);
       errorText = describeError(error);
     } finally {
+      finishComposerMutation(mutationSignature);
       sending = false;
       sendIntent = null;
     }
@@ -6551,6 +6572,31 @@
     return `${normalizeMessageForComparison(prompt)}\u0000${normalizeSelectedSkills(skills).map((skill) => skill.path).sort().join("\u0001")}\u0000${[...attachmentIds].sort().join("\u0001")}`;
   }
 
+  function buildComposerMutationSignature(
+    mode: "message" | "queue" | "steer",
+    sessionId: string,
+    prompt: string,
+    skills: SelectedSkill[],
+    attachmentIds: string[]
+  ) {
+    return `${mode}\u0000${sessionId}\u0000${buildQueueItemSignature(prompt, skills, attachmentIds)}`;
+  }
+
+  function beginComposerMutation(signature: string) {
+    if (pendingComposerMutationSignatures.has(signature)) {
+      return false;
+    }
+
+    pendingComposerMutationSignatures.add(signature);
+    return true;
+  }
+
+  function finishComposerMutation(signature: string | null) {
+    if (signature) {
+      pendingComposerMutationSignatures.delete(signature);
+    }
+  }
+
   function addOptimisticQueuedItem(sessionId: string, prompt: string, skills: SelectedSkill[], attachments: AttachmentRecord[]) {
     const item: SessionQueueItem = {
       id: `optimistic:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
@@ -6898,6 +6944,11 @@
 
   function handleComposerKeydown(event: KeyboardEvent) {
     if (event.isComposing) {
+      return;
+    }
+
+    if (event.key === "Enter" && event.repeat) {
+      event.preventDefault();
       return;
     }
 
@@ -8022,10 +8073,21 @@
     return turn.items.filter(
       (item) =>
         item.type !== "userMessage" &&
+        !isInternalTranscriptItem(item) &&
         item.type !== "fileChange" &&
         item.type !== "imageGeneration" &&
         item.id !== finalAgentItem.id
     );
+  }
+
+  function isInternalTranscriptItem(item: CodexItem) {
+    return [
+      "task_complete",
+      "turn_aborted",
+      "turn_started",
+      "turn_completed",
+      "agent_reasoning_section_break"
+    ].includes(item.type);
   }
 
   function getVisibleSummaryEntries(turn: ConversationState["thread"]["turns"][number]) {
@@ -8059,7 +8121,7 @@
   }
 
   function getTurnEntries(turn: ConversationState["thread"]["turns"][number]) {
-    return getRenderableTurnEntries(turn.items.filter((item) => item.type !== "userMessage"));
+    return getRenderableTurnEntries(turn.items.filter((item) => item.type !== "userMessage" && !isInternalTranscriptItem(item)));
   }
 
   function getCollapsedTurnProgressCount(turn: ConversationState["thread"]["turns"][number]) {

@@ -11,12 +11,48 @@ type CacheEnvelope<T> = {
 
 const DB_NAME = "codex-webui-browser-cache";
 const DB_VERSION = 1;
+const STORE_LIMITS: Record<CacheStoreName, { maxEntries: number; ttlMs: number }> = {
+  "session-details": {
+    maxEntries: 80,
+    ttlMs: 24 * 60 * 60 * 1000
+  },
+  "session-lists": {
+    maxEntries: 40,
+    ttlMs: 10 * 60 * 1000
+  }
+};
 const memoryStores: Record<CacheStoreName, Map<string, CacheEnvelope<unknown>>> = {
   "session-details": new Map(),
   "session-lists": new Map()
 };
 
 let databasePromise: Promise<IDBDatabase> | null = null;
+
+function isExpiredEnvelope(storeName: CacheStoreName, envelope: CacheEnvelope<unknown>) {
+  return Date.now() - envelope.savedAt > STORE_LIMITS[storeName].ttlMs;
+}
+
+function pruneMemoryStore(storeName: CacheStoreName) {
+  const store = memoryStores[storeName];
+  for (const [key, envelope] of store) {
+    if (isExpiredEnvelope(storeName, envelope)) {
+      store.delete(key);
+    }
+  }
+
+  const maxEntries = STORE_LIMITS[storeName].maxEntries;
+  if (store.size <= maxEntries) {
+    return;
+  }
+
+  const keysToDelete = [...store.entries()]
+    .sort((left, right) => left[1].savedAt - right[1].savedAt)
+    .slice(0, store.size - maxEntries)
+    .map(([key]) => key);
+  for (const key of keysToDelete) {
+    store.delete(key);
+  }
+}
 
 function browserSupportsIndexedDb() {
   return typeof window !== "undefined" && typeof window.indexedDB !== "undefined";
@@ -82,6 +118,7 @@ async function runStoreRequest<T>(
 }
 
 async function readEnvelope<T>(storeName: CacheStoreName, key: string) {
+  pruneMemoryStore(storeName);
   const memory = memoryStores[storeName].get(key) as CacheEnvelope<T> | undefined;
 
   try {
@@ -94,19 +131,79 @@ async function readEnvelope<T>(storeName: CacheStoreName, key: string) {
         reject(request.error ?? new Error("Browser cache read failed."));
       };
     });
-    if (value) {
+    if (value && !isExpiredEnvelope(storeName, value as CacheEnvelope<unknown>)) {
       memoryStores[storeName].set(key, value as CacheEnvelope<unknown>);
       return value;
     }
+    if (value) {
+      void deleteEnvelope(storeName, key);
+    }
   } catch {
-    return memory ?? null;
+    return memory && !isExpiredEnvelope(storeName, memory as CacheEnvelope<unknown>) ? memory : null;
   }
 
-  return memory ?? null;
+  return memory && !isExpiredEnvelope(storeName, memory as CacheEnvelope<unknown>) ? memory : null;
+}
+
+async function deleteEnvelope(storeName: CacheStoreName, key: string) {
+  memoryStores[storeName].delete(key);
+  if (!browserSupportsIndexedDb()) {
+    return;
+  }
+
+  try {
+    await runStoreRequest<void>(storeName, "readwrite", (store, resolve, reject) => {
+      const request = store.delete(key);
+      request.onsuccess = () => {
+        resolve();
+      };
+      request.onerror = () => {
+        reject(request.error ?? new Error("Browser cache delete failed."));
+      };
+    });
+  } catch {
+    // Ignore cache delete failures.
+  }
+}
+
+async function prunePersistentStore(storeName: CacheStoreName) {
+  pruneMemoryStore(storeName);
+  if (!browserSupportsIndexedDb()) {
+    return;
+  }
+
+  try {
+    await runStoreRequest<void>(storeName, "readwrite", (store, resolve, reject) => {
+      const request = store.getAll();
+      request.onsuccess = () => {
+        const entries = ((request.result as CacheEnvelope<unknown>[] | undefined) ?? []).filter(Boolean);
+        const expiredKeys = entries.filter((entry) => isExpiredEnvelope(storeName, entry)).map((entry) => entry.key);
+        const maxEntries = STORE_LIMITS[storeName].maxEntries;
+        const overflowKeys =
+          entries.length > maxEntries
+            ? entries
+                .filter((entry) => !expiredKeys.includes(entry.key))
+                .sort((left, right) => left.savedAt - right.savedAt)
+                .slice(0, entries.length - maxEntries)
+                .map((entry) => entry.key)
+            : [];
+        for (const key of new Set([...expiredKeys, ...overflowKeys])) {
+          store.delete(key);
+        }
+        resolve();
+      };
+      request.onerror = () => {
+        reject(request.error ?? new Error("Browser cache prune failed."));
+      };
+    });
+  } catch {
+    // Ignore cache prune failures.
+  }
 }
 
 async function writeEnvelope<T>(storeName: CacheStoreName, envelope: CacheEnvelope<T>) {
   memoryStores[storeName].set(envelope.key, envelope as CacheEnvelope<unknown>);
+  pruneMemoryStore(storeName);
 
   try {
     await runStoreRequest<void>(storeName, "readwrite", (store, resolve, reject) => {
@@ -121,6 +218,7 @@ async function writeEnvelope<T>(storeName: CacheStoreName, envelope: CacheEnvelo
   } catch {
     // Memory fallback already contains the latest value.
   }
+  void prunePersistentStore(storeName);
 }
 
 export async function readSessionListCache(key: string) {

@@ -1635,6 +1635,11 @@
     return "";
   });
   const showTopLoadBar = $derived(Boolean(topLoadLabel));
+  const showComposerSyncPill = $derived(
+    activeWorkspaceTabId === "chat" &&
+      Boolean(conversation) &&
+      (topLoadKind === "sessionRefresh" || topLoadKind === "sessionHydration")
+  );
   const topLoadPercent = $derived.by(() => {
     if (topLoadKind === "sessionHydration" && sessionHydrationPercent !== null) {
       return sessionHydrationPercent;
@@ -8561,7 +8566,7 @@
 {:else}
 <div class="flex h-[100dvh] min-h-[100dvh] w-full bg-white overflow-hidden font-sans text-gray-900" data-testid="workspace-shell">
   {#if showConnectionSnackbar || feedbackSnackbar}
-    <div class="pointer-events-none fixed inset-x-0 top-0 z-[110] flex justify-center px-3 pt-3 sm:px-6">
+    <div class="workspace-snackbar-stack pointer-events-none fixed inset-x-0 z-[110] flex justify-center px-3 sm:px-6">
       <div class="flex w-full max-w-xl flex-col gap-2">
         {#if showConnectionSnackbar}
           {#key `${connectionState}:${connectionBannerText}`}
@@ -8822,10 +8827,12 @@
           <div class="top-load-bar-track">
             <div class="top-load-bar-fill" style={`width:${Math.max(6, Math.min(100, topLoadPercent))}%`}></div>
           </div>
-          <div class="top-load-pill">
-            <RefreshCw size={11} class={topLoadKind === "sessionHydration" ? "" : "animate-spin"} />
-            <span>{topLoadLabel}</span>
-          </div>
+          {#if !showComposerSyncPill}
+            <div class="top-load-pill">
+              <RefreshCw size={11} class={topLoadKind === "sessionHydration" ? "" : "animate-spin"} />
+              <span>{topLoadLabel}</span>
+            </div>
+          {/if}
         </div>
       {/if}
       {#if activeWorkspaceTabId === "chat"}
@@ -9397,6 +9404,14 @@
                         </span>
                       </button>
                     {/each}
+                  </div>
+                {/if}
+                {#if showComposerSyncPill}
+                  <div class="flex justify-center pb-1">
+                    <div class="dock-sync-pill" transition:fly={{ y: 8, duration: 180 }}>
+                      <RefreshCw size={12} class={topLoadKind === "sessionHydration" ? "" : "animate-spin"} />
+                      <span>{topLoadLabel}</span>
+                    </div>
                   </div>
                 {/if}
                 <form bind:this={composerPanelElement} class="composer-panel bg-white/95 border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200 focus-within:-translate-y-0.5 focus-within:border-amber-400/70 focus-within:bg-white focus-within:shadow-[0_24px_60px_-34px_rgba(245,158,11,0.65)]" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
@@ -10185,6 +10200,10 @@
     will-change: transform, opacity, box-shadow;
   }
 
+  .workspace-snackbar-stack {
+    top: calc(env(safe-area-inset-top) + 4rem);
+  }
+
   .ui-animated-button {
     will-change: transform, box-shadow, background-color, border-color, color, opacity;
     transition:
@@ -10245,9 +10264,9 @@
   .top-load-bar-fill {
     height: 100%;
     border-radius: 999px;
-    background: linear-gradient(90deg, color-mix(in srgb, var(--brand) 76%, white 6%), color-mix(in srgb, var(--brand) 54%, var(--ink) 10%));
+    background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 76%, white 6%), color-mix(in srgb, var(--accent) 54%, var(--ink) 10%));
     transition: width 180ms cubic-bezier(0.22, 1, 0.36, 1);
-    box-shadow: 0 0 20px color-mix(in srgb, var(--brand) 24%, transparent);
+    box-shadow: 0 0 20px color-mix(in srgb, var(--accent) 24%, transparent);
   }
 
   .top-load-pill {
@@ -10258,9 +10277,9 @@
     max-width: min(22rem, calc(100vw - 2rem));
     align-items: center;
     gap: 0.45rem;
-    border: 1px solid color-mix(in srgb, var(--panel-line) 78%, transparent);
+    border: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
     border-radius: 999px;
-    background: color-mix(in srgb, var(--panel) 92%, transparent);
+    background: color-mix(in srgb, var(--panel-strong) 92%, transparent);
     color: color-mix(in srgb, var(--ink) 76%, transparent);
     padding: 0.38rem 0.7rem;
     font-size: 0.68rem;
@@ -10271,6 +10290,30 @@
   }
 
   .top-load-pill span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .dock-sync-pill {
+    display: inline-flex;
+    max-width: min(24rem, calc(100vw - 3rem));
+    align-items: center;
+    gap: 0.45rem;
+    border: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--panel-strong) 94%, transparent);
+    color: color-mix(in srgb, var(--ink) 74%, transparent);
+    padding: 0.36rem 0.72rem;
+    font-size: 0.68rem;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    box-shadow: 0 18px 44px -34px rgba(15, 23, 42, 0.48);
+    backdrop-filter: blur(16px);
+  }
+
+  .dock-sync-pill span {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

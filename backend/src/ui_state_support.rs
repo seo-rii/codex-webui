@@ -212,6 +212,20 @@ async fn read_profile_ui_state(config: &Config, profile_id: &str) -> Result<Valu
     }
 }
 
+async fn read_cached_profile_ui_state(state: &AppState, profile_id: &str) -> Result<Value> {
+    if let Some(cached) = state.ui_state_cache.lock().await.get(profile_id).cloned() {
+        return Ok(cached);
+    }
+
+    let ui_state = read_profile_ui_state(&state.config, profile_id).await?;
+    state
+        .ui_state_cache
+        .lock()
+        .await
+        .insert(profile_id.to_string(), ui_state.clone());
+    Ok(ui_state)
+}
+
 async fn write_profile_ui_state(config: &Config, profile_id: &str, ui_state: &Value) -> Result<()> {
     let path = profile_ui_state_path(config, profile_id);
     if let Some(parent) = path.parent() {
@@ -285,7 +299,7 @@ where
         .to_string();
     let lock = ui_state_lock(state, &resolved_profile_id).await;
     let _guard = lock.lock().await;
-    let ui_state = read_profile_ui_state(&state.config, &resolved_profile_id)
+    let ui_state = read_cached_profile_ui_state(state, &resolved_profile_id)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     reader(&ui_state)
@@ -304,13 +318,18 @@ where
         .to_string();
     let lock = ui_state_lock(state, &resolved_profile_id).await;
     let _guard = lock.lock().await;
-    let mut ui_state = read_profile_ui_state(&state.config, &resolved_profile_id)
+    let mut ui_state = read_cached_profile_ui_state(state, &resolved_profile_id)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let result = writer(&mut ui_state)?;
     write_profile_ui_state(&state.config, &resolved_profile_id, &ui_state)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    state
+        .ui_state_cache
+        .lock()
+        .await
+        .insert(resolved_profile_id, ui_state);
     Ok(result)
 }
 

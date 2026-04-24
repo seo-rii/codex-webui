@@ -145,7 +145,7 @@ pub(crate) fn session_filter_from_query(query: Option<&str>) -> SessionFilterCri
     }
 }
 
-fn session_sort_priority(status: Option<&str>) -> i32 {
+pub(crate) fn session_sort_priority(status: Option<&str>) -> i32 {
     match status.unwrap_or_default() {
         "running" | "active" => 1,
         _ => 0,
@@ -291,7 +291,7 @@ pub(crate) fn session_summary_page(
     })
 }
 
-fn session_summary_page_state(
+pub(crate) fn session_summary_page_state(
     sessions: &[Value],
     next_cursor: Option<&str>,
 ) -> (Vec<String>, serde_json::Map<String, Value>, String) {

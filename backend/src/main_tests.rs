@@ -105,6 +105,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
         relays: Arc::new(Mutex::new(HashMap::new())),
         terminals: Arc::new(Mutex::new(HashMap::new())),
         ui_state_locks: Arc::new(Mutex::new(HashMap::new())),
+        ui_state_cache: Arc::new(Mutex::new(HashMap::new())),
         automation_timers: Arc::new(Mutex::new(HashMap::new())),
         queue_dispatching: Arc::new(Mutex::new(HashSet::new())),
         queue_drain_retries: Arc::new(Mutex::new(HashMap::new())),
@@ -146,6 +147,7 @@ threads = {}
 thread_counter = 0
 timestamp_counter = 0
 turn_counter = 0
+request_counts = {}
 
 for raw_line in sys.stdin:
     line = raw_line.strip()
@@ -156,6 +158,7 @@ for raw_line in sys.stdin:
     request_id = payload.get("id")
     method = payload.get("method")
     params = payload.get("params") or {}
+    request_counts[method] = int(request_counts.get(method, 0) or 0) + 1
 
     def write(message):
         sys.stdout.write(json.dumps(message) + "\n")
@@ -279,6 +282,14 @@ for raw_line in sys.stdin:
             "result": {
                 "data": data[start:end] if start < len(data) else [],
                 "nextCursor": next_cursor
+            }
+        })
+    elif method == "debug/requestCount":
+        target = str(params.get("target") or "")
+        write({
+            "id": request_id,
+            "result": {
+                "count": int(request_counts.get(target, 0) or 0)
             }
         })
     elif method == "thread/resume":

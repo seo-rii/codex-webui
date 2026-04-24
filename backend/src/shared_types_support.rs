@@ -32,6 +32,7 @@ pub(crate) struct AppState {
     pub(crate) relays: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
     pub(crate) terminals: Arc<Mutex<HashMap<String, Arc<TerminalSession>>>>,
     pub(crate) ui_state_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    pub(crate) ui_state_cache: Arc<Mutex<HashMap<String, Value>>>,
     pub(crate) automation_timers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(crate) queue_dispatching: Arc<Mutex<HashSet<String>>>,
     pub(crate) queue_drain_retries: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
@@ -51,6 +52,7 @@ pub(crate) struct CachedResponse {
 pub(crate) struct CachedSessionThreads {
     pub(crate) created_at: Instant,
     pub(crate) threads: Vec<Value>,
+    pub(crate) next_cursor: String,
 }
 
 #[derive(Clone)]

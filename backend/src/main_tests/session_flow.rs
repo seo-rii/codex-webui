@@ -1,4 +1,159 @@
 use super::*;
+use rusqlite::{Connection, params};
+
+fn write_rollout_fixture(
+    codex_home: &Path,
+    archived: bool,
+    date_path: &str,
+    timestamp_prefix: &str,
+    session_id: &str,
+    cwd: &Path,
+    prompt: &str,
+    extra_lines: &[&str],
+    session_meta_extra: Option<&str>,
+) {
+    let directory = if archived {
+        codex_home.join("archived_sessions")
+    } else {
+        codex_home.join("sessions").join(date_path)
+    };
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("rollout-{timestamp_prefix}-{session_id}.jsonl"));
+    let session_meta_extra = session_meta_extra.unwrap_or("");
+    let content = format!(
+        "{{\"timestamp\":\"2026-04-24T01:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"timestamp\":\"2026-04-24T01:00:00.000Z\",\"cwd\":\"{}\",\"originator\":\"codex_webui\",\"cli_version\":\"0.121.0\",\"source\":\"vscode\"{session_meta_extra}}}}}\n{{\"timestamp\":\"2026-04-24T01:00:01.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"<environment_context>\\n  <cwd>{}</cwd>\\n</environment_context>\"}}]}}}}\n{{\"timestamp\":\"2026-04-24T01:00:02.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":{prompt:?},\"kind\":\"plain\"}}}}\n{}\n",
+        cwd.display(),
+        cwd.display(),
+        extra_lines.join("\n")
+    );
+    fs::write(path, content).unwrap();
+    std::thread::sleep(Duration::from_millis(8));
+}
+
+fn append_session_index_fixture(
+    codex_home: &Path,
+    session_id: &str,
+    title: &str,
+    updated_at: &str,
+) {
+    let path = codex_home.join("session_index.jsonl");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    use std::io::Write;
+    writeln!(
+        file,
+        "{}",
+        json!({
+            "id": session_id,
+            "thread_name": title,
+            "updated_at": updated_at
+        })
+    )
+    .unwrap();
+}
+
+fn write_state_thread_fixture(
+    codex_home: &Path,
+    session_id: &str,
+    title: &str,
+    preview: &str,
+    cwd: &Path,
+    archived: bool,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    agent_nickname: Option<&str>,
+    agent_role: Option<&str>,
+    is_subagent: bool,
+) {
+    let database_path = codex_home.join("state_5.sqlite");
+    let connection = Connection::open(database_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                model_provider TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                title TEXT NOT NULL,
+                sandbox_policy TEXT NOT NULL,
+                approval_mode TEXT NOT NULL,
+                tokens_used INTEGER NOT NULL DEFAULT 0,
+                has_user_event INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0,
+                archived_at INTEGER,
+                git_sha TEXT,
+                git_branch TEXT,
+                git_origin_url TEXT,
+                cli_version TEXT NOT NULL DEFAULT '',
+                first_user_message TEXT NOT NULL DEFAULT '',
+                agent_nickname TEXT,
+                agent_role TEXT,
+                memory_mode TEXT NOT NULL DEFAULT 'enabled',
+                model TEXT,
+                reasoning_effort TEXT,
+                agent_path TEXT,
+                created_at_ms INTEGER,
+                updated_at_ms INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS thread_spawn_edges (
+                parent_thread_id TEXT NOT NULL,
+                child_thread_id TEXT NOT NULL PRIMARY KEY,
+                status TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO threads (
+                id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                sandbox_policy, approval_mode, tokens_used, has_user_event, archived, archived_at,
+                git_sha, git_branch, git_origin_url, cli_version, first_user_message,
+                agent_nickname, agent_role, memory_mode, model, reasoning_effort, agent_path,
+                created_at_ms, updated_at_ms
+            ) VALUES (
+                ?1, ?2, ?3, ?4, 'vscode', 'openai', ?5, ?6, ?7,
+                'on-request', 0, 1, ?8, NULL, NULL, NULL, NULL, '0.121.0', ?9, ?10, ?11,
+                'enabled', NULL, NULL, NULL, ?12, ?13
+            )",
+            params![
+                session_id,
+                format!("/tmp/{session_id}.jsonl"),
+                created_at_ms / 1000,
+                updated_at_ms / 1000,
+                cwd.display().to_string(),
+                title,
+                r#"{"type":"workspace-write"}"#,
+                if archived { 1 } else { 0 },
+                preview,
+                agent_nickname,
+                agent_role,
+                created_at_ms,
+                updated_at_ms
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM thread_spawn_edges WHERE child_thread_id = ?1",
+            params![session_id],
+        )
+        .unwrap();
+    if is_subagent {
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO thread_spawn_edges (parent_thread_id, child_thread_id, status)
+                VALUES ('parent-thread', ?1, 'running')",
+                params![session_id],
+            )
+            .unwrap();
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_session_payload_uses_app_server_and_persists_preferences() {
@@ -68,6 +223,442 @@ async fn create_session_payload_uses_app_server_and_persists_preferences() {
             .and_then(|value| value.get("name"))
             .and_then(Value::as_str),
         Some("Review docs")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollout_file_listing_and_update_avoid_app_server_thread_lists() {
+    let sandbox = unique_test_dir("session-rollout-listing");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let visible_id = "019e0000-0000-7000-8000-000000000001";
+    let subagent_id = "019e0000-0000-7000-8000-000000000002";
+    let updated_id = "019e0000-0000-7000-8000-000000000003";
+
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-00-00",
+        visible_id,
+        &workspace,
+        "Implement compact session indexing",
+        &[],
+        None,
+    );
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-00-10",
+        subagent_id,
+        &workspace,
+        "Hidden subagent prompt",
+        &[],
+        Some(
+            ",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"parent\",\"depth\":1,\"agent_nickname\":\"Turing\",\"agent_role\":\"explorer\"}}},\"agent_nickname\":\"Turing\",\"agent_role\":\"explorer\"",
+        ),
+    );
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        payload
+            .get("sessions")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        payload
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|sessions| sessions.first())
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some(visible_id)
+    );
+
+    let client = app_server_client(&state, "default").await.unwrap();
+    let thread_list_count = client
+        .request("debug/requestCount", json!({ "target": "thread/list" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        thread_list_count.get("count").and_then(Value::as_i64),
+        Some(0)
+    );
+
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-00-20",
+        updated_id,
+        &workspace,
+        "Newest session after refresh",
+        &[],
+        None,
+    );
+    invalidate_session_lists(&state, "default").await;
+
+    let refreshed = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        refreshed
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|sessions| sessions.first())
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some(updated_id)
+    );
+
+    let thread_list_count_after = client
+        .request("debug/requestCount", json!({ "target": "thread/list" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        thread_list_count_after.get("count").and_then(Value::as_i64),
+        Some(0)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollout_file_listing_prefers_recorded_thread_name_metadata() {
+    let sandbox = unique_test_dir("session-rollout-title");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let titled_id = "019e0000-0000-7000-8000-000000000021";
+    let mut extra_lines = (0..220)
+        .map(|index| {
+            format!(
+                "{{\"timestamp\":\"2026-04-24T01:10:{:02}.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"agent_message\",\"message\":\"filler {index}\",\"phase\":\"commentary\"}}}}",
+                index % 60
+            )
+        })
+        .collect::<Vec<_>>();
+    extra_lines.push(format!(
+        "{{\"timestamp\":\"2026-04-24T01:14:30.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"thread_name_updated\",\"thread_id\":\"{titled_id}\",\"thread_name\":\"AI generated rollout title\"}}}}"
+    ));
+    let extra_line_refs = extra_lines.iter().map(String::as_str).collect::<Vec<_>>();
+
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-10-00",
+        titled_id,
+        &workspace,
+        "Preview fallback title that should not win",
+        &extra_line_refs,
+        None,
+    );
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let session = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .and_then(|sessions| sessions.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        session.get("name").and_then(Value::as_str),
+        Some("AI generated rollout title")
+    );
+    assert_eq!(session.get("id").and_then(Value::as_str), Some(titled_id));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollout_file_listing_hydrates_visible_entries_from_state_metadata() {
+    let sandbox = unique_test_dir("session-rollout-hydration");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let session_id = "019e0000-0000-7000-8000-000000000031";
+
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-20-00",
+        session_id,
+        &workspace,
+        "rollout preview fallback",
+        &[],
+        None,
+    );
+    append_session_index_fixture(
+        &codex_home,
+        session_id,
+        "Indexed title should be replaced by state title",
+        "2026-04-24T01:20:05.000Z",
+    );
+    write_state_thread_fixture(
+        &codex_home,
+        session_id,
+        "Hydrated state title",
+        "Hydrated preview from state database",
+        &workspace.join("nested-project"),
+        false,
+        1_713_920_000_000,
+        1_713_920_005_000,
+        None,
+        None,
+        false,
+    );
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let session = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .and_then(|sessions| sessions.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        session.get("name").and_then(Value::as_str),
+        Some("Hydrated state title")
+    );
+    assert_eq!(
+        session.get("preview").and_then(Value::as_str),
+        Some("Hydrated preview from state database")
+    );
+    assert_eq!(
+        session.get("cwd").and_then(Value::as_str),
+        Some(workspace.join("nested-project").to_str().unwrap())
+    );
+    assert_eq!(
+        session.get("isSubagent").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(session.get("agentNickname"), Some(&Value::Null));
+    assert_eq!(session.get("agentRole"), Some(&Value::Null));
+    assert_eq!(
+        session.get("updatedAt").and_then(Value::as_i64),
+        Some(1_713_920_005_000)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollout_file_search_and_archived_listing_use_file_index() {
+    let sandbox = unique_test_dir("session-rollout-search");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let active_id = "019e0000-0000-7000-8000-000000000011";
+    let archived_id = "019e0000-0000-7000-8000-000000000012";
+
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T02-00-00",
+        active_id,
+        &workspace,
+        "Investigate fallback behavior",
+        &[
+            r#"{"timestamp":"2026-04-24T02:00:03.000Z","type":"event_msg","payload":{"type":"agent_message","message":"The zebra-token regression reproduces in rollout indexing.","phase":"commentary"}}"#,
+        ],
+        None,
+    );
+    write_rollout_fixture(
+        &codex_home,
+        true,
+        "",
+        "2026-04-23T23-30-00",
+        archived_id,
+        &workspace,
+        "Archived rollout thread",
+        &[],
+        None,
+    );
+
+    let matched = search_sessions_payload(
+        &state,
+        "default",
+        "zebra-token",
+        "full",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        matched
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|sessions| sessions.first())
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some(active_id)
+    );
+
+    let archived = list_sessions_payload(
+        &state,
+        "default",
+        true,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        archived
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|sessions| sessions.first())
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some(archived_id)
+    );
+
+    let client = app_server_client(&state, "default").await.unwrap();
+    let thread_list_count = client
+        .request("debug/requestCount", json!({ "target": "thread/list" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        thread_list_count.get("count").and_then(Value::as_i64),
+        Some(0)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollout_file_search_uses_state_metadata_before_full_rollout_scan() {
+    let sandbox = unique_test_dir("session-rollout-search-state");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let session_id = "019e0000-0000-7000-8000-000000000041";
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T02-30-00",
+        session_id,
+        &workspace,
+        "rollout text without target phrase",
+        &[],
+        None,
+    );
+    write_state_thread_fixture(
+        &codex_home,
+        session_id,
+        "State indexed title",
+        "Needle phrase from the state database only",
+        &workspace,
+        false,
+        1_713_920_100_000,
+        1_713_920_110_000,
+        None,
+        None,
+        false,
+    );
+
+    let matched = search_sessions_payload(
+        &state,
+        "default",
+        "needle phrase",
+        "summary",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        matched
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|sessions| sessions.first())
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some(session_id)
     );
 
     let _ = fs::remove_dir_all(sandbox);

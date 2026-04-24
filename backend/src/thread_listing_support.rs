@@ -3,8 +3,17 @@ use super::*;
 const SESSION_THREAD_CACHE_TTL: Duration = Duration::from_secs(3);
 const SESSION_SEARCH_TEXT_CACHE_TTL: Duration = Duration::from_secs(45);
 
-fn session_thread_cache_key(profile_id: &str, archived: bool) -> String {
-    format!("{profile_id}:archived={archived}")
+fn session_thread_cache_key(
+    profile_id: &str,
+    archived: bool,
+    cursor: Option<&str>,
+    limit: u64,
+) -> String {
+    format!(
+        "{profile_id}:archived={archived}:cursor={}:limit={}",
+        cursor.unwrap_or_default(),
+        limit.clamp(1, 200)
+    )
 }
 
 fn session_search_text_cache_key(profile_id: &str, session_id: &str) -> String {
@@ -144,17 +153,45 @@ pub(crate) fn build_session_summary_from_thread_payload(
     }))
 }
 
-async fn list_app_server_threads(
+fn project_thread_listing_payload(thread: &Value) -> Value {
+    let object = thread.as_object().cloned().unwrap_or_default();
+    let mut projected = serde_json::Map::new();
+    for key in [
+        "id",
+        "name",
+        "preview",
+        "cwd",
+        "archived",
+        "createdAt",
+        "updatedAt",
+        "status",
+        "isSubagent",
+        "agentNickname",
+        "agentRole",
+        "source",
+    ] {
+        if let Some(value) = object.get(key) {
+            projected.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(projected)
+}
+
+async fn list_app_server_thread_batch(
     state: &AppState,
     profile_id: &str,
     archived: bool,
-) -> ApiResult<Vec<Value>> {
-    let cache_key = session_thread_cache_key(profile_id, archived);
+    cursor: Option<&str>,
+    limit: u64,
+) -> ApiResult<(Vec<Value>, Option<String>)> {
+    let normalized_limit = limit.clamp(1, 200);
+    let cache_key = session_thread_cache_key(profile_id, archived, cursor, normalized_limit);
     {
         let mut cache = state.session_thread_cache.lock().await;
         cache.retain(|_, entry| entry.created_at.elapsed() < SESSION_THREAD_CACHE_TTL);
         if let Some(cached) = cache.get(&cache_key) {
-            return Ok(cached.threads.clone());
+            let next_cursor = (!cached.next_cursor.is_empty()).then(|| cached.next_cursor.clone());
+            return Ok((cached.threads.clone(), next_cursor));
         }
     }
 
@@ -166,50 +203,67 @@ async fn list_app_server_threads(
                 format!("Failed to connect to codex app-server: {error}"),
             )
         })?;
-    let mut cursor: Option<String> = None;
-    let mut threads = Vec::new();
-
-    loop {
-        let response = client
-            .request(
-                "thread/list",
-                json!({
-                    "limit": 200,
-                    "archived": archived,
-                    "cursor": cursor.clone()
-                }),
+    let response = client
+        .request(
+            "thread/list",
+            json!({
+                "limit": normalized_limit,
+                "archived": archived,
+                "cursor": cursor
+            }),
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to list sessions: {error}"),
             )
-            .await
-            .map_err(|error| {
-                api_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("Failed to list sessions: {error}"),
-                )
-            })?;
-        let batch = response
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        threads.extend(batch);
-        cursor = response
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        if cursor.is_none() {
-            break;
-        }
-    }
+        })?;
+    let threads = response
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|thread| project_thread_listing_payload(&thread))
+        .collect::<Vec<_>>();
+    let next_cursor = response
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     state.session_thread_cache.lock().await.insert(
         cache_key,
         CachedSessionThreads {
             created_at: Instant::now(),
             threads: threads.clone(),
+            next_cursor: next_cursor.clone().unwrap_or_default(),
         },
     );
+
+    Ok((threads, next_cursor))
+}
+
+async fn list_app_server_threads(
+    state: &AppState,
+    profile_id: &str,
+    archived: bool,
+) -> ApiResult<Vec<Value>> {
+    let mut cursor: Option<String> = None;
+    let mut threads = Vec::new();
+
+    loop {
+        let (batch, next_cursor) =
+            list_app_server_thread_batch(state, profile_id, archived, cursor.as_deref(), 200)
+                .await?;
+        threads.extend(batch);
+        cursor = next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
     Ok(threads)
 }
 
@@ -271,6 +325,193 @@ async fn collect_session_summaries_payload(
     Ok(summaries)
 }
 
+fn candidate_matches_session_filter_snapshot(
+    candidate: &Value,
+    snapshot: &SessionSummaryUiSnapshot,
+    filter: &SessionFilterCriteria,
+) -> bool {
+    let Some(session_id) = candidate.get("id").and_then(Value::as_str) else {
+        return false;
+    };
+    if filter.pinned_only
+        && !snapshot
+            .session_meta_by_thread_id
+            .get(session_id)
+            .and_then(|value| value.get("pinned"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    if filter.queued_only
+        && snapshot
+            .queue_counts_by_thread_id
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
+            == 0
+    {
+        return false;
+    }
+    if let Some(highlight) = &filter.highlight {
+        if snapshot
+            .highlights_by_thread_id
+            .get(session_id)
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+            != Some(highlight.as_str())
+        {
+            return false;
+        }
+    }
+    if filter.tags.is_empty() {
+        return true;
+    }
+    let session_tags = snapshot
+        .session_meta_by_thread_id
+        .get(session_id)
+        .and_then(|value| value.get("tags"))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    filter
+        .tags
+        .iter()
+        .all(|tag| session_tags.contains(tag.as_str()))
+}
+
+async fn scan_rollout_sessions_with_query_payload(
+    state: &AppState,
+    profile_id: &str,
+    archived: bool,
+    cursor: Option<&str>,
+    limit: u64,
+    filter: &SessionFilterCriteria,
+    needle: Option<&str>,
+    include_full_text: bool,
+) -> ApiResult<Option<Value>> {
+    let candidates = list_rollout_candidates_payload(state, profile_id, archived).await?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let snapshot = read_session_summary_ui_snapshot(state, profile_id).await?;
+    let start = cursor
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let window_size = limit.clamp(1, 200) as usize;
+    let mut page = Vec::new();
+    let mut matched_count = 0usize;
+    let matched_state_ids = match needle {
+        Some(needle) => {
+            search_state_thread_ids_payload(state, profile_id, archived, needle).await?
+        }
+        None => None,
+    };
+    let chunk_size = window_size.saturating_mul(2).clamp(32, 128);
+    let mut candidate_index = 0usize;
+    let mut has_more = false;
+
+    while candidate_index < candidates.len() && !has_more {
+        let end = candidate_index
+            .saturating_add(chunk_size)
+            .min(candidates.len());
+        let candidate_chunk = &candidates[candidate_index..end];
+        candidate_index = end;
+
+        let hydrated_candidates = candidate_chunk
+            .iter()
+            .filter(|candidate| {
+                candidate_matches_session_filter_snapshot(candidate, &snapshot, filter)
+            })
+            .filter(|candidate| {
+                let Some(needle) = needle else {
+                    return true;
+                };
+                let indexed_match = candidate_matches_indexed_query(candidate, needle);
+                let state_match = matched_state_ids.as_ref().is_some_and(|matched_ids| {
+                    candidate
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|session_id| matched_ids.contains(session_id))
+                });
+                indexed_match || state_match || include_full_text
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if hydrated_candidates.is_empty() {
+            continue;
+        }
+
+        let hydrated_threads = hydrate_rollout_candidates_to_threads_payload(
+            state,
+            profile_id,
+            archived,
+            &hydrated_candidates,
+        )
+        .await?;
+        for (candidate, thread) in hydrated_candidates.iter().zip(hydrated_threads.into_iter()) {
+            if thread_is_subagent(&thread) {
+                continue;
+            }
+            let summary =
+                build_session_summary_from_thread_payload(&thread, &snapshot, None, None)?;
+            if !session_summary_matches_filter(&summary, filter) {
+                continue;
+            }
+            if let Some(needle) = needle {
+                let indexed_match = candidate_matches_indexed_query(candidate, needle);
+                let state_match = matched_state_ids.as_ref().is_some_and(|matched_ids| {
+                    summary
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|session_id| matched_ids.contains(session_id))
+                });
+                let summary_match =
+                    indexed_match || state_match || session_summary_matches_query(&summary, needle);
+                if !summary_match
+                    && (!include_full_text
+                        || !rollout_candidate_contains_query_payload(candidate, needle).await?)
+                {
+                    continue;
+                }
+            }
+
+            if matched_count < start {
+                matched_count += 1;
+                continue;
+            }
+            if page.len() < window_size {
+                page.push(summary);
+                matched_count += 1;
+                continue;
+            }
+            matched_count += 1;
+            has_more = true;
+            break;
+        }
+    }
+
+    let next_cursor = has_more.then(|| start.saturating_add(window_size).to_string());
+    let (session_ids, summary_versions, state_hash) =
+        session_summary_page_state(&page, next_cursor.as_deref());
+
+    Ok(Some(json!({
+        "sessions": page,
+        "nextCursor": next_cursor,
+        "sessionIds": session_ids,
+        "summaryVersions": summary_versions,
+        "stateHash": state_hash
+    })))
+}
+
 pub(crate) async fn list_sessions_payload(
     state: &AppState,
     profile_id: &str,
@@ -279,6 +520,14 @@ pub(crate) async fn list_sessions_payload(
     limit: u64,
     filter: &SessionFilterCriteria,
 ) -> ApiResult<Value> {
+    if let Some(payload) = scan_rollout_sessions_with_query_payload(
+        state, profile_id, archived, cursor, limit, filter, None, false,
+    )
+    .await?
+    {
+        return Ok(payload);
+    }
+
     let sessions = collect_session_summaries_payload(state, profile_id, archived, filter).await?;
     Ok(session_summary_page(sessions, cursor, limit))
 }
@@ -299,6 +548,21 @@ pub(crate) async fn search_sessions_payload(
     }
 
     let include_full_text = scope == "full";
+    if let Some(payload) = scan_rollout_sessions_with_query_payload(
+        state,
+        profile_id,
+        archived,
+        cursor,
+        limit,
+        filter,
+        Some(&needle),
+        include_full_text,
+    )
+    .await?
+    {
+        return Ok(payload);
+    }
+
     let sessions = collect_session_summaries_payload(state, profile_id, archived, filter).await?;
     let mut matched = Vec::new();
 

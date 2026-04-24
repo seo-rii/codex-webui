@@ -90,6 +90,7 @@ mod session_queue_dispatch_support;
 mod session_queue_http_support;
 mod session_queue_mutation_support;
 mod session_queue_support;
+mod session_rollout_index_support;
 mod session_route_dispatch_support;
 mod session_summary_support;
 mod session_transcript_http_support;
@@ -150,6 +151,7 @@ use session_queue_dispatch_support::*;
 use session_queue_http_support::*;
 use session_queue_mutation_support::*;
 use session_queue_support::*;
+use session_rollout_index_support::*;
 use session_route_dispatch_support::*;
 use session_summary_support::*;
 use session_transcript_http_support::*;
@@ -255,6 +257,7 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             relays: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),
             ui_state_locks: Arc::new(Mutex::new(HashMap::new())),
+            ui_state_cache: Arc::new(Mutex::new(HashMap::new())),
             automation_timers: Arc::new(Mutex::new(HashMap::new())),
             queue_dispatching: Arc::new(Mutex::new(HashSet::new())),
             queue_drain_retries: Arc::new(Mutex::new(HashMap::new())),

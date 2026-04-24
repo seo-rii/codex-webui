@@ -329,6 +329,18 @@ pub(crate) async fn read_thread_metadata_payload(
     match read_thread_payload(state, profile_id, session_id, false).await {
         Ok(thread) => Ok(thread),
         Err(read_error) => {
+            if let Some(thread) =
+                read_state_thread_metadata_by_session_id(state, profile_id, session_id, None)
+                    .await?
+            {
+                return Ok(thread);
+            }
+            if let Some(thread) =
+                read_rollout_thread_metadata_by_session_id(state, profile_id, session_id).await?
+            {
+                return Ok(thread);
+            }
+
             let client = match app_server_client(state, profile_id).await {
                 Ok(client) => client,
                 Err(_) => return Err(read_error),

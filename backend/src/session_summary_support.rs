@@ -152,6 +152,17 @@ pub(crate) fn session_sort_priority(status: Option<&str>) -> i32 {
     }
 }
 
+pub(crate) fn normalize_session_timestamp(value: i64) -> i64 {
+    if value <= 0 {
+        return 0;
+    }
+    if value >= 1_000_000_000_000 {
+        value
+    } else {
+        value.saturating_mul(1000)
+    }
+}
+
 pub(crate) fn session_summary_matches_filter(
     summary: &Value,
     filter: &SessionFilterCriteria,
@@ -249,8 +260,15 @@ pub(crate) fn sort_session_summaries(summaries: &mut [Value]) {
         let updated_difference = right
             .get("updatedAt")
             .and_then(Value::as_i64)
+            .map(normalize_session_timestamp)
             .unwrap_or(0)
-            .cmp(&left.get("updatedAt").and_then(Value::as_i64).unwrap_or(0));
+            .cmp(
+                &left
+                    .get("updatedAt")
+                    .and_then(Value::as_i64)
+                    .map(normalize_session_timestamp)
+                    .unwrap_or(0),
+            );
         if updated_difference != std::cmp::Ordering::Equal {
             return updated_difference;
         }
@@ -258,8 +276,15 @@ pub(crate) fn sort_session_summaries(summaries: &mut [Value]) {
         right
             .get("createdAt")
             .and_then(Value::as_i64)
+            .map(normalize_session_timestamp)
             .unwrap_or(0)
-            .cmp(&left.get("createdAt").and_then(Value::as_i64).unwrap_or(0))
+            .cmp(
+                &left
+                    .get("createdAt")
+                    .and_then(Value::as_i64)
+                    .map(normalize_session_timestamp)
+                    .unwrap_or(0),
+            )
     });
 }
 
@@ -451,7 +476,7 @@ pub(crate) async fn read_session_summary_ui_snapshot(
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
         .0
         .to_string();
-    let active_thread_ids = state
+    let mut active_thread_ids = state
         .active_turns
         .lock()
         .await
@@ -463,6 +488,19 @@ pub(crate) async fn read_session_summary_ui_snapshot(
             .map(str::to_string)
         })
         .collect::<HashSet<_>>();
+    active_thread_ids.extend(
+        state
+            .pending_turn_starts
+            .lock()
+            .await
+            .iter()
+            .filter_map(|key| {
+                key.strip_prefix(&format!(
+                    "profile::{resolved_profile_id}::session-runtime::"
+                ))
+                .map(str::to_string)
+            }),
+    );
 
     with_ui_state_read(state, profile_id, |ui_state| {
         let queue_counts_by_thread_id = ui_state

@@ -353,6 +353,131 @@ async fn rollout_file_listing_and_update_avoid_app_server_thread_lists() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollout_file_listing_promotes_old_pinned_and_running_sessions() {
+    let sandbox = unique_test_dir("session-rollout-priority");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let pinned_id = "019e0000-0000-7000-8000-000000000011";
+    let running_id = "019e0000-0000-7000-8000-000000000012";
+    let newest_id = "019e0000-0000-7000-8000-000000000013";
+
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-05-00",
+        pinned_id,
+        &workspace,
+        "Old pinned session",
+        &[],
+        None,
+    );
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-05-10",
+        running_id,
+        &workspace,
+        "Old running session",
+        &[],
+        None,
+    );
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-05-20",
+        newest_id,
+        &workspace,
+        "Newest normal session",
+        &[],
+        None,
+    );
+
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(session_meta) = ui_state
+            .get_mut("sessionMetaByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session meta state is missing",
+            ));
+        };
+        session_meta.insert(
+            pinned_id.to_string(),
+            json!({
+                "pinned": true,
+                "tags": []
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+    state.active_turns.lock().await.insert(
+        runtime_session_key("default", running_id),
+        "turn-running".to_string(),
+    );
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        2,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let session_ids = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|session| {
+            session
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(session_ids, vec![pinned_id, running_id]);
+
+    let next_page = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        payload.get("nextCursor").and_then(Value::as_str),
+        2,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        next_page
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|sessions| sessions.first())
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some(newest_id)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rollout_file_listing_prefers_recorded_thread_name_metadata() {
     let sandbox = unique_test_dir("session-rollout-title");
     let workspace = sandbox.join("workspace");
@@ -930,6 +1055,86 @@ async fn rust_session_list_and_search_use_app_server_threads() {
             .filter_map(|item| item.get("type").and_then(Value::as_str))
             .collect::<Vec<_>>(),
         vec!["agentMessage", "agentMessage"]
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_list_normalizes_mixed_timestamp_units() {
+    let sandbox = unique_test_dir("session-list-timestamp-units");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let client = app_server_client(&state, "default").await.unwrap();
+
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-seconds",
+                    "name": "Seconds timestamp",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1_713_920_000,
+                    "updatedAt": 1_713_920_005,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": null,
+                    "agentRole": null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-millis",
+                    "name": "Millis timestamp",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1_713_919_999_000_i64,
+                    "updatedAt": 1_713_920_004_000_i64,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": null,
+                    "agentRole": null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        payload
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|sessions| sessions.first())
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some("thread-seconds")
     );
 
     let _ = fs::remove_dir_all(sandbox);

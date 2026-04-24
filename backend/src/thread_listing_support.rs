@@ -91,13 +91,18 @@ pub(crate) fn build_session_summary_from_thread_payload(
         .unwrap_or_default()
         .to_string();
     let thread_status = normalized_thread_status(thread.get("status"));
-    let thread_updated_at = thread.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+    let thread_updated_at = thread
+        .get("updatedAt")
+        .and_then(Value::as_i64)
+        .map(normalize_session_timestamp)
+        .unwrap_or(0);
     let runtime_status_value = snapshot.runtime_status_by_thread_id.get(session_id);
     let runtime_status =
         runtime_status_value.and_then(|value| normalized_thread_status(Some(value)));
     let runtime_status_updated_at = runtime_status_value
         .and_then(|value| value.get("updatedAt"))
         .and_then(Value::as_i64)
+        .map(normalize_session_timestamp)
         .unwrap_or(0);
     let status = status_override
         .map(str::trim)
@@ -403,6 +408,56 @@ async fn scan_rollout_sessions_with_query_payload(
     }
 
     let snapshot = read_session_summary_ui_snapshot(state, profile_id).await?;
+    let candidate_priority = |candidate: &Value| {
+        let Some(session_id) = candidate.get("id").and_then(Value::as_str) else {
+            return 0;
+        };
+        if snapshot
+            .session_meta_by_thread_id
+            .get(session_id)
+            .and_then(|value| value.get("pinned"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return 2;
+        }
+        if snapshot.active_thread_ids.contains(session_id)
+            || snapshot
+                .runtime_status_by_thread_id
+                .get(session_id)
+                .and_then(|value| normalized_thread_status(Some(value)))
+                .as_deref()
+                .is_some_and(|status| session_sort_priority(Some(status)) > 0)
+        {
+            return 1;
+        }
+        0
+    };
+    let candidate_updated_at = |candidate: &Value| {
+        normalize_session_timestamp(
+            candidate
+                .get("indexedUpdatedAt")
+                .and_then(Value::as_i64)
+                .or_else(|| candidate.get("updatedAt").and_then(Value::as_i64))
+                .unwrap_or_default(),
+        )
+    };
+    let mut candidates = candidates;
+    candidates.sort_by(|left, right| {
+        let priority_difference = candidate_priority(right).cmp(&candidate_priority(left));
+        if priority_difference != std::cmp::Ordering::Equal {
+            return priority_difference;
+        }
+        let updated_difference = candidate_updated_at(right).cmp(&candidate_updated_at(left));
+        if updated_difference != std::cmp::Ordering::Equal {
+            return updated_difference;
+        }
+        right
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(left.get("id").and_then(Value::as_str).unwrap_or_default())
+    });
     let start = cursor
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(0);

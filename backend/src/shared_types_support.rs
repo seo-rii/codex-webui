@@ -37,6 +37,7 @@ pub(crate) struct AppState {
     pub(crate) queue_dispatching: Arc<Mutex<HashSet<String>>>,
     pub(crate) queue_drain_retries: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(crate) active_turns: Arc<Mutex<HashMap<String, String>>>,
+    pub(crate) pending_turn_starts: Arc<Mutex<HashSet<String>>>,
     pub(crate) pending_server_requests:
         Arc<Mutex<HashMap<String, HashMap<String, PendingServerRequestEntry>>>>,
     pub(crate) shutdown_timers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,

@@ -73,8 +73,13 @@ pub(crate) async fn emit_queue_updated(
         }),
     )
     .await;
-    emit_session_summary_updated(state, profile_id, session_id, None, None).await;
-    emit_runtime_profile_config_updated(state, profile_id).await;
+    let state = state.clone();
+    let profile_id = profile_id.to_string();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        emit_session_summary_updated(&state, &profile_id, &session_id, None, None).await;
+        emit_runtime_profile_config_updated(&state, &profile_id).await;
+    });
 }
 
 pub(crate) async fn list_resume_pending_queues_payload(

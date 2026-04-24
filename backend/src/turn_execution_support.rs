@@ -174,15 +174,27 @@ pub(crate) async fn send_turn_payload(
     preferences: Value,
 ) -> ApiResult<Value> {
     let trimmed_prompt = prompt.trim();
-    let attachments =
-        resolve_selected_attachment_records(state, profile_id, session_id, attachment_ids).await?;
-    let requested_selected_skills = selected_skills_from_value(selected_skills);
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        session_id,
+    );
+    state
+        .pending_turn_starts
+        .lock()
+        .await
+        .insert(runtime_key.clone());
 
-    if trimmed_prompt.is_empty() && attachments.is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
-    }
+    let result = async {
+        let attachments =
+            resolve_selected_attachment_records(state, profile_id, session_id, attachment_ids)
+                .await?;
+        let requested_selected_skills = selected_skills_from_value(selected_skills);
 
-    cancel_scheduled_shutdown_for_activity(state, profile_id).await;
+        if trimmed_prompt.is_empty() && attachments.is_empty() {
+            return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
+        }
+
+        cancel_scheduled_shutdown_for_activity(state, profile_id).await;
 
     let next_preferences =
         normalize_session_preferences_payload(state, profile_id, preferences).await?;
@@ -353,12 +365,13 @@ pub(crate) async fn send_turn_payload(
         .and_then(Value::as_str)
         .map(str::to_string)
     {
-        let runtime_key = runtime_session_key(
-            resolve_runtime_profile_entry(&state.config, profile_id).0,
-            session_id,
-        );
-        state.active_turns.lock().await.insert(runtime_key, turn_id);
+        state
+            .active_turns
+            .lock()
+            .await
+            .insert(runtime_key.clone(), turn_id);
     }
+    state.pending_turn_starts.lock().await.remove(&runtime_key);
 
     clear_session_draft_payload(state, profile_id, session_id).await?;
     emit_session_summary_updated(
@@ -378,6 +391,13 @@ pub(crate) async fn send_turn_payload(
             .cloned()
             .unwrap_or(Value::Null)
     }))
+    }
+    .await;
+
+    if result.is_err() {
+        state.pending_turn_starts.lock().await.remove(&runtime_key);
+    }
+    result
 }
 
 pub(crate) async fn steer_turn_payload(

@@ -110,6 +110,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
         queue_dispatching: Arc::new(Mutex::new(HashSet::new())),
         queue_drain_retries: Arc::new(Mutex::new(HashMap::new())),
         active_turns: Arc::new(Mutex::new(HashMap::new())),
+        pending_turn_starts: Arc::new(Mutex::new(HashSet::new())),
         pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
         shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
     }
@@ -142,6 +143,7 @@ fn test_state_with_fake_app_server(
             r#"#!/usr/bin/env python3
 import json
 import sys
+import time
 
 threads = {}
 thread_counter = 0
@@ -245,6 +247,9 @@ for raw_line in sys.stdin:
             "turns": []
         })
         read_error = thread.get("readError")
+        read_delay_ms = int(thread.get("readDelayMs", 0) or 0)
+        if read_delay_ms > 0:
+            time.sleep(read_delay_ms / 1000)
         if isinstance(read_error, dict) and str(read_error.get("message", "")).strip():
             write({
                 "id": request_id,

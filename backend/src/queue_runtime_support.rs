@@ -231,6 +231,15 @@ pub(crate) async fn maybe_drain_queue(state: &AppState, profile_id: &str, sessio
     maybe_drain_queue_with_attempt(state, profile_id, session_id, 0).await;
 }
 
+pub(crate) fn spawn_queue_drain(state: &AppState, profile_id: &str, session_id: &str) {
+    let state = state.clone();
+    let profile_id = profile_id.to_string();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        maybe_drain_queue(&state, &profile_id, &session_id).await;
+    });
+}
+
 async fn maybe_drain_queue_with_attempt(
     state: &AppState,
     profile_id: &str,
@@ -238,6 +247,18 @@ async fn maybe_drain_queue_with_attempt(
     attempt: usize,
 ) {
     let guarded = with_queue_dispatch_guard(state, profile_id, session_id, async {
+        let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+        let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+        if state
+            .pending_turn_starts
+            .lock()
+            .await
+            .contains(&runtime_key)
+        {
+            schedule_queue_drain_retry(state, profile_id, session_id, attempt);
+            return;
+        }
+
         let queue = match get_session_queue_payload(state, profile_id, session_id).await {
             Ok(queue) => queue,
             Err(_) => return,

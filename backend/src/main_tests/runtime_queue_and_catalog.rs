@@ -1021,6 +1021,20 @@ async fn enqueue_session_queue_payload_auto_dispatches_when_session_is_idle() {
             .is_some_and(|value| !value.is_empty())
     );
 
+    for _ in 0..20 {
+        let queue = get_session_queue_payload(&state, "default", &session_id)
+            .await
+            .unwrap();
+        if queue
+            .get("items")
+            .and_then(Value::as_array)
+            .is_none_or(|items| items.is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     let queue_after = get_session_queue_payload(&state, "default", &session_id)
         .await
         .unwrap();
@@ -1051,6 +1065,146 @@ async fn enqueue_session_queue_payload_auto_dispatches_when_session_is_idle() {
             .and_then(|value| value.get("text"))
             .and_then(Value::as_str),
         Some("Continue the work after the browser disconnects.")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enqueue_session_queue_payload_returns_before_queue_drain_reads_thread() {
+    let sandbox = unique_test_dir("queue-nonblocking-enqueue");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-slow-read";
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Slow queue drain",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "readDelayMs": 900,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let started = Instant::now();
+    let queue = enqueue_session_queue_payload(
+        &state,
+        "default",
+        session_id,
+        "Queue should not wait for a slow thread read.",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "enqueue waited for queue drain: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        queue.get("items").and_then(Value::as_array).map(Vec::len),
+        Some(1)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_drain_waits_while_turn_start_is_pending() {
+    let sandbox = unique_test_dir("queue-pending-turn-start");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-pending-start";
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Pending turn start",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    state
+        .pending_turn_starts
+        .lock()
+        .await
+        .insert(runtime_session_key("default", session_id));
+
+    enqueue_session_queue_payload(
+        &state,
+        "default",
+        session_id,
+        "Do not dispatch until the in-flight turn start resolves.",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let queue = get_session_queue_payload(&state, "default", session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.get("items").and_then(Value::as_array).map(Vec::len),
+        Some(1)
+    );
+
+    state
+        .pending_turn_starts
+        .lock()
+        .await
+        .remove(&runtime_session_key("default", session_id));
+    maybe_drain_queue(&state, "default", session_id).await;
+    let drained = get_session_queue_payload(&state, "default", session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        drained.get("items").and_then(Value::as_array).map(Vec::len),
+        Some(0)
     );
 
     let _ = fs::remove_dir_all(sandbox);

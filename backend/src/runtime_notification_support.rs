@@ -214,6 +214,7 @@ pub(crate) async fn handle_profile_runtime_notification(
 
     match notification.method.as_str() {
         "turn/started" => {
+            state.pending_turn_starts.lock().await.remove(&runtime_key);
             if let Some(turn_id) = notification_turn_id(&notification.params) {
                 state.active_turns.lock().await.insert(runtime_key, turn_id);
             }
@@ -235,6 +236,7 @@ pub(crate) async fn handle_profile_runtime_notification(
             set_session_highlight(state, profile_id, &session_id, None).await;
         }
         "turn/completed" => {
+            state.pending_turn_starts.lock().await.remove(&runtime_key);
             let turn_id = notification_turn_id(&notification.params);
             let mut active_turns = state.active_turns.lock().await;
             if turn_id
@@ -264,7 +266,7 @@ pub(crate) async fn handle_profile_runtime_notification(
                 Ok(())
             })
             .await;
-            maybe_drain_queue(state, profile_id, &session_id).await;
+            spawn_queue_drain(state, profile_id, &session_id);
             maybe_schedule_global_shutdown(state, profile_id, turn_id.as_deref()).await;
             emit_profile_global_notification(
                 state,
@@ -332,10 +334,12 @@ pub(crate) async fn handle_profile_runtime_notification(
             })
             .await;
             if is_live_thread_status(&status) {
+                state.pending_turn_starts.lock().await.remove(&runtime_key);
                 cancel_scheduled_shutdown_for_activity(state, profile_id).await;
             } else {
+                state.pending_turn_starts.lock().await.remove(&runtime_key);
                 state.active_turns.lock().await.remove(&runtime_key);
-                maybe_drain_queue(state, profile_id, &session_id).await;
+                spawn_queue_drain(state, profile_id, &session_id);
                 maybe_schedule_global_shutdown(state, profile_id, None).await;
             }
         }

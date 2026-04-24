@@ -262,6 +262,7 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             queue_dispatching: Arc::new(Mutex::new(HashSet::new())),
             queue_drain_retries: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
+            pending_turn_starts: Arc::new(Mutex::new(HashSet::new())),
             pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
             shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
         };

@@ -124,7 +124,7 @@ pub(crate) async fn enqueue_session_queue_payload(
         queue_object.insert("enqueueItemId".to_string(), json!(accepted_queue_item_id));
     }
     emit_queue_updated(state, profile_id, session_id, Some(queue.clone())).await;
-    maybe_drain_queue(state, profile_id, session_id).await;
+    spawn_queue_drain(state, profile_id, session_id);
 
     Ok(queue)
 }

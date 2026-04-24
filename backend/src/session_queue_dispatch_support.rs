@@ -32,7 +32,7 @@ pub(crate) async fn resume_session_queue_payload(
 
     let queue = get_session_queue_payload(state, profile_id, session_id).await?;
     emit_queue_updated(state, profile_id, session_id, Some(queue.clone())).await;
-    maybe_drain_queue(state, profile_id, session_id).await;
+    spawn_queue_drain(state, profile_id, session_id);
     Ok(queue)
 }
 

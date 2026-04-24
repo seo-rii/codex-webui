@@ -306,20 +306,71 @@ function mergeTurn(existingTurn: CodexTurn | undefined, incomingTurn: CodexTurn)
   };
 }
 
+function normalizeTurnTimestamp(value: number | null | undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+  return value < 10_000_000_000 ? value * 1000 : value;
+}
+
+function uuidV7Timestamp(id: string | null | undefined) {
+  const compact = String(id ?? "").replace(/-/g, "");
+  if (!/^[0-9a-f]{12}7/iu.test(compact)) {
+    return null;
+  }
+
+  const value = Number.parseInt(compact.slice(0, 12), 16);
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function turnChronologyValue(turn: CodexTurn) {
+  return (
+    normalizeTurnTimestamp(turn.startedAt) ??
+    uuidV7Timestamp(turn.id) ??
+    normalizeTurnTimestamp(turn.completedAt)
+  );
+}
+
+function normalizeTurnOrder(turns: CodexTurn[]) {
+  return turns
+    .map((turn, index) => ({
+      turn,
+      index,
+      order: turnChronologyValue(turn)
+    }))
+    .sort((left, right) => {
+      if (left.order !== null && right.order !== null && left.order !== right.order) {
+        return left.order - right.order;
+      }
+      if (left.order !== null && right.order === null) {
+        return -1;
+      }
+      if (left.order === null && right.order !== null) {
+        return 1;
+      }
+      return left.index - right.index;
+    })
+    .map((entry) => entry.turn);
+}
+
 function mergeTurns(existingTurns: CodexTurn[], incomingTurns: CodexTurn[]) {
   const existingById = new Map(existingTurns.map((turn) => [turn.id, turn] as const));
-  const merged = incomingTurns.map((turn) => mergeTurn(existingById.get(turn.id), turn));
+  const incomingById = new Map(incomingTurns.map((turn) => [turn.id, turn] as const));
+  const merged = existingTurns.map((turn) => {
+    const incomingTurn = incomingById.get(turn.id);
+    return incomingTurn ? mergeTurn(turn, incomingTurn) : cloneTurn(turn);
+  });
   const seenIds = new Set(merged.map((turn) => turn.id));
 
-  for (const turn of existingTurns) {
+  for (const turn of incomingTurns) {
     if (seenIds.has(turn.id)) {
       continue;
     }
-    merged.push(cloneTurn(turn));
+    merged.push(mergeTurn(existingById.get(turn.id), turn));
     seenIds.add(turn.id);
   }
 
-  return merged;
+  return normalizeTurnOrder(merged);
 }
 
 function mergePendingRequests(
@@ -373,6 +424,10 @@ function mergeHydration(
 export function createConversationState(detail: SessionDetailPayload): ConversationState {
   return {
     ...detail,
+    thread: {
+      ...detail.thread,
+      turns: normalizeTurnOrder(detail.thread.turns.map(cloneTurn))
+    },
     livePlans: {},
     liveDiffs: {}
   };

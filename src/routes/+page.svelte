@@ -823,7 +823,7 @@
   }
 
   function createDraftConversation(preferences: SessionPreferences, title: string | null = null): ConversationState {
-    const now = Math.floor(Date.now() / 1000);
+    const now = Date.now();
     return {
       thread: {
         id: "",
@@ -1452,6 +1452,7 @@
     const queueItems = selectedSessionQueue?.items ?? ([] as SessionQueueItem[]);
     return sessionId ? mergeOptimisticQueueItems(sessionId, queueItems) : queueItems;
   });
+  const serverQueuedMessages = $derived(selectedSessionQueue?.items ?? ([] as SessionQueueItem[]));
   const hasPendingQueueRequests = $derived.by(() => selectedSessionQueuedRequestCount > 0);
   const activeTurn = $derived.by(() => getConversationLiveTurn());
   const activeLiveTurnSubagents = $derived.by(() => {
@@ -2791,12 +2792,14 @@
       return priorityDifference;
     }
 
-    const updatedDifference = (right.updatedAt || 0) - (left.updatedAt || 0);
+    const updatedDifference =
+      normalizeSessionTimestamp(right.updatedAt || 0) - normalizeSessionTimestamp(left.updatedAt || 0);
     if (updatedDifference !== 0) {
       return updatedDifference;
     }
 
-    const createdDifference = (right.createdAt || 0) - (left.createdAt || 0);
+    const createdDifference =
+      normalizeSessionTimestamp(right.createdAt || 0) - normalizeSessionTimestamp(left.createdAt || 0);
     if (createdDifference !== 0) {
       return createdDifference;
     }
@@ -3100,6 +3103,13 @@
       return window.performance.now();
     }
     return Date.now();
+  }
+
+  function normalizeSessionTimestamp(value: number | null | undefined) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+      return 0;
+    }
+    return value >= 1_000_000_000_000 ? value : value * 1000;
   }
 
   function noteTranscriptUserScrollIntent(durationMs = 800) {
@@ -3481,6 +3491,7 @@
   function buildSessionSummaryFromConversation(state: ConversationState): SessionSummary {
     const hasLiveTurn = hasConversationLiveTurn(state);
     const preview = deriveConversationSummaryPreview(state.thread.preview, state.thread.turns);
+    const existingSummary = sessions.find((session) => session.id === state.thread.id) ?? null;
     const status =
       hasLiveTurn
         ? "running"
@@ -3498,8 +3509,15 @@
       tags: [...(selectedSessionSummary?.tags ?? [])],
       cwd: state.thread.cwd,
       archived: selectedSessionSummary?.archived ?? showArchivedSessions,
-      createdAt: state.thread.createdAt,
-      updatedAt: Math.max(state.thread.updatedAt, Math.floor(Date.now() / 1000)),
+      createdAt: Math.max(
+        normalizeSessionTimestamp(state.thread.createdAt),
+        normalizeSessionTimestamp(existingSummary?.createdAt ?? 0)
+      ),
+      updatedAt: Math.max(
+        normalizeSessionTimestamp(state.thread.updatedAt),
+        normalizeSessionTimestamp(existingSummary?.updatedAt ?? 0),
+        normalizeSessionTimestamp(state.thread.createdAt)
+      ),
       status,
       isSubagent: state.thread.isSubagent,
       agentNickname: state.thread.agentNickname,
@@ -3542,7 +3560,7 @@
     }, nextDelay);
   }
 
-  function scheduleSelectedSessionStateRefresh(sessionId: string, delay = 160) {
+  function scheduleSelectedSessionStateRefresh(sessionId: string, delay = 160, replaceWithRecentWindow = false) {
     if (selectedSessionDetailRefreshTimer) {
       clearTimeout(selectedSessionDetailRefreshTimer);
     }
@@ -3554,7 +3572,13 @@
         return;
       }
 
-      void refreshSelectedSessionState(sessionId, Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize)).catch(() => {});
+      void refreshSelectedSessionState(
+        sessionId,
+        replaceWithRecentWindow ? olderTurnPageSize : Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize),
+        false,
+        replaceWithRecentWindow ? null : sessionDetailCacheVersion,
+        replaceWithRecentWindow
+      ).catch(() => {});
     }, nextDelay);
   }
 
@@ -4167,7 +4191,10 @@
         const catchup = staleSessionCatchup;
         if (catchup?.sessionId === sessionId) {
           if (catchup.refreshing) {
-            queuePendingSessionEvent(sessionId, payload);
+            staleSessionCatchup = {
+              ...catchup,
+              eventCount: catchup.eventCount + 1
+            };
             return;
           }
 
@@ -4175,16 +4202,18 @@
           if (nextEventCount >= staleSessionCatchupEventThreshold) {
             staleSessionCatchup = {
               ...catchup,
-              eventCount: nextEventCount,
+              eventCount: 0,
               refreshing: true
             };
-            pendingSessionEvents = {
-              ...pendingSessionEvents,
-              [sessionId]: [payload]
-            };
+            const nextPendingEvents = { ...pendingSessionEvents };
+            delete nextPendingEvents[sessionId];
+            pendingSessionEvents = nextPendingEvents;
             void refreshSelectedSessionState(
               sessionId,
-              Math.max(conversation.thread.turns.length, olderTurnPageSize)
+              olderTurnPageSize,
+              false,
+              null,
+              true
             ).catch((error) => {
               clearStaleSessionCatchup();
               errorText = describeError(error);
@@ -4402,14 +4431,25 @@
     };
   }
 
-  function applyLoadedSessionDetail(sessionId: string, detail: SessionDetailPayload) {
+  function applyLoadedSessionDetail(
+    sessionId: string,
+    detail: SessionDetailPayload,
+    replaceExisting = false,
+    flushPendingEvents = true
+  ) {
     const pendingEventsBeforeFlush = pendingSessionEvents[sessionId] ?? [];
-    const hadPendingQueueUpdate = pendingEventsBeforeFlush.some(isQueueUpdatedEvent);
+    const hadPendingQueueUpdate = flushPendingEvents && pendingEventsBeforeFlush.some(isQueueUpdatedEvent);
     let nextConversation =
-      conversation && conversation.thread.id === detail.thread.id
+      !replaceExisting && conversation && conversation.thread.id === detail.thread.id
         ? mergeConversationState(conversation, detail)
         : createConversationState(detail);
-    nextConversation = flushPendingSessionEvents(sessionId, nextConversation);
+    if (flushPendingEvents) {
+      nextConversation = flushPendingSessionEvents(sessionId, nextConversation);
+    } else if (pendingEventsBeforeFlush.length > 0) {
+      const nextPendingEvents = { ...pendingSessionEvents };
+      delete nextPendingEvents[sessionId];
+      pendingSessionEvents = nextPendingEvents;
+    }
     nextConversation = normalizeConversationExecutionState(nextConversation);
     const mergedQueue = mergeQueueSnapshot(sessionQueueSnapshotsBySessionId[sessionId], nextConversation.queue);
     if (mergedQueue !== nextConversation.queue) {
@@ -4435,11 +4475,7 @@
       pendingQueueModeSessionId = null;
     }
     titleDraft = getConversationDisplayTitle(nextConversation) ?? "";
-    const existingSummary = sessions.find((session) => session.id === detail.thread.id) ?? null;
-    upsertSessionSummary({
-      ...buildSessionSummaryFromConversation(nextConversation),
-      updatedAt: Math.max(nextConversation.thread.updatedAt, existingSummary?.updatedAt ?? 0)
-    }, false);
+    upsertSessionSummary(buildSessionSummaryFromConversation(nextConversation), false);
     clearHydrationRefresh();
     clearStaleSessionCatchup();
     updateSessionRecoveryPrompt(sessionId, nextConversation);
@@ -4525,11 +4561,26 @@
     }
   }
 
-  async function refreshSelectedSessionState(sessionId: string, turnLimit: number, loadDraft = false, knownVersion: string | null = sessionDetailCacheVersion) {
+  async function refreshSelectedSessionState(
+    sessionId: string,
+    turnLimit: number,
+    loadDraft = false,
+    knownVersion: string | null = sessionDetailCacheVersion,
+    replaceWithRecentWindow = false
+  ) {
     const knownTurnVersions =
-      knownVersion && sessionDetailStateHash && conversation?.thread.id === sessionId ? { ...sessionTurnVersionsById } : null;
-    const knownStateHash = knownVersion && conversation?.thread.id === sessionId ? sessionDetailStateHash : null;
-    const detail = await api.getSession(sessionId, turnLimit, knownVersion, knownTurnVersions, knownStateHash);
+      !replaceWithRecentWindow && knownVersion && sessionDetailStateHash && conversation?.thread.id === sessionId
+        ? { ...sessionTurnVersionsById }
+        : null;
+    const knownStateHash =
+      !replaceWithRecentWindow && knownVersion && conversation?.thread.id === sessionId ? sessionDetailStateHash : null;
+    const detail = await api.getSession(
+      sessionId,
+      turnLimit,
+      replaceWithRecentWindow ? null : knownVersion,
+      knownTurnVersions,
+      knownStateHash
+    );
     if (isCacheValidationResponse(detail)) {
       sessionDetailCacheVersion = detail.cacheVersion;
       if (selectedSessionId !== sessionId || !conversation || conversation.thread.id !== sessionId) {
@@ -4571,7 +4622,16 @@
         return null;
       }
 
-      const nextConversation = applyLoadedSessionDetail(nextDetail.thread.id, nextDetail);
+      const skippedEventCount =
+        replaceWithRecentWindow && staleSessionCatchup?.sessionId === nextDetail.thread.id
+          ? staleSessionCatchup.eventCount
+          : 0;
+      const nextConversation = applyLoadedSessionDetail(
+        nextDetail.thread.id,
+        nextDetail,
+        replaceWithRecentWindow,
+        !replaceWithRecentWindow
+      );
       const detailCacheKey = buildSessionDetailBrowserCacheKey(nextDetail.thread.id);
       if (detailCacheKey) {
         void writeSessionDetailCache(
@@ -4579,6 +4639,9 @@
           sanitizeSessionDetailForBrowserCache(nextDetail),
           nextDetail.cacheVersion
         );
+      }
+      if (replaceWithRecentWindow && skippedEventCount > 0) {
+        scheduleSelectedSessionStateRefresh(nextDetail.thread.id, 160, true);
       }
       if (loadDraft) {
         await loadSavedDraft(nextDetail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
@@ -4592,13 +4655,25 @@
       return null;
     }
 
-    const nextConversation = applyLoadedSessionDetail(detail.thread.id, detail);
+    const skippedEventCount =
+      replaceWithRecentWindow && staleSessionCatchup?.sessionId === detail.thread.id
+        ? staleSessionCatchup.eventCount
+        : 0;
+    const nextConversation = applyLoadedSessionDetail(
+      detail.thread.id,
+      detail,
+      replaceWithRecentWindow,
+      !replaceWithRecentWindow
+    );
     const detailCacheKey = buildSessionDetailBrowserCacheKey(detail.thread.id);
     if (detailCacheKey) {
       void writeSessionDetailCache(detailCacheKey, sanitizeSessionDetailForBrowserCache(detail), detail.cacheVersion);
     }
     if (loadDraft) {
       await loadSavedDraft(detail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
+    }
+    if (replaceWithRecentWindow && skippedEventCount > 0) {
+      scheduleSelectedSessionStateRefresh(detail.thread.id, 160, true);
     }
     stickTranscriptToBottom = true;
     forceTranscriptScroll = true;
@@ -5324,8 +5399,8 @@
         tags: [...(selectedSessionSummary?.tags ?? [])],
         cwd: conversation?.thread.cwd ?? config?.defaults.cwd ?? "",
         archived,
-        createdAt: conversation?.thread.createdAt ?? Math.floor(Date.now() / 1000),
-        updatedAt: Math.floor(Date.now() / 1000),
+        createdAt: normalizeSessionTimestamp(conversation?.thread.createdAt ?? Date.now()),
+        updatedAt: Date.now(),
         status: conversation?.thread.status ?? "unknown",
         isSubagent: conversation?.thread.isSubagent ?? false,
         agentNickname: conversation?.thread.agentNickname ?? null,
@@ -5814,7 +5889,8 @@
   }
 
   function startQueueDrag(event: PointerEvent, queueId: string) {
-    if (queueReorderBusy || queuedMessages.length < 2 || hasPendingQueueRequests) {
+    const draggedItem = serverQueuedMessages.find((item) => item.id === queueId) ?? null;
+    if (queueReorderBusy || serverQueuedMessages.length < 2 || !draggedItem || isOptimisticQueueItem(draggedItem)) {
       return;
     }
 
@@ -5855,7 +5931,11 @@
     }
 
     const sessionId = selectedBinding.sessionId;
-    const nextQueueIds = queuedMessages
+    if (!serverQueuedMessages.some((item) => item.id === dragState.targetQueueId)) {
+      return;
+    }
+
+    const nextQueueIds = serverQueuedMessages
       .filter((item) => item.id !== dragState.queueId)
       .map((item) => item.id);
     const targetIndex = nextQueueIds.indexOf(dragState.targetQueueId);
@@ -5864,7 +5944,7 @@
     }
 
     nextQueueIds.splice(dragState.targetPosition === "before" ? targetIndex : targetIndex + 1, 0, dragState.queueId);
-    const currentQueueIds = queuedMessages.map((item) => item.id);
+    const currentQueueIds = serverQueuedMessages.map((item) => item.id);
     if (
       nextQueueIds.length !== currentQueueIds.length ||
       nextQueueIds.every((id, index) => id === currentQueueIds[index])
@@ -6170,7 +6250,7 @@
         applySessionSummaryUpdate({
           ...session,
           archived: true,
-          updatedAt: Math.floor(Date.now() / 1000)
+          updatedAt: Date.now()
         });
         noticeText = m.session_archived_notice();
       }
@@ -9698,8 +9778,8 @@
                           <div class="flex items-start gap-2">
                             <button
                               aria-label={ui.reorderQueue ?? "Reorder queued message"}
-                              class={`mt-0.5 inline-flex h-6.5 w-6.5 shrink-0 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-400 transition-colors ${queueReorderBusy || queuedMessages.length < 2 || hasPendingQueueRequests ? "cursor-not-allowed opacity-45" : queueDragState?.queueId === item.id ? "cursor-grabbing border-amber-300 bg-amber-50 text-amber-700 shadow-sm" : "cursor-grab hover:bg-gray-100 hover:text-gray-700"}`}
-                              disabled={queueReorderBusy || queuedMessages.length < 2 || hasPendingQueueRequests}
+                              class={`mt-0.5 inline-flex h-6.5 w-6.5 shrink-0 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-400 transition-colors ${queueReorderBusy || serverQueuedMessages.length < 2 || isOptimisticQueueItem(item) ? "cursor-not-allowed opacity-45" : queueDragState?.queueId === item.id ? "cursor-grabbing border-amber-300 bg-amber-50 text-amber-700 shadow-sm" : "cursor-grab hover:bg-gray-100 hover:text-gray-700"}`}
+                              disabled={queueReorderBusy || serverQueuedMessages.length < 2 || isOptimisticQueueItem(item)}
                               onlostpointercapture={cancelQueueDrag}
                               onpointercancel={cancelQueueDrag}
                               onpointerdown={(event) => startQueueDrag(event, item.id)}

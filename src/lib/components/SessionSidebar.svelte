@@ -286,12 +286,13 @@
   }
 
   function formatUpdated(value: number) {
+    const normalizedValue = value >= 1_000_000_000_000 ? value : value * 1000;
     return new Intl.DateTimeFormat(getDateLocale(), {
       month: "short",
       day: "numeric",
       hour: "2-digit",
       minute: "2-digit"
-    }).format(new Date(value * 1000));
+    }).format(new Date(normalizedValue));
   }
 
   function isSessionRunning(session: SessionSummary) {

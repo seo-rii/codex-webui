@@ -255,10 +255,10 @@
       </button>
 
       {#if workspaceMenuOpen}
-        <div class="absolute right-0 top-10 z-[72] w-56 rounded-xl border border-gray-200 bg-white p-1 shadow-2xl">
+        <div class="workspace-open-menu absolute right-0 top-10 z-[72] w-56 rounded-xl border p-1 shadow-2xl">
           {#if isMobileLayout}
             <button
-              class="ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
+              class="workspace-open-menu__item ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50"
               disabled={readOnly}
               onclick={() => {
                 workspaceMenuOpen = false;
@@ -269,22 +269,22 @@
               <MessageSquare size={16} class="text-gray-400 group-hover:text-amber-600" />
               <span>{ui.newThread}</span>
             </button>
-            <div class="mx-2 my-1 h-px bg-gray-100"></div>
+            <div class="workspace-open-menu__divider mx-2 my-1 h-px"></div>
           {/if}
-          <button class="ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-gray-700 transition-colors hover:bg-gray-50" onclick={() => { workspaceMenuOpen = false; onOpenTasksTab(); }} type="button">
+          <button class="workspace-open-menu__item ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors" onclick={() => { workspaceMenuOpen = false; onOpenTasksTab(); }} type="button">
             <History size={16} class="text-gray-400 group-hover:text-amber-600" />
             <span>{ui.tasks}</span>
           </button>
-          <button class="ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-gray-700 transition-colors hover:bg-gray-50" onclick={() => { workspaceMenuOpen = false; onOpenGitTab(); }} type="button">
+          <button class="workspace-open-menu__item ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors" onclick={() => { workspaceMenuOpen = false; onOpenGitTab(); }} type="button">
             <GitBranch size={16} class="text-gray-400 group-hover:text-amber-600" />
             <span>{ui.gitWorkspace}</span>
           </button>
-          <button class="ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-gray-700 transition-colors hover:bg-gray-50" onclick={() => { workspaceMenuOpen = false; onOpenSettingsTab(); }} type="button">
+          <button class="workspace-open-menu__item ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors" onclick={() => { workspaceMenuOpen = false; onOpenSettingsTab(); }} type="button">
             <Settings size={16} class="text-gray-400 group-hover:text-amber-600" />
             <span>{ui.settingsSkills}</span>
           </button>
           <button
-            class="ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
+            class="workspace-open-menu__item ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50"
             disabled={readOnly}
             onclick={() => {
               workspaceMenuOpen = false;
@@ -300,3 +300,30 @@
     </div>
   </div>
 </header>
+
+<style>
+  .workspace-open-menu {
+    border-color: var(--line);
+    background: color-mix(in srgb, var(--panel-strong) 96%, transparent);
+    color: var(--ink-strong);
+    box-shadow: 0 24px 44px -28px rgba(15, 23, 42, 0.38);
+  }
+
+  .workspace-open-menu__item {
+    color: var(--ink);
+  }
+
+  .workspace-open-menu__item:hover {
+    background: var(--panel-soft);
+    color: var(--ink-strong);
+  }
+
+  .workspace-open-menu__divider {
+    background: var(--line);
+  }
+
+  :global(:root[data-theme="dark"]) .workspace-open-menu {
+    background: color-mix(in srgb, var(--panel-strong) 96%, #020617 4%);
+    box-shadow: 0 26px 48px -26px rgba(0, 0, 0, 0.62);
+  }
+</style>

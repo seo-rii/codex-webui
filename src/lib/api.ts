@@ -357,10 +357,14 @@ export const api = {
     return ws.request<SessionDetailPayload["queue"]>("session/queue/get", { sessionId });
   },
 
-  enqueueSessionMessage(sessionId: string, payload: { prompt: string; skills?: SelectedSkill[]; attachmentIds: string[] }) {
+  enqueueSessionMessage(
+    sessionId: string,
+    payload: { prompt: string; skills?: SelectedSkill[]; attachmentIds: string[]; clientRequestId?: string }
+  ) {
     return ws.request<SessionDetailPayload["queue"]>("session/queue/enqueue", {
       sessionId,
       prompt: payload.prompt,
+      clientRequestId: payload.clientRequestId ?? null,
       skills: payload.skills ?? [],
       attachmentIds: payload.attachmentIds
     });

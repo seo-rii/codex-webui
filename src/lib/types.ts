@@ -526,6 +526,7 @@ export type SessionQueueItem = {
   attachmentIds: string[];
   attachmentNames: string[];
   createdAt: number;
+  clientRequestId?: string | null;
 };
 
 export type SessionQueuePayload = {

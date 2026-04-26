@@ -383,6 +383,7 @@ pub(crate) async fn execute_ws_method(
                     .get("prompt")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
+                params.get("clientRequestId").and_then(Value::as_str),
                 params.get("skills"),
                 params.get("attachmentIds"),
             )

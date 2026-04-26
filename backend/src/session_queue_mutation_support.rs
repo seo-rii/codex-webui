@@ -1,32 +1,10 @@
 use super::*;
 
-const QUEUE_DUPLICATE_WINDOW_MS: u64 = 2_000;
-
-fn queue_item_matches_request(
-    item: &Value,
-    prompt: &str,
-    selected_skills: &[Value],
-    attachment_ids: &[String],
-) -> bool {
-    item.get("prompt")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        == prompt
-        && item
-            .get("skills")
-            .and_then(Value::as_array)
-            .is_some_and(|skills| skills == selected_skills)
-        && item
-            .get("attachmentIds")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .is_some_and(|existing_ids| existing_ids == attachment_ids)
+fn normalize_queue_client_request_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(160).collect::<String>())
 }
 
 pub(crate) async fn enqueue_session_queue_payload(
@@ -34,6 +12,7 @@ pub(crate) async fn enqueue_session_queue_payload(
     profile_id: &str,
     session_id: &str,
     prompt: &str,
+    client_request_id: Option<&str>,
     selected_skills: Option<&Value>,
     attachment_ids: Option<&Value>,
 ) -> ApiResult<Value> {
@@ -41,6 +20,7 @@ pub(crate) async fn enqueue_session_queue_payload(
     let (resolved_attachment_ids, attachment_names) =
         resolve_queue_attachment_metadata(state, profile_id, session_id, attachment_ids).await?;
     let next_selected_skills = selected_skills_from_value(selected_skills);
+    let client_request_id = normalize_queue_client_request_id(client_request_id);
     if trimmed_prompt.is_empty() && resolved_attachment_ids.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
     }
@@ -82,36 +62,40 @@ pub(crate) async fn enqueue_session_queue_payload(
                 "queue items are missing",
             ));
         };
-        if let Some(existing_item_id) = items.iter().rev().find_map(|item| {
-            let created_at = item
-                .get("createdAt")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
-            if updated_at.saturating_sub(created_at) > QUEUE_DUPLICATE_WINDOW_MS {
-                return None;
+        if let Some(client_request_id) = client_request_id.as_deref() {
+            if let Some(existing_item_id) = items.iter().rev().find_map(|item| {
+                (item
+                    .get("clientRequestId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    == client_request_id)
+                    .then(|| item.get("id").and_then(Value::as_str).map(str::to_string))
+                    .flatten()
+            }) {
+                accepted_queue_item_id = existing_item_id;
+                queue.insert("resumePending".to_string(), json!(false));
+                queue.insert("updatedAt".to_string(), json!(updated_at));
+                return Ok(());
             }
-            queue_item_matches_request(
-                item,
-                trimmed_prompt,
-                &next_selected_skills,
-                &resolved_attachment_ids,
-            )
-            .then(|| item.get("id").and_then(Value::as_str).map(str::to_string))
-            .flatten()
-        }) {
-            accepted_queue_item_id = existing_item_id;
-            queue.insert("resumePending".to_string(), json!(false));
-            queue.insert("updatedAt".to_string(), json!(updated_at));
-            return Ok(());
         }
-        items.push(json!({
+
+        let mut item = json!({
             "id": queue_item_id,
             "prompt": trimmed_prompt,
             "skills": next_selected_skills,
             "attachmentIds": resolved_attachment_ids,
             "attachmentNames": attachment_names,
             "createdAt": updated_at
-        }));
+        });
+        if let (Some(item_object), Some(client_request_id)) =
+            (item.as_object_mut(), client_request_id.as_ref())
+        {
+            item_object.insert(
+                "clientRequestId".to_string(),
+                Value::String(client_request_id.clone()),
+            );
+        }
+        items.push(item);
         queue.insert("resumePending".to_string(), json!(false));
         queue.insert("updatedAt".to_string(), json!(updated_at));
         Ok(())

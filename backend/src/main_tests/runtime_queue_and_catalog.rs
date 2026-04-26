@@ -868,6 +868,7 @@ async fn queue_write_helpers_mutate_queue_state() {
         "default",
         "thread-1",
         "first",
+        Some("request-first"),
         Some(&queue_skills),
         None,
     )
@@ -883,6 +884,7 @@ async fn queue_write_helpers_mutate_queue_state() {
         "default",
         "thread-1",
         "first",
+        Some("request-first"),
         Some(&queue_skills),
         None,
     )
@@ -899,9 +901,34 @@ async fn queue_write_helpers_mutate_queue_state() {
             .map(Vec::len),
         Some(1)
     );
-    let second = enqueue_session_queue_payload(&state, "default", "thread-1", "second", None, None)
-        .await
-        .unwrap();
+    let repeated_first = enqueue_session_queue_payload(
+        &state,
+        "default",
+        "thread-1",
+        "first",
+        Some("request-first-repeat"),
+        Some(&queue_skills),
+        None,
+    )
+    .await
+    .unwrap();
+    let repeated_first_id = repeated_first
+        .get("enqueueItemId")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    assert_ne!(Some(repeated_first_id.as_str()), Some(first_id.as_str()));
+    assert_eq!(
+        repeated_first
+            .get("items")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(2)
+    );
+    let second =
+        enqueue_session_queue_payload(&state, "default", "thread-1", "second", None, None, None)
+            .await
+            .unwrap();
     let second_id = second
         .get("enqueueItemId")
         .and_then(Value::as_str)
@@ -912,7 +939,11 @@ async fn queue_write_helpers_mutate_queue_state() {
         &state,
         "default",
         "thread-1",
-        &[second_id.clone(), first_id.clone()],
+        &[
+            second_id.clone(),
+            repeated_first_id.clone(),
+            first_id.clone(),
+        ],
     )
     .await
     .unwrap();
@@ -965,7 +996,20 @@ async fn queue_write_helpers_mutate_queue_state() {
         .unwrap();
     assert_eq!(
         removed.get("items").and_then(Value::as_array).map(Vec::len),
-        Some(1)
+        Some(2)
+    );
+    let removed_dispatched_first =
+        remove_session_queue_item_after_dispatch(&state, "default", "thread-1", &first_id)
+            .await
+            .unwrap();
+    assert_eq!(
+        removed_dispatched_first
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_str),
+        Some(repeated_first_id.as_str())
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -1004,6 +1048,7 @@ async fn enqueue_session_queue_payload_auto_dispatches_when_session_is_idle() {
         "default",
         &session_id,
         "Continue the work after the browser disconnects.",
+        None,
         None,
         None,
     )
@@ -1115,6 +1160,7 @@ async fn enqueue_session_queue_payload_returns_before_queue_drain_reads_thread()
         "Queue should not wait for a slow thread read.",
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1178,6 +1224,7 @@ async fn queue_drain_waits_while_turn_start_is_pending() {
         "default",
         session_id,
         "Do not dispatch until the in-flight turn start resolves.",
+        None,
         None,
         None,
     )
@@ -1252,6 +1299,7 @@ async fn queued_message_retries_after_transient_thread_read_error() {
         "default",
         session_id,
         "Dispatch after the transient read failure clears.",
+        None,
         None,
         None,
     )

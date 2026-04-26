@@ -1312,25 +1312,34 @@
   }
 
   function hasQueueableConversationActivity(currentConversation: ConversationState | null = conversation) {
-    if (!currentConversation || !selectedSessionId) {
+    const sessionId = selectedSessionId;
+    if (!sessionId) {
       return false;
     }
 
-    if (pendingQueueModeSessionId === selectedSessionId) {
+    const matchingConversation = currentConversation?.thread.id === sessionId ? currentConversation : null;
+    const cachedQueue = sessionQueueSnapshotsBySessionId[sessionId] ?? null;
+    const selectedSummaryQueueCount = sessions.find((session) => session.id === sessionId)?.queueCount ?? 0;
+    const hasCachedQueuedWork =
+      (matchingConversation?.queue.items.length ?? 0) > 0 ||
+      (cachedQueue?.items.length ?? 0) > 0 ||
+      (optimisticQueuedItemsBySessionId[sessionId]?.length ?? 0) > 0 ||
+      (queuedMessageRequestCountsBySessionId[sessionId] ?? 0) > 0 ||
+      selectedSummaryQueueCount > 0;
+
+    if (hasCachedQueuedWork) {
       return true;
     }
 
-    const hasPendingLocalSend =
-      pendingQueueModeSessionId === selectedSessionId &&
-      (startingMessage ||
-        (optimisticMessage !== null && optimisticMessage.sessionId === selectedSessionId) ||
-        (visibleOptimisticMessage !== null && visibleOptimisticMessage.sessionId === selectedSessionId));
-
-    if (hasPendingLocalSend) {
+    if (pendingQueueModeSessionId === sessionId) {
       return true;
     }
 
-    return hasConversationLiveTurn(currentConversation) || isLiveConversationStatus(currentConversation.thread.status);
+    if (!matchingConversation) {
+      return false;
+    }
+
+    return hasConversationLiveTurn(matchingConversation) || isLiveConversationStatus(matchingConversation.thread.status);
   }
 
   function canQueueComposerMessage(currentConversation: ConversationState | null = conversation) {
@@ -1396,7 +1405,7 @@
   const lastComposerHistoryPrompt = $derived.by(() => lastComposerPromptChip?.prompt ?? "");
   const composerHasContent = $derived.by(() => draft.trim().length > 0 || draftAttachments.length > 0);
   const selectedSessionQueuedRequestCount = $derived.by(() => {
-    const sessionId = conversation?.thread.id ?? null;
+    const sessionId = selectedSessionId ?? conversation?.thread.id ?? null;
     if (!sessionId) {
       return 0;
     }
@@ -5701,6 +5710,7 @@
     void api
       .enqueueSessionMessage(sessionId, {
         prompt: draftText,
+        clientRequestId: optimisticQueueId,
         skills: selectedSkillsSnapshot,
         attachmentIds
       })

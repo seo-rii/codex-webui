@@ -120,7 +120,7 @@
     WsConnectionState
   } from "$lib/types";
 
-  type WorkspaceTabId = "chat" | "tasks" | "git" | "settings" | `git-diff:${string}` | `code-diff:${string}` | `terminal:${string}`;
+  type WorkspaceTabId = "chat" | "tasks" | "git" | "settings" | `git-diff:${string}` | `code-diff:${string}` | `file:${string}` | `terminal:${string}`;
   type ComposerSettingsTabId = "session" | "security" | "skills";
   type GitDiffTab = {
     id: `git-diff:${string}`;
@@ -135,6 +135,11 @@
     label: string;
     title: string;
     views: FileChangeView[];
+  };
+  type FileTab = {
+    id: `file:${string}`;
+    path: string;
+    label: string;
   };
   type SubagentTaskEntry = {
     key: string;
@@ -168,10 +173,11 @@
   };
   type ArenaWorkspaceComponent = typeof import("$lib/components/ArenaWorkspace.svelte").default;
   type CodeDiffWorkspaceComponent = typeof import("$lib/components/CodeDiffWorkspace.svelte").default;
+  type FileWorkspaceComponent = typeof import("$lib/components/FileWorkspace.svelte").default;
   type GitWorkspaceComponent = typeof import("$lib/components/GitWorkspace.svelte").default;
   type SettingsWorkspaceComponent = typeof import("$lib/components/SettingsWorkspace.svelte").default;
   type TerminalWorkspaceComponent = typeof import("$lib/components/TerminalWorkspace.svelte").default;
-  type LazyWorkspaceKind = "arena" | "codeDiff" | "git" | "settings" | "terminal";
+  type LazyWorkspaceKind = "arena" | "codeDiff" | "file" | "git" | "settings" | "terminal";
   type SlashSuggestion = {
     key: string;
     command: string;
@@ -269,6 +275,7 @@
   let activeWorkspaceTabId = $state<WorkspaceTabId>("chat");
   let ArenaWorkspaceView = $state<ArenaWorkspaceComponent | null>(null);
   let CodeDiffWorkspaceView = $state<CodeDiffWorkspaceComponent | null>(null);
+  let FileWorkspaceView = $state<FileWorkspaceComponent | null>(null);
   let GitWorkspaceView = $state<GitWorkspaceComponent | null>(null);
   let SettingsWorkspaceView = $state<SettingsWorkspaceComponent | null>(null);
   let TerminalWorkspaceView = $state<TerminalWorkspaceComponent | null>(null);
@@ -278,6 +285,7 @@
   let settingsTabOpen = $state(false);
   let gitDiffTabs = $state<GitDiffTab[]>([]);
   let codeDiffTabs = $state<CodeDiffTab[]>([]);
+  let fileTabs = $state<FileTab[]>([]);
   let viewerGitRepoPath = $state<string | null>(null);
   let pendingSteerResume = $state<{ sessionId: string; draft: string; updatedAt: number | null } | null>(null);
   let dismissedQueueResumeBySessionId = $state<Record<string, boolean>>({});
@@ -1870,7 +1878,7 @@
   });
   const workspaceTabs = $derived.by(() => {
     const _locale = $localeSignal;
-    const tabs: Array<{ id: WorkspaceTabId; label: string; kind: "chat" | "tasks" | "git" | "settings" | "git-diff" | "code-diff" | "terminal" }> = [
+    const tabs: Array<{ id: WorkspaceTabId; label: string; kind: "chat" | "tasks" | "git" | "settings" | "git-diff" | "code-diff" | "file" | "terminal" }> = [
       { id: "chat", label: ui.chat, kind: "chat" }
     ];
     if (tasksTabOpen) {
@@ -1908,6 +1916,13 @@
         kind: "code-diff"
       });
     }
+    for (const tab of fileTabs) {
+      tabs.push({
+        id: tab.id,
+        label: tab.label,
+        kind: "file"
+      });
+    }
     for (const terminal of terminals) {
       tabs.push({
         id: `terminal:${terminal.id}`,
@@ -1919,6 +1934,7 @@
   });
   const activeGitDiffTab = $derived.by(() => gitDiffTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? null);
   const activeCodeDiffTab = $derived.by(() => codeDiffTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? null);
+  const activeFileTab = $derived.by(() => fileTabs.find((tab) => tab.id === activeWorkspaceTabId) ?? null);
   const startupPausedQueues = $derived(config?.startup.pausedQueues ?? []);
   const startupScheduledShutdown = $derived.by(() => {
     const shutdown = config?.startup.scheduledShutdown ?? null;
@@ -1950,6 +1966,9 @@
     if (kind === "codeDiff" && CodeDiffWorkspaceView) {
       return;
     }
+    if (kind === "file" && FileWorkspaceView) {
+      return;
+    }
     if (kind === "git" && GitWorkspaceView) {
       return;
     }
@@ -1975,6 +1994,11 @@
       if (kind === "codeDiff") {
         const module = await import("$lib/components/CodeDiffWorkspace.svelte");
         CodeDiffWorkspaceView = module.default;
+        return;
+      }
+      if (kind === "file") {
+        const module = await import("$lib/components/FileWorkspace.svelte");
+        FileWorkspaceView = module.default;
         return;
       }
       if (kind === "git") {
@@ -2015,6 +2039,9 @@
     if (activeCodeDiffTab) {
       return ui.aggregatedDiff;
     }
+    if (activeFileTab) {
+      return activeFileTab.label;
+    }
     if (activeWorkspaceTabId.startsWith("terminal:")) {
       return ui.newTerminal;
     }
@@ -2036,6 +2063,10 @@
     }
     if (activeCodeDiffTab) {
       void ensureLazyWorkspaceLoaded("codeDiff");
+      return;
+    }
+    if (activeFileTab) {
+      void ensureLazyWorkspaceLoaded("file");
       return;
     }
     if (activeWorkspaceTabId.startsWith("terminal:")) {
@@ -3708,6 +3739,7 @@
     settingsTabOpen = false;
     gitDiffTabs = [];
     codeDiffTabs = [];
+    fileTabs = [];
     pendingSteerResume = null;
     dismissedQueueResumeBySessionId = {};
     draftPersistencePaused = false;
@@ -6830,6 +6862,38 @@
     }
   }
 
+  function fileTabId(filePath: string): `file:${string}` {
+    return `file:${encodeURIComponent(filePath)}`;
+  }
+
+  function openFileTab(filePath: string) {
+    const cleanPath = extractLocalFilePath(filePath);
+    const id = fileTabId(cleanPath);
+    const existing = fileTabs.find((tab) => tab.id === id);
+
+    if (existing) {
+      activeWorkspaceTabId = existing.id;
+      workspaceMenuOpen = false;
+      return;
+    }
+
+    const nextTab: FileTab = {
+      id,
+      path: cleanPath,
+      label: baseName(cleanPath) || cleanPath
+    };
+    fileTabs = [...fileTabs, nextTab];
+    activeWorkspaceTabId = nextTab.id;
+    workspaceMenuOpen = false;
+  }
+
+  function closeFileTab(tabId: string) {
+    fileTabs = fileTabs.filter((tab) => tab.id !== tabId);
+    if (activeWorkspaceTabId === tabId) {
+      activeWorkspaceTabId = "chat";
+    }
+  }
+
   async function createTerminalTab() {
     if (readOnlyRole) {
       errorText = m.error_forbidden_role();
@@ -6888,9 +6952,13 @@
     return lineMatch?.[1] ?? cleanHref;
   }
 
-  async function openGitFileFromMessage(href: string) {
+  function openFileFromMessage(href: string) {
+    openFileTab(extractLocalFilePath(href));
+  }
+
+  async function openGitFileFromPath(filePath: string) {
     try {
-      const resolved = await api.resolveGitFile(extractLocalFilePath(href));
+      const resolved = await api.resolveGitFile(extractLocalFilePath(filePath));
       if ((viewerGitRepoPath ?? conversation?.preferences.gitRepoPath ?? null) !== resolved.repoPath) {
         handleRepoSelect(resolved.repoPath);
       }
@@ -9469,6 +9537,10 @@
             closeCodeDiffTab(tabId as `code-diff:${string}`);
             return;
           }
+          if (kind === "file") {
+            closeFileTab(tabId as `file:${string}`);
+            return;
+          }
           if (kind === "terminal") {
             void closeTerminalTab(tabId.replace(/^terminal:/u, ""));
           }
@@ -9539,7 +9611,7 @@
                           <button class="p-1.5 rounded-lg text-gray-400 hover:text-amber-700 hover:bg-amber-50 transition-colors" onclick={() => void forkCurrentThread("handoff", { turnId: turn.id, messageText: getUserText(item) })} title={ui.handoffToNewThread} type="button"><ArrowRightLeft size={13} /></button>
                         </div>
                         <div class="px-5 py-3 bg-gray-100 rounded-2xl text-gray-800 shadow-sm border border-gray-200/50">
-                          <MarkdownMessage compact on:openLocalPath={(event: CustomEvent<{ href: string }>) => void openGitFileFromMessage(event.detail.href)} text={getUserText(item)} />
+                          <MarkdownMessage compact on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={getUserText(item)} />
                           {#if getUserAttachmentNames(item).length > 0}
                             <div class="mt-3 flex flex-wrap gap-2">
                               {#each getUserAttachmentNames(item) as name}<span class="px-2 py-1 bg-white/80 rounded-lg border border-gray-200 text-[10px] font-bold text-gray-600 flex items-center gap-1.5"><FileText size={10} />{name}</span>{/each}
@@ -10690,6 +10762,21 @@
             <span>{getWorkspaceLoadingLabel()}</span>
           </div>
         {/if}
+      {:else if activeFileTab}
+        {#if FileWorkspaceView}
+          <FileWorkspaceView
+            filePath={activeFileTab.path}
+            readOnly={readOnlyRole}
+            onClose={() => closeFileTab(activeFileTab.id)}
+            onOpenGit={(filePath) => void openGitFileFromPath(filePath)}
+            onOpenLocalPath={(href) => openFileFromMessage(href)}
+          />
+        {:else}
+          <div class="workspace-loading-card h-full">
+            <RefreshCw size={16} class="animate-spin text-gray-300" />
+            <span>{getWorkspaceLoadingLabel()}</span>
+          </div>
+        {/if}
       {:else}
         {#if TerminalWorkspaceView}
           <TerminalWorkspaceView
@@ -11568,7 +11655,7 @@
       <div class="flex justify-end opacity-0 group-hover/agent-message:opacity-100 transition-opacity">
         <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors" onclick={() => void copyMessageText(String(item.text ?? ""))} title={ui.copyReply} type="button"><Copy size={13} /></button>
       </div>
-      <div class="prose prose-sm max-w-none text-gray-800 leading-relaxed animate-in fade-in slide-in-from-left-2 duration-700"><MarkdownMessage on:openLocalPath={(event: CustomEvent<{ href: string }>) => void openGitFileFromMessage(event.detail.href)} text={String(item.text ?? "")} /></div>
+      <div class="prose prose-sm max-w-none text-gray-800 leading-relaxed animate-in fade-in slide-in-from-left-2 duration-700"><MarkdownMessage on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={String(item.text ?? "")} /></div>
     </div>
   {:else if item.type === "imageGeneration"}
     {@const imageSrc = getImageGenerationSource(item)}
@@ -11631,14 +11718,14 @@
       <div class="space-y-3 bg-white/85 px-4 py-3">
         {#if String(item.text ?? "").trim()}
           <div class="rounded-xl border border-amber-100 bg-white px-3 py-3">
-            <MarkdownMessage compact on:openLocalPath={(event: CustomEvent<{ href: string }>) => void openGitFileFromMessage(event.detail.href)} text={String(item.text ?? "")} />
+            <MarkdownMessage compact on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={String(item.text ?? "")} />
           </div>
         {/if}
         {#if Array.isArray(item.summary) && item.summary.length > 0}
           <div class="space-y-2">
             {#each item.summary as summaryEntry, index (`${item.id}:summary:${index}`)}
               <div class="rounded-xl border border-amber-100/70 bg-amber-50/60 px-3 py-2.5 text-sm leading-relaxed text-gray-700">
-                <MarkdownMessage compact on:openLocalPath={(event: CustomEvent<{ href: string }>) => void openGitFileFromMessage(event.detail.href)} text={summaryEntry} />
+                <MarkdownMessage compact on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={summaryEntry} />
               </div>
             {/each}
           </div>

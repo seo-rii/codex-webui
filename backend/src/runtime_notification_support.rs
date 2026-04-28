@@ -11,11 +11,14 @@ pub(crate) async fn enqueue_profile_notification(
         return;
     }
 
-    let enabled = match with_ui_state_read(state, profile_id, |ui_state| {
-        let enabled_event_types = ui_state
-            .get("notifications")
-            .and_then(|value| value.get("settings"))
-            .and_then(|value| value.get("enabledEventTypes"))
+    let (enabled, notification_settings) = match with_ui_state_read(state, profile_id, |ui_state| {
+        let notification_settings = normalize_notification_settings_value(
+            ui_state
+                .get("notifications")
+                .and_then(|value| value.get("settings")),
+        );
+        let enabled_event_types = notification_settings
+            .get("enabledEventTypes")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_else(|| {
@@ -24,15 +27,18 @@ pub(crate) async fn enqueue_profile_notification(
                     .cloned()
                     .unwrap_or_default()
             });
-        Ok(enabled_event_types
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|entry| entry == notification_type))
+        Ok((
+            enabled_event_types
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|entry| entry == notification_type),
+            notification_settings,
+        ))
     })
     .await
     {
-        Ok(enabled) => enabled,
-        Err(_) => false,
+        Ok(result) => result,
+        Err(_) => (false, default_notification_settings_value()),
     };
     if !enabled {
         return;
@@ -106,6 +112,121 @@ pub(crate) async fn enqueue_profile_notification(
         }),
     )
     .await;
+
+    let delivery_state = state.clone();
+    let delivery_profile_id = profile_id.to_string();
+    tokio::spawn(async move {
+        deliver_notification_webhooks(
+            delivery_state,
+            delivery_profile_id,
+            notification,
+            notification_settings,
+        )
+        .await;
+    });
+}
+
+pub(crate) fn notification_webhook_deliveries(
+    notification: &Value,
+    settings: &Value,
+) -> Vec<(String, Value)> {
+    let mut deliveries = Vec::new();
+    if let Some(url) = settings
+        .get("webhookUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        deliveries.push((
+            url.to_string(),
+            json!({
+                "event": notification.get("type").cloned().unwrap_or(Value::Null),
+                "notification": notification
+            }),
+        ));
+    }
+    if let Some(url) = settings
+        .get("slackWebhookUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let event_type = notification
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("notification");
+        let session_name = notification
+            .get("sessionName")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("Codex WebUI");
+        deliveries.push((
+            url.to_string(),
+            json!({
+                "text": format!("{event_type}: {session_name}"),
+                "codexWebui": {
+                    "event": event_type,
+                    "notification": notification
+                }
+            }),
+        ));
+    }
+    deliveries
+}
+
+async fn deliver_notification_webhooks(
+    state: AppState,
+    profile_id: String,
+    notification: Value,
+    settings: Value,
+) {
+    for (url, payload) in notification_webhook_deliveries(&notification, &settings) {
+        if let Err(error) = send_notification_webhook_with_retries(&state, &url, &payload).await {
+            append_runtime_error_log(
+                &state.config,
+                "notification-webhook",
+                "webhook delivery failed",
+                json!({
+                    "profileId": profile_id,
+                    "notificationId": notification.get("id").cloned().unwrap_or(Value::Null),
+                    "eventType": notification.get("type").cloned().unwrap_or(Value::Null),
+                    "url": redact_user_facing_error(&url),
+                    "error": redact_user_facing_error(&error.to_string())
+                }),
+            );
+        }
+    }
+}
+
+async fn send_notification_webhook_with_retries(
+    state: &AppState,
+    url: &str,
+    payload: &Value,
+) -> Result<()> {
+    let mut last_error: Option<anyhow::Error> = None;
+    for (attempt, delay_ms) in [0_u64, 500, 2_000].into_iter().enumerate() {
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        match state.http.post(url).json(payload).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => {
+                last_error = Some(anyhow!(
+                    "webhook returned HTTP {} on attempt {}",
+                    response.status(),
+                    attempt + 1
+                ));
+            }
+            Err(error) => {
+                last_error = Some(anyhow!(
+                    "webhook request failed on attempt {}: {}",
+                    attempt + 1,
+                    error
+                ));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("webhook delivery failed")))
 }
 
 pub(crate) async fn emit_runtime_profile_config_updated(state: &AppState, profile_id: &str) {

@@ -305,6 +305,43 @@ async fn notification_settings_reject_local_webhook_urls() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[test]
+fn notification_webhook_deliveries_build_generic_and_slack_payloads() {
+    let notification = json!({
+        "id": "n1",
+        "type": "sessionCompleted",
+        "createdAt": 10,
+        "readAt": Value::Null,
+        "sessionId": "thread-1",
+        "sessionName": "Build thread",
+        "payload": {
+            "status": "completed"
+        }
+    });
+    let deliveries = notification_webhook_deliveries(
+        &notification,
+        &json!({
+            "webhookUrl": "https://example.com/generic",
+            "slackWebhookUrl": "https://hooks.slack.test/one"
+        }),
+    );
+
+    assert_eq!(deliveries.len(), 2);
+    assert_eq!(deliveries[0].0, "https://example.com/generic");
+    assert_eq!(
+        deliveries[0].1.get("event").and_then(Value::as_str),
+        Some("sessionCompleted")
+    );
+    assert_eq!(deliveries[1].0, "https://hooks.slack.test/one");
+    assert!(
+        deliveries[1]
+            .1
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("Build thread"))
+    );
+}
+
 #[tokio::test]
 async fn terminal_cleanup_removes_stale_sessions() {
     let sandbox = unique_test_dir("terminal-cleanup");

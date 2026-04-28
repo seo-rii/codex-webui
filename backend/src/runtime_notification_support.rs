@@ -181,6 +181,30 @@ async fn deliver_notification_webhooks(
     settings: Value,
 ) {
     for (url, payload) in notification_webhook_deliveries(&notification, &settings) {
+        let field = if settings
+            .get("slackWebhookUrl")
+            .and_then(Value::as_str)
+            .is_some_and(|candidate| candidate.trim() == url)
+        {
+            "slackWebhookUrl"
+        } else {
+            "webhookUrl"
+        };
+        if let Err(error) = validate_notification_webhook_url_str(&url, field) {
+            append_runtime_error_log(
+                &state.config,
+                "notification-webhook",
+                "webhook delivery skipped invalid URL",
+                json!({
+                    "profileId": profile_id,
+                    "notificationId": notification.get("id").cloned().unwrap_or(Value::Null),
+                    "eventType": notification.get("type").cloned().unwrap_or(Value::Null),
+                    "field": field,
+                    "error": redact_user_facing_error(&error.message)
+                }),
+            );
+            continue;
+        }
         if let Err(error) = send_notification_webhook_with_retries(&state, &url, &payload).await {
             append_runtime_error_log(
                 &state.config,

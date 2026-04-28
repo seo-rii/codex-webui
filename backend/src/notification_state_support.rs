@@ -256,14 +256,11 @@ pub(crate) async fn update_notification_settings_payload(
     Ok(payload)
 }
 
-fn validate_notification_webhook_url(candidate: Option<&Value>, field: &str) -> ApiResult<()> {
-    let Some(raw) = candidate
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+pub(crate) fn validate_notification_webhook_url_str(raw: &str, field: &str) -> ApiResult<()> {
+    let raw = raw.trim();
+    if raw.is_empty() {
         return Ok(());
-    };
+    }
     let url = reqwest::Url::parse(raw).map_err(|_| {
         api_error(
             StatusCode::BAD_REQUEST,
@@ -278,7 +275,10 @@ fn validate_notification_webhook_url(candidate: Option<&Value>, field: &str) -> 
     }
     let host = url.host_str().unwrap_or_default();
     let lowered_host = host.to_ascii_lowercase();
-    if lowered_host == "localhost" || lowered_host.ends_with(".localhost") {
+    if lowered_host == "localhost"
+        || lowered_host.ends_with(".localhost")
+        || lowered_host.ends_with(".local")
+    {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             format!("{field} cannot target a local address."),
@@ -302,4 +302,15 @@ fn validate_notification_webhook_url(candidate: Option<&Value>, field: &str) -> 
         }
     }
     Ok(())
+}
+
+fn validate_notification_webhook_url(candidate: Option<&Value>, field: &str) -> ApiResult<()> {
+    let Some(raw) = candidate
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    validate_notification_webhook_url_str(raw, field)
 }

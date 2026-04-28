@@ -301,6 +301,15 @@ async fn notification_settings_reject_local_webhook_urls() {
         error.message,
         "slackWebhookUrl cannot target a private or local address."
     );
+    assert_eq!(
+        validate_notification_webhook_url_str("https://printer.local/hook", "webhookUrl")
+            .expect_err("local mdns hosts should be rejected")
+            .message,
+        "webhookUrl cannot target a local address."
+    );
+    assert!(
+        validate_notification_webhook_url_str("https://example.com/hook", "webhookUrl").is_ok()
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }

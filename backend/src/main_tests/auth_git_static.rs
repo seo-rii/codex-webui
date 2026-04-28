@@ -394,6 +394,56 @@ async fn git_worktree_payloads_use_rust_git_helpers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_log_list_clamps_limit_and_reads_latest_entries() {
+    let sandbox = unique_test_dir("audit-log-tail");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+
+    for index in 0..(MAX_AUDIT_LOG_LIMIT + 20) {
+        append_audit_log(
+            &state.config,
+            AuditLogEntry {
+                id: format!("entry-{index}"),
+                at: index as u64,
+                role: "admin".to_string(),
+                method: "test/method".to_string(),
+                target: None,
+                ok: true,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let payload = list_audit_log(&state.config, usize::MAX).await.unwrap();
+    let entries = payload
+        .get("entries")
+        .and_then(Value::as_array)
+        .expect("audit entries should be present");
+    assert_eq!(entries.len(), MAX_AUDIT_LOG_LIMIT);
+    assert_eq!(
+        entries
+            .first()
+            .and_then(|entry| entry.get("id"))
+            .and_then(Value::as_str),
+        Some("entry-519")
+    );
+    assert_eq!(
+        entries
+            .last()
+            .and_then(|entry| entry.get("id"))
+            .and_then(Value::as_str),
+        Some("entry-20")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_read_payloads_use_rust_helpers() {
     let sandbox = unique_test_dir("git-read");
     let workspace = sandbox.join("workspace");

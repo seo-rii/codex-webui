@@ -41,7 +41,7 @@ use subtle::ConstantTimeEq;
 use time::Duration as CookieDuration;
 use tokio::{
     fs as tokio_fs,
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     runtime::Builder as TokioRuntimeBuilder,
     sync::{Mutex, broadcast, mpsc},

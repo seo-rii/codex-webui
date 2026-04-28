@@ -1140,8 +1140,21 @@ async fn session_list_normalizes_mixed_timestamp_units() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ws_session_cache_validation_returns_not_modified_for_matching_versions() {
+// This cache-flow test builds a large async state machine; poll it on a larger
+// stack so default `cargo test` runs do not abort on 2 MiB test stacks.
+#[test]
+#[rustfmt::skip]
+fn ws_session_cache_validation_returns_not_modified_for_matching_versions() {
+    std::thread::Builder::new()
+        .name("session-cache-validation".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
     let sandbox = unique_test_dir("session-cache-validation-rust");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -1429,6 +1442,11 @@ async fn ws_session_cache_validation_returns_not_modified_for_matching_versions(
     assert!(detail_patch.get("thread").is_none());
 
     let _ = fs::remove_dir_all(sandbox);
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -112,7 +112,7 @@ impl Config {
         let cwd = env::current_dir().context("failed to read current directory")?;
         load_dotenv(&cwd);
         let project_root = resolve_project_root(&cwd);
-        let allowed_roots = parse_allowed_roots(&project_root);
+        let allowed_roots = parse_allowed_roots(&project_root)?;
         let base_path = normalize_base_path(env::var("CODEX_WEBUI_BASE_PATH").ok());
         let static_dir = project_root.join("build/static");
         let data_dir = env::var("CODEX_WEBUI_DATA_DIR")
@@ -340,30 +340,28 @@ pub(crate) fn parse_runtime_profiles(
     Ok((resolved_default_profile_id, profiles))
 }
 
-pub(crate) fn parse_allowed_roots(project_root: &Path) -> Vec<PathBuf> {
-    let mut roots = env::var_os("CODEX_WEBUI_ALLOWED_ROOTS")
-        .map(|value| {
-            env::split_paths(&value)
-                .map(|entry| {
-                    normalize_path(if entry.is_absolute() {
-                        entry
-                    } else {
-                        project_root.join(entry)
-                    })
-                })
-                .filter(|entry| !entry.as_os_str().is_empty())
-                .collect::<Vec<_>>()
+pub(crate) fn parse_allowed_roots(project_root: &Path) -> Result<Vec<PathBuf>> {
+    let raw = env::var_os("CODEX_WEBUI_ALLOWED_ROOTS").ok_or_else(|| {
+        anyhow!("Set CODEX_WEBUI_ALLOWED_ROOTS to one or more explicit workspace roots.")
+    })?;
+    let mut roots = env::split_paths(&raw)
+        .map(|entry| {
+            normalize_path(if entry.is_absolute() {
+                entry
+            } else {
+                project_root.join(entry)
+            })
         })
-        .unwrap_or_else(|| {
-            let fallback = project_root
-                .parent()
-                .filter(|parent| *parent != project_root)
-                .unwrap_or(project_root);
-            vec![fallback.to_path_buf()]
-        });
+        .filter(|entry| !entry.as_os_str().is_empty())
+        .collect::<Vec<_>>();
 
     roots.dedup();
-    roots
+    if roots.is_empty() {
+        return Err(anyhow!(
+            "CODEX_WEBUI_ALLOWED_ROOTS must contain at least one workspace root."
+        ));
+    }
+    Ok(roots)
 }
 
 pub(crate) fn normalize_path(path: PathBuf) -> PathBuf {

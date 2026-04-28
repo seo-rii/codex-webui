@@ -284,7 +284,7 @@ See [.env.example](./.env.example) for a concise example set.
 - If you need read-only browser access, prefer `CODEX_WEBUI_VIEWER_PASSWORD_HASH` over the plaintext viewer password variable.
 - Set `CODEX_WEBUI_SESSION_SECRET` to a unique random value of at least 32 bytes per deployment; the gateway will not fall back to a password-derived cookie signing key.
 - Optional hCaptcha login protection is only enabled when both `CODEX_WEBUI_HCAPTCHA_SITE_KEY` and `CODEX_WEBUI_HCAPTCHA_SECRET_KEY` are set.
-- Restrict `CODEX_WEBUI_ALLOWED_ROOTS` to the smallest practical set.
+- Set `CODEX_WEBUI_ALLOWED_ROOTS` explicitly and restrict it to the smallest practical set; the gateway does not infer broad fallback roots.
 - Leave cookies on `SameSite=Strict` unless you explicitly need cross-site browser sessions.
 - Run behind HTTPS in production.
 - Leave `CODEX_WEBUI_TRUST_PROXY_HEADERS` unset unless the gateway only receives traffic from a trusted reverse proxy that controls `X-Forwarded-*` headers.

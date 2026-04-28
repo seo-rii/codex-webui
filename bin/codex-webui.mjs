@@ -244,6 +244,37 @@ async function ensureStateDir() {
   await fs.mkdir(stateDir, { recursive: true });
 }
 
+async function writeFileAtomic(filePath, content) {
+  const directory = path.dirname(filePath);
+  await fs.mkdir(directory, { recursive: true });
+  const tempPath = path.join(directory, `.codex-webui-${path.basename(filePath)}-${process.pid}-${Date.now()}.tmp`);
+  let handle = null;
+  try {
+    handle = await fs.open(tempPath, "wx");
+    await handle.writeFile(content, typeof content === "string" ? "utf8" : undefined);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.rename(tempPath, filePath);
+    try {
+      const directoryHandle = await fs.open(directory, "r");
+      try {
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
+    } catch {
+      // Directory fsync is not portable across all supported platforms.
+    }
+  } catch (error) {
+    if (handle) {
+      await handle.close().catch(() => {});
+    }
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
 async function readConfig() {
   try {
     const raw = await fs.readFile(configPath, "utf8");
@@ -254,8 +285,7 @@ async function readConfig() {
 }
 
 async function writeConfig(config) {
-  await fs.mkdir(path.dirname(configPath), { recursive: true });
-  await fs.writeFile(configPath, YAML.stringify(config), "utf8");
+  await writeFileAtomic(configPath, YAML.stringify(config));
 }
 
 async function promptConfig(existing = null) {
@@ -390,7 +420,7 @@ async function readServerMeta() {
 }
 
 async function writeServerMeta(meta) {
-  await fs.writeFile(serverMetaPath, JSON.stringify(meta, null, 2), "utf8");
+  await writeFileAtomic(serverMetaPath, JSON.stringify(meta, null, 2));
 }
 
 async function clearServerStateFiles() {
@@ -409,7 +439,7 @@ async function readNumericFile(filePath) {
 }
 
 async function writeNumericFile(filePath, value) {
-  await fs.writeFile(filePath, String(value), "utf8");
+  await writeFileAtomic(filePath, String(value));
 }
 
 async function readTunnelMeta() {
@@ -421,7 +451,7 @@ async function readTunnelMeta() {
 }
 
 async function writeTunnelMeta(meta) {
-  await fs.writeFile(tunnelMetaPath, JSON.stringify(meta, null, 2), "utf8");
+  await writeFileAtomic(tunnelMetaPath, JSON.stringify(meta, null, 2));
 }
 
 function isRunning(pid) {
@@ -773,7 +803,7 @@ async function startTunnel(config, cliOptions) {
   const tunnelOptions = mergeTunnelOptions(config, cliOptions);
   const launch = buildTunnelLaunch(config, tunnelOptions);
   await fs.mkdir(path.dirname(tunnelLogPath), { recursive: true });
-  await fs.writeFile(tunnelLogPath, "", "utf8");
+  await writeFileAtomic(tunnelLogPath, "");
 
   if (tunnelOptions.background) {
     const logHandle = await fs.open(tunnelLogPath, "a");
@@ -941,7 +971,7 @@ async function startServer(config) {
     }
   });
   child.unref();
-  await fs.writeFile(pidPath, String(child.pid), "utf8");
+  await writeFileAtomic(pidPath, String(child.pid));
   await writeServerMeta({
     pid: child.pid,
     instanceToken,

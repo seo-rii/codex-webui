@@ -18,13 +18,8 @@ pub(crate) async fn handle_session_queue_api_http(
         match request.method() {
             &Method::GET => get_session_queue_payload(&state, &auth.profile_id, session_id).await,
             &Method::POST => {
-                let body = to_bytes(request.into_body(), usize::MAX)
-                    .await
-                    .context("failed to read queue request body");
-                match body {
-                    Ok(body) => {
-                        let payload: Value =
-                            serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                match read_json_body(request, LARGE_JSON_BODY_LIMIT, "queue request body").await {
+                    Ok(payload) => {
                         enqueue_session_queue_payload(
                             &state,
                             &auth.profile_id,
@@ -39,10 +34,7 @@ pub(crate) async fn handle_session_queue_api_http(
                         )
                         .await
                     }
-                    Err(_) => Err(api_error(
-                        StatusCode::BAD_REQUEST,
-                        "Failed to read queue request body.",
-                    )),
+                    Err(error) => Err(error),
                 }
             }
             _ => Err(api_error(
@@ -66,21 +58,14 @@ pub(crate) async fn handle_session_queue_api_http(
                 "Method not allowed.",
             ))
         } else {
-            let body = to_bytes(request.into_body(), usize::MAX)
-                .await
-                .context("failed to read queue reorder request body");
-            match body {
-                Ok(body) => {
-                    let payload: Value =
-                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            match read_json_body(request, SMALL_JSON_BODY_LIMIT, "queue reorder request body").await
+            {
+                Ok(payload) => {
                     let queue_ids = string_array_from_value(payload.get("queueIds"));
                     reorder_session_queue_payload(&state, &auth.profile_id, session_id, &queue_ids)
                         .await
                 }
-                Err(_) => Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "Failed to read queue reorder request body.",
-                )),
+                Err(error) => Err(error),
             }
         }
     } else {
@@ -99,13 +84,14 @@ pub(crate) async fn handle_session_queue_api_http(
                     .await
                 }
                 &Method::PATCH => {
-                    let body = to_bytes(request.into_body(), usize::MAX)
-                        .await
-                        .context("failed to read queue update request body");
-                    match body {
-                        Ok(body) => {
-                            let payload: Value =
-                                serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    match read_json_body(
+                        request,
+                        LARGE_JSON_BODY_LIMIT,
+                        "queue update request body",
+                    )
+                    .await
+                    {
+                        Ok(payload) => {
                             update_session_queue_item_payload(
                                 &state,
                                 &auth.profile_id,
@@ -117,20 +103,18 @@ pub(crate) async fn handle_session_queue_api_http(
                             )
                             .await
                         }
-                        Err(_) => Err(api_error(
-                            StatusCode::BAD_REQUEST,
-                            "Failed to read queue update request body.",
-                        )),
+                        Err(error) => Err(error),
                     }
                 }
                 &Method::POST => {
-                    let body = to_bytes(request.into_body(), usize::MAX)
-                        .await
-                        .context("failed to read queue dispatch request body");
-                    match body {
-                        Ok(body) => {
-                            let payload: Value =
-                                serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                    match read_json_body(
+                        request,
+                        SMALL_JSON_BODY_LIMIT,
+                        "queue dispatch request body",
+                    )
+                    .await
+                    {
+                        Ok(payload) => {
                             dispatch_session_queue_item_payload(
                                 &state,
                                 &auth.profile_id,
@@ -143,10 +127,7 @@ pub(crate) async fn handle_session_queue_api_http(
                             )
                             .await
                         }
-                        Err(_) => Err(api_error(
-                            StatusCode::BAD_REQUEST,
-                            "Failed to read queue dispatch request body.",
-                        )),
+                        Err(error) => Err(error),
                     }
                 }
                 _ => Err(api_error(
@@ -195,12 +176,9 @@ pub(crate) async fn handle_session_approval_api_http(
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
-    let result = match to_bytes(request.into_body(), usize::MAX)
-        .await
-        .context("failed to read approval request body")
+    let result = match read_json_body(request, SMALL_JSON_BODY_LIMIT, "approval request body").await
     {
-        Ok(body) => {
-            let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+        Ok(payload) => {
             let request_id = payload
                 .get("requestId")
                 .and_then(Value::as_str)
@@ -215,10 +193,7 @@ pub(crate) async fn handle_session_approval_api_http(
             )
             .await
         }
-        Err(_) => Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Failed to read approval request body.",
-        )),
+        Err(error) => Err(error),
     };
 
     match result {

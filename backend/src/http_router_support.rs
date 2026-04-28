@@ -10,30 +10,27 @@ pub(crate) async fn handle_account_api_http(
     let result = match (method, route_path.as_str()) {
         (Method::GET, "/api/account") => get_account_state(&state, &auth.profile_id).await,
         (Method::POST, "/api/account/login") => {
-            let body = to_bytes(request.into_body(), usize::MAX)
-                .await
-                .context("failed to read account login request body");
-            match body {
-                Ok(body) => {
-                    let payload: Value =
-                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-                    start_account_login(&state, &auth.profile_id, &payload).await
-                }
-                Err(error) => Err(error),
-            }
+            let payload =
+                match read_json_body(request, SMALL_JSON_BODY_LIMIT, "account login request body")
+                    .await
+                {
+                    Ok(payload) => payload,
+                    Err(error) => return json_error(error.status, &error.message),
+                };
+            start_account_login(&state, &auth.profile_id, &payload).await
         }
         (Method::POST, "/api/account/login/cancel") => {
-            let body = to_bytes(request.into_body(), usize::MAX)
-                .await
-                .context("failed to read account login cancel request body");
-            match body {
-                Ok(body) => {
-                    let payload: Value =
-                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-                    cancel_account_login(&state, &auth.profile_id, &payload).await
-                }
-                Err(error) => Err(error),
-            }
+            let payload = match read_json_body(
+                request,
+                SMALL_JSON_BODY_LIMIT,
+                "account login cancel request body",
+            )
+            .await
+            {
+                Ok(payload) => payload,
+                Err(error) => return json_error(error.status, &error.message),
+            };
+            cancel_account_login(&state, &auth.profile_id, &payload).await
         }
         (Method::POST, "/api/account/logout") => logout_account(&state, &auth.profile_id).await,
         _ => return json_error(StatusCode::NOT_FOUND, "Not found."),
@@ -84,14 +81,9 @@ pub(crate) async fn handle_git_api_http(
         method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     ) {
-        match to_bytes(request.into_body(), usize::MAX)
-            .await
-            .context("failed to read git request body")
-        {
+        match read_limited_body(request, LARGE_JSON_BODY_LIMIT, "git request body").await {
             Ok(body) => Some(body),
-            Err(_) => {
-                return json_error(StatusCode::BAD_REQUEST, "Failed to read git request body.");
-            }
+            Err(error) => return json_error(error.status, &error.message),
         }
     } else {
         None

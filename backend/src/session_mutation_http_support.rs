@@ -13,12 +13,8 @@ pub(crate) async fn handle_session_fork_api_http(
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
-    let result = match to_bytes(request.into_body(), usize::MAX)
-        .await
-        .context("failed to read session fork body")
-    {
-        Ok(body) => {
-            let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    let result = match read_json_body(request, SMALL_JSON_BODY_LIMIT, "session fork body").await {
+        Ok(payload) => {
             fork_session_payload(
                 &state,
                 &auth.profile_id,
@@ -32,10 +28,7 @@ pub(crate) async fn handle_session_fork_api_http(
             )
             .await
         }
-        Err(_) => Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Failed to read session fork body.",
-        )),
+        Err(error) => Err(error),
     };
 
     match result {
@@ -57,18 +50,13 @@ pub(crate) async fn handle_session_organization_api_http(
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
-    let result = match to_bytes(request.into_body(), usize::MAX)
+    let result = match read_json_body(request, SMALL_JSON_BODY_LIMIT, "session organization body")
         .await
-        .context("failed to read session organization body")
     {
-        Ok(body) => {
-            let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+        Ok(payload) => {
             update_session_organization_payload(&state, &auth.profile_id, session_id, payload).await
         }
-        Err(_) => Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Failed to read session organization body.",
-        )),
+        Err(error) => Err(error),
     };
 
     match result {
@@ -90,12 +78,8 @@ pub(crate) async fn handle_session_name_api_http(
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
-    let result = match to_bytes(request.into_body(), usize::MAX)
-        .await
-        .context("failed to read session name body")
-    {
-        Ok(body) => {
-            let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    let result = match read_json_body(request, SMALL_JSON_BODY_LIMIT, "session name body").await {
+        Ok(payload) => {
             rename_session_payload(
                 &state,
                 &auth.profile_id,
@@ -107,10 +91,7 @@ pub(crate) async fn handle_session_name_api_http(
             )
             .await
         }
-        Err(_) => Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Failed to read session name body.",
-        )),
+        Err(error) => Err(error),
     };
 
     match result {
@@ -157,13 +138,8 @@ pub(crate) async fn handle_session_draft_api_http(
             if auth.role != UserRole::Admin {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
-            let body = to_bytes(request.into_body(), usize::MAX)
-                .await
-                .context("failed to read draft request body");
-            match body {
-                Ok(body) => {
-                    let payload: Value =
-                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            match read_json_body(request, SMALL_JSON_BODY_LIMIT, "draft request body").await {
+                Ok(payload) => {
                     save_session_draft_payload(
                         &state,
                         &auth.profile_id,
@@ -179,10 +155,7 @@ pub(crate) async fn handle_session_draft_api_http(
                     )
                     .await
                 }
-                Err(_) => Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "Failed to read draft request body.",
-                )),
+                Err(error) => Err(error),
             }
         }
         &Method::DELETE => {
@@ -213,12 +186,9 @@ pub(crate) async fn handle_session_messages_api_http(
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
-    let result = match to_bytes(request.into_body(), usize::MAX)
-        .await
-        .context("failed to read session message body")
+    let result = match read_json_body(request, LARGE_JSON_BODY_LIMIT, "session message body").await
     {
-        Ok(body) => {
-            let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+        Ok(payload) => {
             send_turn_payload(
                 &state,
                 &auth.profile_id,
@@ -236,10 +206,7 @@ pub(crate) async fn handle_session_messages_api_http(
             )
             .await
         }
-        Err(_) => Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Failed to read session message body.",
-        )),
+        Err(error) => Err(error),
     };
 
     match result {
@@ -261,12 +228,8 @@ pub(crate) async fn handle_session_steer_api_http(
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
-    let result = match to_bytes(request.into_body(), usize::MAX)
-        .await
-        .context("failed to read session steer body")
-    {
-        Ok(body) => {
-            let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    let result = match read_json_body(request, LARGE_JSON_BODY_LIMIT, "session steer body").await {
+        Ok(payload) => {
             steer_turn_payload(
                 &state,
                 &auth.profile_id,
@@ -280,10 +243,7 @@ pub(crate) async fn handle_session_steer_api_http(
             )
             .await
         }
-        Err(_) => Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Failed to read session steer body.",
-        )),
+        Err(error) => Err(error),
     };
 
     match result {

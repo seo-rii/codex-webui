@@ -94,9 +94,10 @@ async fn auth_login(
     request: Request,
 ) -> std::result::Result<Response, String> {
     let secure_request = request_is_secure(&headers);
-    let body = to_bytes(request.into_body(), usize::MAX)
-        .await
-        .map_err(|_| "Invalid request body.".to_string())?;
+    let body = match read_limited_body(request, SMALL_JSON_BODY_LIMIT, "login request body").await {
+        Ok(body) => body,
+        Err(error) => return Ok(json_error(error.status, &error.message)),
+    };
     let payload: LoginPayload = serde_json::from_slice(&body).unwrap_or(LoginPayload {
         password: None,
         hcaptcha_token: None,

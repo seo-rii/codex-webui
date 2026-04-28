@@ -506,19 +506,9 @@ pub(crate) async fn handle_config_api_http(
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
 
-            let body = to_bytes(request.into_body(), usize::MAX)
-                .await
-                .context("failed to read config request body");
-            match body {
-                Ok(body) => {
-                    let payload: Value =
-                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-                    update_config_payload(&state, &auth.profile_id, payload).await
-                }
-                Err(_) => Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "Failed to read config request body.",
-                )),
+            match read_json_body(request, SMALL_JSON_BODY_LIMIT, "config request body").await {
+                Ok(payload) => update_config_payload(&state, &auth.profile_id, payload).await,
+                Err(error) => Err(error),
             }
         }
         _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),

@@ -47,13 +47,7 @@ async fn websocket_response_cache_is_partitioned_by_role_method_and_params() {
     let method = "config/set";
     let params = json!({ "value": "admin-only" });
     let params_hash = request_params_hash(&params);
-    let admin_key = request_cache_key(
-        "default",
-        request_id,
-        UserRole::Admin,
-        method,
-        &params_hash,
-    );
+    let admin_key = request_cache_key("default", request_id, UserRole::Admin, method, &params_hash);
     cache_response(
         &state,
         &admin_key,
@@ -113,7 +107,10 @@ fn websocket_origin_allows_same_origin_and_configured_cors_only() {
         header::ORIGIN,
         HeaderValue::from_static("http://127.0.0.1:4173"),
     );
-    assert!(websocket_origin_allowed(&state.config, &same_origin_headers));
+    assert!(websocket_origin_allowed(
+        &state.config,
+        &same_origin_headers
+    ));
 
     let mut rejected_headers = same_origin_headers.clone();
     rejected_headers.insert(
@@ -127,6 +124,38 @@ fn websocket_origin_allows_same_origin_and_configured_cors_only() {
     state.config = Arc::new(config);
     assert!(websocket_origin_allowed(&state.config, &rejected_headers));
 
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_login_rejects_oversized_json_body() {
+    let sandbox = unique_test_dir("auth-login-body-limit");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(
+            header::CONTENT_LENGTH,
+            (SMALL_JSON_BODY_LIMIT + 1).to_string(),
+        )
+        .body(Body::from(vec![b'a'; SMALL_JSON_BODY_LIMIT + 1]))
+        .unwrap();
+
+    let response = handle_auth_http(
+        state,
+        CookieJar::new(),
+        Method::POST,
+        "/api/auth/login".to_string(),
+        HeaderMap::new(),
+        request,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     let _ = fs::remove_dir_all(sandbox);
 }
 

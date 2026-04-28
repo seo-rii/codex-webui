@@ -48,13 +48,8 @@ pub(crate) async fn handle_sessions_api_http(
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
 
-            let body = to_bytes(request.into_body(), usize::MAX)
-                .await
-                .context("failed to read session create body");
-            match body {
-                Ok(body) => {
-                    let payload: Value =
-                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            match read_json_body(request, SMALL_JSON_BODY_LIMIT, "session create body").await {
+                Ok(payload) => {
                     create_session_payload(
                         &state,
                         &auth.profile_id,
@@ -67,10 +62,7 @@ pub(crate) async fn handle_sessions_api_http(
                     )
                     .await
                 }
-                Err(_) => Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "Failed to read session create body.",
-                )),
+                Err(error) => Err(error),
             }
         }
         _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
@@ -100,13 +92,8 @@ pub(crate) async fn handle_session_api_http(
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
 
-            let body = to_bytes(request.into_body(), usize::MAX)
-                .await
-                .context("failed to read session update body");
-            match body {
-                Ok(body) => {
-                    let payload: Value =
-                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            match read_json_body(request, SMALL_JSON_BODY_LIMIT, "session update body").await {
+                Ok(payload) => {
                     save_session_preferences_payload(
                         &state,
                         &auth.profile_id,
@@ -118,10 +105,7 @@ pub(crate) async fn handle_session_api_http(
                     )
                     .await
                 }
-                Err(_) => Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "Failed to read session update body.",
-                )),
+                Err(error) => Err(error),
             }
         }
         _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),

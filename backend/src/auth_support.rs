@@ -89,10 +89,11 @@ pub(crate) async fn select_profile(
     auth: AuthContext,
 ) -> std::result::Result<Response, String> {
     let secure_request = request_is_secure(&headers);
-    let body = to_bytes(request.into_body(), usize::MAX)
-        .await
-        .map_err(|_| "Invalid request body.".to_string())?;
-    let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    let payload = match read_json_body(request, SMALL_JSON_BODY_LIMIT, "profile request body").await
+    {
+        Ok(payload) => payload,
+        Err(error) => return Ok(json_error(error.status, &error.message)),
+    };
     let requested_profile_id = payload
         .get("profileId")
         .and_then(Value::as_str)

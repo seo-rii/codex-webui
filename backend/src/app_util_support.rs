@@ -41,6 +41,49 @@ pub(crate) fn api_error(status: StatusCode, message: impl Into<String>) -> ApiEr
     }
 }
 
+pub(crate) const SMALL_JSON_BODY_LIMIT: usize = 256 * 1024;
+pub(crate) const LARGE_JSON_BODY_LIMIT: usize = 1024 * 1024;
+
+pub(crate) async fn read_limited_body(
+    request: Request,
+    limit: usize,
+    label: &str,
+) -> ApiResult<Bytes> {
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > limit)
+    {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("{label} exceeds the {limit} byte limit."),
+        ));
+    }
+
+    to_bytes(request.into_body(), limit).await.map_err(|error| {
+        let message = error.to_string();
+        if message.to_ascii_lowercase().contains("length limit") {
+            api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("{label} exceeds the {limit} byte limit."),
+            )
+        } else {
+            api_error(StatusCode::BAD_REQUEST, format!("Failed to read {label}."))
+        }
+    })
+}
+
+pub(crate) async fn read_json_body(
+    request: Request,
+    limit: usize,
+    label: &str,
+) -> ApiResult<Value> {
+    let body = read_limited_body(request, limit, label).await?;
+    Ok(serde_json::from_slice(&body).unwrap_or_else(|_| json!({})))
+}
+
 pub(crate) const USAGE_LIMIT_EXCEEDED_CODE: &str = "USAGE_LIMIT_EXCEEDED";
 
 pub(crate) fn structured_error_value(message: &str) -> Option<Value> {

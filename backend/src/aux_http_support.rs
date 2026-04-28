@@ -17,13 +17,8 @@ pub(crate) async fn handle_editor_api_http(
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
 
-            let body = to_bytes(request.into_body(), usize::MAX)
-                .await
-                .context("failed to read editor request body");
-            match body {
-                Ok(body) => {
-                    let payload: Value =
-                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            match read_json_body(request, LARGE_JSON_BODY_LIMIT, "editor request body").await {
+                Ok(payload) => {
                     let file_path = payload
                         .get("filePath")
                         .and_then(Value::as_str)
@@ -34,10 +29,7 @@ pub(crate) async fn handle_editor_api_http(
                         .unwrap_or_default();
                     write_editable_file_payload(&state, &auth.profile_id, file_path, content).await
                 }
-                Err(_) => Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "Failed to read editor request body.",
-                )),
+                Err(error) => Err(error),
             }
         }
         _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
@@ -81,13 +73,9 @@ pub(crate) async fn handle_notifications_api_http(
             if auth.role != UserRole::Admin {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
-            let body = to_bytes(request.into_body(), usize::MAX)
-                .await
-                .context("failed to read notifications request body");
-            match body {
-                Ok(body) => {
-                    let payload: Value =
-                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            match read_json_body(request, SMALL_JSON_BODY_LIMIT, "notifications request body").await
+            {
+                Ok(payload) => {
                     let ids = payload.get("ids").and_then(Value::as_array).map(|values| {
                         values
                             .iter()
@@ -97,10 +85,7 @@ pub(crate) async fn handle_notifications_api_http(
                     });
                     mark_notifications_read_payload(&state, &auth.profile_id, ids).await
                 }
-                Err(_) => Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "Failed to read notifications request body.",
-                )),
+                Err(error) => Err(error),
             }
         }
         &Method::DELETE => {
@@ -130,18 +115,17 @@ pub(crate) async fn handle_notification_settings_api_http(
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
-    let body = to_bytes(request.into_body(), usize::MAX)
-        .await
-        .context("failed to read notification settings request body");
-    let result = match body {
-        Ok(body) => {
-            let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    let result = match read_json_body(
+        request,
+        SMALL_JSON_BODY_LIMIT,
+        "notification settings request body",
+    )
+    .await
+    {
+        Ok(payload) => {
             update_notification_settings_payload(&state, &auth.profile_id, payload).await
         }
-        Err(_) => Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Failed to read notification settings request body.",
-        )),
+        Err(error) => Err(error),
     };
 
     match result {
@@ -161,13 +145,14 @@ pub(crate) async fn handle_session_filters_api_http(
 
     let result = match request.method() {
         &Method::POST => {
-            let body = to_bytes(request.into_body(), usize::MAX)
-                .await
-                .context("failed to read session filters request body");
-            match body {
-                Ok(body) => {
-                    let payload: Value =
-                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            match read_json_body(
+                request,
+                SMALL_JSON_BODY_LIMIT,
+                "session filters request body",
+            )
+            .await
+            {
+                Ok(payload) => {
                     save_session_filter_payload(
                         &state,
                         &auth.profile_id,
@@ -175,10 +160,7 @@ pub(crate) async fn handle_session_filters_api_http(
                     )
                     .await
                 }
-                Err(_) => Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "Failed to read session filters request body.",
-                )),
+                Err(error) => Err(error),
             }
         }
         &Method::DELETE => {
@@ -206,13 +188,14 @@ pub(crate) async fn handle_prompt_presets_api_http(
 
     let result = match request.method() {
         &Method::POST => {
-            let body = to_bytes(request.into_body(), usize::MAX)
-                .await
-                .context("failed to read prompt presets request body");
-            match body {
-                Ok(body) => {
-                    let payload: Value =
-                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            match read_json_body(
+                request,
+                SMALL_JSON_BODY_LIMIT,
+                "prompt presets request body",
+            )
+            .await
+            {
+                Ok(payload) => {
                     save_prompt_preset_payload(
                         &state,
                         &auth.profile_id,
@@ -220,10 +203,7 @@ pub(crate) async fn handle_prompt_presets_api_http(
                     )
                     .await
                 }
-                Err(_) => Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "Failed to read prompt presets request body.",
-                )),
+                Err(error) => Err(error),
             }
         }
         &Method::DELETE => {
@@ -253,13 +233,10 @@ pub(crate) async fn handle_automations_api_http(
     let result = if route_path == "/api/automations" {
         match request.method() {
             &Method::POST => {
-                let body = to_bytes(request.into_body(), usize::MAX)
+                match read_json_body(request, SMALL_JSON_BODY_LIMIT, "automations request body")
                     .await
-                    .context("failed to read automations request body");
-                match body {
-                    Ok(body) => {
-                        let payload: Value =
-                            serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+                {
+                    Ok(payload) => {
                         save_automation_payload(
                             &state,
                             &auth.profile_id,
@@ -270,10 +247,7 @@ pub(crate) async fn handle_automations_api_http(
                         )
                         .await
                     }
-                    Err(_) => Err(api_error(
-                        StatusCode::BAD_REQUEST,
-                        "Failed to read automations request body.",
-                    )),
+                    Err(error) => Err(error),
                 }
             }
             &Method::DELETE => {
@@ -290,12 +264,14 @@ pub(crate) async fn handle_automations_api_http(
             .unwrap_or_default()
             .trim()
             .to_string();
-        let body = to_bytes(request.into_body(), usize::MAX)
-            .await
-            .context("failed to read automation run request body");
-        match body {
-            Ok(body) => {
-                let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+        match read_json_body(
+            request,
+            SMALL_JSON_BODY_LIMIT,
+            "automation run request body",
+        )
+        .await
+        {
+            Ok(payload) => {
                 let trigger = if payload.get("trigger").and_then(Value::as_str) == Some("schedule")
                 {
                     "schedule"
@@ -304,10 +280,7 @@ pub(crate) async fn handle_automations_api_http(
                 };
                 run_automation_payload(&state, &auth.profile_id, &automation_id, trigger).await
             }
-            Err(_) => Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "Failed to read automation run request body.",
-            )),
+            Err(error) => Err(error),
         }
     } else {
         return json_error(StatusCode::NOT_FOUND, "Not found.");
@@ -330,13 +303,8 @@ pub(crate) async fn handle_arena_api_http(
             if auth.role != UserRole::Admin {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
-            let body = to_bytes(request.into_body(), usize::MAX)
-                .await
-                .context("failed to read arena request body");
-            match body {
-                Ok(body) => {
-                    let payload: Value =
-                        serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            match read_json_body(request, LARGE_JSON_BODY_LIMIT, "arena request body").await {
+                Ok(payload) => {
                     start_arena_run_payload(
                         &state,
                         &auth.profile_id,
@@ -349,10 +317,7 @@ pub(crate) async fn handle_arena_api_http(
                     )
                     .await
                 }
-                Err(_) => Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "Failed to read arena request body.",
-                )),
+                Err(error) => Err(error),
             }
         }
         _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),

@@ -112,13 +112,8 @@ async fn handle_ws_message(
         }
         ClientEnvelope::Request { id, method, params } => {
             let params_hash = request_params_hash(&params);
-            let request_key = request_cache_key(
-                &auth.profile_id,
-                &id,
-                auth.role,
-                &method,
-                &params_hash,
-            );
+            let request_key =
+                request_cache_key(&auth.profile_id, &id, auth.role, &method, &params_hash);
 
             if let Some(cached) = cached_response(state, &request_key).await {
                 let _ = out_tx.send(cached);

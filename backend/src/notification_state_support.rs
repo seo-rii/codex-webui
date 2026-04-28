@@ -184,6 +184,9 @@ pub(crate) async fn update_notification_settings_payload(
     profile_id: &str,
     patch: Value,
 ) -> ApiResult<Value> {
+    validate_notification_webhook_url(patch.get("slackWebhookUrl"), "slackWebhookUrl")?;
+    validate_notification_webhook_url(patch.get("webhookUrl"), "webhookUrl")?;
+
     let payload = with_ui_state_write(state, profile_id, |ui_state| {
         let notifications = ui_state
             .get_mut("notifications")
@@ -251,4 +254,52 @@ pub(crate) async fn update_notification_settings_payload(
     .await;
 
     Ok(payload)
+}
+
+fn validate_notification_webhook_url(candidate: Option<&Value>, field: &str) -> ApiResult<()> {
+    let Some(raw) = candidate
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let url = reqwest::Url::parse(raw).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("{field} must be a valid URL."),
+        )
+    })?;
+    if url.scheme() != "https" {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("{field} must use https."),
+        ));
+    }
+    let host = url.host_str().unwrap_or_default();
+    let lowered_host = host.to_ascii_lowercase();
+    if lowered_host == "localhost" || lowered_host.ends_with(".localhost") {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("{field} cannot target a local address."),
+        ));
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if ip.is_loopback()
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || match ip {
+                std::net::IpAddr::V4(value) => value.is_private() || value.is_link_local(),
+                std::net::IpAddr::V6(value) => {
+                    value.is_unique_local() || value.is_unicast_link_local()
+                }
+            }
+        {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!("{field} cannot target a private or local address."),
+            ));
+        }
+    }
+    Ok(())
 }

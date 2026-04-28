@@ -277,6 +277,35 @@ async fn notification_helpers_update_ui_state_and_counts() {
 }
 
 #[tokio::test]
+async fn notification_settings_reject_local_webhook_urls() {
+    let sandbox = unique_test_dir("notifications-webhook-policy");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let error = update_notification_settings_payload(
+        &state,
+        "default",
+        json!({
+            "slackWebhookUrl": "https://127.0.0.1/hook",
+            "webhookUrl": "http://example.com/hook"
+        }),
+    )
+    .await
+    .expect_err("private and non-https webhook URLs should be rejected");
+
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.message,
+        "slackWebhookUrl cannot target a private or local address."
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn terminal_cleanup_removes_stale_sessions() {
     let sandbox = unique_test_dir("terminal-cleanup");
     let workspace = sandbox.join("workspace");

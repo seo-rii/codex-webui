@@ -301,6 +301,29 @@ pub(crate) async fn get_git_commit_diff_payload(
             "commitHash is required.",
         ));
     }
+    let changed_files = run_git_text_payload(
+        state,
+        &repo_root,
+        vec![
+            "show".to_string(),
+            "--format=".to_string(),
+            "--name-only".to_string(),
+            normalized_commit_hash.to_string(),
+        ],
+    )
+    .await?
+    .lines()
+    .map(str::trim)
+    .filter(|line| !line.is_empty())
+    .count();
+    if changed_files > GIT_DIFF_PREVIEW_MAX_FILES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "The selected commit changes {changed_files} files, which exceeds the {GIT_DIFF_PREVIEW_MAX_FILES} file preview limit."
+            ),
+        ));
+    }
     let diff = run_git_text_payload(
         state,
         &repo_root,
@@ -314,9 +337,19 @@ pub(crate) async fn get_git_commit_diff_payload(
         ],
     )
     .await?;
+    if diff.len() > GIT_DIFF_PREVIEW_LIMIT_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "The selected commit diff exceeds the {} byte preview limit.",
+                GIT_DIFF_PREVIEW_LIMIT_BYTES
+            ),
+        ));
+    }
     Ok(json!({
         "repoPath": repo_root,
         "commitHash": normalized_commit_hash,
+        "changedFileCount": changed_files,
         "diff": diff
     }))
 }

@@ -1065,6 +1065,46 @@ async fn git_read_payloads_use_rust_helpers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_commit_diff_rejects_too_many_changed_files() {
+    let sandbox = unique_test_dir("git-diff-file-limit");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let repo = workspace.join("repo");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    init_test_git_repo(&repo);
+    let bulk_dir = repo.join("bulk");
+    fs::create_dir_all(&bulk_dir).unwrap();
+    for index in 0..=GIT_DIFF_PREVIEW_MAX_FILES {
+        fs::write(
+            bulk_dir.join(format!("file-{index}.txt")),
+            format!("{index}\n"),
+        )
+        .unwrap();
+    }
+    let add = std::process::Command::new("git")
+        .args(["-C", repo.to_str().unwrap(), "add", "bulk"])
+        .output()
+        .unwrap();
+    assert!(add.status.success(), "git add bulk failed");
+    let commit = std::process::Command::new("git")
+        .args(["-C", repo.to_str().unwrap(), "commit", "-m", "bulk update"])
+        .output()
+        .unwrap();
+    assert!(commit.status.success(), "git commit bulk failed");
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let error = get_git_commit_diff_payload(&state, repo.to_str().unwrap(), "HEAD")
+        .await
+        .expect_err("large changed-file count should be rejected");
+
+    assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(error.message.contains("file preview limit"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_write_payloads_use_rust_helpers() {
     let sandbox = unique_test_dir("git-write");
     let workspace = sandbox.join("workspace");

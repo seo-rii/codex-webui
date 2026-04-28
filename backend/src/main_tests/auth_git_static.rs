@@ -47,10 +47,12 @@ async fn websocket_response_cache_is_partitioned_by_role_method_and_params() {
     let method = "config/set";
     let params = json!({ "value": "admin-only" });
     let params_hash = request_params_hash(&params);
-    let admin_key = request_cache_key("default", request_id, UserRole::Admin, method, &params_hash);
+    let admin_key = request_cache_key("default", request_id, UserRole::Admin);
     cache_response(
         &state,
         &admin_key,
+        method,
+        &params_hash,
         ServerEnvelope::Response {
             id: request_id.to_string(),
             ok: true,
@@ -60,34 +62,82 @@ async fn websocket_response_cache_is_partitioned_by_role_method_and_params() {
     )
     .await;
 
-    let viewer_key = request_cache_key(
-        "default",
-        request_id,
-        UserRole::Viewer,
-        method,
-        &params_hash,
-    );
-    assert!(cached_response(&state, &viewer_key).await.is_none());
-
-    let method_key = request_cache_key(
-        "default",
-        request_id,
-        UserRole::Admin,
-        "runtime/status",
-        &params_hash,
-    );
-    assert!(cached_response(&state, &method_key).await.is_none());
+    let viewer_key = request_cache_key("default", request_id, UserRole::Viewer);
+    assert!(matches!(
+        cached_response(&state, &viewer_key, method, &params_hash).await,
+        CachedResponseLookup::Miss
+    ));
+    assert!(matches!(
+        cached_response(&state, &admin_key, "runtime/status", &params_hash).await,
+        CachedResponseLookup::Conflict
+    ));
 
     let different_params_hash = request_params_hash(&json!({ "value": "different" }));
-    let params_key = request_cache_key(
-        "default",
-        request_id,
-        UserRole::Admin,
-        method,
-        &different_params_hash,
-    );
-    assert!(cached_response(&state, &params_key).await.is_none());
-    assert!(cached_response(&state, &admin_key).await.is_some());
+    assert!(matches!(
+        cached_response(&state, &admin_key, method, &different_params_hash).await,
+        CachedResponseLookup::Conflict
+    ));
+    assert!(matches!(
+        cached_response(&state, &admin_key, method, &params_hash).await,
+        CachedResponseLookup::Hit(_)
+    ));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_inflight_requests_reject_id_reuse_with_different_payloads() {
+    let sandbox = unique_test_dir("ws-inflight-idempotency");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let request_key = request_cache_key("default", "client-id", UserRole::Admin);
+    let params_hash = request_params_hash(&json!({ "value": 1 }));
+    let (first_tx, _first_rx) = mpsc::unbounded_channel();
+    let (second_tx, _second_rx) = mpsc::unbounded_channel();
+
+    assert!(matches!(
+        register_inflight_request(&state, &request_key, "session/get", &params_hash, &first_tx)
+            .await,
+        InflightRequestRegistration::Started
+    ));
+    assert!(matches!(
+        register_inflight_request(
+            &state,
+            &request_key,
+            "session/get",
+            &params_hash,
+            &second_tx
+        )
+        .await,
+        InflightRequestRegistration::Joined
+    ));
+
+    let different_params_hash = request_params_hash(&json!({ "value": 2 }));
+    assert!(matches!(
+        register_inflight_request(
+            &state,
+            &request_key,
+            "session/get",
+            &different_params_hash,
+            &second_tx
+        )
+        .await,
+        InflightRequestRegistration::Conflict
+    ));
+    assert!(matches!(
+        register_inflight_request(
+            &state,
+            &request_key,
+            "session/list",
+            &params_hash,
+            &second_tx
+        )
+        .await,
+        InflightRequestRegistration::Conflict
+    ));
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -112,6 +162,8 @@ async fn websocket_response_cache_prunes_oldest_entries_at_cap() {
                         - Duration::from_millis(
                             (RESPONSE_CACHE_MAX_ENTRIES.saturating_sub(index)) as u64,
                         ),
+                    method: "runtime/status".to_string(),
+                    params_hash: request_params_hash(&json!({ "index": index })),
                     message: ServerEnvelope::Response {
                         id: index.to_string(),
                         ok: true,
@@ -126,6 +178,8 @@ async fn websocket_response_cache_prunes_oldest_entries_at_cap() {
     cache_response(
         &state,
         "new-key",
+        "runtime/status",
+        &request_params_hash(&json!({ "new": true })),
         ServerEnvelope::Response {
             id: "new-key".to_string(),
             ok: true,

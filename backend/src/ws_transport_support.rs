@@ -134,16 +134,45 @@ async fn handle_ws_message(
         }
         ClientEnvelope::Request { id, method, params } => {
             let params_hash = request_params_hash(&params);
-            let request_key =
-                request_cache_key(&auth.profile_id, &id, auth.role, &method, &params_hash);
+            let request_key = request_cache_key(&auth.profile_id, &id, auth.role);
 
-            if let Some(cached) = cached_response(state, &request_key).await {
-                let _ = out_tx.send(cached);
-                return Ok(());
+            match cached_response(state, &request_key, &method, &params_hash).await {
+                CachedResponseLookup::Hit(cached) => {
+                    let _ = out_tx.send(cached);
+                    return Ok(());
+                }
+                CachedResponseLookup::Conflict => {
+                    let _ = out_tx.send(ServerEnvelope::Response {
+                        id,
+                        ok: false,
+                        result: None,
+                        error: Some(
+                            "WebSocket request id was already used with a different method or parameters."
+                                .to_string(),
+                        ),
+                    });
+                    return Ok(());
+                }
+                CachedResponseLookup::Miss => {}
             }
 
-            if !register_inflight_request(state, &request_key, out_tx).await {
-                return Ok(());
+            match register_inflight_request(state, &request_key, &method, &params_hash, out_tx)
+                .await
+            {
+                InflightRequestRegistration::Started => {}
+                InflightRequestRegistration::Joined => return Ok(()),
+                InflightRequestRegistration::Conflict => {
+                    let _ = out_tx.send(ServerEnvelope::Response {
+                        id,
+                        ok: false,
+                        result: None,
+                        error: Some(
+                            "WebSocket request id is already in flight with a different method or parameters."
+                                .to_string(),
+                        ),
+                    });
+                    return Ok(());
+                }
             }
 
             let audit_target = summarize_audit_target(&params);
@@ -214,7 +243,7 @@ async fn handle_ws_message(
                 });
             }
 
-            cache_response(state, &request_key, message.clone()).await;
+            cache_response(state, &request_key, &method, &params_hash, message.clone()).await;
             resolve_inflight_request(state, &request_key, message).await;
         }
     }

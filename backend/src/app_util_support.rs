@@ -14,20 +14,12 @@ pub(crate) fn request_params_hash(params: &Value) -> String {
     URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(bytes))
 }
 
-pub(crate) fn request_cache_key(
-    profile_id: &str,
-    request_id: &str,
-    role: UserRole,
-    method: &str,
-    params_hash: &str,
-) -> String {
+pub(crate) fn request_cache_key(profile_id: &str, request_id: &str, role: UserRole) -> String {
     let role = match role {
         UserRole::Admin => "admin",
         UserRole::Viewer => "viewer",
     };
-    format!(
-        "profile::{profile_id}::role::{role}::method::{method}::params::{params_hash}::request::{request_id}"
-    )
+    format!("profile::{profile_id}::role::{role}::request::{request_id}")
 }
 
 pub(crate) fn runtime_session_key(profile_id: &str, session_id: &str) -> String {

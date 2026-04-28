@@ -27,8 +27,7 @@ pub(crate) struct AppState {
     pub(crate) git_repository_cache: Arc<Mutex<Option<CachedGitRepositories>>>,
     pub(crate) pinned_git_repositories: Arc<Mutex<HashMap<String, Value>>>,
     pub(crate) git_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    pub(crate) inflight_requests:
-        Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<ServerEnvelope>>>>>,
+    pub(crate) inflight_requests: Arc<Mutex<HashMap<String, InflightRequest>>>,
     pub(crate) quota_cache: Arc<Mutex<HashMap<String, CachedQuota>>>,
     pub(crate) relays: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
     pub(crate) terminals: Arc<Mutex<HashMap<String, Arc<TerminalSession>>>>,
@@ -47,7 +46,15 @@ pub(crate) struct AppState {
 #[derive(Clone)]
 pub(crate) struct CachedResponse {
     pub(crate) created_at: Instant,
+    pub(crate) method: String,
+    pub(crate) params_hash: String,
     pub(crate) message: ServerEnvelope,
+}
+
+pub(crate) struct InflightRequest {
+    pub(crate) method: String,
+    pub(crate) params_hash: String,
+    pub(crate) waiters: Vec<mpsc::UnboundedSender<ServerEnvelope>>,
 }
 
 #[derive(Clone)]

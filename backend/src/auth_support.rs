@@ -9,7 +9,7 @@ pub(crate) fn issue_auth_cookie(
     let secure = resolve_cookie_secure(config, secure_request)?;
     let cookie_value = make_auth_token(config, role)?;
     let mut cookie = Cookie::new(AUTH_COOKIE, cookie_value);
-    cookie.set_path("/");
+    cookie.set_path(auth_cookie_path(config));
     cookie.set_http_only(true);
     cookie.set_same_site(match config.cookie_same_site {
         SameSiteMode::Strict => SameSite::Strict,
@@ -29,7 +29,7 @@ pub(crate) fn issue_profile_cookie(
 ) -> Result<CookieJar> {
     let secure = resolve_cookie_secure(config, secure_request)?;
     let mut cookie = Cookie::new(PROFILE_COOKIE, profile_id.to_string());
-    cookie.set_path("/");
+    cookie.set_path(auth_cookie_path(config));
     cookie.set_http_only(true);
     cookie.set_same_site(match config.cookie_same_site {
         SameSiteMode::Strict => SameSite::Strict,
@@ -39,6 +39,14 @@ pub(crate) fn issue_profile_cookie(
     cookie.set_secure(secure);
     cookie.set_max_age(CookieDuration::days(30));
     Ok(jar.add(cookie))
+}
+
+pub(crate) fn auth_cookie_path(config: &Config) -> String {
+    if config.base_path.is_empty() {
+        "/".to_string()
+    } else {
+        config.base_path.clone()
+    }
 }
 
 pub(crate) fn resolve_cookie_secure(config: &Config, secure_request: bool) -> Result<bool> {

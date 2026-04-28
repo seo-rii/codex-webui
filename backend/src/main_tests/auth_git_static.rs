@@ -255,6 +255,58 @@ fn auth_token_signing_requires_explicit_session_secret() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_cookies_are_scoped_to_base_path() {
+    let sandbox = unique_test_dir("auth-cookie-path");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    config.base_path = "/absproxy/4173".to_string();
+
+    let jar = issue_auth_cookie(&config, CookieJar::new(), false, UserRole::Admin).unwrap();
+    assert_eq!(
+        jar.get(AUTH_COOKIE).and_then(|cookie| cookie.path()),
+        Some("/absproxy/4173")
+    );
+    let jar = issue_profile_cookie(&config, jar, false, "default").unwrap();
+    assert_eq!(
+        jar.get(PROFILE_COOKIE).and_then(|cookie| cookie.path()),
+        Some("/absproxy/4173")
+    );
+
+    state.config = Arc::new(config);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/logout")
+        .body(Body::empty())
+        .unwrap();
+    let response = handle_auth_http(
+        state,
+        jar,
+        Method::POST,
+        "/api/auth/logout".to_string(),
+        HeaderMap::new(),
+        request,
+    )
+    .await;
+    let set_cookies = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        set_cookies
+            .iter()
+            .all(|cookie| cookie.contains("Path=/absproxy/4173"))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_login_rejects_oversized_json_body() {
     let sandbox = unique_test_dir("auth-login-body-limit");
     let workspace = sandbox.join("workspace");

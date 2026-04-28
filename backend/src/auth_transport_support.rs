@@ -38,7 +38,7 @@ pub(crate) async fn handle_auth_http(
 
     let result = match (method, route_path.as_str()) {
         (Method::POST, "/api/auth/login") => auth_login(state.clone(), jar, headers, request).await,
-        (Method::POST, "/api/auth/logout") => Ok(auth_logout(jar)),
+        (Method::POST, "/api/auth/logout") => Ok(auth_logout(&state.config, jar)),
         (Method::POST, "/api/auth/profile") => {
             let Some(auth) = auth_context(&state.config, &jar) else {
                 return json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
@@ -255,12 +255,12 @@ async fn auth_login(
         .into_response())
 }
 
-fn auth_logout(jar: CookieJar) -> Response {
+fn auth_logout(config: &Config, jar: CookieJar) -> Response {
     let mut cookie = Cookie::new(AUTH_COOKIE, "");
-    cookie.set_path("/");
+    cookie.set_path(auth_cookie_path(config));
     cookie.set_max_age(CookieDuration::seconds(0));
     let mut profile_cookie = Cookie::new(PROFILE_COOKIE, "");
-    profile_cookie.set_path("/");
+    profile_cookie.set_path(auth_cookie_path(config));
     profile_cookie.set_max_age(CookieDuration::seconds(0));
     (
         jar.remove(cookie).remove(profile_cookie),

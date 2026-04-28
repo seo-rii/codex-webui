@@ -127,6 +127,46 @@ fn websocket_origin_allows_same_origin_and_configured_cors_only() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[test]
+fn viewer_websocket_permissions_are_session_observation_only() {
+    for method in [
+        "sessions/list",
+        "sessions/search",
+        "session/get",
+        "session/olderTurns/get",
+        "session/turn/get",
+        "session/itemDetail/get",
+        "notifications/list",
+        "session/subscribe",
+        "session/unsubscribe",
+    ] {
+        assert!(
+            is_ws_method_allowed(UserRole::Viewer, method),
+            "{method} should remain visible to viewers"
+        );
+    }
+
+    for method in [
+        "config/get",
+        "account/get",
+        "audit/list",
+        "directories/browse",
+        "editor/file/get",
+        "git/repositories/list",
+        "git/status",
+        "git/file/get",
+        "terminal/list",
+        "terminal/read",
+        "session/draft/get",
+        "session/queue/get",
+    ] {
+        assert!(
+            !is_ws_method_allowed(UserRole::Viewer, method),
+            "{method} should require admin"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_login_rejects_oversized_json_body() {
     let sandbox = unique_test_dir("auth-login-body-limit");

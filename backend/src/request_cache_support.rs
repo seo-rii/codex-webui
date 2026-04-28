@@ -36,6 +36,13 @@ pub(crate) async fn cache_response(
     params_hash: &str,
     message: ServerEnvelope,
 ) {
+    let response_bytes = serde_json::to_vec(&message)
+        .map(|bytes| bytes.len())
+        .unwrap_or_default();
+    if response_bytes > RESPONSE_CACHE_MAX_ENTRY_BYTES {
+        return;
+    }
+
     let mut cache = state.response_cache.lock().await;
     prune_response_cache(&mut cache);
     cache.insert(
@@ -44,6 +51,7 @@ pub(crate) async fn cache_response(
             created_at: Instant::now(),
             method: method.to_string(),
             params_hash: params_hash.to_string(),
+            response_bytes,
             message,
         },
     );
@@ -52,7 +60,11 @@ pub(crate) async fn cache_response(
 
 fn prune_response_cache(cache: &mut HashMap<String, CachedResponse>) {
     cache.retain(|_, entry| entry.created_at.elapsed() < CACHE_TTL);
-    if cache.len() <= RESPONSE_CACHE_MAX_ENTRIES {
+    let mut total_bytes = cache
+        .values()
+        .map(|entry| entry.response_bytes)
+        .sum::<usize>();
+    if cache.len() <= RESPONSE_CACHE_MAX_ENTRIES && total_bytes <= RESPONSE_CACHE_MAX_BYTES {
         return;
     }
 
@@ -61,11 +73,13 @@ fn prune_response_cache(cache: &mut HashMap<String, CachedResponse>) {
         .map(|(key, entry)| (key.clone(), entry.created_at))
         .collect::<Vec<_>>();
     entries.sort_by_key(|(_, created_at)| *created_at);
-    for (key, _) in entries
-        .into_iter()
-        .take(cache.len().saturating_sub(RESPONSE_CACHE_MAX_ENTRIES))
-    {
-        cache.remove(&key);
+    for (key, _) in entries.into_iter() {
+        if cache.len() <= RESPONSE_CACHE_MAX_ENTRIES && total_bytes <= RESPONSE_CACHE_MAX_BYTES {
+            break;
+        }
+        if let Some(removed) = cache.remove(&key) {
+            total_bytes = total_bytes.saturating_sub(removed.response_bytes);
+        }
     }
 }
 

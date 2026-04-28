@@ -121,7 +121,16 @@ pub(crate) async fn handle_http(
                     );
                 }
 
-                let response_cache_entries = state.response_cache.lock().await.len();
+                let (response_cache_entries, response_cache_bytes) = {
+                    let cache = state.response_cache.lock().await;
+                    (
+                        cache.len(),
+                        cache
+                            .values()
+                            .map(|entry| entry.response_bytes)
+                            .sum::<usize>(),
+                    )
+                };
                 let session_thread_cache_entries = state.session_thread_cache.lock().await.len();
                 let session_search_cache_entries =
                     state.session_search_text_cache.lock().await.len();
@@ -156,6 +165,8 @@ codex_webui_allowed_roots {}\n\
 codex_webui_app_server_clients {app_server_client_count}\n\
 # TYPE codex_webui_response_cache_entries gauge\n\
 codex_webui_response_cache_entries {response_cache_entries}\n\
+# TYPE codex_webui_response_cache_bytes gauge\n\
+codex_webui_response_cache_bytes {response_cache_bytes}\n\
 # TYPE codex_webui_session_thread_cache_entries gauge\n\
 codex_webui_session_thread_cache_entries {session_thread_cache_entries}\n\
 # TYPE codex_webui_session_search_cache_entries gauge\n\

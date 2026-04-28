@@ -48,6 +48,7 @@ pub(crate) struct CachedResponse {
     pub(crate) created_at: Instant,
     pub(crate) method: String,
     pub(crate) params_hash: String,
+    pub(crate) response_bytes: usize,
     pub(crate) message: ServerEnvelope,
 }
 

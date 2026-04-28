@@ -205,6 +205,7 @@ async fn websocket_response_cache_prunes_oldest_entries_at_cap() {
                         ),
                     method: "runtime/status".to_string(),
                     params_hash: request_params_hash(&json!({ "index": index })),
+                    response_bytes: 64,
                     message: ServerEnvelope::Response {
                         id: index.to_string(),
                         ok: true,
@@ -234,6 +235,39 @@ async fn websocket_response_cache_prunes_oldest_entries_at_cap() {
     assert!(cache.len() <= RESPONSE_CACHE_MAX_ENTRIES);
     assert!(!cache.contains_key("key-0"));
     assert!(cache.contains_key("new-key"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_response_cache_skips_oversized_entries() {
+    let sandbox = unique_test_dir("ws-cache-entry-size");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let params_hash = request_params_hash(&json!({}));
+    let request_key = request_cache_key("default", "large-response", UserRole::Admin);
+
+    cache_response(
+        &state,
+        &request_key,
+        "session/get",
+        &params_hash,
+        ServerEnvelope::Response {
+            id: "large-response".to_string(),
+            ok: true,
+            result: Some(json!({ "payload": "x".repeat(RESPONSE_CACHE_MAX_ENTRY_BYTES + 1) })),
+            error: None,
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        cached_response(&state, &request_key, "session/get", &params_hash).await,
+        CachedResponseLookup::Miss
+    ));
 
     let _ = fs::remove_dir_all(sandbox);
 }

@@ -332,11 +332,25 @@ pub(crate) async fn upload_attachments(
     session_id: &str,
     files: Vec<UploadFilePayload>,
 ) -> ApiResult<Value> {
+    if files.len() > MAX_ATTACHMENTS_PER_REQUEST {
+        return Err(attachment_count_limit_error());
+    }
+
     let mut uploads = Vec::new();
     for file in files {
+        let max_encoded_len = (((state.config.max_upload_bytes as usize).saturating_add(2)) / 3)
+            .saturating_mul(4)
+            .saturating_add(4);
+        if file.data_base64.len() > max_encoded_len {
+            return Err(api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                attachment_limit_error_message(state.config.max_upload_bytes),
+            ));
+        }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(file.data_base64)
             .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+        validate_attachment_size(&state.config, bytes.len() as u64)?;
         uploads.push(AttachmentUploadPayload {
             name: file.name,
             mime_type: file.mime_type,

@@ -318,6 +318,54 @@ async fn session_attachments_http_handlers_use_rust_storage() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_attachment_upload_rejects_oversized_streamed_file() {
+    let sandbox = unique_test_dir("attachment-http-limit");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let mut state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let mut config = (*state.config).clone();
+    config.max_upload_bytes = 4;
+    state.config = Arc::new(config);
+
+    let boundary = "codex-webui-boundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"notes.md\"\r\nContent-Type: text/markdown\r\n\r\nnotes\r\n--{boundary}--\r\n"
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+
+    let response = handle_session_attachments_api_http(
+        state.clone(),
+        request,
+        AuthContext {
+            role: UserRole::Admin,
+            profile_id: "default".to_string(),
+        },
+        "thread-1",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        list_session_attachment_records(&state, "default", "thread-1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_recovery_ws_method_recovers_rollout_file() {
     let sandbox = unique_test_dir("session-recovery-ws");
     let workspace = sandbox.join("workspace");

@@ -104,6 +104,13 @@ fn attachment_storage_paths(
     )
 }
 
+pub(crate) fn session_uploads_dir(state: &AppState, profile_id: &str, session_id: &str) -> PathBuf {
+    resolve_runtime_profile(&state.config, profile_id)
+        .data_dir
+        .join("uploads")
+        .join(session_id)
+}
+
 fn attachment_kind_for_mime(mime_type: &str) -> &'static str {
     match mime_type {
         "image/png" | "image/jpeg" | "image/webp" | "image/gif" => "image",
@@ -111,9 +118,28 @@ fn attachment_kind_for_mime(mime_type: &str) -> &'static str {
     }
 }
 
-fn attachment_limit_error_message(max_upload_bytes: u64) -> String {
+pub(crate) fn attachment_limit_error_message(max_upload_bytes: u64) -> String {
     let max_upload_mb = ((max_upload_bytes as f64) / (1024.0 * 1024.0)).round() as u64;
     format!("Upload exceeds the {max_upload_mb}MB limit.")
+}
+
+pub(crate) const MAX_ATTACHMENTS_PER_REQUEST: usize = 20;
+
+pub(crate) fn attachment_count_limit_error() -> ApiError {
+    api_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!("Upload is limited to {MAX_ATTACHMENTS_PER_REQUEST} files."),
+    )
+}
+
+pub(crate) fn validate_attachment_size(config: &Config, size: u64) -> ApiResult<()> {
+    if size > config.max_upload_bytes {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            attachment_limit_error_message(config.max_upload_bytes),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn attachment_payload_from_record(record: &StoredAttachmentRecord) -> Value {
@@ -215,6 +241,64 @@ pub(crate) async fn save_uploaded_attachment_records(
     }
 
     Ok(stored)
+}
+
+pub(crate) async fn store_uploaded_attachment_file(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    original_name: &str,
+    mime_type: Option<String>,
+    size: u64,
+    source_path: &Path,
+) -> ApiResult<StoredAttachmentRecord> {
+    validate_attachment_size(&state.config, size)?;
+    let uploads_dir = resolve_runtime_profile(&state.config, profile_id)
+        .data_dir
+        .join("uploads")
+        .join(session_id);
+    tokio_fs::create_dir_all(&uploads_dir)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    let attachment_id = Uuid::new_v4().to_string();
+    let original_name = if original_name.trim().is_empty() {
+        "attachment".to_string()
+    } else {
+        original_name.trim().to_string()
+    };
+    let mime_type = mime_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let (file_path, meta_path) = attachment_storage_paths(
+        state,
+        profile_id,
+        session_id,
+        &attachment_id,
+        &original_name,
+    );
+    tokio_fs::rename(source_path, &file_path)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    let record = StoredAttachmentRecord {
+        id: attachment_id,
+        original_name,
+        path: Some(file_path.display().to_string()),
+        mime_type: Some(mime_type.clone()),
+        size: Some(size),
+        kind: Some(attachment_kind_for_mime(&mime_type).to_string()),
+        created_at: Some(now_unix_ms().to_string()),
+    };
+    let metadata = serde_json::to_vec_pretty(&record)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    tokio_fs::write(&meta_path, metadata)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(record)
 }
 
 pub(crate) async fn emit_attachments_updated(

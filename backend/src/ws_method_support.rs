@@ -49,6 +49,23 @@ pub(crate) fn ws_method_requires_owner(method: &str, params: &Value) -> bool {
             .unwrap_or(false))
 }
 
+pub(crate) fn authorize_ws_method(
+    config: &Config,
+    role: UserRole,
+    method: &str,
+    params: &Value,
+) -> Result<()> {
+    if !is_ws_method_allowed(role, method) {
+        anyhow::bail!(
+            "{{\"code\":\"FORBIDDEN_ROLE\",\"message\":\"This action requires an admin role.\"}}"
+        );
+    }
+    if ws_method_requires_owner(method, params) && !role_has_owner_access(config, role) {
+        anyhow::bail!(owner_required_error_value());
+    }
+    Ok(())
+}
+
 pub(crate) fn should_audit_ws_method(method: &str) -> bool {
     !matches!(
         method,

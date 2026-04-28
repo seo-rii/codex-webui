@@ -167,6 +167,17 @@ async fn owner_config_blocks_admin_from_owner_only_websocket_methods() {
         "git/worktrees/remove",
         &json!({ "force": false })
     ));
+    assert!(
+        authorize_ws_method(
+            &state.config,
+            UserRole::Admin,
+            "runtime/install",
+            &json!({})
+        )
+        .expect_err("admin should fail owner preflight")
+        .to_string()
+        .contains("OWNER_REQUIRED")
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }

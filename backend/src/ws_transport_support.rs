@@ -149,6 +149,18 @@ async fn handle_ws_message(
             let _ = out_tx.send(ServerEnvelope::Pong { nonce }).await;
         }
         ClientEnvelope::Request { id, method, params } => {
+            if let Err(error) = authorize_ws_method(&state.config, auth.role, &method, &params) {
+                let _ = out_tx
+                    .send(ServerEnvelope::Response {
+                        id,
+                        ok: false,
+                        result: None,
+                        error: Some(redact_user_facing_error(&error.to_string())),
+                    })
+                    .await;
+                return Ok(());
+            }
+
             let params_hash = request_params_hash(&params);
             let request_key = request_cache_key(&auth.profile_id, &id, auth.role);
 

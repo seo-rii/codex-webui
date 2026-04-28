@@ -170,6 +170,7 @@ pub(crate) async fn remove_git_worktree_payload(
     let repo_lock = git_operation_lock(state, &repo_root).await;
     let _repo_guard = repo_lock.lock().await;
     let resolved_worktree_path = resolve_git_worktree_path(state, worktree_path).await?;
+    reject_git_mutation_if_repo_busy(state, &resolved_worktree_path).await?;
     let worktrees_output = run_git_text_payload(
         state,
         &repo_root,

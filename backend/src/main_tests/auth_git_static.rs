@@ -1261,6 +1261,56 @@ async fn git_mutations_share_repo_operation_lock() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destructive_git_mutations_reject_active_codex_work() {
+    let sandbox = unique_test_dir("git-busy-active-turn");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let repo = workspace.join("repo");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    init_test_git_repo(&repo);
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(preferences_by_thread_id) = ui_state
+            .get_mut("preferencesByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "preferences state is missing",
+            ));
+        };
+        preferences_by_thread_id.insert(
+            "thread-1".to_string(),
+            json!({
+                "cwd": repo.display().to_string(),
+                "gitRepoPath": repo.display().to_string()
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+    state.active_turns.lock().await.insert(
+        runtime_session_key("default", "thread-1"),
+        "turn-1".to_string(),
+    );
+
+    let error = checkout_git_branch_payload(&state, repo.to_str().unwrap(), "busy-test", true)
+        .await
+        .expect_err("branch switching should reject active Codex work");
+
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(
+        error.message,
+        "Refusing to mutate this repository while a Codex turn is active."
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_file_save_rejects_symlinked_parent_escape() {

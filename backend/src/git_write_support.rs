@@ -9,6 +9,74 @@ pub(crate) async fn git_operation_lock(state: &AppState, repo_root: &str) -> Arc
     )
 }
 
+fn runtime_session_key_parts(key: &str) -> Option<(&str, &str)> {
+    key.strip_prefix("profile::")?
+        .split_once("::session-runtime::")
+}
+
+pub(crate) async fn reject_git_mutation_if_repo_busy(
+    state: &AppState,
+    repo_root: &str,
+) -> ApiResult<()> {
+    let repo_root_path = tokio_fs::canonicalize(repo_root)
+        .await
+        .unwrap_or_else(|_| PathBuf::from(repo_root));
+    let runtime_keys = {
+        let active_turns = state.active_turns.lock().await;
+        let pending_turn_starts = state.pending_turn_starts.lock().await;
+        active_turns
+            .keys()
+            .chain(pending_turn_starts.iter())
+            .cloned()
+            .collect::<HashSet<_>>()
+    };
+
+    for runtime_key in runtime_keys {
+        let Some((profile_id, session_id)) = runtime_session_key_parts(&runtime_key) else {
+            continue;
+        };
+        let candidate_paths = with_ui_state_read(state, profile_id, |ui_state| {
+            let preferences = ui_state
+                .get("preferencesByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id))
+                .and_then(Value::as_object);
+            let mut paths = Vec::new();
+            if let Some(preferences) = preferences {
+                for key in ["gitRepoPath", "cwd"] {
+                    if let Some(path) = preferences
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        paths.push(path.to_string());
+                    }
+                }
+            }
+            Ok(paths)
+        })
+        .await
+        .unwrap_or_default();
+
+        for candidate in candidate_paths {
+            let candidate_path = tokio_fs::canonicalize(&candidate)
+                .await
+                .unwrap_or_else(|_| PathBuf::from(&candidate));
+            if path_is_within(&repo_root_path, &candidate_path)
+                || path_is_within(&candidate_path, &repo_root_path)
+            {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    "Refusing to mutate this repository while a Codex turn is active.",
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn save_git_file_payload(
     state: &AppState,
     repo_path: &str,
@@ -97,6 +165,7 @@ pub(crate) async fn pull_git_repository_payload(
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
     let repo_lock = git_operation_lock(state, &repo_root).await;
     let _repo_guard = repo_lock.lock().await;
+    reject_git_mutation_if_repo_busy(state, &repo_root).await?;
     run_git_text_payload(
         state,
         &repo_root,
@@ -144,6 +213,7 @@ pub(crate) async fn checkout_git_branch_payload(
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
     let repo_lock = git_operation_lock(state, &repo_root).await;
     let _repo_guard = repo_lock.lock().await;
+    reject_git_mutation_if_repo_busy(state, &repo_root).await?;
     let trimmed_branch_name = branch_name.trim();
     if trimmed_branch_name.is_empty() {
         return Err(api_error(

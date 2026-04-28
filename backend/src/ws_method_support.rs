@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) fn is_ws_method_allowed(role: UserRole, method: &str) -> bool {
-    if role == UserRole::Admin {
+    if role_has_admin_access(role) {
         return true;
     }
 
@@ -21,6 +21,27 @@ pub(crate) fn is_ws_method_allowed(role: UserRole, method: &str) -> bool {
             | "events/subscribe"
             | "events/unsubscribe"
     )
+}
+
+pub(crate) fn ws_method_requires_owner(method: &str, params: &Value) -> bool {
+    matches!(
+        method,
+        "config/update"
+            | "runtime/install"
+            | "runtime/update"
+            | "terminal/list"
+            | "terminal/create"
+            | "terminal/read"
+            | "terminal/context/attach"
+            | "terminal/input"
+            | "terminal/close"
+            | "terminal/subscribe"
+            | "terminal/unsubscribe"
+    ) || (method == "git/worktrees/remove"
+        && params
+            .get("force")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
 }
 
 pub(crate) fn should_audit_ws_method(method: &str) -> bool {

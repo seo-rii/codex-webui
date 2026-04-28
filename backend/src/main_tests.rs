@@ -81,6 +81,8 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
             system_shutdown_command_override: None,
             password: None,
             password_hash: None,
+            owner_password: None,
+            owner_password_hash: None,
             viewer_password: None,
             viewer_password_hash: None,
             hcaptcha_site_key: None,

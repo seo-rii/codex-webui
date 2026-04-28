@@ -502,8 +502,11 @@ pub(crate) async fn handle_config_api_http(
     let result = match request.method() {
         &Method::GET => get_config_payload(&state, &auth.profile_id).await,
         &Method::PATCH => {
-            if auth.role != UserRole::Admin {
+            if !role_has_admin_access(auth.role) {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+            }
+            if !role_has_owner_access(&state.config, auth.role) {
+                return json_error(StatusCode::FORBIDDEN, &owner_required_error_value());
             }
 
             match read_json_body(request, SMALL_JSON_BODY_LIMIT, "config request body").await {

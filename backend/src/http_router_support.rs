@@ -72,7 +72,7 @@ pub(crate) async fn handle_git_api_http(
     route_path: &str,
 ) -> Response {
     let method = request.method().clone();
-    if method != Method::GET && auth.role != UserRole::Admin {
+    if method != Method::GET && !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 

@@ -9,7 +9,7 @@ pub(crate) async fn handle_session_fork_api_http(
     if request.method() != Method::POST {
         return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
     }
-    if auth.role != UserRole::Admin {
+    if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
@@ -46,7 +46,7 @@ pub(crate) async fn handle_session_organization_api_http(
     if request.method() != Method::PATCH {
         return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
     }
-    if auth.role != UserRole::Admin {
+    if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
@@ -74,7 +74,7 @@ pub(crate) async fn handle_session_name_api_http(
     if request.method() != Method::POST {
         return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
     }
-    if auth.role != UserRole::Admin {
+    if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
@@ -110,7 +110,7 @@ pub(crate) async fn handle_session_archive_api_http(
     if request.method() != Method::POST {
         return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
     }
-    if auth.role != UserRole::Admin {
+    if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
@@ -135,7 +135,7 @@ pub(crate) async fn handle_session_draft_api_http(
     let result = match request.method() {
         &Method::GET => get_session_draft_payload(&state, &auth.profile_id, session_id).await,
         &Method::PATCH => {
-            if auth.role != UserRole::Admin {
+            if !role_has_admin_access(auth.role) {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
             match read_json_body(request, SMALL_JSON_BODY_LIMIT, "draft request body").await {
@@ -159,7 +159,7 @@ pub(crate) async fn handle_session_draft_api_http(
             }
         }
         &Method::DELETE => {
-            if auth.role != UserRole::Admin {
+            if !role_has_admin_access(auth.role) {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
             clear_session_draft_payload(&state, &auth.profile_id, session_id).await
@@ -182,7 +182,7 @@ pub(crate) async fn handle_session_messages_api_http(
     if request.method() != Method::POST {
         return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
     }
-    if auth.role != UserRole::Admin {
+    if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
@@ -224,7 +224,7 @@ pub(crate) async fn handle_session_steer_api_http(
     if request.method() != Method::POST {
         return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
     }
-    if auth.role != UserRole::Admin {
+    if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 

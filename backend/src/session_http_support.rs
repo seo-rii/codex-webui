@@ -44,7 +44,7 @@ pub(crate) async fn handle_sessions_api_http(
             }
         }
         &Method::POST => {
-            if auth.role != UserRole::Admin {
+            if !role_has_admin_access(auth.role) {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
 
@@ -88,7 +88,7 @@ pub(crate) async fn handle_session_api_http(
             session_detail_payload(&state, &auth.profile_id, session_id, limit).await
         }
         &Method::PATCH => {
-            if auth.role != UserRole::Admin {
+            if !role_has_admin_access(auth.role) {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
 

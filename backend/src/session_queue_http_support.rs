@@ -10,7 +10,7 @@ pub(crate) async fn handle_session_queue_api_http(
     let queue_prefix = format!("/api/sessions/{session_id}/queue");
     let suffix = route_path.strip_prefix(&queue_prefix).unwrap_or_default();
     let requires_admin = request.method() != Method::GET;
-    if requires_admin && auth.role != UserRole::Admin {
+    if requires_admin && !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
@@ -153,7 +153,7 @@ pub(crate) async fn handle_session_abort_api_http(
     if request.method() != Method::POST {
         return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
     }
-    if auth.role != UserRole::Admin {
+    if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
@@ -172,7 +172,7 @@ pub(crate) async fn handle_session_approval_api_http(
     if request.method() != Method::POST {
         return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
     }
-    if auth.role != UserRole::Admin {
+    if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 

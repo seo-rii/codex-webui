@@ -376,7 +376,7 @@
       }
     ];
 
-    if (webRole === "admin") {
+    if (webRole !== "viewer") {
       tabs.splice(2, 0, {
         id: "audit",
         label: ui.auditLog,
@@ -426,7 +426,7 @@
   });
 
   $effect(() => {
-    if (webRole !== "admin") {
+    if (webRole === "viewer") {
       auditLoadedForAdmin = false;
       return;
     }
@@ -543,13 +543,13 @@
       const [nextFile, nextCatalog, nextAudit] = await Promise.all([
         api.getEditableFile(configFilePath),
         api.getCatalog(),
-        webRole === "admin" ? api.getAuditLog(120) : Promise.resolve({ entries: [] as AuditLogEntry[] })
+        webRole !== "viewer" ? api.getAuditLog(120) : Promise.resolve({ entries: [] as AuditLogEntry[] })
       ]);
       configFile = nextFile;
       editorValue = nextFile.content;
       catalog = nextCatalog;
       auditEntries = nextAudit.entries;
-      auditLoadedForAdmin = webRole === "admin";
+      auditLoadedForAdmin = webRole !== "viewer";
     } catch (error) {
       errorText = error instanceof Error ? error.message : ui.failedLoad;
     } finally {

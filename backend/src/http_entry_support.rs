@@ -114,7 +114,7 @@ pub(crate) async fn handle_http(
                 let Some(auth) = auth_context(&state.config, &jar) else {
                     return json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
                 };
-                if auth.role != UserRole::Admin {
+                if !role_has_admin_access(auth.role) {
                     return json_error(
                         StatusCode::FORBIDDEN,
                         "This action requires an admin role.",

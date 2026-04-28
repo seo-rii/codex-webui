@@ -13,7 +13,7 @@ pub(crate) async fn handle_editor_api_http(
             read_editable_file_payload(&state, &auth.profile_id, &file_path).await
         }
         Method::PUT => {
-            if auth.role != UserRole::Admin {
+            if !role_has_admin_access(auth.role) {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
 
@@ -70,7 +70,7 @@ pub(crate) async fn handle_notifications_api_http(
             get_notifications_payload(&state, &auth.profile_id, limit).await
         }
         &Method::PATCH => {
-            if auth.role != UserRole::Admin {
+            if !role_has_admin_access(auth.role) {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
             match read_json_body(request, SMALL_JSON_BODY_LIMIT, "notifications request body").await
@@ -89,7 +89,7 @@ pub(crate) async fn handle_notifications_api_http(
             }
         }
         &Method::DELETE => {
-            if auth.role != UserRole::Admin {
+            if !role_has_admin_access(auth.role) {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
             clear_notifications_payload(&state, &auth.profile_id).await
@@ -111,7 +111,7 @@ pub(crate) async fn handle_notification_settings_api_http(
     if request.method() != Method::PATCH {
         return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
     }
-    if auth.role != UserRole::Admin {
+    if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
@@ -139,7 +139,7 @@ pub(crate) async fn handle_session_filters_api_http(
     request: Request,
     auth: AuthContext,
 ) -> Response {
-    if auth.role != UserRole::Admin {
+    if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
@@ -182,7 +182,7 @@ pub(crate) async fn handle_prompt_presets_api_http(
     request: Request,
     auth: AuthContext,
 ) -> Response {
-    if auth.role != UserRole::Admin {
+    if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
@@ -226,7 +226,7 @@ pub(crate) async fn handle_automations_api_http(
     auth: AuthContext,
     route_path: &str,
 ) -> Response {
-    if auth.role != UserRole::Admin {
+    if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
@@ -300,7 +300,7 @@ pub(crate) async fn handle_arena_api_http(
     let result = match request.method() {
         &Method::GET => list_arena_runs_payload(&state, &auth.profile_id).await,
         &Method::POST => {
-            if auth.role != UserRole::Admin {
+            if !role_has_admin_access(auth.role) {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
             match read_json_body(request, LARGE_JSON_BODY_LIMIT, "arena request body").await {

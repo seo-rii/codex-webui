@@ -77,6 +77,89 @@ fn user_facing_error_redaction_hides_paths_and_tokens() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_password_authenticates_as_owner_role() {
+    let sandbox = unique_test_dir("owner-password-role");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let mut config = (*test_state(workspace.clone(), vec![workspace], codex_home).config).clone();
+    config.owner_password = Some("owner-secret".to_string());
+    config.password = Some("admin-secret".to_string());
+
+    assert_eq!(
+        authenticate_role(&config, "owner-secret").unwrap(),
+        Some(UserRole::Owner)
+    );
+    assert_eq!(
+        authenticate_role(&config, "admin-secret").unwrap(),
+        Some(UserRole::Admin)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[test]
+fn auth_cookie_round_trips_owner_role() {
+    let sandbox = unique_test_dir("owner-cookie-role");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let config = (*test_state(workspace.clone(), vec![workspace], codex_home).config).clone();
+    let jar = issue_auth_cookie(&config, CookieJar::new(), false, UserRole::Owner).unwrap();
+    let auth = auth_context(&config, &jar).expect("owner cookie should authenticate");
+
+    assert_eq!(auth.role, UserRole::Owner);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_config_blocks_admin_from_owner_only_websocket_methods() {
+    let sandbox = unique_test_dir("owner-only-ws-method");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    config.owner_password = Some("owner-secret".to_string());
+    state.config = Arc::new(config);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    let auth = AuthContext {
+        profile_id: "default".to_string(),
+        role: UserRole::Admin,
+    };
+
+    let error = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "runtime/install",
+        json!({}),
+    )
+    .await
+    .expect_err("admin should not run owner-only method when owner role is configured");
+
+    assert!(error.to_string().contains("OWNER_REQUIRED"));
+    assert!(is_ws_method_allowed(UserRole::Owner, "terminal/create"));
+    assert!(ws_method_requires_owner("terminal/create", &json!({})));
+    assert!(ws_method_requires_owner(
+        "git/worktrees/remove",
+        &json!({ "force": true })
+    ));
+    assert!(!ws_method_requires_owner(
+        "git/worktrees/remove",
+        &json!({ "force": false })
+    ));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_response_cache_is_partitioned_by_role_method_and_params() {
     let sandbox = unique_test_dir("ws-cache-partition");
     let workspace = sandbox.join("workspace");

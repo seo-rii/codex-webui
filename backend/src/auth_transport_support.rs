@@ -57,6 +57,7 @@ pub(crate) async fn handle_auth_http(
                     "authenticated": auth.is_some(),
                     "activeProfileId": active_profile_id,
                     "role": auth.map(|context| match context.role {
+                        UserRole::Owner => "owner",
                         UserRole::Admin => "admin",
                         UserRole::Viewer => "viewer",
                     }),
@@ -231,10 +232,7 @@ async fn auth_login(
         AuditLogEntry {
             id: Uuid::new_v4().to_string(),
             at: now_unix_ms(),
-            role: match role {
-                UserRole::Admin => "admin".to_string(),
-                UserRole::Viewer => "viewer".to_string(),
-            },
+            role: user_role_label(role).to_string(),
             method: "auth/login".to_string(),
             target: None,
             ok: true,
@@ -246,10 +244,7 @@ async fn auth_login(
         next_jar,
         Json(json!({
             "ok": true,
-            "role": match role {
-                UserRole::Admin => "admin",
-                UserRole::Viewer => "viewer",
-            }
+            "role": user_role_label(role)
         })),
     )
         .into_response())

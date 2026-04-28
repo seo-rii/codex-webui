@@ -13,6 +13,10 @@ pub(crate) async fn execute_ws_method(
             "{{\"code\":\"FORBIDDEN_ROLE\",\"message\":\"This action requires an admin role.\"}}"
         ));
     }
+    if ws_method_requires_owner(method, &params) && !role_has_owner_access(&state.config, auth.role)
+    {
+        return Err(anyhow!(owner_required_error_value()));
+    }
 
     match method {
         "config/get" => get_config_payload(state, &auth.profile_id)

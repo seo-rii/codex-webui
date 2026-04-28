@@ -77,14 +77,7 @@ pub(crate) fn make_auth_token(config: &Config, role: UserRole) -> Result<String>
     let now = now_millis();
     let expires = now + 7 * 24 * 60 * 60 * 1000;
     let nonce = Uuid::new_v4().simple().to_string();
-    let payload = format!(
-        "{now}.{expires}.{}.{}",
-        match role {
-            UserRole::Admin => "admin",
-            UserRole::Viewer => "viewer",
-        },
-        nonce
-    );
+    let payload = format!("{now}.{expires}.{}.{}", user_role_label(role), nonce);
     let signature = sign(config, &payload)?;
     Ok(format!("{payload}.{signature}"))
 }
@@ -119,10 +112,7 @@ pub(crate) async fn select_profile(
         AuditLogEntry {
             id: Uuid::new_v4().to_string(),
             at: now_unix_ms(),
-            role: match auth.role {
-                UserRole::Admin => "admin".to_string(),
-                UserRole::Viewer => "viewer".to_string(),
-            },
+            role: user_role_label(auth.role).to_string(),
             method: "auth/profile".to_string(),
             target: Some(requested_profile_id.clone()),
             ok: true,
@@ -169,6 +159,7 @@ pub(crate) fn auth_context(config: &Config, jar: &CookieJar) -> Option<AuthConte
 
     let role = if parts.len() == 5 {
         match parts[2] {
+            "owner" => UserRole::Owner,
             "viewer" => UserRole::Viewer,
             _ => UserRole::Admin,
         }
@@ -371,6 +362,17 @@ pub(crate) fn verify_password_pair(
 }
 
 pub(crate) fn authenticate_role(config: &Config, input: &str) -> Result<Option<UserRole>> {
+    if (config.owner_password.is_some() || config.owner_password_hash.is_some())
+        && verify_password_pair(
+            config.owner_password.as_ref(),
+            config.owner_password_hash.as_ref(),
+            input,
+            "Failed to verify owner password.",
+        )?
+    {
+        return Ok(Some(UserRole::Owner));
+    }
+
     if verify_password_pair(
         config.password.as_ref(),
         config.password_hash.as_ref(),

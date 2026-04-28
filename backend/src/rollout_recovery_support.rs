@@ -125,7 +125,7 @@ pub(crate) async fn recover_session_rollout_payload(
     role: UserRole,
     session_id: &str,
 ) -> Result<Value, RolloutRecoveryActionError> {
-    if role != UserRole::Admin {
+    if !role_has_admin_access(role) {
         return Err(RolloutRecoveryActionError::new(
             StatusCode::FORBIDDEN,
             "FORBIDDEN_ROLE",

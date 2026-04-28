@@ -15,7 +15,7 @@ pub(crate) async fn handle_session_attachments_api_http(
             }
         }
         Method::POST => {
-            if auth.role != UserRole::Admin {
+            if !role_has_admin_access(auth.role) {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
             let max_total_upload_bytes = state
@@ -166,7 +166,7 @@ pub(crate) async fn handle_session_attachment_api_http(
     if request.method() != Method::DELETE {
         return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
     }
-    if auth.role != UserRole::Admin {
+    if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 

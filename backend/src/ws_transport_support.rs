@@ -230,6 +230,7 @@ async fn handle_ws_message(
                             id: Uuid::new_v4().to_string(),
                             at: now_unix_ms(),
                             role: match role {
+                                UserRole::Owner => "owner".to_string(),
                                 UserRole::Admin => "admin".to_string(),
                                 UserRole::Viewer => "viewer".to_string(),
                             },

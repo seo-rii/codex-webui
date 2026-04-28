@@ -14,12 +14,48 @@ pub(crate) fn request_params_hash(params: &Value) -> String {
     URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(bytes))
 }
 
-pub(crate) fn request_cache_key(profile_id: &str, request_id: &str, role: UserRole) -> String {
-    let role = match role {
+pub(crate) fn user_role_label(role: UserRole) -> &'static str {
+    match role {
+        UserRole::Owner => "owner",
         UserRole::Admin => "admin",
         UserRole::Viewer => "viewer",
-    };
-    format!("profile::{profile_id}::role::{role}::request::{request_id}")
+    }
+}
+
+pub(crate) fn role_has_admin_access(role: UserRole) -> bool {
+    matches!(role, UserRole::Owner | UserRole::Admin)
+}
+
+pub(crate) fn owner_role_configured(config: &Config) -> bool {
+    config
+        .owner_password
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        || config
+            .owner_password_hash
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+}
+
+pub(crate) fn role_has_owner_access(config: &Config, role: UserRole) -> bool {
+    !owner_role_configured(config) || matches!(role, UserRole::Owner)
+}
+
+pub(crate) fn owner_required_error_value() -> String {
+    json!({
+        "code": "OWNER_REQUIRED",
+        "message": "This action requires the owner role."
+    })
+    .to_string()
+}
+
+pub(crate) fn request_cache_key(profile_id: &str, request_id: &str, role: UserRole) -> String {
+    format!(
+        "profile::{profile_id}::role::{}::request::{request_id}",
+        user_role_label(role)
+    )
 }
 
 pub(crate) fn runtime_session_key(profile_id: &str, session_id: &str) -> String {

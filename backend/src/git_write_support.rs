@@ -8,14 +8,10 @@ pub(crate) async fn save_git_file_payload(
 ) -> ApiResult<Value> {
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
     let target_path = resolve_git_repository_file_path(&repo_root, file_path).await?;
-    if let Some(parent) = target_path.parent() {
-        tokio_fs::create_dir_all(parent)
-            .await
-            .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
-    }
-    tokio_fs::write(&target_path, content)
+    let repo_root_path = tokio_fs::canonicalize(&repo_root)
         .await
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+        .unwrap_or_else(|_| PathBuf::from(&repo_root));
+    write_text_file_safely(&target_path, content, &[repo_root_path]).await?;
     get_git_file_payload(state, &repo_root, file_path).await
 }
 

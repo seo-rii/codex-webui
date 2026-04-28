@@ -567,6 +567,40 @@ async fn git_write_payloads_use_rust_helpers() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_file_save_rejects_symlinked_parent_escape() {
+    let sandbox = unique_test_dir("git-write-symlink-parent");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let repo = workspace.join("repo");
+    let outside = sandbox.join("outside");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    init_test_git_repo(&repo);
+    std::os::unix::fs::symlink(&outside, repo.join("link-out")).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let error = save_git_file_payload(
+        &state,
+        repo.to_str().unwrap(),
+        "link-out/secret.txt",
+        "secret\n",
+    )
+    .await
+    .expect_err("git file save must not write through symlinked parents");
+
+    assert_eq!(error.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        error.message,
+        "Refusing to write through a symlinked parent directory."
+    );
+    assert!(!outside.join("secret.txt").exists());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_http_handlers_use_rust_routes() {
     let sandbox = unique_test_dir("git-http");

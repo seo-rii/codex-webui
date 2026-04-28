@@ -80,6 +80,42 @@ async fn rejects_sensitive_editable_files_inside_profile_home() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn rejects_editable_file_writes_through_symlinked_parent() {
+    let sandbox = unique_test_dir("editor-symlink-parent");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let outside = sandbox.join("outside");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, workspace.join("link-out")).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let error = write_editable_file_payload(
+        &state,
+        "default",
+        workspace
+            .join("link-out")
+            .join("secret.txt")
+            .to_str()
+            .unwrap(),
+        "secret\n",
+    )
+    .await
+    .expect_err("symlinked parent writes must be rejected");
+
+    assert_eq!(error.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        error.message,
+        "Refusing to write through a symlinked parent directory."
+    );
+    assert!(!outside.join("secret.txt").exists());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test]
 async fn notification_helpers_update_ui_state_and_counts() {
     let sandbox = unique_test_dir("notifications");

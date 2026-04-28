@@ -193,10 +193,7 @@ pub(crate) async fn resolve_editable_file_path(
     let path_to_check = existing.unwrap_or_else(|| candidate.clone());
     ensure_not_sensitive_file_path(&path_to_check)?;
 
-    let mut roots = resolved_allowed_roots(&state.config).await;
-    let profile_root =
-        real_path_safe(&resolve_runtime_profile(&state.config, profile_id).codex_home).await;
-    roots.push(profile_root);
+    let roots = editable_file_roots(state, profile_id).await;
 
     if !roots
         .iter()
@@ -209,6 +206,125 @@ pub(crate) async fn resolve_editable_file_path(
     }
 
     Ok(candidate)
+}
+
+pub(crate) async fn editable_file_roots(state: &AppState, profile_id: &str) -> Vec<PathBuf> {
+    let mut roots = resolved_allowed_roots(&state.config).await;
+    let profile_root =
+        real_path_safe(&resolve_runtime_profile(&state.config, profile_id).codex_home).await;
+    roots.push(profile_root);
+    roots
+}
+
+pub(crate) async fn write_text_file_safely(
+    target_path: &Path,
+    content: &str,
+    allowed_roots: &[PathBuf],
+) -> ApiResult<()> {
+    ensure_not_sensitive_file_path(target_path)?;
+    let parent_path = target_path.parent().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "The selected file path has no parent directory.",
+        )
+    })?;
+    let file_name = target_path.file_name().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "The selected file path has no file name.",
+        )
+    })?;
+
+    let mut ancestor = PathBuf::new();
+    for component in parent_path.components() {
+        ancestor.push(component.as_os_str());
+        if let Ok(metadata) = tokio_fs::symlink_metadata(&ancestor).await {
+            if metadata.file_type().is_symlink() {
+                return Err(api_error(
+                    StatusCode::FORBIDDEN,
+                    "Refusing to write through a symlinked parent directory.",
+                ));
+            }
+        }
+    }
+
+    tokio_fs::create_dir_all(parent_path).await.map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create parent directories for the file.",
+        )
+    })?;
+
+    let canonical_parent = tokio_fs::canonicalize(parent_path).await.map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "The selected file parent directory is invalid.",
+        )
+    })?;
+    if !allowed_roots
+        .iter()
+        .any(|root| path_is_within(root, &canonical_parent))
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "The selected file parent directory is outside editable roots.",
+        ));
+    }
+
+    let final_path = canonical_parent.join(file_name);
+    ensure_not_sensitive_file_path(&final_path)?;
+    if let Ok(metadata) = tokio_fs::symlink_metadata(&final_path).await {
+        if metadata.file_type().is_symlink() {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "Refusing to replace a symlinked file.",
+            ));
+        }
+    }
+
+    let temp_path = canonical_parent.join(format!(
+        ".codex-webui-write-{}-{}.tmp",
+        file_name.to_string_lossy(),
+        Uuid::new_v4()
+    ));
+    let write_result = async {
+        let mut temp_file = tokio_fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .await?;
+        temp_file.write_all(content.as_bytes()).await?;
+        temp_file.sync_all().await?;
+        drop(temp_file);
+        tokio_fs::rename(&temp_path, &final_path).await?;
+        if let Ok(parent_dir) = tokio_fs::File::open(&canonical_parent).await {
+            let _ = parent_dir.sync_all().await;
+        }
+        std::io::Result::Ok(())
+    }
+    .await;
+    if let Err(error) = write_result {
+        let _ = tokio_fs::remove_file(&temp_path).await;
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.to_string(),
+        ));
+    }
+
+    let final_check = tokio_fs::canonicalize(&final_path)
+        .await
+        .unwrap_or_else(|_| final_path.clone());
+    if !allowed_roots
+        .iter()
+        .any(|root| path_is_within(root, &final_check))
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "The selected file escaped editable roots during save.",
+        ));
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn read_editable_file_payload(
@@ -250,22 +366,8 @@ pub(crate) async fn write_editable_file_payload(
     content: &str,
 ) -> ApiResult<Value> {
     let resolved_path = resolve_editable_file_path(state, profile_id, file_path).await?;
-    if let Some(parent) = resolved_path.parent() {
-        tokio_fs::create_dir_all(parent).await.map_err(|_| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to create parent directories for the file.",
-            )
-        })?;
-    }
-    tokio_fs::write(&resolved_path, content)
-        .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to write the selected file.",
-            )
-        })?;
+    let roots = editable_file_roots(state, profile_id).await;
+    write_text_file_safely(&resolved_path, content, &roots).await?;
     read_editable_file_payload(state, profile_id, &resolved_path.display().to_string()).await
 }
 

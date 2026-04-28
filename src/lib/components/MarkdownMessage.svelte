@@ -3,6 +3,7 @@
   import { Marked, Renderer } from "marked";
   import { createLowlight, common } from "lowlight";
   import { toHtml } from "hast-util-to-html";
+  import { m } from "$lib/paraglide/messages.js";
 
   let {
     text = "",
@@ -20,6 +21,7 @@
   let rootElement = $state<HTMLDivElement | null>(null);
 
   const lowlight = createLowlight(common);
+  const codeCopyResetTimers = new WeakMap<HTMLButtonElement, number>();
 
   function escapeHtml(value: string) {
     return value
@@ -68,10 +70,18 @@
     const highlighted = toHtml(tree);
     const languageClass = normalizedLanguage ? ` language-${escapeAttribute(normalizedLanguage)}` : "";
     const languageLabel = normalizedLanguage || (tree as any).data?.language || "text";
+    const copyLabel = m.copy_code();
     
     return `<div class="code-block group relative my-4 rounded-xl overflow-hidden border border-gray-200 bg-gray-50/50">
       <div class="flex items-center justify-between px-4 py-1.5 bg-gray-100/50 border-b border-gray-200 text-[10px] font-bold text-gray-500 uppercase tracking-widest">
         <span>${escapeHtml(languageLabel)}</span>
+        <button aria-label="${escapeAttribute(copyLabel)}" class="code-copy-button" data-copy-code data-copy-label="${escapeAttribute(copyLabel)}" title="${escapeAttribute(copyLabel)}" type="button">
+          <svg aria-hidden="true" class="code-copy-button__icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path d="M8 7a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2V7Z" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"></path>
+            <path d="M16 19H6a2 2 0 0 1-2-2V7" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"></path>
+          </svg>
+          <span data-copy-code-label>${escapeHtml(copyLabel)}</span>
+        </button>
       </div>
       <pre class="p-4 overflow-x-auto text-sm leading-relaxed"><code class="hljs${languageClass}">${highlighted}</code></pre>
     </div>`;
@@ -131,6 +141,13 @@
   });
 
   function handleClick(event: MouseEvent) {
+    const copyButton = (event.target as HTMLElement | null)?.closest("button[data-copy-code]");
+    if (copyButton instanceof HTMLButtonElement) {
+      event.preventDefault();
+      void copyCodeBlock(copyButton);
+      return;
+    }
+
     const anchor = (event.target as HTMLElement | null)?.closest("a");
     if (!anchor) {
       return;
@@ -143,6 +160,73 @@
 
     event.preventDefault();
     dispatch("openLocalPath", { href });
+  }
+
+  async function copyCodeBlock(button: HTMLButtonElement) {
+    const code = button.closest(".code-block")?.querySelector("pre code")?.textContent ?? "";
+    if (!code) {
+      return;
+    }
+
+    try {
+      await writeClipboard(code);
+      markCodeCopied(button);
+    } catch {
+      button.dataset.copied = "false";
+    }
+  }
+
+  async function writeClipboard(value: string) {
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(value);
+        return;
+      } catch {
+        // Fall through to the legacy path for restricted clipboard contexts.
+      }
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = value;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    textarea.style.pointerEvents = "none";
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand("copy");
+    textarea.remove();
+    if (!copied) {
+      throw new Error("Clipboard copy failed");
+    }
+  }
+
+  function markCodeCopied(button: HTMLButtonElement) {
+    const label = button.querySelector<HTMLElement>("[data-copy-code-label]");
+    const copyLabel = button.dataset.copyLabel ?? m.copy_code();
+    const copiedLabel = m.copied_to_clipboard();
+    const previousTimer = codeCopyResetTimers.get(button);
+    if (previousTimer) {
+      clearTimeout(previousTimer);
+    }
+
+    button.dataset.copied = "true";
+    button.title = copiedLabel;
+    button.setAttribute("aria-label", copiedLabel);
+    if (label) {
+      label.textContent = copiedLabel;
+    }
+
+    const timer = window.setTimeout(() => {
+      button.dataset.copied = "false";
+      button.title = copyLabel;
+      button.setAttribute("aria-label", copyLabel);
+      if (label) {
+        label.textContent = copyLabel;
+      }
+      codeCopyResetTimers.delete(button);
+    }, 1400);
+    codeCopyResetTimers.set(button, timer);
   }
 </script>
 
@@ -272,6 +356,54 @@
     color: var(--markdown-code-block-header-fg, rgb(107 114 128)) !important;
   }
 
+  .markdown-body :global(.code-copy-button) {
+    display: inline-flex;
+    max-width: min(9rem, 44vw);
+    align-items: center;
+    gap: 0.35rem;
+    border: 1px solid var(--markdown-code-copy-border, rgb(209 213 219 / 0.78));
+    border-radius: 999px;
+    background: var(--markdown-code-copy-bg, rgb(255 255 255 / 0.72));
+    color: var(--markdown-code-copy-fg, rgb(75 85 99));
+    padding: 0.22rem 0.5rem;
+    font-size: 0.62rem;
+    font-weight: 750;
+    letter-spacing: 0.06em;
+    line-height: 1;
+    text-transform: uppercase;
+    transition:
+      background-color 150ms ease,
+      border-color 150ms ease,
+      color 150ms ease,
+      transform 150ms ease;
+  }
+
+  .markdown-body :global(.code-copy-button:hover) {
+    border-color: var(--markdown-code-copy-hover-border, rgb(245 158 11 / 0.45));
+    background: var(--markdown-code-copy-hover-bg, rgb(255 251 235 / 0.95));
+    color: var(--markdown-code-copy-hover-fg, rgb(180 83 9));
+    transform: translateY(-1px);
+  }
+
+  .markdown-body :global(.code-copy-button[data-copied="true"]) {
+    border-color: var(--markdown-code-copy-copied-border, rgb(16 185 129 / 0.38));
+    background: var(--markdown-code-copy-copied-bg, rgb(236 253 245 / 0.94));
+    color: var(--markdown-code-copy-copied-fg, rgb(4 120 87));
+  }
+
+  .markdown-body :global(.code-copy-button__icon) {
+    height: 0.74rem;
+    width: 0.74rem;
+    flex-shrink: 0;
+  }
+
+  .markdown-body :global(.code-copy-button span) {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .markdown-body :global(.code-block pre) {
     color: var(--markdown-code-block-fg, rgb(31 41 55));
   }
@@ -340,6 +472,15 @@
     --markdown-code-block-header-bg: rgb(30 41 59 / 0.92);
     --markdown-code-block-header-fg: rgb(148 163 184);
     --markdown-code-block-fg: rgb(226 232 240);
+    --markdown-code-copy-border: rgb(71 85 105 / 0.7);
+    --markdown-code-copy-bg: rgb(15 23 42 / 0.72);
+    --markdown-code-copy-fg: rgb(203 213 225);
+    --markdown-code-copy-hover-border: rgb(245 158 11 / 0.45);
+    --markdown-code-copy-hover-bg: rgb(69 39 10 / 0.58);
+    --markdown-code-copy-hover-fg: rgb(252 211 77);
+    --markdown-code-copy-copied-border: rgb(52 211 153 / 0.38);
+    --markdown-code-copy-copied-bg: rgb(6 78 59 / 0.46);
+    --markdown-code-copy-copied-fg: rgb(167 243 208);
   }
 
   :global(:root[data-theme="dark"]) .markdown-body :global(a) {

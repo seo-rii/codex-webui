@@ -214,6 +214,7 @@
   "resume_auto_load": "Resume Auto-load",
   "load_older_turns": "Load Older Turns",
   "copy_message": "Copy message",
+  "copy_code": "Копировать код",
   "edit_in_composer": "Edit in composer",
   "branch_into_new_thread": "Fork into a new thread",
   "steps_count": "{count} steps",

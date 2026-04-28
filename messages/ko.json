@@ -214,6 +214,7 @@
   "resume_auto_load": "자동 불러오기 재개",
   "load_older_turns": "이전 턴 불러오기",
   "copy_message": "메시지 복사",
+  "copy_code": "코드 복사",
   "edit_in_composer": "입력창에서 수정",
   "branch_into_new_thread": "새 스레드로 포크",
   "steps_count": "{count}단계",

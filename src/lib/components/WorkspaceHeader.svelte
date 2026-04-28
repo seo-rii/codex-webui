@@ -244,7 +244,7 @@
 
     <div class="relative">
       <button
-        class="surface-contrast-button ui-animated-button ui-animated-button--strong flex h-8 shrink-0 items-center gap-1 whitespace-nowrap rounded-lg bg-gray-900 px-2.5 text-[11px] font-bold text-white shadow-sm transition-all hover:bg-gray-800 active:scale-95 sm:h-9 sm:px-3 sm:text-xs"
+        class="workspace-open-trigger surface-contrast-button ui-animated-button ui-animated-button--strong flex h-8 shrink-0 items-center gap-1 whitespace-nowrap rounded-lg px-2.5 text-[11px] font-bold shadow-sm transition-all active:scale-95 sm:h-9 sm:px-3 sm:text-xs"
         onclick={() => (workspaceMenuOpen = !workspaceMenuOpen)}
         title={ui.open}
         type="button"
@@ -302,6 +302,17 @@
 </header>
 
 <style>
+  .workspace-open-trigger {
+    border: 1px solid rgba(15, 23, 42, 0.08);
+    background: linear-gradient(180deg, #111827, #1f2937);
+    color: #fff;
+    box-shadow: 0 16px 30px -22px rgba(15, 23, 42, 0.46);
+  }
+
+  .workspace-open-trigger:hover {
+    background: linear-gradient(180deg, #1f2937, #334155);
+  }
+
   .workspace-open-menu {
     border-color: var(--line);
     background: color-mix(in srgb, var(--panel-strong) 96%, transparent);
@@ -325,5 +336,16 @@
   :global(:root[data-theme="dark"]) .workspace-open-menu {
     background: color-mix(in srgb, var(--panel-strong) 96%, #020617 4%);
     box-shadow: 0 26px 48px -26px rgba(0, 0, 0, 0.62);
+  }
+
+  :global(:root[data-theme="dark"]) .workspace-open-trigger {
+    border-color: rgba(148, 163, 184, 0.22);
+    background: linear-gradient(180deg, rgba(51, 65, 85, 0.96), rgba(30, 41, 59, 0.98));
+    color: #f8fafc;
+    box-shadow: 0 18px 34px -26px rgba(2, 6, 23, 0.72);
+  }
+
+  :global(:root[data-theme="dark"]) .workspace-open-trigger:hover {
+    background: linear-gradient(180deg, rgba(71, 85, 105, 0.98), rgba(51, 65, 85, 1));
   }
 </style>

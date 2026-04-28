@@ -35,6 +35,30 @@ fn maps_account_login_completed_notifications() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminate_process_hard_kills_term_ignoring_process_group() {
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("trap '' TERM; sleep 30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.process_group(0);
+    let mut child = command.spawn().expect("test process should start");
+    let pid = child.id().expect("test process should have a pid");
+
+    terminate_process(pid)
+        .await
+        .expect("terminal process should terminate");
+    let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .expect("process should exit after hard kill")
+        .expect("wait should succeed");
+    assert!(!status.success());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_response_cache_is_partitioned_by_role_method_and_params() {
     let sandbox = unique_test_dir("ws-cache-partition");

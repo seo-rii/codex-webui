@@ -292,19 +292,50 @@ pub(crate) async fn terminate_process(pid: u32) -> Result<()> {
         return Ok(());
     }
 
-    let group_output = run_command_with_timeout(
+    let _ = run_command_with_timeout(
         "kill",
         vec!["-TERM".to_string(), "--".to_string(), format!("-{pid}")],
         Duration::from_secs(4),
     )
     .await?;
-    if group_output.status.success() {
+    let _ = run_command_with_timeout(
+        "kill",
+        vec!["-TERM".to_string(), pid.to_string()],
+        Duration::from_secs(4),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let group_probe = run_command_with_timeout(
+        "kill",
+        vec!["-0".to_string(), "--".to_string(), format!("-{pid}")],
+        Duration::from_secs(2),
+    )
+    .await?;
+    if !group_probe.status.success() {
+        return Ok(());
+    }
+
+    let _ = run_command_with_timeout(
+        "kill",
+        vec!["-KILL".to_string(), "--".to_string(), format!("-{pid}")],
+        Duration::from_secs(4),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let group_probe = run_command_with_timeout(
+        "kill",
+        vec!["-0".to_string(), "--".to_string(), format!("-{pid}")],
+        Duration::from_secs(2),
+    )
+    .await?;
+    if !group_probe.status.success() {
         return Ok(());
     }
 
     let output = run_command_with_timeout(
         "kill",
-        vec!["-TERM".to_string(), pid.to_string()],
+        vec!["-KILL".to_string(), pid.to_string()],
         Duration::from_secs(4),
     )
     .await?;

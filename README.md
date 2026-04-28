@@ -27,7 +27,8 @@ The goal is not to replace upstream surfaces. The goal is to make Codex usable f
 - Password-protected browser access with signed HTTP-only cookies
 - Multi-account profile switching backed by separate `CODEX_HOME` directories and profile-scoped `codex app-server` instances
 - Reconnect-safe WebSocket control plane for chat, sessions, Git, terminals, runtime actions, and account flows
-- Request-ID dedupe at the public gateway so reconnect replays do not execute queue or other mutating RPC calls twice
+- Request-ID dedupe at the public gateway so reconnect replays do not execute queue or other mutating RPC calls twice, with role/method/parameter matching and response-size budgets
+- Operational probes for `/healthz`, `/readyz`, and admin-only `/metrics`
 - Dedicated runtime error logs under `<dataDir>/logs/` for Rust gateway failures and per-profile `codex app-server` stderr
 - Session queue, explicit steer flow, persisted queued follow-ups, and resume prompts after restart
 - Composer history recall with keyboard navigation, a quick "reuse last message" chip, and one-click resend/queue for the most recent prompt
@@ -151,6 +152,7 @@ Once configured, the CLI supports:
 ```bash
 codex-webui
 codex-webui config
+codex-webui status
 codex-webui restart
 codex-webui stop
 codex-webui tunnel
@@ -261,6 +263,7 @@ The Rust gateway honors a focused set of `CODEX_WEBUI_*` environment variables. 
 - `CODEX_WEBUI_HCAPTCHA_SECRET_KEY`
 - `CODEX_WEBUI_CORS_ALLOWED_ORIGINS`
 - `CODEX_WEBUI_TRUST_PROXY_HEADERS`
+- `CODEX_WEBUI_INSTANCE_TOKEN` for CLI-owned health verification of background processes
 - `CODEX_WEBUI_ALLOWED_ROOTS`
 - `CODEX_WEBUI_BASE_PATH`
 - `CODEX_WEBUI_DATA_DIR`
@@ -288,6 +291,9 @@ See [.env.example](./.env.example) for a concise example set.
 - Leave cookies on `SameSite=Strict` unless you explicitly need cross-site browser sessions.
 - Run behind HTTPS in production.
 - Leave `CODEX_WEBUI_TRUST_PROXY_HEADERS` unset unless the gateway only receives traffic from a trusted reverse proxy that controls `X-Forwarded-*` headers.
+- WebSocket upgrades check `Origin` against same-origin or configured CORS origins; do not rely on HTTP CORS alone when exposing the gateway.
+- Login and JSON mutation bodies are size-limited, attachment uploads are streamed with per-file/request caps, and large file/diff previews are bounded.
+- User-facing HTTP and WebSocket errors redact common token-shaped values and the host user's home directory; detailed diagnostics go to server logs instead.
 - Use the viewer password for observation-only access instead of sharing the admin password when multiple humans need browser visibility.
 - Git actions are intentionally gated on explicit repository selection.
 - System shutdown support is disabled by default and must be explicitly enabled.

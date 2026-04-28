@@ -41,8 +41,9 @@ The package already exposes:
 - first-run interactive setup
 - reading and writing `~/.codex/codex-webui.yml`
 - starting, restarting, and stopping the background server
+- verifying the recorded background PID with a per-instance `/healthz` token before status, stop, or restart actions
 - printing the launch URL, PID, config path, and log path
-- exposing `config`, `restart`, `stop`, and richer `tunnel` management commands
+- exposing `config`, `status`, `restart`, `stop`, and richer `tunnel` management commands
 
 On first run, it prompts for:
 
@@ -72,6 +73,7 @@ The CLI owns two user-local locations:
 That runtime state currently includes:
 
 - PID file
+- server metadata JSON with a per-instance verification token
 - server log
 - tunnel PID file
 - tunnel log
@@ -104,6 +106,7 @@ The CLI starts the Rust gateway as a detached background process and injects the
 - `CODEX_WEBUI_HCAPTCHA_SITE_KEY`
 - `CODEX_WEBUI_HCAPTCHA_SECRET_KEY`
 - `CODEX_WEBUI_SESSION_SECRET`
+- `CODEX_WEBUI_INSTANCE_TOKEN`
 - `CODEX_WEBUI_CORS_ALLOWED_ORIGINS`
 
 At runtime the public base path is owned by Rust, not baked permanently into the shipped SPA:
@@ -124,6 +127,8 @@ The CLI also accepts transient launch overrides:
 Prefer the YAML config or environment variables for the secret key in long-lived deployments, because shell history and process inspection can expose command-line secrets.
 
 The CLI prints the workspace root URL, and the login experience is handled inline by the workspace shell.
+
+The CLI writes config, PID, server metadata, tunnel metadata, and tunnel log state through temp files followed by rename. On stop or restart, it refuses to signal the recorded PID unless the running gateway confirms the stored instance token through `/healthz`; stale files are removed only when the PID is no longer alive.
 
 When system shutdown support is enabled, the actual armed and scheduled state is still runtime data rather than static CLI config:
 
@@ -214,6 +219,7 @@ Before publishing a package, verify at least:
 
 - first-run interactive setup creates `~/.codex/codex-webui.yml`
 - `codex-webui` starts the background server and prints a usable URL
+- `codex-webui status` verifies the current instance rather than trusting a raw PID file
 - login works through the printed base path
 - WebSocket connection succeeds after login
 - `codex-webui restart` and `codex-webui stop` work

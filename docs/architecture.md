@@ -33,12 +33,14 @@ It is responsible for:
 - runtime base-path placeholder replacement for HTML, JS, and CSS assets
 - public WebSocket upgrade handling and fan-out
 - request-ID response caching and in-flight dedupe for reconnect-safe RPC replay
+- WebSocket Origin enforcement, request concurrency caps, message-size caps, and bounded response dedupe cache memory
 - long-lived terminal processes
 - runtime install/update checks
 - quota fetching
 - session, queue, attachment, Git, editor, notification, and runtime API handling
 - enforcing base path and CORS policy
 - appending audit-log entries for privileged login and WebSocket actions
+- exposing lightweight `/healthz`, `/readyz`, and admin-only `/metrics` diagnostics
 
 ### Codex app-server
 
@@ -67,7 +69,9 @@ It is responsible for:
 - Rust authenticates the socket
 - browser sends JSON-RPC-like requests
 - Rust handles the request directly
-- mutating requests are keyed by profile-scoped request ID, so reconnect replays wait on the original in-flight result instead of executing a second time
+- mutating requests are keyed by profile, role, and client request ID
+- replays only reuse an in-flight or cached response when the method and parameter hash match; conflicting reuse returns an error instead of executing a second action
+- very large responses are not stored in the replay cache, preventing multi-megabyte session reads from accumulating in memory
 
 ### 3. Codex execution
 
@@ -123,6 +127,8 @@ This separation matters:
 - UI queue/draft/editor state remains `codex-webui`-owned
 - global operational state, such as a scheduled shutdown-after-queue-completion timer, remains `codex-webui`-owned
 - long-running work can survive browser disconnects because the server-side state is durable
+- important `codex-webui`-owned JSON/TOML state is written via temp-file, fsync, rename, and best-effort parent-directory fsync
+- the CLI writes config, PID, server metadata, tunnel metadata, and tunnel logs atomically
 
 ## Session Listing And Search
 
@@ -193,8 +199,19 @@ The Rust gateway owns terminal processes.
 - terminal output is buffered server-side
 - terminal tabs survive browser reloads while the gateway stays up
 - terminal input/output is streamed incrementally over WebSocket
+- terminal creation is capped, idle/exited sessions are cleaned up, and Unix shutdown targets the process group with TERM followed by KILL if the group ignores TERM
 
 The terminal lifecycle is intentionally separate from Codex thread lifecycle.
+
+## Operational Probes
+
+The Rust gateway exposes:
+
+- `/healthz` for process liveness and version/build metadata
+- `/readyz` for readiness checks such as profile presence, allowed-root configuration, and `CODEX_WEBUI_DATA_DIR` writability
+- `/metrics` for admin-authenticated Prometheus-style counters covering cache sizes, active turns, terminals, relays, and pending server requests
+
+The CLI starts the gateway with a per-instance token and stores it in `~/.codex/codex-webui/server.json`. `codex-webui status`, `stop`, and `restart` verify that token against `/healthz` before managing the recorded PID, which avoids acting on a reused PID that belongs to another process.
 
 ## Global Operational State
 
@@ -231,6 +248,12 @@ The trust boundary is narrow:
 - Git actions require explicit repository selection
 - cookies are signed and HTTP-only
 - cross-origin browser access must be explicitly allowed
+- cookie paths are scoped to the configured base path
+- unsafe HTTP mutations reject cross-origin requests unless the origin is explicitly trusted
+- WebSocket upgrades validate Origin separately from HTTP CORS
+- default viewer access is transcript-oriented; code, terminal, audit, config, and Git file reads remain admin-only
+- file reads/writes deny common secret paths and bound preview sizes
+- webhook URLs must use HTTPS and cannot target localhost or private/link-local IP literals
 
 The model is designed to reduce accidental exposure, not to make an untrusted multi-tenant Codex host safe by default.
 

@@ -2,7 +2,7 @@ use super::*;
 
 pub(crate) async fn execute_ws_method(
     state: &AppState,
-    out_tx: &mpsc::UnboundedSender<ServerEnvelope>,
+    out_tx: &mpsc::Sender<ServerEnvelope>,
     subscriptions: &Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     auth: &AuthContext,
     method: &str,

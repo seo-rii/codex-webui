@@ -25,7 +25,7 @@ pub(crate) async fn handle_ws(
 
 async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext) {
     let (mut sender, mut receiver) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerEnvelope>();
+    let (out_tx, mut out_rx) = mpsc::channel::<ServerEnvelope>(WS_OUTBOUND_QUEUE_CAPACITY);
     let connection_id = Uuid::new_v4().to_string();
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -47,9 +47,11 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
         }
     });
 
-    let _ = out_tx.send(ServerEnvelope::Ready {
-        connection_id: connection_id.clone(),
-    });
+    let _ = out_tx
+        .send(ServerEnvelope::Ready {
+            connection_id: connection_id.clone(),
+        })
+        .await;
 
     while let Some(Ok(message)) = receiver.next().await {
         match message {
@@ -57,12 +59,14 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
                 let payload = match serde_json::from_str::<ClientEnvelope>(&text) {
                     Ok(payload) => payload,
                     Err(error) => {
-                        let _ = out_tx.send(ServerEnvelope::Response {
-                            id: Uuid::new_v4().to_string(),
-                            ok: false,
-                            result: None,
-                            error: Some(format!("Invalid websocket payload: {error}")),
-                        });
+                        let _ = out_tx
+                            .send(ServerEnvelope::Response {
+                                id: Uuid::new_v4().to_string(),
+                                ok: false,
+                                result: None,
+                                error: Some(format!("Invalid websocket payload: {error}")),
+                            })
+                            .await;
                         continue;
                     }
                 };
@@ -72,14 +76,16 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
                         match Arc::clone(&request_slots).try_acquire_owned() {
                             Ok(permit) => Some(permit),
                             Err(_) => {
-                                let _ = out_tx.send(ServerEnvelope::Response {
-                                    id: id.clone(),
-                                    ok: false,
-                                    result: None,
-                                    error: Some(
-                                        "Too many concurrent websocket requests.".to_string(),
-                                    ),
-                                });
+                                let _ = out_tx
+                                    .send(ServerEnvelope::Response {
+                                        id: id.clone(),
+                                        ok: false,
+                                        result: None,
+                                        error: Some(
+                                            "Too many concurrent websocket requests.".to_string(),
+                                        ),
+                                    })
+                                    .await;
                                 continue;
                             }
                         }
@@ -105,9 +111,11 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
                 });
             }
             Message::Ping(payload) => {
-                let _ = out_tx.send(ServerEnvelope::Pong {
-                    nonce: Some(URL_SAFE_NO_PAD.encode(payload)),
-                });
+                let _ = out_tx
+                    .send(ServerEnvelope::Pong {
+                        nonce: Some(URL_SAFE_NO_PAD.encode(payload)),
+                    })
+                    .await;
             }
             Message::Close(_) => break,
             _ => {}
@@ -123,14 +131,14 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
 
 async fn handle_ws_message(
     state: &AppState,
-    out_tx: &mpsc::UnboundedSender<ServerEnvelope>,
+    out_tx: &mpsc::Sender<ServerEnvelope>,
     subscriptions: &Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     auth: &AuthContext,
     payload: ClientEnvelope,
 ) -> Result<()> {
     match payload {
         ClientEnvelope::Ping { nonce } => {
-            let _ = out_tx.send(ServerEnvelope::Pong { nonce });
+            let _ = out_tx.send(ServerEnvelope::Pong { nonce }).await;
         }
         ClientEnvelope::Request { id, method, params } => {
             let params_hash = request_params_hash(&params);
@@ -138,19 +146,21 @@ async fn handle_ws_message(
 
             match cached_response(state, &request_key, &method, &params_hash).await {
                 CachedResponseLookup::Hit(cached) => {
-                    let _ = out_tx.send(cached);
+                    let _ = out_tx.send(cached).await;
                     return Ok(());
                 }
                 CachedResponseLookup::Conflict => {
-                    let _ = out_tx.send(ServerEnvelope::Response {
-                        id,
-                        ok: false,
-                        result: None,
-                        error: Some(
-                            "WebSocket request id was already used with a different method or parameters."
-                                .to_string(),
-                        ),
-                    });
+                    let _ = out_tx
+                        .send(ServerEnvelope::Response {
+                            id,
+                            ok: false,
+                            result: None,
+                            error: Some(
+                                "WebSocket request id was already used with a different method or parameters."
+                                    .to_string(),
+                            ),
+                        })
+                        .await;
                     return Ok(());
                 }
                 CachedResponseLookup::Miss => {}
@@ -162,15 +172,17 @@ async fn handle_ws_message(
                 InflightRequestRegistration::Started => {}
                 InflightRequestRegistration::Joined => return Ok(()),
                 InflightRequestRegistration::Conflict => {
-                    let _ = out_tx.send(ServerEnvelope::Response {
-                        id,
-                        ok: false,
-                        result: None,
-                        error: Some(
-                            "WebSocket request id is already in flight with a different method or parameters."
-                                .to_string(),
-                        ),
-                    });
+                    let _ = out_tx
+                        .send(ServerEnvelope::Response {
+                            id,
+                            ok: false,
+                            result: None,
+                            error: Some(
+                                "WebSocket request id is already in flight with a different method or parameters."
+                                    .to_string(),
+                            ),
+                        })
+                        .await;
                     return Ok(());
                 }
             }

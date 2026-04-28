@@ -88,7 +88,7 @@ pub(crate) async fn register_inflight_request(
     request_id: &str,
     method: &str,
     params_hash: &str,
-    out_tx: &mpsc::UnboundedSender<ServerEnvelope>,
+    out_tx: &mpsc::Sender<ServerEnvelope>,
 ) -> InflightRequestRegistration {
     let mut inflight = state.inflight_requests.lock().await;
     inflight.retain(|_, request| !request.waiters.is_empty());
@@ -126,6 +126,6 @@ pub(crate) async fn resolve_inflight_request(
     };
 
     for waiter in waiters {
-        let _ = waiter.send(message.clone());
+        let _ = waiter.send(message.clone()).await;
     }
 }

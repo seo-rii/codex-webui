@@ -2,7 +2,7 @@ use super::*;
 
 pub(crate) async fn subscribe_session(
     state: AppState,
-    out_tx: mpsc::UnboundedSender<ServerEnvelope>,
+    out_tx: mpsc::Sender<ServerEnvelope>,
     subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     profile_id: String,
     session_id: String,
@@ -15,10 +15,16 @@ pub(crate) async fn subscribe_session(
         loop {
             match receiver.recv().await {
                 Ok(event) => {
-                    let _ = stream_out_tx.send(ServerEnvelope::Event {
-                        session_id: session_key.clone(),
-                        event,
-                    });
+                    if stream_out_tx
+                        .send(ServerEnvelope::Event {
+                            session_id: session_key.clone(),
+                            event,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!("websocket lagged on session {session_key}: skipped {skipped} messages");
@@ -34,16 +40,18 @@ pub(crate) async fn subscribe_session(
     }
 
     if let Ok(queue) = get_session_queue_payload(&state, &profile_id, &session_id).await {
-        let _ = out_tx.send(ServerEnvelope::Event {
-            session_id: session_id.clone(),
-            event: json!({
-                "kind": "notification",
-                "method": "codex-webui/queueUpdated",
-                "params": {
-                    "queue": queue
-                }
-            }),
-        });
+        let _ = out_tx
+            .send(ServerEnvelope::Event {
+                session_id: session_id.clone(),
+                event: json!({
+                    "kind": "notification",
+                    "method": "codex-webui/queueUpdated",
+                    "params": {
+                        "queue": queue
+                    }
+                }),
+            })
+            .await;
     }
 
     Ok(())
@@ -51,7 +59,7 @@ pub(crate) async fn subscribe_session(
 
 pub(crate) async fn subscribe_terminal(
     state: AppState,
-    out_tx: mpsc::UnboundedSender<ServerEnvelope>,
+    out_tx: mpsc::Sender<ServerEnvelope>,
     subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     terminal_id: String,
 ) -> Result<()> {
@@ -63,10 +71,16 @@ pub(crate) async fn subscribe_terminal(
         loop {
             match receiver.recv().await {
                 Ok(event) => {
-                    let _ = out_tx.send(ServerEnvelope::TerminalEvent {
-                        terminal_id: terminal_key.clone(),
-                        event,
-                    });
+                    if out_tx
+                        .send(ServerEnvelope::TerminalEvent {
+                            terminal_id: terminal_key.clone(),
+                            event,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(
@@ -87,7 +101,7 @@ pub(crate) async fn subscribe_terminal(
 
 pub(crate) async fn subscribe_global(
     state: AppState,
-    out_tx: mpsc::UnboundedSender<ServerEnvelope>,
+    out_tx: mpsc::Sender<ServerEnvelope>,
     subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     profile_id: String,
 ) -> Result<()> {
@@ -97,7 +111,13 @@ pub(crate) async fn subscribe_global(
         loop {
             match receiver.recv().await {
                 Ok(event) => {
-                    let _ = out_tx.send(ServerEnvelope::GlobalEvent { event });
+                    if out_tx
+                        .send(ServerEnvelope::GlobalEvent { event })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!("websocket lagged on global relay: skipped {skipped} messages");

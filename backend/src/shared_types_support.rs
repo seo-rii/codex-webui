@@ -56,7 +56,7 @@ pub(crate) struct CachedResponse {
 pub(crate) struct InflightRequest {
     pub(crate) method: String,
     pub(crate) params_hash: String,
-    pub(crate) waiters: Vec<mpsc::UnboundedSender<ServerEnvelope>>,
+    pub(crate) waiters: Vec<mpsc::Sender<ServerEnvelope>>,
 }
 
 #[derive(Clone)]

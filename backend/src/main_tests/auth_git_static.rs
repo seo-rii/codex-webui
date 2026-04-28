@@ -126,7 +126,7 @@ async fn owner_config_blocks_admin_from_owner_only_websocket_methods() {
     let mut config = (*state.config).clone();
     config.owner_password = Some("owner-secret".to_string());
     state.config = Arc::new(config);
-    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = mpsc::channel(8);
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {
         profile_id: "default".to_string(),
@@ -219,8 +219,8 @@ async fn websocket_inflight_requests_reject_id_reuse_with_different_payloads() {
     let state = test_state(workspace.clone(), vec![workspace], codex_home);
     let request_key = request_cache_key("default", "client-id", UserRole::Admin);
     let params_hash = request_params_hash(&json!({ "value": 1 }));
-    let (first_tx, _first_rx) = mpsc::unbounded_channel();
-    let (second_tx, _second_rx) = mpsc::unbounded_channel();
+    let (first_tx, _first_rx) = mpsc::channel(8);
+    let (second_tx, _second_rx) = mpsc::channel(8);
 
     assert!(matches!(
         register_inflight_request(&state, &request_key, "session/get", &params_hash, &first_tx)

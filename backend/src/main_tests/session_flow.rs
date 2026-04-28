@@ -1165,7 +1165,7 @@ async fn ws_session_cache_validation_returns_not_modified_for_matching_versions(
         .unwrap()
         .to_string();
 
-    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = mpsc::channel(8);
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {

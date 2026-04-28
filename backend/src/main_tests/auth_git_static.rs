@@ -92,6 +92,57 @@ async fn websocket_response_cache_is_partitioned_by_role_method_and_params() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_response_cache_prunes_oldest_entries_at_cap() {
+    let sandbox = unique_test_dir("ws-cache-cap");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let now = Instant::now();
+
+    {
+        let mut cache = state.response_cache.lock().await;
+        for index in 0..=RESPONSE_CACHE_MAX_ENTRIES {
+            cache.insert(
+                format!("key-{index}"),
+                CachedResponse {
+                    created_at: now
+                        - Duration::from_millis(
+                            (RESPONSE_CACHE_MAX_ENTRIES.saturating_sub(index)) as u64,
+                        ),
+                    message: ServerEnvelope::Response {
+                        id: index.to_string(),
+                        ok: true,
+                        result: Some(json!({ "index": index })),
+                        error: None,
+                    },
+                },
+            );
+        }
+    }
+
+    cache_response(
+        &state,
+        "new-key",
+        ServerEnvelope::Response {
+            id: "new-key".to_string(),
+            ok: true,
+            result: Some(json!({ "new": true })),
+            error: None,
+        },
+    )
+    .await;
+
+    let cache = state.response_cache.lock().await;
+    assert!(cache.len() <= RESPONSE_CACHE_MAX_ENTRIES);
+    assert!(!cache.contains_key("key-0"));
+    assert!(cache.contains_key("new-key"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn websocket_origin_allows_same_origin_and_configured_cors_only() {
     let sandbox = unique_test_dir("ws-origin-policy");

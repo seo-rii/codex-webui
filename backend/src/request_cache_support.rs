@@ -2,13 +2,13 @@ use super::*;
 
 pub(crate) async fn cached_response(state: &AppState, request_id: &str) -> Option<ServerEnvelope> {
     let mut cache = state.response_cache.lock().await;
-    cache.retain(|_, entry| entry.created_at.elapsed() < CACHE_TTL);
+    prune_response_cache(&mut cache);
     cache.get(request_id).map(|entry| entry.message.clone())
 }
 
 pub(crate) async fn cache_response(state: &AppState, request_id: &str, message: ServerEnvelope) {
     let mut cache = state.response_cache.lock().await;
-    cache.retain(|_, entry| entry.created_at.elapsed() < CACHE_TTL);
+    prune_response_cache(&mut cache);
     cache.insert(
         request_id.to_string(),
         CachedResponse {
@@ -16,6 +16,26 @@ pub(crate) async fn cache_response(state: &AppState, request_id: &str, message: 
             message,
         },
     );
+    prune_response_cache(&mut cache);
+}
+
+fn prune_response_cache(cache: &mut HashMap<String, CachedResponse>) {
+    cache.retain(|_, entry| entry.created_at.elapsed() < CACHE_TTL);
+    if cache.len() <= RESPONSE_CACHE_MAX_ENTRIES {
+        return;
+    }
+
+    let mut entries = cache
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.created_at))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(_, created_at)| *created_at);
+    for (key, _) in entries
+        .into_iter()
+        .take(cache.len().saturating_sub(RESPONSE_CACHE_MAX_ENTRIES))
+    {
+        cache.remove(&key);
+    }
 }
 
 pub(crate) async fn register_inflight_request(

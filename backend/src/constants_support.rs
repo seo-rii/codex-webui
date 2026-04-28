@@ -5,6 +5,7 @@ pub(crate) const PROFILE_COOKIE: &str = "codex_webui_profile";
 pub(crate) const LOGIN_WINDOW_MS: u128 = 10 * 60 * 1000;
 pub(crate) const LOGIN_MAX_ATTEMPTS: usize = 8;
 pub(crate) const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+pub(crate) const RESPONSE_CACHE_MAX_ENTRIES: usize = 2048;
 pub(crate) const GLOBAL_RELAY_KEY: &str = "__global__";
 pub(crate) const CODEX_NPM_PACKAGE: &str = "@openai/codex";
 pub(crate) const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";

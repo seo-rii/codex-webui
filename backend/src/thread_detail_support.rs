@@ -221,10 +221,16 @@ pub(crate) async fn session_detail_payload(
     );
     let active_turn_id_from_payload = active_turn_id_from_turns(&turns);
     let cached_active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
-    let active_turn_id = cached_active_turn_id
-        .filter(|turn_id| active_turn_id_from_payload.as_ref() == Some(turn_id))
-        .or_else(|| active_turn_id_from_payload.clone());
-    if active_turn_id.is_none() {
+    let active_turn_id = active_turn_id_from_payload
+        .clone()
+        .or_else(|| cached_active_turn_id.clone());
+    if let Some(turn_id) = active_turn_id_from_payload {
+        state
+            .active_turns
+            .lock()
+            .await
+            .insert(runtime_key.clone(), turn_id);
+    } else if active_turn_id.is_none() {
         state.active_turns.lock().await.remove(&runtime_key);
     }
     let preferences = with_ui_state_read(state, profile_id, |ui_state| {

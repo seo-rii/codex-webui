@@ -2097,3 +2097,73 @@ async fn steer_turn_payload_uses_active_turn_from_thread_reads() {
 
     let _ = fs::remove_dir_all(sandbox);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_detail_preserves_cached_active_turn_when_thread_payload_lags() {
+    let sandbox = unique_test_dir("session-detail-active-turn-lag");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-1",
+                    "name": "Lagging thread",
+                    "preview": "Lagging thread",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "running",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "completed",
+                            "error": Value::Null,
+                            "startedAt": 10,
+                            "completedAt": 20,
+                            "durationMs": 10,
+                            "items": []
+                        }
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, "default").0,
+        "thread-1",
+    );
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-2".to_string());
+
+    let detail = session_detail_payload(&state, "default", "thread-1", 20)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail.get("activeTurnId").and_then(Value::as_str),
+        Some("turn-2")
+    );
+    assert_eq!(
+        state.active_turns.lock().await.get(&runtime_key).cloned(),
+        Some("turn-2".to_string())
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}

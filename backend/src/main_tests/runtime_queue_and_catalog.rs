@@ -341,6 +341,114 @@ async fn session_list_shows_completed_when_runtime_completion_beats_stale_thread
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn older_turn_completion_does_not_override_newer_active_turn() {
+    let sandbox = unique_test_dir("session-list-active-turn-wins");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-1",
+                    "name": "Status sync",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "running",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "inProgress",
+                            "error": Value::Null,
+                            "startedAt": 10,
+                            "completedAt": Value::Null,
+                            "durationMs": Value::Null,
+                            "items": []
+                        },
+                        {
+                            "id": "turn-2",
+                            "status": "inProgress",
+                            "error": Value::Null,
+                            "startedAt": 20,
+                            "completedAt": Value::Null,
+                            "durationMs": Value::Null,
+                            "items": []
+                        }
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    state.active_turns.lock().await.insert(
+        runtime_session_key("default", "thread-1"),
+        "turn-2".to_string(),
+    );
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "turn/completed".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": []
+                }
+            }),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        state
+            .active_turns
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-1"))
+            .cloned(),
+        Some("turn-2".to_string())
+    );
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let first = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .and_then(|sessions| sessions.first())
+        .cloned()
+        .expect("expected seeded session");
+    assert_eq!(first.get("id").and_then(Value::as_str), Some("thread-1"));
+    assert_eq!(first.get("status").and_then(Value::as_str), Some("running"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_list_prefers_newer_thread_status_over_older_runtime_completion_override() {
     let sandbox = unique_test_dir("session-list-newer-thread-status");
     let workspace = sandbox.join("workspace");

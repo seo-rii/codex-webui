@@ -1284,7 +1284,10 @@
   }
 
   function hasConversationLiveTurn(currentConversation: ConversationState | null = conversation) {
-    return Boolean(getConversationLiveTurn(currentConversation));
+    return Boolean(
+      getConversationLiveTurn(currentConversation) ||
+        (currentConversation?.activeTurnId && isLiveConversationStatus(currentConversation.thread.status))
+    );
   }
 
   function normalizeConversationExecutionState(currentConversation: ConversationState) {
@@ -1300,7 +1303,9 @@
       };
     }
 
-    const shouldKeepLiveShell = currentConversation.thread.turns.length === 0 && isLiveConversationStatus(currentConversation.thread.status);
+    const shouldKeepLiveShell =
+      isLiveConversationStatus(currentConversation.thread.status) &&
+      (currentConversation.thread.turns.length === 0 || Boolean(currentConversation.activeTurnId));
     const nextStatus = !shouldKeepLiveShell && isLiveConversationStatus(currentConversation.thread.status) ? "completed" : currentConversation.thread.status;
     if (currentConversation.activeTurnId === null && nextStatus === currentConversation.thread.status) {
       return currentConversation;

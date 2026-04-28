@@ -196,6 +196,9 @@ async fn session_turn_activity(
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
     let runtime_key = runtime_session_key(resolved_profile_id, session_id);
     let cached_active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
+    if cached_active_turn_id.is_some() {
+        return SessionTurnActivity::Active;
+    }
 
     let thread = match read_thread_payload(state, profile_id, session_id, true).await {
         Ok(payload) => payload,

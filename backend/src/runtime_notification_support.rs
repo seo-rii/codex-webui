@@ -198,6 +198,39 @@ fn notification_turn_id(params: &Value) -> Option<String> {
         })
 }
 
+async fn session_has_cached_runtime_activity(state: &AppState, runtime_key: &str) -> bool {
+    state.active_turns.lock().await.contains_key(runtime_key)
+        || state.pending_turn_starts.lock().await.contains(runtime_key)
+}
+
+async fn set_runtime_session_status(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    status: &str,
+) {
+    let _ = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        runtime_status_by_thread_id.insert(
+            session_id.to_string(),
+            json!({
+                "status": status,
+                "updatedAt": now_unix_ms()
+            }),
+        );
+        Ok(())
+    })
+    .await;
+}
+
 pub(crate) async fn handle_profile_runtime_notification(
     state: &AppState,
     profile_id: &str,
@@ -216,22 +249,13 @@ pub(crate) async fn handle_profile_runtime_notification(
         "turn/started" => {
             state.pending_turn_starts.lock().await.remove(&runtime_key);
             if let Some(turn_id) = notification_turn_id(&notification.params) {
-                state.active_turns.lock().await.insert(runtime_key, turn_id);
+                state
+                    .active_turns
+                    .lock()
+                    .await
+                    .insert(runtime_key.clone(), turn_id);
             }
-            let _ = with_ui_state_write(state, profile_id, |ui_state| {
-                let Some(runtime_status_by_thread_id) = ui_state
-                    .get_mut("runtimeStatusByThreadId")
-                    .and_then(Value::as_object_mut)
-                else {
-                    return Err(api_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "runtime status state is missing",
-                    ));
-                };
-                runtime_status_by_thread_id.remove(&session_id);
-                Ok(())
-            })
-            .await;
+            set_runtime_session_status(state, profile_id, &session_id, "running").await;
             cancel_scheduled_shutdown_for_activity(state, profile_id).await;
             set_session_highlight(state, profile_id, &session_id, None).await;
         }
@@ -246,101 +270,76 @@ pub(crate) async fn handle_profile_runtime_notification(
                 active_turns.remove(&runtime_key);
             }
             drop(active_turns);
-            let _ = with_ui_state_write(state, profile_id, |ui_state| {
-                let Some(runtime_status_by_thread_id) = ui_state
-                    .get_mut("runtimeStatusByThreadId")
-                    .and_then(Value::as_object_mut)
-                else {
-                    return Err(api_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "runtime status state is missing",
-                    ));
-                };
-                runtime_status_by_thread_id.insert(
-                    session_id.clone(),
-                    json!({
-                        "status": "completed",
-                        "updatedAt": now_unix_ms()
-                    }),
-                );
-                Ok(())
-            })
-            .await;
-            spawn_queue_drain(state, profile_id, &session_id);
-            maybe_schedule_global_shutdown(state, profile_id, turn_id.as_deref()).await;
-            emit_profile_global_notification(
+            let still_active = session_has_cached_runtime_activity(state, &runtime_key).await;
+            set_runtime_session_status(
                 state,
                 profile_id,
-                json!({
-                    "kind": "notification",
-                    "method": "codex-webui/sessionAttention",
-                    "params": {
-                        "sessionId": session_id,
-                        "reason": "completed"
-                    }
-                }),
+                &session_id,
+                if still_active { "running" } else { "completed" },
             )
             .await;
-            enqueue_profile_notification(
-                state,
-                profile_id,
-                "sessionCompleted",
-                Some(&session_id),
-                json!({
-                    "turnId": turn_id.clone().map(Value::String).unwrap_or(Value::Null)
-                }),
-            )
-            .await;
-            if session_stream_has_subscribers(state, profile_id, &session_id).await {
+            if still_active {
                 set_session_highlight(state, profile_id, &session_id, None).await;
             } else {
-                set_session_highlight(
+                spawn_queue_drain(state, profile_id, &session_id);
+                maybe_schedule_global_shutdown(state, profile_id, turn_id.as_deref()).await;
+                emit_profile_global_notification(
                     state,
                     profile_id,
-                    &session_id,
-                    Some(json!({
-                        "kind": "completed",
-                        "at": now_unix_ms()
-                    })),
+                    json!({
+                        "kind": "notification",
+                        "method": "codex-webui/sessionAttention",
+                        "params": {
+                            "sessionId": session_id,
+                            "reason": "completed"
+                        }
+                    }),
                 )
                 .await;
+                enqueue_profile_notification(
+                    state,
+                    profile_id,
+                    "sessionCompleted",
+                    Some(&session_id),
+                    json!({
+                        "turnId": turn_id.clone().map(Value::String).unwrap_or(Value::Null)
+                    }),
+                )
+                .await;
+                if session_stream_has_subscribers(state, profile_id, &session_id).await {
+                    set_session_highlight(state, profile_id, &session_id, None).await;
+                } else {
+                    set_session_highlight(
+                        state,
+                        profile_id,
+                        &session_id,
+                        Some(json!({
+                            "kind": "completed",
+                            "at": now_unix_ms()
+                        })),
+                    )
+                    .await;
+                }
             }
         }
         "thread/status/changed" => {
             let status = normalized_thread_status(notification.params.get("status"))
                 .unwrap_or_else(|| "unknown".to_string());
-            let _ = with_ui_state_write(state, profile_id, |ui_state| {
-                let Some(runtime_status_by_thread_id) = ui_state
-                    .get_mut("runtimeStatusByThreadId")
-                    .and_then(Value::as_object_mut)
-                else {
-                    return Err(api_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "runtime status state is missing",
-                    ));
-                };
-                if is_live_thread_status(&status) {
-                    runtime_status_by_thread_id.remove(&session_id);
-                } else {
-                    runtime_status_by_thread_id.insert(
-                        session_id.clone(),
-                        json!({
-                            "status": status.clone(),
-                            "updatedAt": now_unix_ms()
-                        }),
-                    );
-                }
-                Ok(())
-            })
-            .await;
             if is_live_thread_status(&status) {
                 state.pending_turn_starts.lock().await.remove(&runtime_key);
+                set_runtime_session_status(state, profile_id, &session_id, "running").await;
                 cancel_scheduled_shutdown_for_activity(state, profile_id).await;
             } else {
-                state.pending_turn_starts.lock().await.remove(&runtime_key);
-                state.active_turns.lock().await.remove(&runtime_key);
-                spawn_queue_drain(state, profile_id, &session_id);
-                maybe_schedule_global_shutdown(state, profile_id, None).await;
+                let still_active = session_has_cached_runtime_activity(state, &runtime_key).await;
+                if still_active {
+                    set_runtime_session_status(state, profile_id, &session_id, "running").await;
+                } else {
+                    state.pending_turn_starts.lock().await.remove(&runtime_key);
+                    state.active_turns.lock().await.remove(&runtime_key);
+                    set_runtime_session_status(state, profile_id, &session_id, &status).await;
+                    spawn_queue_drain(state, profile_id, &session_id);
+                    maybe_schedule_global_shutdown(state, profile_id, None).await;
+                }
             }
         }
         "thread/archived" | "thread/unarchived" => {
@@ -361,7 +360,17 @@ pub(crate) async fn handle_profile_runtime_notification(
         _ => {}
     }
 
-    if let Some(event) = map_app_server_session_notification(notification) {
+    if let Some(mut event) = map_app_server_session_notification(notification) {
+        if notification.method == "thread/status/changed"
+            && normalized_thread_status(notification.params.get("status"))
+                .as_deref()
+                .is_some_and(|status| !is_live_thread_status(status))
+            && session_has_cached_runtime_activity(state, &runtime_key).await
+        {
+            if let Some(params) = event.get_mut("params").and_then(Value::as_object_mut) {
+                params.insert("status".to_string(), Value::String("running".to_string()));
+            }
+        }
         emit_session_notification(state, profile_id, &session_id, event).await;
     }
 
@@ -371,8 +380,26 @@ pub(crate) async fn handle_profile_runtime_notification(
     ) {
         let status_override = match notification.method.as_str() {
             "turn/started" => Some("running".to_string()),
-            "turn/completed" => Some("completed".to_string()),
-            "thread/status/changed" => normalized_thread_status(notification.params.get("status")),
+            "turn/completed" => Some(
+                if session_has_cached_runtime_activity(state, &runtime_key).await {
+                    "running"
+                } else {
+                    "completed"
+                }
+                .to_string(),
+            ),
+            "thread/status/changed" => {
+                let status = normalized_thread_status(notification.params.get("status"));
+                if status
+                    .as_deref()
+                    .is_some_and(|status| !is_live_thread_status(status))
+                    && session_has_cached_runtime_activity(state, &runtime_key).await
+                {
+                    Some("running".to_string())
+                } else {
+                    status
+                }
+            }
             _ => None,
         };
         emit_session_summary_updated(

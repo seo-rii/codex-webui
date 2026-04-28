@@ -305,6 +305,12 @@ pub(crate) async fn handle_arena_api_http(
             }
             match read_json_body(request, LARGE_JSON_BODY_LIMIT, "arena request body").await {
                 Ok(payload) => {
+                    let preferences = payload.get("preferences").unwrap_or(&Value::Null);
+                    if preferences_payload_requires_owner(preferences)
+                        && !role_has_owner_access(&state.config, auth.role)
+                    {
+                        return json_error(StatusCode::FORBIDDEN, &owner_required_error_value());
+                    }
                     start_arena_run_payload(
                         &state,
                         &auth.profile_id,
@@ -313,7 +319,7 @@ pub(crate) async fn handle_arena_api_http(
                             .and_then(Value::as_str)
                             .unwrap_or_default(),
                         payload.get("contestants").unwrap_or(&Value::Null),
-                        payload.get("preferences").unwrap_or(&Value::Null),
+                        preferences,
                     )
                     .await
                 }

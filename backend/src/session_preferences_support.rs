@@ -1,5 +1,22 @@
 use super::*;
 
+pub(crate) fn preferences_payload_requires_owner(preferences: &Value) -> bool {
+    preferences.as_object().is_some_and(|entries| {
+        entries
+            .get("autoApproveMode")
+            .and_then(Value::as_str)
+            .is_some_and(|value| matches!(value, "turn" | "session"))
+            || entries
+                .get("approvalPolicy")
+                .and_then(Value::as_str)
+                .is_some_and(|value| matches!(value, "never" | "on-failure"))
+            || entries
+                .get("sandboxMode")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == "danger-full-access")
+    })
+}
+
 pub(crate) async fn normalize_session_preferences_payload(
     state: &AppState,
     profile_id: &str,

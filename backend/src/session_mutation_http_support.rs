@@ -189,6 +189,15 @@ pub(crate) async fn handle_session_messages_api_http(
     let result = match read_json_body(request, LARGE_JSON_BODY_LIMIT, "session message body").await
     {
         Ok(payload) => {
+            let preferences = payload
+                .get("preferences")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if preferences_payload_requires_owner(&preferences)
+                && !role_has_owner_access(&state.config, auth.role)
+            {
+                return json_error(StatusCode::FORBIDDEN, &owner_required_error_value());
+            }
             send_turn_payload(
                 &state,
                 &auth.profile_id,
@@ -199,10 +208,7 @@ pub(crate) async fn handle_session_messages_api_http(
                     .unwrap_or_default(),
                 payload.get("attachmentIds"),
                 payload.get("skills"),
-                payload
-                    .get("preferences")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
+                preferences,
             )
             .await
         }

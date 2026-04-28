@@ -50,13 +50,19 @@ pub(crate) async fn handle_sessions_api_http(
 
             match read_json_body(request, SMALL_JSON_BODY_LIMIT, "session create body").await {
                 Ok(payload) => {
+                    let preferences = payload
+                        .get("preferences")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    if preferences_payload_requires_owner(&preferences)
+                        && !role_has_owner_access(&state.config, auth.role)
+                    {
+                        return json_error(StatusCode::FORBIDDEN, &owner_required_error_value());
+                    }
                     create_session_payload(
                         &state,
                         &auth.profile_id,
-                        payload
-                            .get("preferences")
-                            .cloned()
-                            .unwrap_or_else(|| json!({})),
+                        preferences,
                         payload.get("selectedSkills"),
                         payload.get("name").and_then(Value::as_str),
                     )
@@ -94,14 +100,20 @@ pub(crate) async fn handle_session_api_http(
 
             match read_json_body(request, SMALL_JSON_BODY_LIMIT, "session update body").await {
                 Ok(payload) => {
+                    let preferences = payload
+                        .get("preferences")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    if preferences_payload_requires_owner(&preferences)
+                        && !role_has_owner_access(&state.config, auth.role)
+                    {
+                        return json_error(StatusCode::FORBIDDEN, &owner_required_error_value());
+                    }
                     save_session_preferences_payload(
                         &state,
                         &auth.profile_id,
                         session_id,
-                        payload
-                            .get("preferences")
-                            .cloned()
-                            .unwrap_or_else(|| json!({})),
+                        preferences,
                     )
                     .await
                 }

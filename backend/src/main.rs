@@ -233,6 +233,8 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
     let result = async {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
             .build()
             .context("failed to build reqwest client")?;
 

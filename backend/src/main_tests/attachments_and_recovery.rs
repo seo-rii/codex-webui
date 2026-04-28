@@ -188,6 +188,80 @@ async fn delete_attachment_payload_removes_attachment_files() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_cleanup_removes_orphan_files_and_metadata() {
+    let sandbox = unique_test_dir("attachment-cleanup");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let runtime_profile = resolve_runtime_profile(&state.config, "default");
+    let uploads_dir = runtime_profile.data_dir.join("uploads").join("thread-1");
+    fs::create_dir_all(&uploads_dir).unwrap();
+    let kept_file = uploads_dir.join("att-1-notes.md");
+    let kept_meta = uploads_dir.join("att-1-notes.md.json");
+    let orphan_file = uploads_dir.join("orphan.bin");
+    let orphan_meta = uploads_dir.join("att-2-missing.md.json");
+    let temp_upload = uploads_dir.join(".stale.upload");
+    fs::write(&kept_file, "notes").unwrap();
+    fs::write(&orphan_file, "orphan").unwrap();
+    fs::write(&temp_upload, "temp").unwrap();
+    fs::write(
+        &kept_meta,
+        serde_json::to_vec(&json!({
+            "id": "att-1",
+            "originalName": "notes.md",
+            "path": kept_file.display().to_string(),
+            "mimeType": "text/markdown",
+            "size": 5,
+            "kind": "file",
+            "createdAt": "1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &orphan_meta,
+        serde_json::to_vec(&json!({
+            "id": "att-2",
+            "originalName": "missing.md",
+            "path": uploads_dir.join("missing.md").display().to_string(),
+            "mimeType": "text/markdown",
+            "size": 5,
+            "kind": "file",
+            "createdAt": "1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let dry_run = cleanup_attachment_orphans_payload(&state, "default", true, 0)
+        .await
+        .unwrap();
+    assert_eq!(dry_run.get("orphanFiles").and_then(Value::as_u64), Some(2));
+    assert_eq!(
+        dry_run.get("orphanMetadata").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert!(orphan_file.exists());
+    assert!(orphan_meta.exists());
+
+    let removed = cleanup_attachment_orphans_payload(&state, "default", false, 0)
+        .await
+        .unwrap();
+    assert_eq!(removed.get("removedPaths").and_then(Value::as_u64), Some(3));
+    assert!(kept_file.exists());
+    assert!(kept_meta.exists());
+    assert!(!orphan_file.exists());
+    assert!(!orphan_meta.exists());
+    assert!(!temp_upload.exists());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_attachments_store_files_without_internal_backend() {
     let sandbox = unique_test_dir("attachment-upload-rust");
     let workspace = sandbox.join("workspace");

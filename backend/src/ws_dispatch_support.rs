@@ -562,6 +562,20 @@ pub(crate) async fn execute_ws_method(
                 .await
                 .map_err(anyhow::Error::from)
         }
+        "attachments/cleanup" => cleanup_attachment_orphans_payload(
+            state,
+            &auth.profile_id,
+            params
+                .get("dryRun")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            params
+                .get("minAgeMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(7 * 24 * 60 * 60 * 1000),
+        )
+        .await
+        .map_err(anyhow::Error::from),
         "account/get" => get_account_state(state, &auth.profile_id).await,
         "account/login/start" => start_account_login(state, &auth.profile_id, &params).await,
         "account/login/cancel" => cancel_account_login(state, &auth.profile_id, &params).await,

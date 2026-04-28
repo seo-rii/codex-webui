@@ -418,3 +418,157 @@ pub(crate) async fn delete_attachment_payload(
     emit_attachments_updated(state, profile_id, session_id).await?;
     Ok(json!({ "ok": true }))
 }
+
+async fn path_is_old_enough(path: &Path, min_age_ms: u64) -> bool {
+    if min_age_ms == 0 {
+        return true;
+    }
+    tokio_fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age.as_millis() as u64 >= min_age_ms)
+}
+
+pub(crate) async fn cleanup_attachment_orphans_payload(
+    state: &AppState,
+    profile_id: &str,
+    dry_run: bool,
+    min_age_ms: u64,
+) -> ApiResult<Value> {
+    let uploads_root = resolve_runtime_profile(&state.config, profile_id)
+        .data_dir
+        .join("uploads");
+    let mut scanned_sessions = 0_u64;
+    let mut orphan_files = 0_u64;
+    let mut orphan_metadata = 0_u64;
+    let mut removed_paths = 0_u64;
+    let mut removed_bytes = 0_u64;
+    let mut session_dirs = match tokio_fs::read_dir(&uploads_root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({
+                "dryRun": dry_run,
+                "scannedSessions": 0,
+                "orphanFiles": 0,
+                "orphanMetadata": 0,
+                "removedPaths": 0,
+                "removedBytes": 0
+            }));
+        }
+        Err(error) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.to_string(),
+            ));
+        }
+    };
+
+    while let Some(session_entry) = session_dirs
+        .next_entry()
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    {
+        let session_path = session_entry.path();
+        if !session_entry
+            .file_type()
+            .await
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        scanned_sessions += 1;
+        let mut metadata_paths = Vec::new();
+        let mut referenced_names = HashSet::new();
+        let mut file_paths = Vec::new();
+        let mut entries = match tokio_fs::read_dir(&session_path).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        {
+            let path = entry.path();
+            if !entry
+                .file_type()
+                .await
+                .map(|file_type| file_type.is_file())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                metadata_paths.push(path);
+            } else {
+                file_paths.push(path);
+            }
+        }
+
+        for metadata_path in metadata_paths {
+            let raw = match tokio_fs::read_to_string(&metadata_path).await {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let record = serde_json::from_str::<StoredAttachmentRecord>(&raw).ok();
+            let referenced = record
+                .as_ref()
+                .and_then(|record| record.path.as_deref())
+                .map(PathBuf::from)
+                .and_then(|path| path.file_name().map(|name| name.to_os_string()));
+            if let Some(name) = referenced {
+                let referenced_path = session_path.join(&name);
+                if tokio_fs::metadata(&referenced_path).await.is_ok() {
+                    referenced_names.insert(name);
+                    continue;
+                }
+            }
+
+            if path_is_old_enough(&metadata_path, min_age_ms).await {
+                orphan_metadata += 1;
+                let size = tokio_fs::metadata(&metadata_path)
+                    .await
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                if !dry_run && tokio_fs::remove_file(&metadata_path).await.is_ok() {
+                    removed_paths += 1;
+                    removed_bytes = removed_bytes.saturating_add(size);
+                }
+            }
+        }
+
+        for file_path in file_paths {
+            let Some(file_name) = file_path.file_name().map(|name| name.to_os_string()) else {
+                continue;
+            };
+            let is_temp_upload = file_name.to_string_lossy().ends_with(".upload");
+            if !is_temp_upload && referenced_names.contains(&file_name) {
+                continue;
+            }
+            if path_is_old_enough(&file_path, min_age_ms).await {
+                orphan_files += 1;
+                let size = tokio_fs::metadata(&file_path)
+                    .await
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                if !dry_run && tokio_fs::remove_file(&file_path).await.is_ok() {
+                    removed_paths += 1;
+                    removed_bytes = removed_bytes.saturating_add(size);
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "dryRun": dry_run,
+        "scannedSessions": scanned_sessions,
+        "orphanFiles": orphan_files,
+        "orphanMetadata": orphan_metadata,
+        "removedPaths": removed_paths,
+        "removedBytes": removed_bytes
+    }))
+}

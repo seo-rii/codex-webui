@@ -30,6 +30,7 @@ The goal is not to replace upstream surfaces. The goal is to make Codex usable f
 - Request-ID dedupe at the public gateway so reconnect replays do not execute queue or other mutating RPC calls twice, with role/method/parameter matching and response-size budgets
 - Operational probes for `/healthz`, `/readyz`, and admin-only `/metrics`
 - Dedicated runtime error logs under `<dataDir>/logs/` for Rust gateway failures and per-profile `codex app-server` stderr
+- Optional owner role for host-level capabilities such as terminals, runtime install/update, forced worktree removal, and dangerous session approval/sandbox settings
 - Session queue, explicit steer flow, persisted queued follow-ups, and resume prompts after restart
 - Composer history recall with keyboard navigation, a quick "reuse last message" chip, and one-click resend/queue for the most recent prompt
 - Session completion and input-required badges are persisted server-side, so they survive reconnects and show up consistently across multiple clients
@@ -298,8 +299,11 @@ See [.env.example](./.env.example) for a concise example set.
 - User-facing HTTP and WebSocket errors redact common token-shaped values and the host user's home directory; detailed diagnostics go to server logs instead.
 - Use the viewer password for observation-only access instead of sharing the admin password when multiple humans need browser visibility.
 - Git actions are intentionally gated on explicit repository selection.
+- Pull, branch switch, and worktree removal are blocked while a live or pending Codex turn is using that repository.
+- If `ownerPasswordHash` is configured, host-level controls require owner login rather than ordinary admin login.
 - System shutdown support is disabled by default and must be explicitly enabled.
 - The shutdown control is global to the running server, so all connected clients see the same armed and scheduled state.
+- Notification webhook URLs are validated when settings are saved and again immediately before delivery, so stale or corrupted state cannot silently post to local/private targets.
 
 ## Development
 

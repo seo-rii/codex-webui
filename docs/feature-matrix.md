@@ -49,7 +49,7 @@ In the comparison columns:
 | Aggregated diff view | Implemented | Different shape | Comparable | Exposes grouped file changes per turn and in dedicated tabs. |
 | Inline file editing | Implemented | Partial | Comparable | Focused on quick inspection and edits rather than full IDE parity. |
 | Git repository discovery | Implemented | Different shape | Comparable | Discovery is depth-limited and gated on explicit repository selection. |
-| Git status, fetch/pull, diff, commit inspection | Implemented | Partial | Comparable | Designed as a browser-side Git workspace, not a full desktop VCS client, and now includes VS Code-inspired staged/unstaged Source Control sections, dense one-row actions, tree-or-list change browsing, fetch/pull controls, and a mobile-friendly navigation mode. |
+| Git status, fetch/pull, diff, commit inspection | Implemented | Partial | Comparable | Designed as a browser-side Git workspace, not a full desktop VCS client, and now includes VS Code-inspired staged/unstaged Source Control sections, dense one-row actions, tree-or-list change browsing, fetch/pull controls, active-turn safety checks, and a mobile-friendly navigation mode. |
 | Git worktree management | Implemented | Partial | Comparable | Explicitly exposed in the web UI because multiple browser workspaces benefit from it. |
 | Terminal tabs | Implemented | Different shape | Comparable | Terminals live in the Rust gateway and survive page reloads while the server stays up. |
 | Subagent activity view | Implemented | Comparable | Comparable | Subagent activity is rendered inline and can open related threads in tabs. |
@@ -96,6 +96,7 @@ The project leans into browser-native Git inspection and workspace management:
 - grouped file-change views
 - Monaco diff panes
 - worktree operations
+- safety checks that block destructive repo mutations while a Codex turn is active in that repo
 
 These features are meant to make remote Codex usage practical, not to replace a full desktop Git client.
 

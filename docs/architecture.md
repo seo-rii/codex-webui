@@ -244,8 +244,10 @@ The trust boundary is narrow:
 
 - public browser traffic reaches only the Rust gateway
 - browser sessions can authenticate as either admin or viewer, and the Rust gateway enforces the write boundary before handling WebSocket methods
+- deployments can also configure an owner password; when present, host-level controls such as terminal access, runtime install/update, forced worktree removal, auto-approve session settings, no-prompt approval policies, and `danger-full-access` sandbox selection require owner role
 - filesystem browsing is limited to allowed roots plus Codex-owned config/runtime paths
 - Git actions require explicit repository selection
+- destructive Git mutations such as pull, branch switch, and worktree removal refuse to run while a live or pending Codex turn is associated with the same repository
 - cookies are signed and HTTP-only
 - cross-origin browser access must be explicitly allowed
 - cookie paths are scoped to the configured base path
@@ -253,7 +255,7 @@ The trust boundary is narrow:
 - WebSocket upgrades validate Origin separately from HTTP CORS
 - default viewer access is transcript-oriented; code, terminal, audit, config, and Git file reads remain admin-only
 - file reads/writes deny common secret paths and bound preview sizes
-- webhook URLs must use HTTPS and cannot target localhost or private/link-local IP literals
+- webhook URLs must use HTTPS and cannot target localhost, `.local`, or private/link-local IP literal targets; delivery revalidates the persisted URL before sending
 
 The model is designed to reduce accidental exposure, not to make an untrusted multi-tenant Codex host safe by default.
 

@@ -99,6 +99,38 @@ async fn websocket_response_cache_is_partitioned_by_role_method_and_params() {
 }
 
 #[test]
+fn websocket_origin_allows_same_origin_and_configured_cors_only() {
+    let sandbox = unique_test_dir("ws-origin-policy");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+
+    let mut same_origin_headers = HeaderMap::new();
+    same_origin_headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:4173"));
+    same_origin_headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://127.0.0.1:4173"),
+    );
+    assert!(websocket_origin_allowed(&state.config, &same_origin_headers));
+
+    let mut rejected_headers = same_origin_headers.clone();
+    rejected_headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://attacker.example"),
+    );
+    assert!(!websocket_origin_allowed(&state.config, &rejected_headers));
+
+    let mut config = (*state.config).clone();
+    config.cors_allowed_origins = vec!["https://attacker.example".to_string()];
+    state.config = Arc::new(config);
+    assert!(websocket_origin_allowed(&state.config, &rejected_headers));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[test]
 fn maps_session_item_notifications_for_stream_clients() {
     let mapped = map_app_server_session_notification(&AppServerNotification {
         method: "item/started".to_string(),

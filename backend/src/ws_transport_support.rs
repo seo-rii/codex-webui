@@ -7,8 +7,13 @@ tokio::task_local! {
 pub(crate) async fn handle_ws(
     State(state): State<AppState>,
     jar: CookieJar,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if !websocket_origin_allowed(&state.config, &headers) {
+        return (StatusCode::FORBIDDEN, "WebSocket origin is not allowed.").into_response();
+    }
+
     let Some(auth) = auth_context(&state.config, &jar) else {
         return (StatusCode::UNAUTHORIZED, "Authentication required.").into_response();
     };

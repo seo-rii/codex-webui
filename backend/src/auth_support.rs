@@ -219,6 +219,33 @@ pub(crate) fn allowed_cors_origin(config: &Config, origin: &Option<String>) -> O
     }
 }
 
+pub(crate) fn websocket_origin_allowed(config: &Config, headers: &HeaderMap) -> bool {
+    let Some(origin) = extract_origin(headers) else {
+        return true;
+    };
+    if allowed_cors_origin(config, &Some(origin.clone())).is_some() {
+        return true;
+    }
+
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let scheme = if request_is_secure(headers) {
+        "https"
+    } else {
+        "http"
+    };
+    let Some(expected_origin) = normalize_origin(&format!("{scheme}://{host}")) else {
+        return false;
+    };
+    origin == expected_origin
+}
+
 pub(crate) fn apply_cors_headers(
     headers: &mut HeaderMap,
     origin: &str,

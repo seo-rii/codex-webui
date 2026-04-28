@@ -686,6 +686,26 @@ async fn static_asset_handler_rewrites_base_path_and_uses_spa_fallbacks() {
             "no-store, max-age=0, must-revalidate"
         ))
     );
+    let content_security_policy = root_response
+        .headers()
+        .get(header::HeaderName::from_static("content-security-policy"))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(content_security_policy.contains("object-src 'none'"));
+    assert!(content_security_policy.contains("base-uri 'none'"));
+    assert!(content_security_policy.contains("frame-ancestors 'none'"));
+    assert_eq!(
+        root_response
+            .headers()
+            .get(header::HeaderName::from_static("x-content-type-options")),
+        Some(&HeaderValue::from_static("nosniff"))
+    );
+    assert_eq!(
+        root_response
+            .headers()
+            .get(header::HeaderName::from_static("referrer-policy")),
+        Some(&HeaderValue::from_static("same-origin"))
+    );
     let root_body = to_bytes(root_response.into_body(), usize::MAX)
         .await
         .unwrap();

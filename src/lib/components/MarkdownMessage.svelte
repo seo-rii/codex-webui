@@ -22,6 +22,45 @@
 
   const lowlight = createLowlight(common);
   const codeCopyResetTimers = new WeakMap<HTMLButtonElement, number>();
+  const markdownAllowedTags = new Set([
+    "a",
+    "blockquote",
+    "br",
+    "button",
+    "code",
+    "div",
+    "em",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "hr",
+    "img",
+    "li",
+    "ol",
+    "p",
+    "path",
+    "pre",
+    "span",
+    "strong",
+    "svg",
+    "table",
+    "tbody",
+    "td",
+    "th",
+    "thead",
+    "tr",
+    "ul"
+  ]);
+  const markdownGlobalAttributes = new Set(["aria-hidden", "aria-label", "class", "title"]);
+  const markdownTagAttributes = new Map([
+    ["a", new Set(["href", "rel", "target"])],
+    ["button", new Set(["data-copy-code", "data-copy-label", "type"])],
+    ["img", new Set(["alt", "loading", "src"])],
+    ["path", new Set(["d", "stroke-linecap", "stroke-linejoin", "stroke-width"])],
+    ["span", new Set(["data-copy-code-label"])],
+    ["svg", new Set(["fill", "stroke", "viewbox"])]
+  ]);
 
   function escapeHtml(value: string) {
     return value
@@ -125,7 +164,57 @@
     if (!text?.trim()) {
       return "";
     }
-    return marked.parse(text) as string;
+    const parsed = marked.parse(text) as string;
+    if (typeof document === "undefined") {
+      return parsed;
+    }
+
+    const template = document.createElement("template");
+    template.innerHTML = parsed;
+    const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_ELEMENT);
+    const elements: Element[] = [];
+    let current = walker.nextNode();
+    while (current) {
+      elements.push(current as Element);
+      current = walker.nextNode();
+    }
+
+    for (const element of elements) {
+      const tagName = element.tagName.toLowerCase();
+      if (!markdownAllowedTags.has(tagName)) {
+        element.replaceWith(document.createTextNode(element.textContent ?? ""));
+        continue;
+      }
+
+      const tagAttributes = markdownTagAttributes.get(tagName);
+      for (const attribute of Array.from(element.attributes)) {
+        const name = attribute.name.toLowerCase();
+        const value = attribute.value;
+        let keep = markdownGlobalAttributes.has(name) || Boolean(tagAttributes?.has(name));
+
+        if (name.startsWith("on") || name === "style") {
+          keep = false;
+        } else if ((name === "href" || name === "src") && !safeHref(value)) {
+          keep = false;
+        } else if (name === "target" && value !== "_blank") {
+          keep = false;
+        } else if (name === "type" && tagName === "button" && value !== "button") {
+          keep = false;
+        } else if (name === "class" && !/^[\w\s:./,[\]()%+=-]+$/u.test(value)) {
+          keep = false;
+        } else if (name === "d" && !/^[ACHLQSTVZMac hlqstvz0-9,.\s-]+$/u.test(value)) {
+          keep = false;
+        } else if (name === "rel") {
+          element.setAttribute("rel", "noreferrer");
+        }
+
+        if (!keep) {
+          element.removeAttribute(attribute.name);
+        }
+      }
+    }
+
+    return template.innerHTML;
   });
 
   $effect(() => {
@@ -134,17 +223,77 @@
     }
 
     const element = rootElement;
-    element.addEventListener("click", handleClick as EventListener);
+    element.addEventListener("click", handleClick);
     return () => {
-      element.removeEventListener("click", handleClick as EventListener);
+      element.removeEventListener("click", handleClick);
     };
   });
 
-  function handleClick(event: MouseEvent) {
+  async function handleClick(event: Event) {
     const copyButton = (event.target as HTMLElement | null)?.closest("button[data-copy-code]");
     if (copyButton instanceof HTMLButtonElement) {
       event.preventDefault();
-      void copyCodeBlock(copyButton);
+      const code = copyButton.closest(".code-block")?.querySelector("pre code")?.textContent ?? "";
+      if (!code) {
+        return;
+      }
+
+      try {
+        let copied = false;
+        if (navigator.clipboard?.writeText) {
+          try {
+            await navigator.clipboard.writeText(code);
+            copied = true;
+          } catch {
+            copied = false;
+          }
+        }
+
+        if (!copied) {
+          const textarea = document.createElement("textarea");
+          textarea.value = code;
+          textarea.setAttribute("readonly", "");
+          textarea.style.position = "fixed";
+          textarea.style.opacity = "0";
+          textarea.style.pointerEvents = "none";
+          document.body.appendChild(textarea);
+          textarea.select();
+          copied = document.execCommand("copy");
+          textarea.remove();
+        }
+
+        if (!copied) {
+          throw new Error("Clipboard copy failed");
+        }
+
+        const label = copyButton.querySelector<HTMLElement>("[data-copy-code-label]");
+        const copyLabel = copyButton.dataset.copyLabel ?? m.copy_code();
+        const copiedLabel = m.copied_to_clipboard();
+        const previousTimer = codeCopyResetTimers.get(copyButton);
+        if (previousTimer) {
+          clearTimeout(previousTimer);
+        }
+
+        copyButton.dataset.copied = "true";
+        copyButton.title = copiedLabel;
+        copyButton.setAttribute("aria-label", copiedLabel);
+        if (label) {
+          label.textContent = copiedLabel;
+        }
+
+        const timer = window.setTimeout(() => {
+          copyButton.dataset.copied = "false";
+          copyButton.title = copyLabel;
+          copyButton.setAttribute("aria-label", copyLabel);
+          if (label) {
+            label.textContent = copyLabel;
+          }
+          codeCopyResetTimers.delete(copyButton);
+        }, 1400);
+        codeCopyResetTimers.set(copyButton, timer);
+      } catch {
+        copyButton.dataset.copied = "false";
+      }
       return;
     }
 
@@ -160,73 +309,6 @@
 
     event.preventDefault();
     dispatch("openLocalPath", { href });
-  }
-
-  async function copyCodeBlock(button: HTMLButtonElement) {
-    const code = button.closest(".code-block")?.querySelector("pre code")?.textContent ?? "";
-    if (!code) {
-      return;
-    }
-
-    try {
-      await writeClipboard(code);
-      markCodeCopied(button);
-    } catch {
-      button.dataset.copied = "false";
-    }
-  }
-
-  async function writeClipboard(value: string) {
-    if (navigator.clipboard?.writeText) {
-      try {
-        await navigator.clipboard.writeText(value);
-        return;
-      } catch {
-        // Fall through to the legacy path for restricted clipboard contexts.
-      }
-    }
-
-    const textarea = document.createElement("textarea");
-    textarea.value = value;
-    textarea.setAttribute("readonly", "");
-    textarea.style.position = "fixed";
-    textarea.style.opacity = "0";
-    textarea.style.pointerEvents = "none";
-    document.body.appendChild(textarea);
-    textarea.select();
-    const copied = document.execCommand("copy");
-    textarea.remove();
-    if (!copied) {
-      throw new Error("Clipboard copy failed");
-    }
-  }
-
-  function markCodeCopied(button: HTMLButtonElement) {
-    const label = button.querySelector<HTMLElement>("[data-copy-code-label]");
-    const copyLabel = button.dataset.copyLabel ?? m.copy_code();
-    const copiedLabel = m.copied_to_clipboard();
-    const previousTimer = codeCopyResetTimers.get(button);
-    if (previousTimer) {
-      clearTimeout(previousTimer);
-    }
-
-    button.dataset.copied = "true";
-    button.title = copiedLabel;
-    button.setAttribute("aria-label", copiedLabel);
-    if (label) {
-      label.textContent = copiedLabel;
-    }
-
-    const timer = window.setTimeout(() => {
-      button.dataset.copied = "false";
-      button.title = copyLabel;
-      button.setAttribute("aria-label", copyLabel);
-      if (label) {
-        label.textContent = copyLabel;
-      }
-      codeCopyResetTimers.delete(button);
-    }, 1400);
-    codeCopyResetTimers.set(button, timer);
   }
 </script>
 

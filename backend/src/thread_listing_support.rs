@@ -239,14 +239,31 @@ async fn list_app_server_thread_batch(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    state.session_thread_cache.lock().await.insert(
-        cache_key,
-        CachedSessionThreads {
-            created_at: Instant::now(),
-            threads: threads.clone(),
-            next_cursor: next_cursor.clone().unwrap_or_default(),
-        },
-    );
+    {
+        let mut cache = state.session_thread_cache.lock().await;
+        cache.insert(
+            cache_key,
+            CachedSessionThreads {
+                created_at: Instant::now(),
+                threads: threads.clone(),
+                next_cursor: next_cursor.clone().unwrap_or_default(),
+            },
+        );
+        cache.retain(|_, entry| entry.created_at.elapsed() < SESSION_THREAD_CACHE_TTL);
+        if cache.len() > SESSION_THREAD_CACHE_MAX_ENTRIES {
+            let mut entries = cache
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.created_at))
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|(_, created_at)| *created_at);
+            for (key, _) in entries {
+                if cache.len() <= SESSION_THREAD_CACHE_MAX_ENTRIES {
+                    break;
+                }
+                cache.remove(&key);
+            }
+        }
+    }
 
     Ok((threads, next_cursor))
 }
@@ -297,13 +314,40 @@ async fn cached_session_search_text(
             )
         })?;
 
-    state.session_search_text_cache.lock().await.insert(
-        cache_key,
-        CachedSessionSearchText {
-            created_at: Instant::now(),
-            text: text.clone(),
-        },
-    );
+    {
+        let mut cache = state.session_search_text_cache.lock().await;
+        if text.len() <= SESSION_SEARCH_TEXT_CACHE_MAX_BYTES {
+            cache.insert(
+                cache_key,
+                CachedSessionSearchText {
+                    created_at: Instant::now(),
+                    text_bytes: text.len(),
+                    text: text.clone(),
+                },
+            );
+        }
+        cache.retain(|_, entry| entry.created_at.elapsed() < SESSION_SEARCH_TEXT_CACHE_TTL);
+        let mut total_bytes = cache.values().map(|entry| entry.text_bytes).sum::<usize>();
+        if cache.len() > SESSION_SEARCH_TEXT_CACHE_MAX_ENTRIES
+            || total_bytes > SESSION_SEARCH_TEXT_CACHE_MAX_BYTES
+        {
+            let mut entries = cache
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.created_at))
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|(_, created_at)| *created_at);
+            for (key, _) in entries {
+                if cache.len() <= SESSION_SEARCH_TEXT_CACHE_MAX_ENTRIES
+                    && total_bytes <= SESSION_SEARCH_TEXT_CACHE_MAX_BYTES
+                {
+                    break;
+                }
+                if let Some(removed) = cache.remove(&key) {
+                    total_bytes = total_bytes.saturating_sub(removed.text_bytes);
+                }
+            }
+        }
+    }
     Ok(text)
 }
 

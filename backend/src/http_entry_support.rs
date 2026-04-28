@@ -132,8 +132,13 @@ pub(crate) async fn handle_http(
                     )
                 };
                 let session_thread_cache_entries = state.session_thread_cache.lock().await.len();
-                let session_search_cache_entries =
-                    state.session_search_text_cache.lock().await.len();
+                let (session_search_cache_entries, session_search_cache_bytes) = {
+                    let cache = state.session_search_text_cache.lock().await;
+                    (
+                        cache.len(),
+                        cache.values().map(|entry| entry.text_bytes).sum::<usize>(),
+                    )
+                };
                 let (static_asset_cache_entries, static_asset_cache_bytes) = {
                     let cache = state.static_asset_cache.lock().await;
                     (
@@ -171,6 +176,8 @@ codex_webui_response_cache_bytes {response_cache_bytes}\n\
 codex_webui_session_thread_cache_entries {session_thread_cache_entries}\n\
 # TYPE codex_webui_session_search_cache_entries gauge\n\
 codex_webui_session_search_cache_entries {session_search_cache_entries}\n\
+# TYPE codex_webui_session_search_cache_bytes gauge\n\
+codex_webui_session_search_cache_bytes {session_search_cache_bytes}\n\
 # TYPE codex_webui_static_asset_cache_entries gauge\n\
 codex_webui_static_asset_cache_entries {static_asset_cache_entries}\n\
 # TYPE codex_webui_static_asset_cache_bytes gauge\n\

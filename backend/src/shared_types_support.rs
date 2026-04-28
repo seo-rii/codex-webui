@@ -68,6 +68,7 @@ pub(crate) struct CachedSessionThreads {
 #[derive(Clone)]
 pub(crate) struct CachedSessionSearchText {
     pub(crate) created_at: Instant,
+    pub(crate) text_bytes: usize,
     pub(crate) text: String,
 }
 

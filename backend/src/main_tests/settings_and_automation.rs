@@ -107,6 +107,23 @@ async fn rejects_oversized_editable_file_previews() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn command_runner_rejects_oversized_output() {
+    let error = run_command_with_timeout(
+        "sh",
+        vec![
+            "-c".to_string(),
+            format!("yes x | head -c {}", CHILD_OUTPUT_LIMIT_BYTES + 1),
+        ],
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("oversized command output should be rejected");
+
+    assert!(format!("{error:#}").contains("output limit"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn rejects_editable_file_writes_through_symlinked_parent() {
     let sandbox = unique_test_dir("editor-symlink-parent");
     let workspace = sandbox.join("workspace");

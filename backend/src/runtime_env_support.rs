@@ -108,18 +108,74 @@ pub(crate) async fn run_command_with_timeout(
     args: Vec<String>,
     timeout: Duration,
 ) -> Result<std::process::Output> {
-    let child = Command::new(command)
+    let mut child = Command::new(command)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to start `{command}`"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .with_context(|| format!("failed to capture `{command}` stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .with_context(|| format!("failed to capture `{command}` stderr"))?;
 
-    tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| anyhow!("`{command}` timed out"))?
-        .with_context(|| format!("failed to wait for `{command}`"))
+    match tokio::time::timeout(timeout, async {
+        let (status, stdout, stderr) = tokio::try_join!(
+            async {
+                child
+                    .wait()
+                    .await
+                    .with_context(|| format!("failed to wait for `{command}`"))
+            },
+            read_child_pipe_limited(stdout, "stdout"),
+            read_child_pipe_limited(stderr, "stderr")
+        )?;
+        Result::<std::process::Output>::Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await
+    {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(error).with_context(|| format!("failed to wait for `{command}`"))
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(anyhow!("`{command}` timed out"))
+        }
+    }
+}
+
+async fn read_child_pipe_limited<R>(mut reader: R, label: &str) -> Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        if output.len().saturating_add(count) > CHILD_OUTPUT_LIMIT_BYTES {
+            return Err(anyhow!(
+                "command {label} exceeded the {CHILD_OUTPUT_LIMIT_BYTES} byte output limit"
+            ));
+        }
+        output.extend_from_slice(&chunk[..count]);
+    }
+    Ok(output)
 }
 
 pub(crate) async fn command_available(name: &str) -> bool {

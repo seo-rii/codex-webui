@@ -9,6 +9,7 @@ pub(crate) const RESPONSE_CACHE_MAX_ENTRIES: usize = 2048;
 pub(crate) const WS_MAX_CONCURRENT_REQUESTS: usize = 32;
 pub(crate) const WS_MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const TEXT_FILE_PREVIEW_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const CHILD_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const GLOBAL_RELAY_KEY: &str = "__global__";
 pub(crate) const CODEX_NPM_PACKAGE: &str = "@openai/codex";
 pub(crate) const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";

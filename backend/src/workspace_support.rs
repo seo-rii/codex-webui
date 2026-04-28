@@ -327,12 +327,34 @@ pub(crate) async fn write_text_file_safely(
     Ok(())
 }
 
+pub(crate) async fn ensure_text_file_preview_size(path: &Path) -> ApiResult<()> {
+    match tokio_fs::metadata(path).await {
+        Ok(metadata) => {
+            if metadata.len() > TEXT_FILE_PREVIEW_LIMIT_BYTES {
+                return Err(api_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "The selected file is too large to preview.",
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to inspect the selected file.",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn read_editable_file_payload(
     state: &AppState,
     profile_id: &str,
     file_path: &str,
 ) -> ApiResult<Value> {
     let resolved_path = resolve_editable_file_path(state, profile_id, file_path).await?;
+    ensure_text_file_preview_size(&resolved_path).await?;
     let content = match tokio_fs::read_to_string(&resolved_path).await {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),

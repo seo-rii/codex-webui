@@ -180,6 +180,7 @@ pub(crate) async fn get_git_file_payload(
         .unwrap_or(Value::Null);
 
     let candidate_path = resolve_git_repository_file_path(&repo_root, file_path).await?;
+    ensure_text_file_preview_size(&candidate_path).await?;
     let modified_bytes = tokio_fs::read(&candidate_path).await.unwrap_or_default();
     let modified_is_binary = modified_bytes.contains(&0);
     let modified_content = if modified_is_binary {
@@ -207,6 +208,12 @@ pub(crate) async fn get_git_file_payload(
     .ok();
     let (original_content, original_is_binary) = if let Some(output) = head_output {
         if output.status.success() {
+            if output.stdout.len() as u64 > TEXT_FILE_PREVIEW_LIMIT_BYTES {
+                return Err(api_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "The selected Git file is too large to preview.",
+                ));
+            }
             let is_binary = output.stdout.contains(&0);
             (
                 if is_binary {

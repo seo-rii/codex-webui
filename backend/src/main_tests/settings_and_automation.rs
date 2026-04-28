@@ -80,6 +80,31 @@ async fn rejects_sensitive_editable_files_inside_profile_home() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test]
+async fn rejects_oversized_editable_file_previews() {
+    let sandbox = unique_test_dir("editor-large-preview");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let large_path = workspace.join("large.txt");
+    fs::write(
+        &large_path,
+        vec![b'a'; TEXT_FILE_PREVIEW_LIMIT_BYTES as usize + 1],
+    )
+    .unwrap();
+    let error = read_editable_file_payload(&state, "default", large_path.to_str().unwrap())
+        .await
+        .expect_err("large files should not be loaded into editor preview");
+
+    assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(error.message, "The selected file is too large to preview.");
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn rejects_editable_file_writes_through_symlinked_parent() {

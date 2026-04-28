@@ -1343,6 +1343,49 @@ async fn static_asset_handler_rejects_invalid_and_missing_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn static_asset_cache_prunes_to_entry_budget() {
+    let sandbox = unique_test_dir("static-assets-cache-budget");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let static_dir = workspace.join("static");
+    let immutable_dir = static_dir.join("_app").join("immutable");
+    fs::create_dir_all(&immutable_dir).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(static_dir.join("index.html"), "<html></html>").unwrap();
+    fs::write(static_dir.join("200.html"), "<html></html>").unwrap();
+
+    let state = test_state_with_static_dir_and_base_path(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home,
+        static_dir,
+        "",
+    );
+
+    for index in 0..=STATIC_ASSET_CACHE_MAX_ENTRIES {
+        let file_name = format!("asset-{index}.js");
+        fs::write(
+            immutable_dir.join(&file_name),
+            format!("console.log({index});"),
+        )
+        .unwrap();
+        let response =
+            serve_static_asset(state.clone(), &format!("/_app/immutable/{file_name}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let cache = state.static_asset_cache.lock().await;
+    assert!(cache.len() <= STATIC_ASSET_CACHE_MAX_ENTRIES);
+    assert!(!cache.contains_key("_app/immutable/asset-0.js"));
+    assert!(cache.contains_key(&format!(
+        "_app/immutable/asset-{}.js",
+        STATIC_ASSET_CACHE_MAX_ENTRIES
+    )));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_fetch_and_pull_payloads_use_rust_helpers() {
     let sandbox = unique_test_dir("git-fetch-pull");
     let workspace = sandbox.join("workspace");

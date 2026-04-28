@@ -22,11 +22,31 @@ pub(crate) async fn serve_static_asset(state: AppState, route_path: &str) -> Res
     let asset_path = state.config.static_dir.join(&relative_path);
     if let Some(asset) = load_static_asset(&state.config, &asset_path, route_path).await {
         if cacheable {
-            state
-                .static_asset_cache
-                .lock()
-                .await
-                .insert(cache_key, asset.clone());
+            let mut cache = state.static_asset_cache.lock().await;
+            if asset.bytes.len() <= STATIC_ASSET_CACHE_MAX_BYTES {
+                cache.insert(cache_key, asset.clone());
+            }
+
+            let mut total_bytes = cache.values().map(|asset| asset.bytes.len()).sum::<usize>();
+            if cache.len() > STATIC_ASSET_CACHE_MAX_ENTRIES
+                || total_bytes > STATIC_ASSET_CACHE_MAX_BYTES
+            {
+                let mut entries = cache
+                    .iter()
+                    .map(|(key, asset)| (key.clone(), asset.created_at))
+                    .collect::<Vec<_>>();
+                entries.sort_by_key(|(_, created_at)| *created_at);
+                for (key, _) in entries {
+                    if cache.len() <= STATIC_ASSET_CACHE_MAX_ENTRIES
+                        && total_bytes <= STATIC_ASSET_CACHE_MAX_BYTES
+                    {
+                        break;
+                    }
+                    if let Some(removed) = cache.remove(&key) {
+                        total_bytes = total_bytes.saturating_sub(removed.bytes.len());
+                    }
+                }
+            }
         }
         return static_asset_response(asset);
     }
@@ -90,6 +110,15 @@ async fn load_static_asset(
     if !metadata.is_file() {
         return None;
     }
+    if metadata.len() > STATIC_ASSET_MAX_BYTES {
+        warn!(
+            path = %asset_path.display(),
+            size = metadata.len(),
+            max_size = STATIC_ASSET_MAX_BYTES,
+            "static asset exceeds preview limit"
+        );
+        return None;
+    }
 
     let content_type = static_content_type(asset_path);
     let cache_control = static_cache_control(route_path, asset_path);
@@ -98,6 +127,7 @@ async fn load_static_asset(
         let text = tokio_fs::read_to_string(asset_path).await.ok()?;
         let replaced = text.replace(STATIC_BASE_PLACEHOLDER, &config.base_path);
         return Some(CachedStaticAsset {
+            created_at: Instant::now(),
             bytes: Bytes::from(replaced),
             content_type,
             cache_control,
@@ -106,6 +136,7 @@ async fn load_static_asset(
 
     let bytes = tokio_fs::read(asset_path).await.ok()?;
     Some(CachedStaticAsset {
+        created_at: Instant::now(),
         bytes: Bytes::from(bytes),
         content_type,
         cache_control,

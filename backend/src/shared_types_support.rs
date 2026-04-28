@@ -78,6 +78,7 @@ pub(crate) struct CachedQuota {
 
 #[derive(Clone)]
 pub(crate) struct CachedStaticAsset {
+    pub(crate) created_at: Instant,
     pub(crate) bytes: Bytes,
     pub(crate) content_type: &'static str,
     pub(crate) cache_control: &'static str,

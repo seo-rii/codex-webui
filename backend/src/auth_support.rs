@@ -222,6 +222,10 @@ pub(crate) fn allowed_cors_origin(config: &Config, origin: &Option<String>) -> O
 }
 
 pub(crate) fn websocket_origin_allowed(config: &Config, headers: &HeaderMap) -> bool {
+    request_origin_allowed(config, headers)
+}
+
+pub(crate) fn request_origin_allowed(config: &Config, headers: &HeaderMap) -> bool {
     let Some(origin) = extract_origin(headers) else {
         return true;
     };

@@ -150,6 +150,38 @@ fn websocket_origin_allows_same_origin_and_configured_cors_only() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsafe_http_api_mutations_reject_cross_origin_requests() {
+    let sandbox = unique_test_dir("http-origin-policy");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+
+    let rejected = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::HOST, "127.0.0.1:4173")
+        .header(header::ORIGIN, "https://attacker.example")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = handle_http(State(state.clone()), CookieJar::new(), rejected).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let same_origin = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::HOST, "127.0.0.1:4173")
+        .header(header::ORIGIN, "http://127.0.0.1:4173")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = handle_http(State(state), CookieJar::new(), same_origin).await;
+    assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn viewer_websocket_permissions_are_session_observation_only() {
     for method in [

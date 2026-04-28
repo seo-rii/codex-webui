@@ -38,6 +38,16 @@ pub(crate) async fn handle_http(
                 return (StatusCode::FORBIDDEN, "CORS origin is not allowed.").into_response();
             }
 
+            if route_path.starts_with("/api/")
+                && matches!(
+                    method,
+                    Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+                )
+                && !request_origin_allowed(&state.config, &headers)
+            {
+                return (StatusCode::FORBIDDEN, "Request origin is not allowed.").into_response();
+            }
+
             if route_path.starts_with("/api/auth/") {
                 return handle_auth_http(state, jar, method, route_path, headers, request)
                     .await

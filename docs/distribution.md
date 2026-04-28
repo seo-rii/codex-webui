@@ -148,7 +148,7 @@ The Settings page also exposes a per-user automatic startup toggle:
 The tunnel command family is:
 
 ```bash
-codex-webui tunnel start [--provider auto|cloudflared|ngrok] [--foreground] [--hostname host] [--name tunnel] [--overwrite-dns] [--log-level level] [--arg value]
+codex-webui tunnel start [--provider auto|cloudflared|ngrok] [--foreground] [--hostname host] [--name tunnel] [--overwrite-dns] [--log-level level] [--arg value] [--yes]
 codex-webui tunnel status [--json]
 codex-webui tunnel stop
 codex-webui tunnel logs [--lines 80] [--json]
@@ -162,6 +162,13 @@ Behavior:
 4. background launches persist tunnel PID and metadata under `~/.codex/codex-webui/`
 5. `status` reports the provider, PID, origin URL, public URL when discovered, and log path
 6. `logs` prints the most recent tunnel log lines without requiring the user to hunt down the log file manually
+
+Before opening a public tunnel, the CLI prints a safety checklist covering the
+configured owner password, hCaptcha, allowed roots, and public route. Interactive
+runs require typing `expose`; non-interactive runs must pass `--yes` or set
+`CODEX_WEBUI_TUNNEL_ASSUME_YES=true`. This is intentional because a tunnel
+exposes Codex control, Git operations, file tools, runtime actions, and host
+terminals outside localhost.
 
 Provider notes:
 

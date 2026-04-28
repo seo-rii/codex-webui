@@ -108,6 +108,7 @@ function defaultConfigValues() {
     ],
     allowedRoots: [process.cwd()],
     passwordHash: "",
+    ownerPasswordHash: "",
     hcaptchaSiteKey: "",
     hcaptchaSecretKey: "",
     sessionSecret: createSessionSecret(),
@@ -235,6 +236,7 @@ function normalizeConfig(rawConfig = {}) {
         ? rawConfig.allowedRoots.map((entry) => expandHome(String(entry)))
         : defaults.allowedRoots,
     corsAllowedOrigins: Array.isArray(rawConfig.corsAllowedOrigins) ? rawConfig.corsAllowedOrigins : defaults.corsAllowedOrigins,
+    ownerPasswordHash: String(rawConfig.ownerPasswordHash ?? rawConfig.owner_password_hash ?? defaults.ownerPasswordHash).trim(),
     backendBinaryPath: expandHome(String(rawConfig.backendBinaryPath ?? defaults.backendBinaryPath)),
     tunnel: normalizeTunnelConfig(rawConfig.tunnel)
   };
@@ -343,6 +345,8 @@ async function promptConfig(existing = null) {
     const tunnelNameInput = (await rl.question(`Tunnel name (cloudflared only, optional) [${formatOptionalPrompt(defaults.tunnel.name)}]: `)).trim();
     const password = await rl.question("Password (leave blank to keep existing hash): ");
     const passwordHash = password.trim() ? hashPassword(password.trim()) : defaults.passwordHash;
+    const ownerPassword = await rl.question("Owner password for terminal/runtime/shutdown actions (optional, leave blank to keep existing): ");
+    const ownerPasswordHash = ownerPassword.trim() ? hashPassword(ownerPassword.trim()) : defaults.ownerPasswordHash;
     const hcaptchaSiteKeyInput = (await rl.question(`hCaptcha site key (optional) [${formatOptionalPrompt(defaults.hcaptchaSiteKey)}]: `)).trim();
     const hcaptchaSecretKey = (
       await rl.question(
@@ -373,6 +377,7 @@ async function promptConfig(existing = null) {
           ? corsRaw.split(",").map((entry) => entry.trim()).filter(Boolean)
           : defaults.corsAllowedOrigins,
       passwordHash,
+      ownerPasswordHash,
       hcaptchaSiteKey: hcaptchaSiteKeyInput || defaults.hcaptchaSiteKey,
       hcaptchaSecretKey,
       sessionSecret: defaults.sessionSecret || createSessionSecret(),
@@ -612,6 +617,82 @@ function buildTunnelLaunch(config, tunnelOptions) {
   };
 }
 
+function isBroadAllowedRoot(rootPath) {
+  const resolved = path.resolve(expandHome(String(rootPath ?? "")));
+  const home = path.resolve(os.homedir());
+  const parsed = path.parse(resolved);
+  return resolved === parsed.root || resolved === home || home.startsWith(`${resolved}${path.sep}`);
+}
+
+function tunnelSafetyFindings(config) {
+  const findings = [];
+  if (!String(config.passwordHash ?? "").trim()) {
+    findings.push("Password hash is not configured.");
+  }
+  if (!String(config.sessionSecret ?? "").trim() || String(config.sessionSecret ?? "").trim().length < 32) {
+    findings.push("Session secret is missing or short.");
+  }
+  if (!String(config.ownerPasswordHash ?? "").trim()) {
+    findings.push("Owner password is not configured, so admin sessions can still use terminal/runtime/shutdown actions.");
+  }
+  if (!String(config.hcaptchaSiteKey ?? "").trim() || !String(config.hcaptchaSecretKey ?? "").trim()) {
+    findings.push("hCaptcha is not configured for the public login surface.");
+  }
+  const broadRoot = (config.allowedRoots ?? []).find(isBroadAllowedRoot);
+  if (broadRoot) {
+    findings.push(`Allowed root is broad: ${broadRoot}`);
+  }
+  if ((config.corsAllowedOrigins ?? []).some((origin) => String(origin).trim() === "*")) {
+    findings.push("CORS allows every origin.");
+  }
+  return findings;
+}
+
+function printTunnelSafetyChecklist(config, launch, findings) {
+  console.log("Tunnel safety checklist:");
+  console.log(`  Provider: ${launch.provider}`);
+  console.log(`  Local origin: ${launch.originUrl}`);
+  console.log(`  Public route: ${config.basePath || "/"}`);
+  console.log(`  Allowed roots: ${(config.allowedRoots ?? []).join(", ") || "(none)"}`);
+  console.log(`  Owner password: ${String(config.ownerPasswordHash ?? "").trim() ? "configured" : "not configured"}`);
+  console.log(`  hCaptcha: ${String(config.hcaptchaSiteKey ?? "").trim() && String(config.hcaptchaSecretKey ?? "").trim() ? "configured" : "not configured"}`);
+  if (findings.length > 0) {
+    console.log("");
+    console.log("Warnings:");
+    for (const finding of findings) {
+      console.log(`  - ${finding}`);
+    }
+  }
+  console.log("");
+  console.log("A tunnel exposes Codex chat control, Git operations, file tools, and host terminals to the public internet.");
+}
+
+async function confirmTunnelSafety(config, options, launch) {
+  if (options.yes || process.env.CODEX_WEBUI_TUNNEL_ASSUME_YES === "true") {
+    return;
+  }
+
+  const findings = tunnelSafetyFindings(config);
+  printTunnelSafetyChecklist(config, launch, findings);
+
+  if (!process.stdin.isTTY || options.json) {
+    throw new Error("Refusing to start a public tunnel without explicit confirmation. Re-run with --yes after reviewing the tunnel safety checklist.");
+  }
+
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+  try {
+    const answer = (await rl.question('Type "expose" to start the tunnel: ')).trim().toLowerCase();
+    if (answer !== "expose") {
+      throw new Error("Tunnel start cancelled.");
+    }
+  } finally {
+    rl.close();
+  }
+}
+
 async function readTunnelStatus(config) {
   const pid = await readNumericFile(tunnelPidPath);
   const meta = await readTunnelMeta();
@@ -700,6 +781,7 @@ function parseTunnelArgs(argv) {
     logLevel: null,
     extraArgs: [],
     json: false,
+    yes: false,
     lines: 80,
     help: false
   };
@@ -720,6 +802,11 @@ function parseTunnelArgs(argv) {
     }
     if (token === "--json") {
       options.json = true;
+      index += 1;
+      continue;
+    }
+    if (token === "--yes" || token === "-y") {
+      options.yes = true;
       index += 1;
       continue;
     }
@@ -802,6 +889,7 @@ async function startTunnel(config, cliOptions) {
 
   const tunnelOptions = mergeTunnelOptions(config, cliOptions);
   const launch = buildTunnelLaunch(config, tunnelOptions);
+  await confirmTunnelSafety(config, cliOptions, launch);
   await fs.mkdir(path.dirname(tunnelLogPath), { recursive: true });
   await writeFileAtomic(tunnelLogPath, "");
 
@@ -963,6 +1051,7 @@ async function startServer(config) {
       ),
       CODEX_WEBUI_ALLOWED_ROOTS: config.allowedRoots.join(path.delimiter),
       CODEX_WEBUI_PASSWORD_HASH: String(config.passwordHash),
+      CODEX_WEBUI_OWNER_PASSWORD_HASH: String(config.ownerPasswordHash ?? ""),
       CODEX_WEBUI_HCAPTCHA_SITE_KEY: String(config.hcaptchaSiteKey ?? ""),
       CODEX_WEBUI_HCAPTCHA_SECRET_KEY: String(config.hcaptchaSecretKey ?? ""),
       CODEX_WEBUI_SESSION_SECRET: String(config.sessionSecret),
@@ -1008,7 +1097,7 @@ async function restartServer(config) {
 
 function printTunnelUsage() {
   console.log("Tunnel commands:");
-  console.log("  codex-webui tunnel start [--provider auto|cloudflared|ngrok] [--foreground] [--hostname host] [--name tunnel] [--overwrite-dns] [--log-level level] [--arg value] [--json]");
+  console.log("  codex-webui tunnel start [--provider auto|cloudflared|ngrok] [--foreground] [--hostname host] [--name tunnel] [--overwrite-dns] [--log-level level] [--arg value] [--yes] [--json]");
   console.log("  codex-webui tunnel status [--json]");
   console.log("  codex-webui tunnel stop");
   console.log("  codex-webui tunnel logs [--lines 80] [--json]");
@@ -1083,6 +1172,7 @@ function printCommandHelp() {
   console.log("  --hcaptcha-site-key <key>      Enable hCaptcha on the login screen with this site key");
   console.log("  --hcaptcha-secret-key <secret> Enable hCaptcha verification with this secret");
   console.log("  --disable-hcaptcha             Disable hCaptcha even if it is configured");
+  console.log("  codex-webui tunnel start --yes Skip the public-exposure confirmation after reviewing the checklist");
 }
 
 function readOptionValue(argv, index, flagName) {
@@ -1181,6 +1271,10 @@ async function main() {
 
   if (help) {
     printCommandHelp();
+    return;
+  }
+  if (command === "tunnel" && parseTunnelArgs(restArgs).help) {
+    printTunnelUsage();
     return;
   }
 

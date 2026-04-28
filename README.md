@@ -142,7 +142,7 @@ npx codex-webui
 
 On first run the CLI:
 
-1. asks for host, port, base path, Codex binary, the global data directory, one or more profile-specific `CODEX_HOME` paths, allowed roots, optional CORS origins, password, and optional hCaptcha keys
+1. asks for host, port, base path, Codex binary, the global data directory, one or more profile-specific `CODEX_HOME` paths, allowed roots, optional CORS origins, password, optional owner password, and optional hCaptcha keys
 2. hashes the password with scrypt
 3. writes `~/.codex/codex-webui.yml`
 4. starts the Rust gateway in the background
@@ -155,14 +155,14 @@ codex-webui config
 codex-webui status
 codex-webui restart
 codex-webui stop
-codex-webui tunnel
+codex-webui tunnel start --yes
 codex-webui tunnel status
 codex-webui tunnel stop
 codex-webui tunnel logs
 codex-webui --hcaptcha-site-key <site-key> --hcaptcha-secret-key <secret>
 ```
 
-`tunnel` supports provider selection, background or foreground execution, status inspection, and log inspection. It prefers `cloudflared` when available and falls back to `ngrok`.
+`tunnel` supports provider selection, background or foreground execution, status inspection, and log inspection. It prefers `cloudflared` when available and falls back to `ngrok`. Starting a public tunnel prints a safety checklist and requires explicit confirmation; use `--yes` only after reviewing the exposure.
 
 You can also override login protection at launch time with `--hcaptcha-site-key`, `--hcaptcha-secret-key`, or `--disable-hcaptcha`.
 
@@ -193,6 +193,7 @@ profiles:
 allowedRoots:
   - /home/user/work
 passwordHash: scrypt$...
+ownerPasswordHash: scrypt$...
 sessionSecret: ...
 corsAllowedOrigins: []
 backendBinaryPath: ""
@@ -216,6 +217,7 @@ Meaning of the main fields:
 - `profiles`: named Codex runtimes, each with its own `CODEX_HOME` and profile-local data directory
 - `allowedRoots`: filesystem roots the UI is allowed to browse
 - `passwordHash`: hashed login password
+- `ownerPasswordHash`: optional stronger owner login for terminal, runtime install/update, shutdown, and other host-level operations
 - `sessionSecret`: cookie signing secret
 - `corsAllowedOrigins`: trusted origins allowed to use browser credentials against the gateway
 - `backendBinaryPath`: explicit Rust gateway path, mainly for packaged or custom deployments

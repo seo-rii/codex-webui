@@ -201,7 +201,7 @@ async fn read_profile_ui_state(config: &Config, profile_id: &str) -> Result<Valu
             let backup_path = path.with_extension(format!("json.corrupt-{}", now_millis()));
             let _ = tokio_fs::rename(&path, &backup_path).await;
             let fallback = default_ui_state_value();
-            tokio_fs::write(
+            write_json_file_atomically(
                 &path,
                 serde_json::to_vec_pretty(&fallback).expect("default ui-state should serialize"),
             )
@@ -228,15 +228,51 @@ async fn read_cached_profile_ui_state(state: &AppState, profile_id: &str) -> Res
 
 async fn write_profile_ui_state(config: &Config, profile_id: &str, ui_state: &Value) -> Result<()> {
     let path = profile_ui_state_path(config, profile_id);
-    if let Some(parent) = path.parent() {
-        tokio_fs::create_dir_all(parent)
-            .await
-            .context("failed to create profile data directory")?;
-    }
     let bytes = serde_json::to_vec_pretty(ui_state).context("failed to serialize ui-state")?;
-    tokio_fs::write(&path, bytes)
+    write_json_file_atomically(&path, bytes)
         .await
         .context("failed to write ui-state file")?;
+    Ok(())
+}
+
+async fn write_json_file_atomically(path: &Path, bytes: Vec<u8>) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("state file path has no parent directory"))?;
+    tokio_fs::create_dir_all(parent)
+        .await
+        .context("failed to create state directory")?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("state file path has no file name"))?;
+    let temp_path = parent.join(format!(
+        ".codex-webui-state-{file_name}-{}.tmp",
+        Uuid::new_v4()
+    ));
+
+    let write_result = async {
+        let mut temp_file = tokio_fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .await?;
+        temp_file.write_all(&bytes).await?;
+        temp_file.sync_all().await?;
+        drop(temp_file);
+        tokio_fs::rename(&temp_path, path).await?;
+        if let Ok(parent_dir) = tokio_fs::File::open(parent).await {
+            let _ = parent_dir.sync_all().await;
+        }
+        std::io::Result::Ok(())
+    }
+    .await;
+    if let Err(error) = write_result {
+        let _ = tokio_fs::remove_file(&temp_path).await;
+        return Err(error).context("failed to atomically write state file");
+    }
+
     Ok(())
 }
 
@@ -273,14 +309,9 @@ pub(crate) async fn write_stored_theme_settings(
     theme: &Value,
 ) -> Result<Value> {
     let path = theme_settings_path(config, profile_id);
-    if let Some(parent) = path.parent() {
-        tokio_fs::create_dir_all(parent)
-            .await
-            .context("failed to create theme settings directory")?;
-    }
     let payload = theme.clone();
     let bytes = serde_json::to_vec_pretty(&payload).context("failed to encode theme settings")?;
-    tokio_fs::write(&path, bytes)
+    write_json_file_atomically(&path, bytes)
         .await
         .context("failed to write theme settings")?;
     Ok(payload)

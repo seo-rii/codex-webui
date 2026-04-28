@@ -345,6 +345,48 @@ async fn theme_settings_round_trip_through_rust_store() {
 }
 
 #[tokio::test]
+async fn ui_state_writes_leave_no_atomic_temp_files() {
+    let sandbox = unique_test_dir("ui-state-atomic");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["sessionMetaByThreadId"]["thread-1"]["title"] = json!("Atomic");
+        Ok(())
+    })
+    .await
+    .expect("ui state should save");
+
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    let raw = fs::read_to_string(&ui_state_path).expect("ui state file should exist");
+    let parsed: Value = serde_json::from_str(&raw).expect("ui state should be valid JSON");
+    assert_eq!(
+        parsed
+            .get("sessionMetaByThreadId")
+            .and_then(|value| value.get("thread-1"))
+            .and_then(|value| value.get("title"))
+            .and_then(Value::as_str),
+        Some("Atomic")
+    );
+
+    let mut entries = fs::read_dir(ui_state_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    entries.sort();
+    assert!(
+        !entries
+            .iter()
+            .any(|name| name.starts_with(".codex-webui-state-"))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn arming_shutdown_while_idle_waits_for_future_activity() {
     let sandbox = unique_test_dir("shutdown-idle-arming");
     let workspace = sandbox.join("workspace");

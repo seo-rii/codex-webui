@@ -444,6 +444,12 @@ async fn git_read_payloads_use_rust_helpers() {
         Some("README.md")
     );
 
+    fs::write(repo.join(".env"), "TOKEN=secret\n").unwrap();
+    let error = get_git_file_payload(&state, repo.to_str().unwrap(), ".env")
+        .await
+        .expect_err("sensitive git files must be blocked");
+    assert_eq!(error.status, StatusCode::FORBIDDEN);
+
     let _ = fs::remove_dir_all(sandbox);
 }
 

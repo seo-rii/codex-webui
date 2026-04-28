@@ -57,6 +57,30 @@ async fn rejects_editable_files_outside_allowed_roots() {
 }
 
 #[tokio::test]
+async fn rejects_sensitive_editable_files_inside_profile_home() {
+    let sandbox = unique_test_dir("editor-sensitive");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home.clone());
+    let auth_path = codex_home.join("auth.json");
+    fs::write(&auth_path, "{}").unwrap();
+    let error = read_editable_file_payload(&state, "default", auth_path.to_str().unwrap())
+        .await
+        .expect_err("auth files must be blocked");
+
+    assert_eq!(error.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        error.message,
+        "This file is blocked by the sensitive file policy."
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn notification_helpers_update_ui_state_and_counts() {
     let sandbox = unique_test_dir("notifications");
     let workspace = sandbox.join("workspace");

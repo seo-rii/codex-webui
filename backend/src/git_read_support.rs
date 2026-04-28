@@ -265,9 +265,11 @@ pub(crate) async fn resolve_git_repository_file_path(
 ) -> ApiResult<PathBuf> {
     let repo_root_path = PathBuf::from(repo_root);
     let candidate_path = normalize_path(repo_root_path.join(file_path));
+    ensure_not_sensitive_file_path(&candidate_path)?;
     let existing_path = tokio_fs::canonicalize(&candidate_path)
         .await
         .unwrap_or_else(|_| candidate_path.clone());
+    ensure_not_sensitive_file_path(&existing_path)?;
     if !path_is_within(&repo_root_path, &existing_path) {
         return Err(api_error(
             StatusCode::FORBIDDEN,

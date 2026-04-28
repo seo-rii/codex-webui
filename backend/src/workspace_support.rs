@@ -65,6 +65,34 @@ fn infer_editor_language(file_path: &Path) -> String {
     .to_string()
 }
 
+pub(crate) fn ensure_not_sensitive_file_path(path: &Path) -> ApiResult<()> {
+    for component in path.components() {
+        let Some(part) = component.as_os_str().to_str() else {
+            continue;
+        };
+        let lowered = part.to_ascii_lowercase();
+        if lowered == ".ssh"
+            || lowered == ".git"
+            || lowered == ".git-credentials"
+            || lowered == ".npmrc"
+            || lowered == "auth.json"
+            || lowered == "id_rsa"
+            || lowered == "id_ed25519"
+            || lowered.starts_with(".env")
+            || lowered.ends_with(".pem")
+            || lowered.ends_with(".key")
+            || lowered.contains("session_secret")
+            || lowered.contains("password_hash")
+        {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "This file is blocked by the sensitive file policy.",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn list_directories_payload(
     state: &AppState,
     current_path: Option<&str>,
@@ -160,8 +188,10 @@ pub(crate) async fn resolve_editable_file_path(
     }
 
     let candidate = resolve_input_path(&state.config.project_root, file_path);
+    ensure_not_sensitive_file_path(&candidate)?;
     let existing = tokio_fs::canonicalize(&candidate).await.ok();
     let path_to_check = existing.unwrap_or_else(|| candidate.clone());
+    ensure_not_sensitive_file_path(&path_to_check)?;
 
     let mut roots = resolved_allowed_roots(&state.config).await;
     let profile_root =

@@ -443,6 +443,23 @@ pub(crate) fn json_error(status: StatusCode, message: &str) -> Response {
     response
 }
 
+pub(crate) fn apply_security_headers(headers: &mut HeaderMap) {
+    headers.entry(header::HeaderName::from_static("content-security-policy")).or_insert(
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline' https://hcaptcha.com https://*.hcaptcha.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http: https:; font-src 'self' data:; connect-src 'self' ws: wss: http: https:; worker-src 'self' blob:; frame-src https://hcaptcha.com https://*.hcaptcha.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    headers
+        .entry(header::HeaderName::from_static("x-content-type-options"))
+        .or_insert(HeaderValue::from_static("nosniff"));
+    headers
+        .entry(header::HeaderName::from_static("referrer-policy"))
+        .or_insert(HeaderValue::from_static("same-origin"));
+    headers
+        .entry(header::HeaderName::from_static("x-frame-options"))
+        .or_insert(HeaderValue::from_static("DENY"));
+}
+
 pub(crate) fn redact_user_facing_error(message: &str) -> String {
     let mut redacted = message.to_string();
     if let Ok(home) = env::var("HOME") {

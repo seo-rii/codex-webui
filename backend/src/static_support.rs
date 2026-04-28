@@ -154,20 +154,7 @@ fn static_asset_response(asset: CachedStaticAsset) -> Response {
         header::CACHE_CONTROL,
         HeaderValue::from_static(asset.cache_control),
     );
-    headers.insert(
-        header::HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static(
-            "default-src 'self'; script-src 'self' 'unsafe-inline' https://hcaptcha.com https://*.hcaptcha.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http: https:; font-src 'self' data:; connect-src 'self' ws: wss: http: https:; worker-src 'self' blob:; frame-src https://hcaptcha.com https://*.hcaptcha.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
-        ),
-    );
-    headers.insert(
-        header::HeaderName::from_static("x-content-type-options"),
-        HeaderValue::from_static("nosniff"),
-    );
-    headers.insert(
-        header::HeaderName::from_static("referrer-policy"),
-        HeaderValue::from_static("same-origin"),
-    );
+    apply_security_headers(headers);
     response
 }
 

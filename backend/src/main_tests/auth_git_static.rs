@@ -466,6 +466,19 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
         .unwrap();
     let health_response = handle_http(State(state.clone()), CookieJar::new(), health_request).await;
     assert_eq!(health_response.status(), StatusCode::OK);
+    assert_eq!(
+        health_response
+            .headers()
+            .get(header::HeaderName::from_static("x-frame-options")),
+        Some(&HeaderValue::from_static("DENY"))
+    );
+    assert!(
+        health_response
+            .headers()
+            .get(header::HeaderName::from_static("content-security-policy"))
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("frame-ancestors 'none'"))
+    );
     let health_body = to_bytes(health_response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -506,6 +519,12 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
         .unwrap();
     let metrics_response = handle_http(State(state), jar, metrics_request).await;
     assert_eq!(metrics_response.status(), StatusCode::OK);
+    assert_eq!(
+        metrics_response
+            .headers()
+            .get(header::HeaderName::from_static("x-content-type-options")),
+        Some(&HeaderValue::from_static("nosniff"))
+    );
     assert_eq!(
         metrics_response.headers().get(header::CONTENT_TYPE),
         Some(&HeaderValue::from_static(

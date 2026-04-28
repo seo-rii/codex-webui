@@ -11,16 +11,24 @@ pub(crate) async fn handle_ws(
     ws: WebSocketUpgrade,
 ) -> Response {
     if !websocket_origin_allowed(&state.config, &headers) {
-        return (StatusCode::FORBIDDEN, "WebSocket origin is not allowed.").into_response();
+        let mut response =
+            (StatusCode::FORBIDDEN, "WebSocket origin is not allowed.").into_response();
+        apply_security_headers(response.headers_mut());
+        return response;
     }
 
     let Some(auth) = auth_context(&state.config, &jar) else {
-        return (StatusCode::UNAUTHORIZED, "Authentication required.").into_response();
+        let mut response = (StatusCode::UNAUTHORIZED, "Authentication required.").into_response();
+        apply_security_headers(response.headers_mut());
+        return response;
     };
 
-    ws.max_message_size(WS_MAX_MESSAGE_BYTES)
+    let mut response = ws
+        .max_message_size(WS_MAX_MESSAGE_BYTES)
         .on_upgrade(move |socket| websocket_session(socket, state, auth))
-        .into_response()
+        .into_response();
+    apply_security_headers(response.headers_mut());
+    response
 }
 
 async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext) {

@@ -5,6 +5,12 @@ pub(crate) async fn handle_http(
     jar: CookieJar,
     request: Request,
 ) -> Response {
+    let mut response = handle_http_inner(state, jar, request).await;
+    apply_security_headers(response.headers_mut());
+    response
+}
+
+async fn handle_http_inner(state: AppState, jar: CookieJar, request: Request) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
     let headers = request.headers().clone();

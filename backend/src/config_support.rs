@@ -778,7 +778,7 @@ pub(crate) async fn sync_codex_toml_with_preferences(
         ),
     );
 
-    tokio_fs::write(&file_path, raw)
+    write_file_atomically(&file_path, raw.into_bytes())
         .await
         .context("failed to write config.toml")
 }

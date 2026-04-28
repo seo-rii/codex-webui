@@ -193,7 +193,7 @@ pub(crate) async fn recover_session_rollout_payload(
                 error.to_string(),
             )
         })?;
-    tokio_fs::write(&rollout_path, plan.recovered_content.as_bytes())
+    write_file_atomically(&rollout_path, plan.recovered_content.as_bytes().to_vec())
         .await
         .map_err(|error| {
             RolloutRecoveryActionError::new(

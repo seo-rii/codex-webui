@@ -201,7 +201,7 @@ async fn read_profile_ui_state(config: &Config, profile_id: &str) -> Result<Valu
             let backup_path = path.with_extension(format!("json.corrupt-{}", now_millis()));
             let _ = tokio_fs::rename(&path, &backup_path).await;
             let fallback = default_ui_state_value();
-            write_json_file_atomically(
+            write_file_atomically(
                 &path,
                 serde_json::to_vec_pretty(&fallback).expect("default ui-state should serialize"),
             )
@@ -229,13 +229,13 @@ async fn read_cached_profile_ui_state(state: &AppState, profile_id: &str) -> Res
 async fn write_profile_ui_state(config: &Config, profile_id: &str, ui_state: &Value) -> Result<()> {
     let path = profile_ui_state_path(config, profile_id);
     let bytes = serde_json::to_vec_pretty(ui_state).context("failed to serialize ui-state")?;
-    write_json_file_atomically(&path, bytes)
+    write_file_atomically(&path, bytes)
         .await
         .context("failed to write ui-state file")?;
     Ok(())
 }
 
-async fn write_json_file_atomically(path: &Path, bytes: Vec<u8>) -> Result<()> {
+pub(crate) async fn write_file_atomically(path: &Path, bytes: Vec<u8>) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("state file path has no parent directory"))?;
@@ -311,7 +311,7 @@ pub(crate) async fn write_stored_theme_settings(
     let path = theme_settings_path(config, profile_id);
     let payload = theme.clone();
     let bytes = serde_json::to_vec_pretty(&payload).context("failed to encode theme settings")?;
-    write_json_file_atomically(&path, bytes)
+    write_file_atomically(&path, bytes)
         .await
         .context("failed to write theme settings")?;
     Ok(payload)

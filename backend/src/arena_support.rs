@@ -16,10 +16,7 @@ async fn read_arena_store_state(state: &AppState, profile_id: &str) -> Result<Ar
             Ok(parsed) => Ok(parsed),
             Err(_) => {
                 let empty = ArenaStoreState::default();
-                if let Some(parent) = path.parent() {
-                    tokio_fs::create_dir_all(parent).await.ok();
-                }
-                tokio_fs::write(
+                write_file_atomically(
                     &path,
                     serde_json::to_vec_pretty(&empty).unwrap_or_else(|_| b"{\"runs\":[]}".to_vec()),
                 )
@@ -42,14 +39,9 @@ async fn write_arena_store_state(
 ) -> Result<()> {
     let _guard = ui_state_lock(state, profile_id).await.lock_owned().await;
     let path = arena_store_path(&state.config, profile_id);
-    if let Some(parent) = path.parent() {
-        tokio_fs::create_dir_all(parent)
-            .await
-            .context("failed to create arena store directory")?;
-    }
     let bytes =
         serde_json::to_vec_pretty(arena_state).context("failed to encode arena store state")?;
-    tokio_fs::write(path, bytes)
+    write_file_atomically(&path, bytes)
         .await
         .context("failed to write arena store state")
 }

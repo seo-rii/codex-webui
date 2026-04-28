@@ -642,6 +642,13 @@ async fn syncs_codex_toml_with_preferences_for_plan_mode() {
     assert!(raw.contains("plan_mode_reasoning_effort = \"high\""));
     assert!(raw.contains("[sandbox_workspace_write]"));
     assert!(raw.contains("network_access = true"));
+    let temp_files = fs::read_dir(&codex_home)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with(".codex-webui-state-config.toml-"))
+        .collect::<Vec<_>>();
+    assert!(temp_files.is_empty());
 
     let _ = fs::remove_dir_all(sandbox);
 }

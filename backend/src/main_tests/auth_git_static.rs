@@ -584,6 +584,48 @@ async fn git_worktree_payloads_use_rust_git_helpers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_worktree_remove_rejects_dirty_force_remove() {
+    let sandbox = unique_test_dir("git-worktree-dirty-remove");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let repo = workspace.join("repo");
+    let worktree = workspace.join(".codex-webui-worktrees").join("dirty");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    init_test_git_repo(&repo);
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    create_git_worktree_payload(
+        &state,
+        repo.to_str().unwrap(),
+        worktree.to_str().unwrap(),
+        Some("feature/dirty"),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    fs::write(worktree.join("dirty.txt"), "dirty\n").unwrap();
+
+    let error = remove_git_worktree_payload(
+        &state,
+        repo.to_str().unwrap(),
+        worktree.to_str().unwrap(),
+        true,
+    )
+    .await
+    .expect_err("dirty worktree force-removal should be rejected");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(
+        error.message,
+        "Refusing to force-remove a worktree with uncommitted changes."
+    );
+    assert!(worktree.exists());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit_log_list_clamps_limit_and_reads_latest_entries() {
     let sandbox = unique_test_dir("audit-log-tail");
     let workspace = sandbox.join("workspace");

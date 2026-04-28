@@ -170,6 +170,41 @@ pub(crate) async fn remove_git_worktree_payload(
     let repo_lock = git_operation_lock(state, &repo_root).await;
     let _repo_guard = repo_lock.lock().await;
     let resolved_worktree_path = resolve_git_worktree_path(state, worktree_path).await?;
+    let worktrees_output = run_git_text_payload(
+        state,
+        &repo_root,
+        vec![
+            "worktree".to_string(),
+            "list".to_string(),
+            "--porcelain".to_string(),
+        ],
+    )
+    .await?;
+    let registered = parse_git_worktrees_payload(&repo_root, &worktrees_output)
+        .iter()
+        .any(|entry| {
+            entry.get("path").and_then(Value::as_str) == Some(resolved_worktree_path.as_str())
+        });
+    if !registered {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "The selected path is not a registered worktree.",
+        ));
+    }
+    if force {
+        let dirty_output = run_git_text_payload(
+            state,
+            &resolved_worktree_path,
+            vec!["status".to_string(), "--porcelain".to_string()],
+        )
+        .await?;
+        if !dirty_output.trim().is_empty() {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "Refusing to force-remove a worktree with uncommitted changes.",
+            ));
+        }
+    }
     let mut args = vec!["worktree".to_string(), "remove".to_string()];
     if force {
         args.push("--force".to_string());

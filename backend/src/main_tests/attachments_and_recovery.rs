@@ -366,6 +366,63 @@ async fn session_attachment_upload_rejects_oversized_streamed_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_routes_reject_invalid_session_ids_before_storage_access() {
+    let sandbox = unique_test_dir("session-route-invalid-id");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let jar = issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Admin).unwrap();
+    let route_path = "/api/sessions/..%2Fescape/attachments";
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(route_path)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = handle_session_route_http(state, &jar, request, route_path, None, None).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_session_methods_reject_invalid_session_ids() {
+    let sandbox = unique_test_dir("ws-invalid-session-id");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    let error = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &AuthContext {
+            role: UserRole::Admin,
+            profile_id: "default".to_string(),
+        },
+        "session/get",
+        json!({
+            "sessionId": "../escape"
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("INVALID_SESSION_ID"));
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_recovery_ws_method_recovers_rollout_file() {
     let sandbox = unique_test_dir("session-recovery-ws");
     let workspace = sandbox.join("workspace");

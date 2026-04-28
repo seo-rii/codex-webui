@@ -214,7 +214,7 @@ pub(crate) async fn execute_ws_method(
         .await
         .map_err(anyhow::Error::from),
         "session/organization/update" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             update_session_organization_payload(state, &auth.profile_id, &session_id, params)
                 .await
                 .map_err(anyhow::Error::from)
@@ -246,7 +246,7 @@ pub(crate) async fn execute_ws_method(
                 .map_err(anyhow::Error::from)
         }
         "session/get" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
             let known_version = params
                 .get("knownVersion")
@@ -271,13 +271,13 @@ pub(crate) async fn execute_ws_method(
             ))
         }
         "session/recovery" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             recover_session_rollout_payload(state, &auth.profile_id, auth.role, &session_id)
                 .await
                 .map_err(RolloutRecoveryActionError::into_ws_error)
         }
         "session/fork" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             fork_session_payload(
                 state,
                 &auth.profile_id,
@@ -290,7 +290,7 @@ pub(crate) async fn execute_ws_method(
             .map_err(anyhow::Error::from)
         }
         "session/search" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let query_raw = require_string(&params, "query")?;
             let cursor = params
                 .get("cursor")
@@ -309,7 +309,7 @@ pub(crate) async fn execute_ws_method(
             .map_err(anyhow::Error::from)
         }
         "session/olderTurns/get" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let before_turn_id = require_string(&params, "beforeTurnId")?;
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20);
             session_older_turns_payload(
@@ -323,14 +323,14 @@ pub(crate) async fn execute_ws_method(
             .map_err(anyhow::Error::from)
         }
         "session/turn/get" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let turn_id = require_string(&params, "turnId")?;
             session_turn_payload(state, &auth.profile_id, &session_id, &turn_id)
                 .await
                 .map_err(anyhow::Error::from)
         }
         "session/itemDetail/get" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let turn_id = require_string(&params, "turnId")?;
             let item_id = require_string(&params, "itemId")?;
             session_item_detail_payload(state, &auth.profile_id, &session_id, &turn_id, &item_id)
@@ -338,13 +338,13 @@ pub(crate) async fn execute_ws_method(
                 .map_err(anyhow::Error::from)
         }
         "session/draft/get" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             get_session_draft_payload(state, &auth.profile_id, &session_id)
                 .await
                 .map_err(anyhow::Error::from)
         }
         "session/draft/save" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             save_session_draft_payload(
                 state,
                 &auth.profile_id,
@@ -362,19 +362,19 @@ pub(crate) async fn execute_ws_method(
             .map_err(anyhow::Error::from)
         }
         "session/draft/clear" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             clear_session_draft_payload(state, &auth.profile_id, &session_id)
                 .await
                 .map_err(anyhow::Error::from)
         }
         "session/queue/get" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             get_session_queue_payload(state, &auth.profile_id, &session_id)
                 .await
                 .map_err(anyhow::Error::from)
         }
         "session/queue/enqueue" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             enqueue_session_queue_payload(
                 state,
                 &auth.profile_id,
@@ -391,20 +391,20 @@ pub(crate) async fn execute_ws_method(
             .map_err(anyhow::Error::from)
         }
         "session/queue/resume" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             resume_session_queue_payload(state, &auth.profile_id, &session_id)
                 .await
                 .map_err(anyhow::Error::from)
         }
         "session/queue/remove" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let queue_id = require_string(&params, "queueId")?;
             remove_session_queue_item_payload(state, &auth.profile_id, &session_id, &queue_id)
                 .await
                 .map_err(anyhow::Error::from)
         }
         "session/queue/update" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let queue_id = require_string(&params, "queueId")?;
             update_session_queue_item_payload(
                 state,
@@ -419,14 +419,14 @@ pub(crate) async fn execute_ws_method(
             .map_err(anyhow::Error::from)
         }
         "session/queue/reorder" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let queue_ids = string_array_from_value(params.get("queueIds"));
             reorder_session_queue_payload(state, &auth.profile_id, &session_id, &queue_ids)
                 .await
                 .map_err(anyhow::Error::from)
         }
         "session/queue/dispatch" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let queue_id = require_string(&params, "queueId")?;
             dispatch_session_queue_item_payload(
                 state,
@@ -439,7 +439,7 @@ pub(crate) async fn execute_ws_method(
             .map_err(anyhow::Error::from)
         }
         "session/savePreferences" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             save_session_preferences_payload(
                 state,
                 &auth.profile_id,
@@ -453,13 +453,13 @@ pub(crate) async fn execute_ws_method(
             .map_err(anyhow::Error::from)
         }
         "session/skills/save" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             save_session_skills_payload(state, &auth.profile_id, &session_id, params.get("skills"))
                 .await
                 .map_err(anyhow::Error::from)
         }
         "session/rename" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             rename_session_payload(
                 state,
                 &auth.profile_id,
@@ -470,19 +470,19 @@ pub(crate) async fn execute_ws_method(
             .map_err(anyhow::Error::from)
         }
         "session/archive" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             archive_session_payload(state, &auth.profile_id, &session_id)
                 .await
                 .map_err(anyhow::Error::from)
         }
         "session/unarchive" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             unarchive_session_payload(state, &auth.profile_id, &session_id)
                 .await
                 .map_err(anyhow::Error::from)
         }
         "turn/send" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             send_turn_payload(
                 state,
                 &auth.profile_id,
@@ -502,7 +502,7 @@ pub(crate) async fn execute_ws_method(
             .map_err(anyhow::Error::from)
         }
         "turn/steer" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let prompt = require_string(&params, "prompt")?;
             steer_turn_payload(
                 state,
@@ -516,13 +516,13 @@ pub(crate) async fn execute_ws_method(
             .map_err(anyhow::Error::from)
         }
         "turn/abort" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             abort_turn_payload(state, &auth.profile_id, &session_id)
                 .await
                 .map_err(anyhow::Error::from)
         }
         "approval/resolve" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let request_id = require_string(&params, "requestId")?;
             resolve_server_request_payload(
                 state,
@@ -541,7 +541,7 @@ pub(crate) async fn execute_ws_method(
                 .map_err(anyhow::Error::from)
         }
         "attachments/upload" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let files = params
                 .get("files")
                 .cloned()
@@ -552,7 +552,7 @@ pub(crate) async fn execute_ws_method(
                 .map_err(anyhow::Error::from)
         }
         "attachments/delete" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let attachment_id = require_string(&params, "attachmentId")?;
             delete_attachment_payload(state, &auth.profile_id, &session_id, &attachment_id)
                 .await
@@ -734,7 +734,7 @@ pub(crate) async fn execute_ws_method(
             read_terminal(state, &terminal_id).await
         }
         "terminal/context/attach" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let terminal_id = require_string(&params, "terminalId")?;
             let max_bytes = params
                 .get("maxBytes")
@@ -830,7 +830,7 @@ pub(crate) async fn execute_ws_method(
             close_terminal(state.clone(), &terminal_id).await
         }
         "session/subscribe" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             subscribe_session(
                 state.clone(),
                 out_tx.clone(),
@@ -842,7 +842,7 @@ pub(crate) async fn execute_ws_method(
             Ok(json!({ "subscribed": true, "sessionId": session_id }))
         }
         "session/unsubscribe" => {
-            let session_id = require_string(&params, "sessionId")?;
+            let session_id = require_session_id(&params, "sessionId")?;
             let mut current = subscriptions.lock().await;
             if let Some(handle) = current.remove(&session_relay_key(&auth.profile_id, &session_id))
             {

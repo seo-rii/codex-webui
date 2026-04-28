@@ -439,6 +439,29 @@ pub(crate) fn require_string(params: &Value, key: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("{key} is required"))
 }
 
+pub(crate) fn validate_session_id(value: &str) -> ApiResult<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 80
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Invalid session id."));
+    }
+    Ok(value.to_string())
+}
+
+pub(crate) fn require_session_id(params: &Value, key: &str) -> Result<String> {
+    let value = require_string(params, key)?;
+    validate_session_id(&value).map_err(|error| {
+        anyhow!(
+            "{{\"code\":\"INVALID_SESSION_ID\",\"message\":\"{}\"}}",
+            error.message
+        )
+    })
+}
+
 pub(crate) fn query_param_value(query: Option<&str>, key: &str) -> Option<String> {
     query?.split('&').find_map(|entry| {
         let (raw_key, raw_value) = entry.split_once('=').unwrap_or((entry, ""));

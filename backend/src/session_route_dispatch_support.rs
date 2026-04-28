@@ -33,6 +33,17 @@ fn not_found_route_response(
     )
 }
 
+fn invalid_session_id_route_response(
+    cors_origin: Option<&str>,
+    requested_headers: Option<&str>,
+) -> Response {
+    apply_route_cors(
+        json_error(StatusCode::BAD_REQUEST, "Invalid session id."),
+        cors_origin,
+        requested_headers,
+    )
+}
+
 fn session_auth_or_response(
     state: &AppState,
     jar: &CookieJar,
@@ -60,6 +71,17 @@ pub(crate) async fn handle_session_route_http(
     cors_origin: Option<&str>,
     requested_headers: Option<&str>,
 ) -> Response {
+    macro_rules! checked_session_id {
+        ($value:expr) => {
+            match validate_session_id(&$value) {
+                Ok(session_id) => session_id,
+                Err(_) => {
+                    return invalid_session_id_route_response(cors_origin, requested_headers);
+                }
+            }
+        };
+    }
+
     if route_path == "/api/sessions" {
         let auth = match session_auth_or_response(&state, jar, cors_origin, requested_headers) {
             Ok(auth) => auth,
@@ -77,7 +99,7 @@ pub(crate) async fn handle_session_route_http(
             Ok(auth) => auth,
             Err(response) => return response,
         };
-        let session_id = session_id_from_suffix(route_path, "/organization");
+        let session_id = checked_session_id!(session_id_from_suffix(route_path, "/organization"));
         return apply_route_cors(
             handle_session_organization_api_http(state, &session_id, request, auth).await,
             cors_origin,
@@ -90,7 +112,7 @@ pub(crate) async fn handle_session_route_http(
             Ok(auth) => auth,
             Err(response) => return response,
         };
-        let session_id = session_id_from_suffix(route_path, "/name");
+        let session_id = checked_session_id!(session_id_from_suffix(route_path, "/name"));
         return apply_route_cors(
             handle_session_name_api_http(state, &session_id, request, auth).await,
             cors_origin,
@@ -103,7 +125,7 @@ pub(crate) async fn handle_session_route_http(
             Ok(auth) => auth,
             Err(response) => return response,
         };
-        let session_id = session_id_from_suffix(route_path, "/archive");
+        let session_id = checked_session_id!(session_id_from_suffix(route_path, "/archive"));
         return apply_route_cors(
             handle_session_archive_api_http(state, &session_id, request, auth, true).await,
             cors_origin,
@@ -116,7 +138,7 @@ pub(crate) async fn handle_session_route_http(
             Ok(auth) => auth,
             Err(response) => return response,
         };
-        let session_id = session_id_from_suffix(route_path, "/unarchive");
+        let session_id = checked_session_id!(session_id_from_suffix(route_path, "/unarchive"));
         return apply_route_cors(
             handle_session_archive_api_http(state, &session_id, request, auth, false).await,
             cors_origin,
@@ -129,7 +151,7 @@ pub(crate) async fn handle_session_route_http(
             Ok(auth) => auth,
             Err(response) => return response,
         };
-        let session_id = session_id_from_suffix(route_path, "/fork");
+        let session_id = checked_session_id!(session_id_from_suffix(route_path, "/fork"));
         return apply_route_cors(
             handle_session_fork_api_http(state, &session_id, request, auth).await,
             cors_origin,
@@ -146,6 +168,7 @@ pub(crate) async fn handle_session_route_http(
             Ok(auth) => auth,
             Err(response) => return response,
         };
+        let session_id = checked_session_id!(session_id);
         return apply_route_cors(
             handle_session_api_http(state, &session_id, request, auth).await,
             cors_origin,
@@ -158,7 +181,7 @@ pub(crate) async fn handle_session_route_http(
             Ok(auth) => auth,
             Err(response) => return response,
         };
-        let session_id = session_id_from_suffix(route_path, "/draft");
+        let session_id = checked_session_id!(session_id_from_suffix(route_path, "/draft"));
         return apply_route_cors(
             handle_session_draft_api_http(state, request, auth, &session_id).await,
             cors_origin,
@@ -171,7 +194,7 @@ pub(crate) async fn handle_session_route_http(
             Ok(auth) => auth,
             Err(response) => return response,
         };
-        let session_id = session_id_from_suffix(route_path, "/messages");
+        let session_id = checked_session_id!(session_id_from_suffix(route_path, "/messages"));
         return apply_route_cors(
             handle_session_messages_api_http(state, request, auth, &session_id).await,
             cors_origin,
@@ -184,7 +207,7 @@ pub(crate) async fn handle_session_route_http(
             Ok(auth) => auth,
             Err(response) => return response,
         };
-        let session_id = session_id_from_suffix(route_path, "/steer");
+        let session_id = checked_session_id!(session_id_from_suffix(route_path, "/steer"));
         return apply_route_cors(
             handle_session_steer_api_http(state, request, auth, &session_id).await,
             cors_origin,
@@ -203,6 +226,7 @@ pub(crate) async fn handle_session_route_http(
             .unwrap_or_default()
             .trim_end_matches('/')
             .to_string();
+        let session_id = checked_session_id!(session_id);
         return apply_route_cors(
             handle_session_queue_api_http(state, request, auth, &session_id, route_path).await,
             cors_origin,
@@ -215,7 +239,7 @@ pub(crate) async fn handle_session_route_http(
             Ok(auth) => auth,
             Err(response) => return response,
         };
-        let session_id = session_id_from_suffix(route_path, "/search");
+        let session_id = checked_session_id!(session_id_from_suffix(route_path, "/search"));
         return apply_route_cors(
             handle_session_search_api_http(state, request, auth, &session_id).await,
             cors_origin,
@@ -228,7 +252,7 @@ pub(crate) async fn handle_session_route_http(
             Ok(auth) => auth,
             Err(response) => return response,
         };
-        let session_id = session_id_from_suffix(route_path, "/turns");
+        let session_id = checked_session_id!(session_id_from_suffix(route_path, "/turns"));
         return apply_route_cors(
             handle_session_turns_api_http(state, request, auth, &session_id).await,
             cors_origin,
@@ -252,6 +276,7 @@ pub(crate) async fn handle_session_route_http(
             .unwrap_or_default()
             .trim_end_matches('/')
             .to_string();
+        let session_id = checked_session_id!(session_id);
         let rest = segments.next().unwrap_or_default();
         let mut turn_segments = rest.split("/items/");
         let turn_id = turn_segments
@@ -294,6 +319,7 @@ pub(crate) async fn handle_session_route_http(
             .unwrap_or_default()
             .trim_end_matches('/')
             .to_string();
+        let session_id = checked_session_id!(session_id);
         return apply_route_cors(
             handle_session_attachments_api_http(state, request, auth, &session_id).await,
             cors_origin,
@@ -314,6 +340,7 @@ pub(crate) async fn handle_session_route_http(
             .unwrap_or_default()
             .trim_end_matches('/')
             .to_string();
+        let session_id = checked_session_id!(session_id);
         let attachment_id = segments
             .next()
             .unwrap_or_default()
@@ -340,6 +367,7 @@ pub(crate) async fn handle_session_route_http(
             .unwrap_or_default()
             .trim_end_matches('/')
             .to_string();
+        let session_id = checked_session_id!(session_id);
         let turn_id = segments
             .next()
             .unwrap_or_default()
@@ -357,7 +385,7 @@ pub(crate) async fn handle_session_route_http(
             Ok(auth) => auth,
             Err(response) => return response,
         };
-        let session_id = session_id_from_suffix(route_path, "/abort");
+        let session_id = checked_session_id!(session_id_from_suffix(route_path, "/abort"));
         return apply_route_cors(
             handle_session_abort_api_http(state, request, auth, &session_id).await,
             cors_origin,
@@ -370,7 +398,7 @@ pub(crate) async fn handle_session_route_http(
             Ok(auth) => auth,
             Err(response) => return response,
         };
-        let session_id = session_id_from_suffix(route_path, "/approval");
+        let session_id = checked_session_id!(session_id_from_suffix(route_path, "/approval"));
         return apply_route_cors(
             handle_session_approval_api_http(state, request, auth, &session_id).await,
             cors_origin,

@@ -90,6 +90,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
             cookie_secure_mode: CookieSecureMode::Auto,
             cors_allowed_origins: Vec::new(),
             trust_proxy_headers: false,
+            instance_token: None,
         }),
         app_servers: AppServerManager::new(AppServerClientConfig::default()),
         http: reqwest::Client::new(),

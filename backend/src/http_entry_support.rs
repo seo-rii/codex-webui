@@ -49,11 +49,19 @@ pub(crate) async fn handle_http(
             }
 
             if route_path == "/healthz" {
+                let instance_token_matched = headers
+                    .get("x-codex-webui-instance-token")
+                    .and_then(|value| value.to_str().ok())
+                    .zip(state.config.instance_token.as_deref())
+                    .is_some_and(|(provided, expected)| {
+                        !expected.is_empty() && provided.trim() == expected
+                    });
                 return Json(json!({
                     "status": "ok",
                     "version": env!("CARGO_PKG_VERSION"),
                     "buildVersion": option_env!("CODEX_WEBUI_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
-                    "buildCommit": option_env!("CODEX_WEBUI_BUILD_COMMIT").unwrap_or("unknown")
+                    "buildCommit": option_env!("CODEX_WEBUI_BUILD_COMMIT").unwrap_or("unknown"),
+                    "instanceTokenMatched": instance_token_matched
                 }))
                 .into_response();
             }

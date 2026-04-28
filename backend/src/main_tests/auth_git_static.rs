@@ -294,12 +294,16 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
     let codex_home = sandbox.join("codex-home");
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
-    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    config.instance_token = Some("probe-token".to_string());
+    state.config = Arc::new(config);
     fs::create_dir_all(&state.config.data_dir).unwrap();
 
     let health_request = Request::builder()
         .method(Method::GET)
         .uri("/healthz")
+        .header("x-codex-webui-instance-token", "probe-token")
         .body(Body::empty())
         .unwrap();
     let health_response = handle_http(State(state.clone()), CookieJar::new(), health_request).await;
@@ -311,6 +315,12 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
     assert_eq!(
         health_payload.get("status").and_then(Value::as_str),
         Some("ok")
+    );
+    assert_eq!(
+        health_payload
+            .get("instanceTokenMatched")
+            .and_then(Value::as_bool),
+        Some(true)
     );
 
     let ready_request = Request::builder()

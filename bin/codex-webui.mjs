@@ -14,6 +14,7 @@ const packageRoot = path.resolve(new URL("..", import.meta.url).pathname);
 const stateDir = path.join(os.homedir(), ".codex", "codex-webui");
 const configPath = path.join(os.homedir(), ".codex", "codex-webui.yml");
 const pidPath = path.join(stateDir, "server.pid");
+const serverMetaPath = path.join(stateDir, "server.json");
 const logPath = path.join(stateDir, "server.log");
 const tunnelPidPath = path.join(stateDir, "tunnel.pid");
 const tunnelLogPath = path.join(stateDir, "tunnel.log");
@@ -380,6 +381,25 @@ async function readPid() {
   }
 }
 
+async function readServerMeta() {
+  try {
+    return JSON.parse(await fs.readFile(serverMetaPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function writeServerMeta(meta) {
+  await fs.writeFile(serverMetaPath, JSON.stringify(meta, null, 2), "utf8");
+}
+
+async function clearServerStateFiles() {
+  await Promise.all([
+    fs.rm(pidPath, { force: true }),
+    fs.rm(serverMetaPath, { force: true })
+  ]);
+}
+
 async function readNumericFile(filePath) {
   try {
     return Number.parseInt((await fs.readFile(filePath, "utf8")).trim(), 10) || null;
@@ -414,6 +434,49 @@ function isRunning(pid) {
   } catch {
     return false;
   }
+}
+
+async function verifyServerInstance(config, meta) {
+  const token = String(meta?.instanceToken ?? "").trim();
+  if (!token) {
+    return false;
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1500);
+  try {
+    const response = await fetch(`${buildBaseUrl(config)}/healthz`, {
+      headers: {
+        "x-codex-webui-instance-token": token
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      return false;
+    }
+    const payload = await response.json();
+    return payload?.instanceTokenMatched === true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readServerStatus(config) {
+  const meta = await readServerMeta();
+  const rawPid = meta?.pid ?? (await readPid());
+  const pid = Number.parseInt(String(rawPid ?? ""), 10) || null;
+  const running = isRunning(pid);
+  const verified = running && meta ? await verifyServerInstance(config, meta) : false;
+  if (pid && !running) {
+    await clearServerStateFiles();
+  }
+  return {
+    pid,
+    running,
+    verified,
+    meta
+  };
 }
 
 function buildOriginUrl(config) {
@@ -833,14 +896,20 @@ async function resolveBackendBinary(config) {
 
 async function startServer(config) {
   await ensureStateDir();
-  const currentPid = await readPid();
-  if (isRunning(currentPid)) {
-    return { pid: currentPid, alreadyRunning: true };
+  const current = await readServerStatus(config);
+  if (current.verified) {
+    return { pid: current.pid, alreadyRunning: true };
+  }
+  if (current.running) {
+    throw new Error(
+      `Refusing to reuse PID ${current.pid}: the process is running but does not match this codex-webui instance. Remove ${pidPath} and ${serverMetaPath} only if you have verified it is stale.`
+    );
   }
 
   const backendBinary = await resolveBackendBinary(config);
   const logHandle = await fs.open(logPath, "a");
   const defaultProfile = config.profiles.find((profile) => profile.id === config.defaultProfileId) ?? config.profiles[0];
+  const instanceToken = createSessionSecret();
   const child = spawn(backendBinary, {
     cwd: packageRoot,
     detached: true,
@@ -867,28 +936,43 @@ async function startServer(config) {
       CODEX_WEBUI_HCAPTCHA_SITE_KEY: String(config.hcaptchaSiteKey ?? ""),
       CODEX_WEBUI_HCAPTCHA_SECRET_KEY: String(config.hcaptchaSecretKey ?? ""),
       CODEX_WEBUI_SESSION_SECRET: String(config.sessionSecret),
+      CODEX_WEBUI_INSTANCE_TOKEN: instanceToken,
       CODEX_WEBUI_CORS_ALLOWED_ORIGINS: config.corsAllowedOrigins.join(",")
     }
   });
   child.unref();
   await fs.writeFile(pidPath, String(child.pid), "utf8");
+  await writeServerMeta({
+    pid: child.pid,
+    instanceToken,
+    startedAt: new Date().toISOString(),
+    command: backendBinary,
+    cwd: packageRoot,
+    url: buildUrl(config)
+  });
   await logHandle.close();
   return { pid: child.pid, alreadyRunning: false };
 }
 
-async function stopServer() {
-  const pid = await readPid();
-  if (!pid || !isRunning(pid)) {
-    await fs.rm(pidPath, { force: true });
+async function stopServer(config) {
+  const status = await readServerStatus(config);
+  if (!status.pid || !status.running) {
+    await clearServerStateFiles();
     return { stopped: false };
   }
-  process.kill(pid, "SIGTERM");
-  await fs.rm(pidPath, { force: true });
-  return { stopped: true, pid };
+  if (!status.verified) {
+    return { stopped: false, unsafe: true, pid: status.pid };
+  }
+  process.kill(status.pid, "SIGTERM");
+  await clearServerStateFiles();
+  return { stopped: true, pid: status.pid };
 }
 
 async function restartServer(config) {
-  await stopServer();
+  const stopResult = await stopServer(config);
+  if (stopResult.unsafe) {
+    throw new Error(`Refusing to restart: PID ${stopResult.pid} could not be verified as this codex-webui instance.`);
+  }
   return startServer(config);
 }
 
@@ -957,6 +1041,7 @@ function printUsage(config, pid, alreadyRunning) {
 function printCommandHelp() {
   console.log("Commands:");
   console.log("  codex-webui config   Re-run the interactive setup");
+  console.log("  codex-webui status   Show the background server state");
   console.log("  codex-webui restart  Restart the background server");
   console.log("  codex-webui stop     Stop the background server");
   console.log("  codex-webui tunnel start   Start a cloudflared/ngrok tunnel");
@@ -1014,7 +1099,7 @@ function applyCliConfigOverrides(config, overrides) {
 }
 
 function parseCliInvocation(argv) {
-  const knownCommands = new Set(["config", "restart", "stop", "tunnel"]);
+  const knownCommands = new Set(["config", "status", "restart", "stop", "tunnel"]);
   let command = "";
   let restArgs = [...argv];
   if (knownCommands.has(restArgs[0] ?? "")) {
@@ -1081,8 +1166,28 @@ async function main() {
     }
   }
 
+  if (command === "status") {
+    const status = await readServerStatus(config);
+    if (!status.pid || !status.running) {
+      console.log("codex-webui is not running.");
+      return;
+    }
+    console.log(status.verified ? "codex-webui is running." : "A process is running at the recorded PID, but it could not be verified.");
+    console.log(`PID: ${status.pid}`);
+    console.log(`URL: ${buildUrl(config)}`);
+    console.log(`Config: ${configPath}`);
+    if (!status.verified) {
+      console.log(`Refusing to manage this PID until ${serverMetaPath} and /healthz verification match.`);
+    }
+    return;
+  }
+
   if (command === "stop") {
-    const result = await stopServer();
+    const result = await stopServer(config);
+    if (result.unsafe) {
+      console.log(`Refusing to stop PID ${result.pid}: it could not be verified as this codex-webui instance.`);
+      return;
+    }
     console.log(result.stopped ? `Stopped codex-webui (pid ${result.pid}).` : "codex-webui is not running.");
     return;
   }

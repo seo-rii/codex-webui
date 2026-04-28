@@ -87,6 +87,7 @@ pub(crate) struct Config {
     pub(crate) cookie_secure_mode: CookieSecureMode,
     pub(crate) cors_allowed_origins: Vec<String>,
     pub(crate) trust_proxy_headers: bool,
+    pub(crate) instance_token: Option<String>,
 }
 
 impl Config {
@@ -190,6 +191,10 @@ impl Config {
                     "1" | "true" | "yes" | "on"
                 )
             }),
+            instance_token: env::var("CODEX_WEBUI_INSTANCE_TOKEN")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         })
     }
 }

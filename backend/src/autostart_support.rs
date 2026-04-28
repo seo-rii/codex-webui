@@ -177,7 +177,7 @@ pub(crate) async fn write_windows_startup_script(config: &Config) -> Result<()> 
             .await
             .context("failed to create the Windows startup directory")?;
     }
-    tokio_fs::write(
+    write_file_atomically(
         &target_path,
         [
             "Set WshShell = CreateObject(\"WScript.Shell\")".to_string(),
@@ -190,7 +190,8 @@ pub(crate) async fn write_windows_startup_script(config: &Config) -> Result<()> 
                 escape_windows_vbs_string(&executable.display().to_string())
             ),
         ]
-        .join("\r\n"),
+        .join("\r\n")
+        .into_bytes(),
     )
     .await
     .context("failed to write the Windows startup script")?;
@@ -212,7 +213,7 @@ pub(crate) async fn write_macos_launch_agent(config: &Config) -> Result<()> {
             .await
             .context("failed to create the autostart log directory")?;
     }
-    tokio_fs::write(
+    write_file_atomically(
         &target_path,
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n  <dict>\n    <key>Label</key>\n    <string>{}</string>\n    <key>ProgramArguments</key>\n    <array>\n      <string>{}</string>\n    </array>\n    <key>WorkingDirectory</key>\n    <string>{}</string>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>KeepAlive</key>\n    <false/>\n    <key>StandardOutPath</key>\n    <string>{}</string>\n    <key>StandardErrorPath</key>\n    <string>{}</string>\n  </dict>\n</plist>\n",
@@ -221,7 +222,8 @@ pub(crate) async fn write_macos_launch_agent(config: &Config) -> Result<()> {
             escape_xml(&working_directory.display().to_string()),
             escape_xml(&log_path.display().to_string()),
             escape_xml(&log_path.display().to_string())
-        ),
+        )
+        .into_bytes(),
     )
     .await
     .context("failed to write the launch agent")?;
@@ -263,13 +265,14 @@ pub(crate) async fn write_linux_systemd_user_service(config: &Config) -> Result<
             .await
             .context("failed to create the systemd user directory")?;
     }
-    tokio_fs::write(
+    write_file_atomically(
         &target_path,
         format!(
             "[Unit]\nDescription=Codex Web UI autostart\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
             escape_systemd_value(&working_directory.display().to_string()),
             escape_systemd_value(&executable.display().to_string())
-        ),
+        )
+        .into_bytes(),
     )
     .await
     .context("failed to write the systemd user service")?;
@@ -311,13 +314,14 @@ pub(crate) async fn write_linux_desktop_entry(config: &Config) -> Result<()> {
             .await
             .context("failed to create the desktop autostart directory")?;
     }
-    tokio_fs::write(
+    write_file_atomically(
         &target_path,
         format!(
             "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Codex Web UI\nComment=Start Codex Web UI automatically when you sign in\nExec={}\nPath={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\nHidden=false\n",
             escape_desktop_value(&executable.display().to_string()),
             escape_desktop_value(&working_directory.display().to_string())
-        ),
+        )
+        .into_bytes(),
     )
     .await
     .context("failed to write the desktop autostart entry")?;

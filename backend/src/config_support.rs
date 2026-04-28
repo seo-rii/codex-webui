@@ -29,8 +29,10 @@ pub(crate) fn append_runtime_error_log(
 
     if let Ok(line) = serde_json::to_string(&entry) {
         if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = std::io::Write::write_all(&mut file, line.as_bytes());
-            let _ = std::io::Write::write_all(&mut file, b"\n");
+            let mut record = Vec::with_capacity(line.len() + 1);
+            record.extend_from_slice(line.as_bytes());
+            record.push(b'\n');
+            let _ = std::io::Write::write_all(&mut file, &record);
         }
     }
 }

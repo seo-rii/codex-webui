@@ -28,6 +28,43 @@ pub(crate) async fn emit_terminals_updated(state: &AppState) {
     .await;
 }
 
+pub(crate) async fn cleanup_terminal_sessions(state: AppState) {
+    let now = now_unix_ms();
+    let terminals = {
+        let current = state.terminals.lock().await;
+        current.values().cloned().collect::<Vec<_>>()
+    };
+    let mut expired = Vec::new();
+    for terminal in terminals {
+        let summary = terminal.summary().await;
+        let age_ms = now.saturating_sub(summary.last_activity_at);
+        if (summary.status == "exited" && age_ms > TERMINAL_EXITED_TTL_MS)
+            || (summary.status == "running" && age_ms > TERMINAL_IDLE_TTL_MS)
+        {
+            expired.push((summary.id, terminal.pid));
+        }
+    }
+
+    if expired.is_empty() {
+        return;
+    }
+
+    let mut removed = Vec::new();
+    {
+        let mut current = state.terminals.lock().await;
+        for (terminal_id, pid) in &expired {
+            if current.remove(terminal_id).is_some() {
+                removed.push(*pid);
+            }
+        }
+    }
+
+    for pid in removed.into_iter().flatten() {
+        let _ = terminate_process(pid).await;
+    }
+    emit_terminals_updated(&state).await;
+}
+
 pub(crate) async fn get_terminal_session(
     state: &AppState,
     terminal_id: &str,
@@ -104,6 +141,21 @@ pub(crate) async fn create_terminal(
     title: Option<String>,
 ) -> Result<Value> {
     let cwd = validate_terminal_cwd(&state, cwd).await?;
+    cleanup_terminal_sessions(state.clone()).await;
+    let existing_terminals = {
+        let current = state.terminals.lock().await;
+        current.values().cloned().collect::<Vec<_>>()
+    };
+    let mut running_count = 0;
+    for terminal in existing_terminals {
+        if terminal.summary().await.status == "running" {
+            running_count += 1;
+        }
+    }
+    if running_count >= MAX_TERMINAL_SESSIONS {
+        anyhow::bail!("terminal session limit reached.");
+    }
+
     let mut child = spawn_terminal_process(&cwd).await?;
     let stdout = child
         .stdout
@@ -185,6 +237,7 @@ pub(crate) async fn create_terminal(
 }
 
 pub(crate) async fn list_terminals(state: &AppState) -> Result<Value> {
+    cleanup_terminal_sessions(state.clone()).await;
     Ok(json!({
         "terminals": list_terminal_summaries(state).await
     }))

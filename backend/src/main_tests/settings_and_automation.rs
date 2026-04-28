@@ -235,6 +235,84 @@ async fn notification_helpers_update_ui_state_and_counts() {
 }
 
 #[tokio::test]
+async fn terminal_cleanup_removes_stale_sessions() {
+    let sandbox = unique_test_dir("terminal-cleanup");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let (relay, _) = broadcast::channel(1);
+    let terminal_id = "stale-terminal".to_string();
+    state.terminals.lock().await.insert(
+        terminal_id.clone(),
+        Arc::new(TerminalSession {
+            summary: Mutex::new(TerminalSummaryState {
+                id: terminal_id.clone(),
+                title: "Old".to_string(),
+                cwd: workspace.display().to_string(),
+                created_at: 1,
+                last_activity_at: now_unix_ms()
+                    .saturating_sub(TERMINAL_EXITED_TTL_MS)
+                    .saturating_sub(1),
+                status: "exited".to_string(),
+                exit_code: Some(0),
+            }),
+            buffer: Mutex::new(String::new()),
+            stdin: Mutex::new(None),
+            relay,
+            pid: None,
+        }),
+    );
+
+    cleanup_terminal_sessions(state.clone()).await;
+    assert!(!state.terminals.lock().await.contains_key(&terminal_id));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn terminal_create_rejects_session_limit_before_spawning() {
+    let sandbox = unique_test_dir("terminal-limit");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    for index in 0..MAX_TERMINAL_SESSIONS {
+        let (relay, _) = broadcast::channel(1);
+        let terminal_id = format!("terminal-{index}");
+        state.terminals.lock().await.insert(
+            terminal_id.clone(),
+            Arc::new(TerminalSession {
+                summary: Mutex::new(TerminalSummaryState {
+                    id: terminal_id,
+                    title: "Running".to_string(),
+                    cwd: workspace.display().to_string(),
+                    created_at: now_unix_ms(),
+                    last_activity_at: now_unix_ms(),
+                    status: "running".to_string(),
+                    exit_code: None,
+                }),
+                buffer: Mutex::new(String::new()),
+                stdin: Mutex::new(None),
+                relay,
+                pid: None,
+            }),
+        );
+    }
+
+    let error = create_terminal(state, Some(workspace.display().to_string()), None)
+        .await
+        .expect_err("terminal limit should reject before process spawn");
+    assert!(error.to_string().contains("terminal session limit reached"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn theme_settings_round_trip_through_rust_store() {
     let sandbox = unique_test_dir("theme-settings");
     let workspace = sandbox.join("workspace");

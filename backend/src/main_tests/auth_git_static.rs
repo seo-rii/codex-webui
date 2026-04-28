@@ -807,6 +807,47 @@ async fn git_write_payloads_use_rust_helpers() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_mutations_share_repo_operation_lock() {
+    let sandbox = unique_test_dir("git-write-lock");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let repo = workspace.join("repo");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    init_test_git_repo(&repo);
+    fs::write(repo.join("queued.txt"), "queued\n").unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let repo_root = resolve_git_repo_root(&state, repo.to_str().unwrap())
+        .await
+        .unwrap();
+    let repo_lock = git_operation_lock(&state, &repo_root).await;
+    let guard = repo_lock.lock().await;
+    let state_for_task = state.clone();
+    let repo_for_task = repo_root.clone();
+    let handle = tokio::spawn(async move {
+        stage_git_changes_payload(&state_for_task, &repo_for_task, Some("queued.txt")).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!handle.is_finished());
+    drop(guard);
+
+    let staged = handle.await.unwrap().unwrap();
+    assert!(
+        staged
+            .get("files")
+            .and_then(Value::as_array)
+            .is_some_and(|files| files.iter().any(|entry| {
+                entry.get("path").and_then(Value::as_str) == Some("queued.txt")
+                    && entry.get("hasStagedChanges").and_then(Value::as_bool) == Some(true)
+            }))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_file_save_rejects_symlinked_parent_escape() {

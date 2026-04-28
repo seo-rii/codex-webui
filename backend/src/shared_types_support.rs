@@ -26,6 +26,7 @@ pub(crate) struct AppState {
     pub(crate) catalog_cache: Arc<Mutex<HashMap<String, CachedCatalog>>>,
     pub(crate) git_repository_cache: Arc<Mutex<Option<CachedGitRepositories>>>,
     pub(crate) pinned_git_repositories: Arc<Mutex<HashMap<String, Value>>>,
+    pub(crate) git_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub(crate) inflight_requests:
         Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<ServerEnvelope>>>>>,
     pub(crate) quota_cache: Arc<Mutex<HashMap<String, CachedQuota>>>,

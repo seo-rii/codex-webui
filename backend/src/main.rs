@@ -254,6 +254,7 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             catalog_cache: Arc::new(Mutex::new(HashMap::new())),
             git_repository_cache: Arc::new(Mutex::new(None)),
             pinned_git_repositories: Arc::new(Mutex::new(HashMap::new())),
+            git_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             inflight_requests: Arc::new(Mutex::new(HashMap::new())),
             quota_cache: Arc::new(Mutex::new(HashMap::new())),
             relays: Arc::new(Mutex::new(HashMap::new())),

@@ -110,6 +110,8 @@ pub(crate) async fn create_git_worktree_payload(
     detach: bool,
 ) -> ApiResult<Value> {
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let repo_lock = git_operation_lock(state, &repo_root).await;
+    let _repo_guard = repo_lock.lock().await;
     let resolved_worktree_path = resolve_git_worktree_path(state, worktree_path).await?;
     let trimmed_branch_name = branch_name
         .map(str::trim)
@@ -165,6 +167,8 @@ pub(crate) async fn remove_git_worktree_payload(
     force: bool,
 ) -> ApiResult<Value> {
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let repo_lock = git_operation_lock(state, &repo_root).await;
+    let _repo_guard = repo_lock.lock().await;
     let resolved_worktree_path = resolve_git_worktree_path(state, worktree_path).await?;
     let mut args = vec!["worktree".to_string(), "remove".to_string()];
     if force {

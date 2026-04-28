@@ -360,6 +360,8 @@ pub(crate) async fn checkout_github_pull_request_payload(
     number: u64,
 ) -> ApiResult<Value> {
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let repo_lock = git_operation_lock(state, &repo_root).await;
+    let _repo_guard = repo_lock.lock().await;
     let pull_request_number = number.max(1);
     run_gh_text_payload(
         &repo_root,

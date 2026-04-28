@@ -233,6 +233,73 @@ async fn unsafe_http_api_mutations_reject_cross_origin_requests() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
+    let sandbox = unique_test_dir("ops-probes");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    fs::create_dir_all(&state.config.data_dir).unwrap();
+
+    let health_request = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let health_response = handle_http(State(state.clone()), CookieJar::new(), health_request).await;
+    assert_eq!(health_response.status(), StatusCode::OK);
+    let health_body = to_bytes(health_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let health_payload: Value = serde_json::from_slice(&health_body).unwrap();
+    assert_eq!(
+        health_payload.get("status").and_then(Value::as_str),
+        Some("ok")
+    );
+
+    let ready_request = Request::builder()
+        .method(Method::GET)
+        .uri("/readyz")
+        .body(Body::empty())
+        .unwrap();
+    let ready_response = handle_http(State(state.clone()), CookieJar::new(), ready_request).await;
+    assert_eq!(ready_response.status(), StatusCode::OK);
+
+    let metrics_request = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let metrics_response =
+        handle_http(State(state.clone()), CookieJar::new(), metrics_request).await;
+    assert_eq!(metrics_response.status(), StatusCode::UNAUTHORIZED);
+
+    let jar = issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Admin).unwrap();
+    let metrics_request = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let metrics_response = handle_http(State(state), jar, metrics_request).await;
+    assert_eq!(metrics_response.status(), StatusCode::OK);
+    assert_eq!(
+        metrics_response.headers().get(header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static(
+            "text/plain; version=0.0.4; charset=utf-8"
+        ))
+    );
+    let metrics_body = to_bytes(metrics_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let metrics_text = String::from_utf8(metrics_body.to_vec()).unwrap();
+    assert!(metrics_text.contains("codex_webui_profiles 1"));
+    assert!(metrics_text.contains("codex_webui_response_cache_entries 0"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn viewer_websocket_permissions_are_session_observation_only() {
     for method in [

@@ -414,6 +414,10 @@ impl AppServerManager {
         Ok(())
     }
 
+    pub async fn client_count(&self) -> usize {
+        self.clients.lock().await.len()
+    }
+
     pub async fn close_all(&self) -> Result<()> {
         let clients = {
             let mut clients = self.clients.lock().await;

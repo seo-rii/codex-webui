@@ -401,9 +401,91 @@ pub(crate) async fn upload_attachments(
 }
 
 pub(crate) fn json_error(status: StatusCode, message: &str) -> Response {
-    let mut response = Json(json!({ "message": message })).into_response();
+    let mut response =
+        Json(json!({ "message": redact_user_facing_error(message) })).into_response();
     *response.status_mut() = status;
     response
+}
+
+pub(crate) fn redact_user_facing_error(message: &str) -> String {
+    let mut redacted = message.to_string();
+    if let Ok(home) = env::var("HOME") {
+        let home = home.trim();
+        if !home.is_empty() && home != "/" {
+            redacted = redacted.replace(home, "~");
+        }
+    }
+
+    let lowered = redacted.to_ascii_lowercase();
+    while let Some(index) = lowered.find("bearer ") {
+        let value_start = index + "bearer ".len();
+        let value_end = redacted[value_start..]
+            .char_indices()
+            .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | '}'))
+            .map(|(offset, _)| value_start + offset)
+            .unwrap_or(redacted.len());
+        if redacted[value_start..].starts_with("[redacted]") {
+            break;
+        }
+        if value_end > value_start {
+            redacted.replace_range(value_start..value_end, "[redacted]");
+            break;
+        } else {
+            break;
+        }
+    }
+
+    for key in [
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "authorization",
+        "password",
+        "session_secret",
+        "sessionSecret",
+        "hcaptchaSecretKey",
+        "webhookUrl",
+        "slackWebhookUrl",
+    ] {
+        for separator in ["=", ":", "\":", "':"] {
+            loop {
+                let lowered = redacted.to_ascii_lowercase();
+                let needle = format!("{}{}", key.to_ascii_lowercase(), separator);
+                let Some(index) = lowered.find(&needle) else {
+                    break;
+                };
+                let mut value_start = index + needle.len();
+                while let Some(ch) = redacted[value_start..].chars().next() {
+                    if ch.is_whitespace() || matches!(ch, '"' | '\'') {
+                        value_start += ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                let value_end = redacted[value_start..]
+                    .char_indices()
+                    .find(|(_, ch)| {
+                        ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | '}')
+                    })
+                    .map(|(offset, _)| value_start + offset)
+                    .unwrap_or(redacted.len());
+                if redacted[value_start..].starts_with("[redacted]") {
+                    break;
+                }
+                if value_end <= value_start {
+                    break;
+                }
+                redacted.replace_range(value_start..value_end, "[redacted]");
+                break;
+            }
+        }
+    }
+
+    if redacted.len() > 4000 {
+        redacted.truncate(4000);
+        redacted.push_str("...[truncated]");
+    }
+    redacted
 }
 
 pub(crate) fn normalize_request_path(base_path: &str, path: &str) -> NormalizedPath {

@@ -197,7 +197,7 @@ async fn handle_ws_message(
                     id: id.clone(),
                     ok: false,
                     result: None,
-                    error: Some(error.to_string()),
+                    error: Some(redact_user_facing_error(&error.to_string())),
                 },
             };
             let elapsed = started_at.elapsed();

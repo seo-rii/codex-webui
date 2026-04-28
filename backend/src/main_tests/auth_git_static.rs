@@ -59,6 +59,23 @@ async fn terminate_process_hard_kills_term_ignoring_process_group() {
     assert!(!status.success());
 }
 
+#[test]
+fn user_facing_error_redaction_hides_paths_and_tokens() {
+    let home = env::var("HOME").unwrap_or_else(|_| "/home/example".to_string());
+    let redacted = redact_user_facing_error(&format!(
+        "failed at {home}/.codex/auth.json with Bearer sk-secret access_token=abc123 password:super-secret \"refresh_token\":\"refresh-secret\""
+    ));
+
+    assert!(!redacted.contains("sk-secret"));
+    assert!(!redacted.contains("abc123"));
+    assert!(!redacted.contains("super-secret"));
+    assert!(!redacted.contains("refresh-secret"));
+    if home != "/" {
+        assert!(!redacted.contains(&home));
+    }
+    assert!(redacted.contains("[redacted]"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_response_cache_is_partitioned_by_role_method_and_params() {
     let sandbox = unique_test_dir("ws-cache-partition");

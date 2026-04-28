@@ -118,7 +118,8 @@ async fn spawn_terminal_process(cwd: &str) -> Result<Child> {
             .spawn()
             .context("failed to start terminal process")
     } else {
-        Command::new("script")
+        let mut command = Command::new("script");
+        command
             .current_dir(cwd)
             .args([
                 "-q",
@@ -129,9 +130,9 @@ async fn spawn_terminal_process(cwd: &str) -> Result<Child> {
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to start terminal process")
+            .stderr(Stdio::null());
+        command.process_group(0);
+        command.spawn().context("failed to start terminal process")
     }
 }
 

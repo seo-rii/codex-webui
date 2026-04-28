@@ -282,7 +282,7 @@ See [.env.example](./.env.example) for a concise example set.
 - Prefer `CODEX_WEBUI_PASSWORD_HASH` over plaintext password variables.
 - Prefer config or environment variables for hCaptcha secrets; command-line flags can leak through shell history and process inspection.
 - If you need read-only browser access, prefer `CODEX_WEBUI_VIEWER_PASSWORD_HASH` over the plaintext viewer password variable.
-- Keep `CODEX_WEBUI_SESSION_SECRET` unique per deployment.
+- Set `CODEX_WEBUI_SESSION_SECRET` to a unique random value of at least 32 bytes per deployment; the gateway will not fall back to a password-derived cookie signing key.
 - Optional hCaptcha login protection is only enabled when both `CODEX_WEBUI_HCAPTCHA_SITE_KEY` and `CODEX_WEBUI_HCAPTCHA_SECRET_KEY` are set.
 - Restrict `CODEX_WEBUI_ALLOWED_ROOTS` to the smallest practical set.
 - Leave cookies on `SameSite=Strict` unless you explicitly need cross-site browser sessions.

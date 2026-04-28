@@ -190,6 +190,38 @@ fn viewer_websocket_permissions_are_session_observation_only() {
     }
 }
 
+#[test]
+fn auth_token_signing_requires_explicit_session_secret() {
+    let sandbox = unique_test_dir("auth-token-secret");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+
+    config.session_secret = None;
+    assert!(
+        sign(&config, "payload")
+            .unwrap_err()
+            .to_string()
+            .contains("CODEX_WEBUI_SESSION_SECRET")
+    );
+
+    config.session_secret = Some("too-short".to_string());
+    assert!(
+        sign(&config, "payload")
+            .unwrap_err()
+            .to_string()
+            .contains("at least 32 bytes")
+    );
+
+    config.session_secret = Some("test-session-secret-for-cookie-signing".to_string());
+    assert!(sign(&config, "payload").is_ok());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_login_rejects_oversized_json_body() {
     let sandbox = unique_test_dir("auth-login-body-limit");

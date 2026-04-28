@@ -142,6 +142,9 @@ impl Config {
             ));
         }
 
+        let session_secret = env::var("CODEX_WEBUI_SESSION_SECRET").ok();
+        validate_session_secret_value(session_secret.as_deref())?;
+
         let codex_home = resolve_codex_home()?;
         let (default_profile_id, profiles) = parse_runtime_profiles(&codex_home, &data_dir)?;
 
@@ -171,7 +174,7 @@ impl Config {
             viewer_password_hash: env::var("CODEX_WEBUI_VIEWER_PASSWORD_HASH").ok(),
             hcaptcha_site_key: env::var("CODEX_WEBUI_HCAPTCHA_SITE_KEY").ok(),
             hcaptcha_secret_key: env::var("CODEX_WEBUI_HCAPTCHA_SECRET_KEY").ok(),
-            session_secret: env::var("CODEX_WEBUI_SESSION_SECRET").ok(),
+            session_secret,
             cookie_same_site: parse_same_site(
                 env::var("CODEX_WEBUI_COOKIE_SAMESITE").ok().as_deref(),
             ),
@@ -210,6 +213,20 @@ pub(crate) enum CookieSecureMode {
     Auto,
     Always,
     Never,
+}
+
+pub(crate) fn validate_session_secret_value(value: Option<&str>) -> Result<&str> {
+    let Some(secret) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err(anyhow!(
+            "Set CODEX_WEBUI_SESSION_SECRET to a unique random value before starting the gateway."
+        ));
+    };
+    if secret.as_bytes().len() < 32 {
+        return Err(anyhow!(
+            "CODEX_WEBUI_SESSION_SECRET must be at least 32 bytes."
+        ));
+    }
+    Ok(secret)
 }
 
 #[derive(Debug, Deserialize)]

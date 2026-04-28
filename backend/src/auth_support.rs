@@ -178,12 +178,7 @@ pub(crate) fn auth_context(config: &Config, jar: &CookieJar) -> Option<AuthConte
 }
 
 pub(crate) fn sign(config: &Config, payload: &str) -> Result<String> {
-    let secret = config
-        .session_secret
-        .clone()
-        .or_else(|| config.password_hash.clone())
-        .or_else(|| config.password.clone())
-        .unwrap_or_default();
+    let secret = validate_session_secret_value(config.session_secret.as_deref())?;
     let mut mac =
         Hmac::<Sha256>::new_from_slice(secret.as_bytes()).context("failed to initialize HMAC")?;
     mac.update(payload.as_bytes());

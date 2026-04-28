@@ -85,7 +85,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
             viewer_password_hash: None,
             hcaptcha_site_key: None,
             hcaptcha_secret_key: None,
-            session_secret: None,
+            session_secret: Some("test-session-secret-for-cookie-signing".to_string()),
             cookie_same_site: SameSiteMode::Strict,
             cookie_secure_mode: CookieSecureMode::Auto,
             cors_allowed_origins: Vec::new(),

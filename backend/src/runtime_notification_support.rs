@@ -515,18 +515,26 @@ pub(crate) async fn restore_runtime_profile_state(state: AppState, profile_id: S
     }
     emit_runtime_profile_config_updated(&state, &profile_id).await;
 
+    let mut reconnect_delay = Duration::from_secs(1);
     loop {
         let client = match app_server_client(&state, &profile_id).await {
             Ok(client) => client,
             Err(error) => {
-                warn!("failed to create app-server client for {profile_id}: {error:#}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                warn!(
+                    retry_after_ms = reconnect_delay.as_millis(),
+                    "failed to create app-server client for {profile_id}: {error:#}"
+                );
+                tokio::time::sleep(reconnect_delay).await;
+                reconnect_delay = reconnect_delay
+                    .saturating_mul(2)
+                    .min(Duration::from_secs(60));
                 continue;
             }
         };
         let _ = client
             .request("model/list", json!({ "includeHidden": false }))
             .await;
+        reconnect_delay = Duration::from_secs(1);
         let mut notifications = client.subscribe_notifications();
         let mut requests = client.subscribe_requests();
 
@@ -557,6 +565,9 @@ pub(crate) async fn restore_runtime_profile_state(state: AppState, profile_id: S
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(reconnect_delay).await;
+        reconnect_delay = reconnect_delay
+            .saturating_mul(2)
+            .min(Duration::from_secs(60));
     }
 }

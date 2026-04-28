@@ -18,7 +18,8 @@ pub(crate) async fn handle_ws(
         return (StatusCode::UNAUTHORIZED, "Authentication required.").into_response();
     };
 
-    ws.on_upgrade(move |socket| websocket_session(socket, state, auth))
+    ws.max_message_size(WS_MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| websocket_session(socket, state, auth))
         .into_response()
 }
 
@@ -28,6 +29,7 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
     let connection_id = Uuid::new_v4().to_string();
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let request_slots = Arc::new(tokio::sync::Semaphore::new(WS_MAX_CONCURRENT_REQUESTS));
 
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
@@ -65,11 +67,31 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
                     }
                 };
 
+                let request_permit = match &payload {
+                    ClientEnvelope::Request { id, .. } => {
+                        match Arc::clone(&request_slots).try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                let _ = out_tx.send(ServerEnvelope::Response {
+                                    id: id.clone(),
+                                    ok: false,
+                                    result: None,
+                                    error: Some(
+                                        "Too many concurrent websocket requests.".to_string(),
+                                    ),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    ClientEnvelope::Ping { .. } => None,
+                };
                 let state = state.clone();
                 let out_tx = out_tx.clone();
                 let subscriptions = Arc::clone(&subscriptions);
                 let auth = auth.clone();
                 tokio::spawn(async move {
+                    let _request_permit = request_permit;
                     ACTIVE_PROFILE_ID
                         .scope(auth.profile_id.clone(), async move {
                             if let Err(error) =

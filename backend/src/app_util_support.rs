@@ -9,8 +9,25 @@ pub(crate) fn global_relay_key(profile_id: &str) -> String {
     format!("profile::{profile_id}::{GLOBAL_RELAY_KEY}")
 }
 
-pub(crate) fn request_cache_key(profile_id: &str, request_id: &str) -> String {
-    format!("profile::{profile_id}::request::{request_id}")
+pub(crate) fn request_params_hash(params: &Value) -> String {
+    let bytes = serde_json::to_vec(params).unwrap_or_else(|_| params.to_string().into_bytes());
+    URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(bytes))
+}
+
+pub(crate) fn request_cache_key(
+    profile_id: &str,
+    request_id: &str,
+    role: UserRole,
+    method: &str,
+    params_hash: &str,
+) -> String {
+    let role = match role {
+        UserRole::Admin => "admin",
+        UserRole::Viewer => "viewer",
+    };
+    format!(
+        "profile::{profile_id}::role::{role}::method::{method}::params::{params_hash}::request::{request_id}"
+    )
 }
 
 pub(crate) fn runtime_session_key(profile_id: &str, session_id: &str) -> String {

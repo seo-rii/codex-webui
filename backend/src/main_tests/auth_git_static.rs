@@ -35,6 +35,69 @@ fn maps_account_login_completed_notifications() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_response_cache_is_partitioned_by_role_method_and_params() {
+    let sandbox = unique_test_dir("ws-cache-partition");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let request_id = "client-controlled-id";
+    let method = "config/set";
+    let params = json!({ "value": "admin-only" });
+    let params_hash = request_params_hash(&params);
+    let admin_key = request_cache_key(
+        "default",
+        request_id,
+        UserRole::Admin,
+        method,
+        &params_hash,
+    );
+    cache_response(
+        &state,
+        &admin_key,
+        ServerEnvelope::Response {
+            id: request_id.to_string(),
+            ok: true,
+            result: Some(json!({ "secret": true })),
+            error: None,
+        },
+    )
+    .await;
+
+    let viewer_key = request_cache_key(
+        "default",
+        request_id,
+        UserRole::Viewer,
+        method,
+        &params_hash,
+    );
+    assert!(cached_response(&state, &viewer_key).await.is_none());
+
+    let method_key = request_cache_key(
+        "default",
+        request_id,
+        UserRole::Admin,
+        "runtime/status",
+        &params_hash,
+    );
+    assert!(cached_response(&state, &method_key).await.is_none());
+
+    let different_params_hash = request_params_hash(&json!({ "value": "different" }));
+    let params_key = request_cache_key(
+        "default",
+        request_id,
+        UserRole::Admin,
+        method,
+        &different_params_hash,
+    );
+    assert!(cached_response(&state, &params_key).await.is_none());
+    assert!(cached_response(&state, &admin_key).await.is_some());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn maps_session_item_notifications_for_stream_clients() {
     let mapped = map_app_server_session_notification(&AppServerNotification {

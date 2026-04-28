@@ -142,6 +142,44 @@ pub(crate) fn validate_attachment_size(config: &Config, size: u64) -> ApiResult<
     Ok(())
 }
 
+async fn write_attachment_bytes_atomically(path: &Path, bytes: &[u8]) -> ApiResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "Attachment path has no parent directory.",
+        )
+    })?;
+    tokio_fs::create_dir_all(parent)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let temp_path = parent.join(format!(".codex-webui-attachment-{}.tmp", Uuid::new_v4()));
+    let write_result = async {
+        let mut file = tokio_fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio_fs::rename(&temp_path, path).await?;
+        if let Ok(parent_dir) = tokio_fs::File::open(parent).await {
+            let _ = parent_dir.sync_all().await;
+        }
+        std::io::Result::Ok(())
+    }
+    .await;
+
+    if let Err(error) = write_result {
+        let _ = tokio_fs::remove_file(&temp_path).await;
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn attachment_payload_from_record(record: &StoredAttachmentRecord) -> Value {
     json!({
         "id": record.id,
@@ -222,14 +260,10 @@ pub(crate) async fn save_uploaded_attachment_records(
             created_at: Some(now_unix_ms().to_string()),
         };
 
-        tokio_fs::write(&file_path, &upload.bytes)
-            .await
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        write_attachment_bytes_atomically(&file_path, &upload.bytes).await?;
         let metadata = serde_json::to_vec_pretty(&record)
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        tokio_fs::write(&meta_path, metadata)
-            .await
-            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        write_attachment_bytes_atomically(&meta_path, &metadata).await?;
         stored.push(record);
     }
 
@@ -295,9 +329,7 @@ pub(crate) async fn store_uploaded_attachment_file(
     };
     let metadata = serde_json::to_vec_pretty(&record)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    tokio_fs::write(&meta_path, metadata)
-        .await
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    write_attachment_bytes_atomically(&meta_path, &metadata).await?;
     Ok(record)
 }
 

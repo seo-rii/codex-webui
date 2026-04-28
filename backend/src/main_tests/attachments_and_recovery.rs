@@ -239,6 +239,18 @@ async fn upload_attachments_store_files_without_internal_backend() {
             && attachment.kind.as_deref() == Some("image")
             && attachment.size == Some(7)
     }));
+    let upload_dir = session_uploads_dir(&state, "default", "thread-1");
+    let temp_entries = fs::read_dir(upload_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".codex-webui-attachment-"))
+        })
+        .count();
+    assert_eq!(temp_entries, 0);
 
     let _ = fs::remove_dir_all(sandbox);
 }

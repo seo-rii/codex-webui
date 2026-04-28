@@ -260,6 +260,7 @@ The Rust gateway honors a focused set of `CODEX_WEBUI_*` environment variables. 
 - `CODEX_WEBUI_HCAPTCHA_SITE_KEY`
 - `CODEX_WEBUI_HCAPTCHA_SECRET_KEY`
 - `CODEX_WEBUI_CORS_ALLOWED_ORIGINS`
+- `CODEX_WEBUI_TRUST_PROXY_HEADERS`
 - `CODEX_WEBUI_ALLOWED_ROOTS`
 - `CODEX_WEBUI_BASE_PATH`
 - `CODEX_WEBUI_DATA_DIR`
@@ -286,6 +287,7 @@ See [.env.example](./.env.example) for a concise example set.
 - Restrict `CODEX_WEBUI_ALLOWED_ROOTS` to the smallest practical set.
 - Leave cookies on `SameSite=Strict` unless you explicitly need cross-site browser sessions.
 - Run behind HTTPS in production.
+- Leave `CODEX_WEBUI_TRUST_PROXY_HEADERS` unset unless the gateway only receives traffic from a trusted reverse proxy that controls `X-Forwarded-*` headers.
 - Use the viewer password for observation-only access instead of sharing the admin password when multiple humans need browser visibility.
 - Git actions are intentionally gated on explicit repository selection.
 - System shutdown support is disabled by default and must be explicitly enabled.

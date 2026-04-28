@@ -112,6 +112,29 @@ fn websocket_origin_allows_same_origin_and_configured_cors_only() {
         &same_origin_headers
     ));
 
+    let mut forwarded_https_headers = same_origin_headers.clone();
+    forwarded_https_headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://127.0.0.1:4173"),
+    );
+    forwarded_https_headers.insert("x-forwarded-proto", HeaderValue::from_static("https, http"));
+    assert!(!request_is_secure(&state.config, &forwarded_https_headers));
+    assert!(!websocket_origin_allowed(
+        &state.config,
+        &forwarded_https_headers
+    ));
+
+    let mut trusted_proxy_config = (*state.config).clone();
+    trusted_proxy_config.trust_proxy_headers = true;
+    assert!(request_is_secure(
+        &trusted_proxy_config,
+        &forwarded_https_headers
+    ));
+    assert!(websocket_origin_allowed(
+        &trusted_proxy_config,
+        &forwarded_https_headers
+    ));
+
     let mut rejected_headers = same_origin_headers.clone();
     rejected_headers.insert(
         header::ORIGIN,

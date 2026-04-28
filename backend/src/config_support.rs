@@ -86,6 +86,7 @@ pub(crate) struct Config {
     pub(crate) cookie_same_site: SameSiteMode,
     pub(crate) cookie_secure_mode: CookieSecureMode,
     pub(crate) cors_allowed_origins: Vec<String>,
+    pub(crate) trust_proxy_headers: bool,
 }
 
 impl Config {
@@ -180,6 +181,12 @@ impl Config {
             cors_allowed_origins: parse_cors_origins(
                 env::var("CODEX_WEBUI_CORS_ALLOWED_ORIGINS").ok(),
             )?,
+            trust_proxy_headers: env::var("CODEX_WEBUI_TRUST_PROXY_HEADERS").is_ok_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            }),
         })
     }
 }

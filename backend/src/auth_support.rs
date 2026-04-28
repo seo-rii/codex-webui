@@ -88,7 +88,7 @@ pub(crate) async fn select_profile(
     request: Request,
     auth: AuthContext,
 ) -> std::result::Result<Response, String> {
-    let secure_request = request_is_secure(&headers);
+    let secure_request = request_is_secure(&config, &headers);
     let payload = match read_json_body(request, SMALL_JSON_BODY_LIMIT, "profile request body").await
     {
         Ok(payload) => payload,
@@ -190,10 +190,16 @@ pub(crate) fn sign(config: &Config, payload: &str) -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
 }
 
-pub(crate) fn request_is_secure(headers: &HeaderMap) -> bool {
+pub(crate) fn request_is_secure(config: &Config, headers: &HeaderMap) -> bool {
+    if !config.trust_proxy_headers {
+        return false;
+    }
     if let Some(forwarded) = headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
     {
         return forwarded.eq_ignore_ascii_case("https");
     }
@@ -236,7 +242,7 @@ pub(crate) fn websocket_origin_allowed(config: &Config, headers: &HeaderMap) -> 
     else {
         return false;
     };
-    let scheme = if request_is_secure(headers) {
+    let scheme = if request_is_secure(config, headers) {
         "https"
     } else {
         "http"

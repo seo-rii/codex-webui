@@ -93,7 +93,7 @@ async fn auth_login(
     headers: HeaderMap,
     request: Request,
 ) -> std::result::Result<Response, String> {
-    let secure_request = request_is_secure(&headers);
+    let secure_request = request_is_secure(&state.config, &headers);
     let body = match read_limited_body(request, SMALL_JSON_BODY_LIMIT, "login request body").await {
         Ok(body) => body,
         Err(error) => return Ok(json_error(error.status, &error.message)),
@@ -103,14 +103,18 @@ async fn auth_login(
         hcaptcha_token: None,
     });
     let password = payload.password.unwrap_or_default();
-    let identifier = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("unknown")
-        .to_string();
+    let identifier = if state.config.trust_proxy_headers {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown")
+            .to_string()
+    } else {
+        "unknown".to_string()
+    };
 
     if !check_rate_limit(&state, &identifier).await {
         return Ok(json_error(

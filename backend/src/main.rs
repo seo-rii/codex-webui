@@ -50,6 +50,8 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
+const SERVER_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 mod app_util_support;
 mod arena_support;
 mod attachment_support;
@@ -201,13 +203,16 @@ fn main() -> Result<()> {
 
     info!(
         server_threads,
-        blocking_threads, "starting codex-webui runtime"
+        blocking_threads,
+        server_thread_stack_bytes = SERVER_THREAD_STACK_BYTES,
+        "starting codex-webui runtime"
     );
 
     let runtime = TokioRuntimeBuilder::new_multi_thread()
         .enable_all()
         .worker_threads(server_threads)
         .max_blocking_threads(blocking_threads)
+        .thread_stack_size(SERVER_THREAD_STACK_BYTES)
         .thread_name("codex-webui-server")
         .build()
         .context("failed to build codex-webui server runtime")?;

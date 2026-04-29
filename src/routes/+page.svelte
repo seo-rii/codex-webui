@@ -6439,9 +6439,12 @@
     loginMessage = "";
 
     try {
-      await api.login(loginPassword.trim(), loginHcaptchaToken || null);
+      const loginResult = await api.login(loginPassword.trim(), loginHcaptchaToken || null);
       loginPassword = "";
-      await bootstrap();
+      authenticated = true;
+      webRole = loginResult.role ?? "admin";
+      loading = true;
+      void bootstrap();
     } catch (error) {
       authenticated = false;
       loginMessage = error instanceof Error ? error.message : ui.loginFailed;

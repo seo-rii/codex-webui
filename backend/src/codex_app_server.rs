@@ -23,6 +23,8 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+const APP_SERVER_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppServerProfile {
     pub id: String,
@@ -443,12 +445,14 @@ impl AppServerControllerRuntime {
 
         thread::Builder::new()
             .name("codex-webui-codex-controller".to_string())
+            .stack_size(APP_SERVER_THREAD_STACK_BYTES)
             .spawn(move || {
                 let runtime = TokioRuntimeBuilder::new_multi_thread()
                     .enable_all()
                     .worker_threads(worker_threads)
                     .max_blocking_threads(blocking_threads)
                     .thread_name("codex-webui-codex-io")
+                    .thread_stack_size(APP_SERVER_THREAD_STACK_BYTES)
                     .build()
                     .expect("failed to build codex app-server controller runtime");
                 let handle = runtime.handle().clone();

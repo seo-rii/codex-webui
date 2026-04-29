@@ -93,7 +93,7 @@ export const api = {
   },
 
   login(password: string, hcaptchaToken: string | null = null) {
-    return request<{ ok: true }>(apiPath("/auth/login"), {
+    return request<{ ok: true; role?: AuthSessionPayload["role"] }>(apiPath("/auth/login"), {
       method: "POST",
       body: JSON.stringify({ password, hcaptchaToken })
     });

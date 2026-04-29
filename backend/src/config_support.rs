@@ -147,7 +147,7 @@ impl Config {
             ));
         }
 
-        let session_secret = env::var("CODEX_WEBUI_SESSION_SECRET").ok();
+        let session_secret = optional_env("CODEX_WEBUI_SESSION_SECRET");
         validate_session_secret_value(session_secret.as_deref())?;
 
         let codex_home = resolve_codex_home()?;
@@ -173,14 +173,14 @@ impl Config {
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
-            password: env::var("CODEX_WEBUI_PASSWORD").ok(),
-            password_hash: env::var("CODEX_WEBUI_PASSWORD_HASH").ok(),
-            owner_password: env::var("CODEX_WEBUI_OWNER_PASSWORD").ok(),
-            owner_password_hash: env::var("CODEX_WEBUI_OWNER_PASSWORD_HASH").ok(),
-            viewer_password: env::var("CODEX_WEBUI_VIEWER_PASSWORD").ok(),
-            viewer_password_hash: env::var("CODEX_WEBUI_VIEWER_PASSWORD_HASH").ok(),
-            hcaptcha_site_key: env::var("CODEX_WEBUI_HCAPTCHA_SITE_KEY").ok(),
-            hcaptcha_secret_key: env::var("CODEX_WEBUI_HCAPTCHA_SECRET_KEY").ok(),
+            password: optional_env("CODEX_WEBUI_PASSWORD"),
+            password_hash: optional_env("CODEX_WEBUI_PASSWORD_HASH"),
+            owner_password: optional_env("CODEX_WEBUI_OWNER_PASSWORD"),
+            owner_password_hash: optional_env("CODEX_WEBUI_OWNER_PASSWORD_HASH"),
+            viewer_password: optional_env("CODEX_WEBUI_VIEWER_PASSWORD"),
+            viewer_password_hash: optional_env("CODEX_WEBUI_VIEWER_PASSWORD_HASH"),
+            hcaptcha_site_key: optional_env("CODEX_WEBUI_HCAPTCHA_SITE_KEY"),
+            hcaptcha_secret_key: optional_env("CODEX_WEBUI_HCAPTCHA_SECRET_KEY"),
             session_secret,
             cookie_same_site: parse_same_site(
                 env::var("CODEX_WEBUI_COOKIE_SAMESITE").ok().as_deref(),
@@ -197,10 +197,7 @@ impl Config {
                     "1" | "true" | "yes" | "on"
                 )
             }),
-            instance_token: env::var("CODEX_WEBUI_INSTANCE_TOKEN")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            instance_token: optional_env("CODEX_WEBUI_INSTANCE_TOKEN"),
         })
     }
 }
@@ -822,6 +819,13 @@ fn parse_port(value: Option<String>, fallback: u16) -> Result<u16> {
             .with_context(|| format!("invalid port: {value}")),
         None => Ok(fallback),
     }
+}
+
+fn optional_env(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn parse_same_site(value: Option<&str>) -> SameSiteMode {

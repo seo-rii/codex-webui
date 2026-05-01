@@ -22,6 +22,19 @@ async fn handle_http_inner(state: AppState, jar: CookieJar, request: Request) ->
         NormalizedPath::Route(route_path) => {
             let origin = extract_origin(&headers);
             let cors_origin = allowed_cors_origin(&state.config, &origin);
+            let route_requires_admin = |route_path: &str| {
+                matches!(
+                    route_path,
+                    "/api/account"
+                        | "/api/account/login"
+                        | "/api/account/login/cancel"
+                        | "/api/account/logout"
+                        | "/api/config"
+                        | "/api/directories"
+                        | "/api/editor"
+                        | "/api/git/repositories"
+                ) || route_path.starts_with("/api/git/")
+            };
             let requested_headers = headers
                 .get("access-control-request-headers")
                 .and_then(|value| value.to_str().ok())
@@ -232,6 +245,18 @@ codex_webui_pending_server_requests {pending_server_request_count}\n",
                     }
                     return response;
                 };
+                if route_requires_admin(&route_path) && !role_has_admin_access(auth.role) {
+                    let mut response =
+                        json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                }
 
                 let mut response =
                     handle_account_api_http(state, method, route_path, request, auth).await;
@@ -268,6 +293,18 @@ codex_webui_pending_server_requests {pending_server_request_count}\n",
                     }
                     return response;
                 };
+                if route_requires_admin(&route_path) && !role_has_admin_access(auth.role) {
+                    let mut response =
+                        json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                }
 
                 let mut response = match route_path.as_str() {
                     "/api/config" => handle_config_api_http(state, request, auth).await,
@@ -311,6 +348,18 @@ codex_webui_pending_server_requests {pending_server_request_count}\n",
                     }
                     return response;
                 };
+                if route_requires_admin(&route_path) && !role_has_admin_access(auth.role) {
+                    let mut response =
+                        json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
+                    if let Some(origin_value) = cors_origin {
+                        apply_cors_headers(
+                            response.headers_mut(),
+                            &origin_value,
+                            requested_headers.as_deref(),
+                        );
+                    }
+                    return response;
+                }
 
                 let mut response = handle_git_api_http(state, request, auth, &route_path).await;
                 if let Some(origin_value) = cors_origin {

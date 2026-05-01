@@ -604,6 +604,40 @@ fn viewer_websocket_permissions_are_session_observation_only() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn viewer_http_routes_match_websocket_authorization_policy() {
+    let sandbox = unique_test_dir("viewer-http-policy");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let jar = issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Viewer).unwrap();
+
+    for (method, uri) in [
+        (Method::GET, "/api/config"),
+        (Method::GET, "/api/editor?filePath=README.md"),
+        (Method::GET, "/api/directories"),
+        (Method::GET, "/api/git/status?repoPath=/tmp/repo"),
+        (Method::GET, "/api/account"),
+        (Method::POST, "/api/account/logout"),
+    ] {
+        let request = Request::builder()
+            .method(method.clone())
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let response = handle_http(State(state.clone()), jar.clone(), request).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} should require admin access"
+        );
+    }
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn auth_token_signing_requires_explicit_session_secret() {
     let sandbox = unique_test_dir("auth-token-secret");

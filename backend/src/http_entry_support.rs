@@ -75,14 +75,20 @@ async fn handle_http_inner(state: AppState, jar: CookieJar, request: Request) ->
                     .is_some_and(|(provided, expected)| {
                         !expected.is_empty() && provided.trim() == expected
                     });
-                return Json(json!({
+                let mut payload = json!({
                     "status": "ok",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "buildVersion": option_env!("CODEX_WEBUI_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
-                    "buildCommit": option_env!("CODEX_WEBUI_BUILD_COMMIT").unwrap_or("unknown"),
                     "instanceTokenMatched": instance_token_matched
-                }))
-                .into_response();
+                });
+                if instance_token_matched {
+                    payload["version"] = json!(env!("CARGO_PKG_VERSION"));
+                    payload["buildVersion"] = json!(
+                        option_env!("CODEX_WEBUI_BUILD_VERSION")
+                            .unwrap_or(env!("CARGO_PKG_VERSION"))
+                    );
+                    payload["buildCommit"] =
+                        json!(option_env!("CODEX_WEBUI_BUILD_COMMIT").unwrap_or("unknown"));
+                }
+                return Json(payload).into_response();
             }
 
             if route_path == "/readyz" {

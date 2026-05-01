@@ -481,6 +481,31 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
     state.config = Arc::new(config);
     fs::create_dir_all(&state.config.data_dir).unwrap();
 
+    let public_health_request = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let public_health_response = handle_http(
+        State(state.clone()),
+        CookieJar::new(),
+        public_health_request,
+    )
+    .await;
+    assert_eq!(public_health_response.status(), StatusCode::OK);
+    let public_health_body = to_bytes(public_health_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let public_health_payload: Value = serde_json::from_slice(&public_health_body).unwrap();
+    assert_eq!(
+        public_health_payload.get("status").and_then(Value::as_str),
+        Some("ok")
+    );
+    assert!(
+        public_health_payload.get("buildCommit").is_none(),
+        "public health response must not expose build metadata"
+    );
+
     let health_request = Request::builder()
         .method(Method::GET)
         .uri("/healthz")

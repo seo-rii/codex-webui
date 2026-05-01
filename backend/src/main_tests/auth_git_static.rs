@@ -182,6 +182,30 @@ async fn owner_config_blocks_admin_from_owner_only_websocket_methods() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[test]
+fn external_or_shutdown_modes_require_configured_owner_role_for_owner_actions() {
+    let sandbox = unique_test_dir("owner-secure-mode");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+
+    assert!(role_has_owner_access(&config, UserRole::Admin));
+
+    config.public_host = "0.0.0.0".to_string();
+    assert!(!role_has_owner_access(&config, UserRole::Admin));
+    assert!(role_has_owner_access(&config, UserRole::Owner));
+
+    config.public_host = "127.0.0.1".to_string();
+    config.system_shutdown_enabled = true;
+    assert!(!role_has_owner_access(&config, UserRole::Admin));
+    assert!(role_has_owner_access(&config, UserRole::Owner));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_response_cache_is_partitioned_by_role_method_and_params() {
     let sandbox = unique_test_dir("ws-cache-partition");

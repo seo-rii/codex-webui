@@ -40,7 +40,17 @@ pub(crate) fn owner_role_configured(config: &Config) -> bool {
 }
 
 pub(crate) fn role_has_owner_access(config: &Config, role: UserRole) -> bool {
-    !owner_role_configured(config) || matches!(role, UserRole::Owner)
+    let host = config.public_host.trim().trim_matches(['[', ']']);
+    let owner_required_by_host = if host.eq_ignore_ascii_case("localhost") {
+        false
+    } else {
+        host.parse::<std::net::IpAddr>()
+            .map(|ip| !ip.is_loopback())
+            .unwrap_or(true)
+    };
+    let owner_required =
+        owner_role_configured(config) || config.system_shutdown_enabled || owner_required_by_host;
+    !owner_required || matches!(role, UserRole::Owner)
 }
 
 pub(crate) fn owner_required_error_value() -> String {

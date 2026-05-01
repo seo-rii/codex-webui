@@ -103,7 +103,12 @@ pub(crate) async fn stage_git_changes_payload(
     let repo_lock = git_operation_lock(state, &repo_root).await;
     let _repo_guard = repo_lock.lock().await;
     let args = if let Some(file_path) = file_path.filter(|value| !value.trim().is_empty()) {
-        vec!["add".to_string(), "--".to_string(), file_path.to_string()]
+        vec![
+            "--literal-pathspecs".to_string(),
+            "add".to_string(),
+            "--".to_string(),
+            file_path.to_string(),
+        ]
     } else {
         vec!["add".to_string(), "-A".to_string()]
     };
@@ -121,6 +126,7 @@ pub(crate) async fn unstage_git_changes_payload(
     let _repo_guard = repo_lock.lock().await;
     let args = if let Some(file_path) = file_path.filter(|value| !value.trim().is_empty()) {
         vec![
+            "--literal-pathspecs".to_string(),
             "restore".to_string(),
             "--staged".to_string(),
             "--".to_string(),

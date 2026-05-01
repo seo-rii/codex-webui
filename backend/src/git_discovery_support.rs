@@ -76,7 +76,23 @@ pub(crate) async fn resolve_git_repo_root(state: &AppState, repo_path: &str) -> 
             "The selected repository path is not inside a Git repository.",
         ));
     }
-    Ok(repo_root)
+    let repo_root_path = tokio_fs::canonicalize(&repo_root).await.map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "The selected Git repository root does not exist.",
+        )
+    })?;
+    let allowed_roots = resolved_allowed_roots(&state.config).await;
+    if !allowed_roots
+        .iter()
+        .any(|root| path_is_within(root, &repo_root_path))
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "The selected Git repository root is outside the allowed roots.",
+        ));
+    }
+    Ok(repo_root_path.display().to_string())
 }
 
 pub(crate) async fn run_git_text_payload(

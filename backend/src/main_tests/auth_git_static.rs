@@ -1255,6 +1255,80 @@ async fn git_write_payloads_use_rust_helpers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_repo_root_must_remain_inside_allowed_roots() {
+    let sandbox = unique_test_dir("git-root-escape");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let repo = workspace.join("repo");
+    let allowed_subdir = repo.join("src");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    init_test_git_repo(&repo);
+    fs::create_dir_all(&allowed_subdir).unwrap();
+
+    let state = test_state(repo.clone(), vec![allowed_subdir.clone()], codex_home);
+    let error = resolve_git_repo_root(&state, allowed_subdir.to_str().unwrap())
+        .await
+        .expect_err("repo root outside allowed root should be rejected");
+
+    assert_eq!(error.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        error.message,
+        "The selected Git repository root is outside the allowed roots."
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_stage_and_unstage_treat_file_path_as_literal_pathspec() {
+    let sandbox = unique_test_dir("git-literal-pathspec");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let repo = workspace.join("repo");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    init_test_git_repo(&repo);
+    fs::write(repo.join(":(glob)**"), "literal\n").unwrap();
+    fs::write(repo.join("other.txt"), "other\n").unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let staged = stage_git_changes_payload(&state, repo.to_str().unwrap(), Some(":(glob)**"))
+        .await
+        .unwrap();
+    let files = staged
+        .get("files")
+        .and_then(Value::as_array)
+        .expect("git status files should be returned");
+    assert!(files.iter().any(|entry| {
+        entry.get("path").and_then(Value::as_str) == Some(":(glob)**")
+            && entry.get("hasStagedChanges").and_then(Value::as_bool) == Some(true)
+    }));
+    assert!(files.iter().any(|entry| {
+        entry.get("path").and_then(Value::as_str) == Some("other.txt")
+            && entry.get("hasStagedChanges").and_then(Value::as_bool) != Some(true)
+    }));
+
+    let unstaged = unstage_git_changes_payload(&state, repo.to_str().unwrap(), Some(":(glob)**"))
+        .await
+        .unwrap();
+    let files = unstaged
+        .get("files")
+        .and_then(Value::as_array)
+        .expect("git status files should be returned");
+    assert!(files.iter().any(|entry| {
+        entry.get("path").and_then(Value::as_str) == Some(":(glob)**")
+            && entry.get("isUntracked").and_then(Value::as_bool) == Some(true)
+    }));
+    assert!(files.iter().any(|entry| {
+        entry.get("path").and_then(Value::as_str) == Some("other.txt")
+            && entry.get("hasStagedChanges").and_then(Value::as_bool) != Some(true)
+    }));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_mutations_share_repo_operation_lock() {
     let sandbox = unique_test_dir("git-write-lock");
     let workspace = sandbox.join("workspace");

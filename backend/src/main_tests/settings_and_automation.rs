@@ -390,6 +390,51 @@ async fn terminal_cleanup_removes_stale_sessions() {
 }
 
 #[tokio::test]
+async fn terminal_cleanup_loop_removes_stale_sessions_without_api_polling() {
+    let sandbox = unique_test_dir("terminal-cleanup-loop");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let (relay, _) = broadcast::channel(1);
+    let terminal_id = "stale-loop-terminal".to_string();
+    state.terminals.lock().await.insert(
+        terminal_id.clone(),
+        Arc::new(TerminalSession {
+            summary: Mutex::new(TerminalSummaryState {
+                id: terminal_id.clone(),
+                title: "Old".to_string(),
+                cwd: workspace.display().to_string(),
+                created_at: 1,
+                last_activity_at: now_unix_ms()
+                    .saturating_sub(TERMINAL_EXITED_TTL_MS)
+                    .saturating_sub(1),
+                status: "exited".to_string(),
+                exit_code: Some(0),
+            }),
+            buffer: Mutex::new(String::new()),
+            stdin: Mutex::new(None),
+            relay,
+            pid: None,
+        }),
+    );
+
+    let cleanup_task = spawn_terminal_cleanup_loop(state.clone(), Duration::from_millis(10));
+    for _ in 0..20 {
+        if !state.terminals.lock().await.contains_key(&terminal_id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cleanup_task.abort();
+    assert!(!state.terminals.lock().await.contains_key(&terminal_id));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn terminal_create_rejects_session_limit_before_spawning() {
     let sandbox = unique_test_dir("terminal-limit");
     let workspace = sandbox.join("workspace");

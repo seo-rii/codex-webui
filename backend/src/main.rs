@@ -276,6 +276,7 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
         };
 
         tokio::spawn(restore_automation_schedules(state.clone()));
+        spawn_terminal_cleanup_loop(state.clone(), Duration::from_secs(60));
         for profile_id in state.config.profiles.keys().cloned().collect::<Vec<_>>() {
             tokio::spawn(restore_runtime_profile_state(state.clone(), profile_id));
         }

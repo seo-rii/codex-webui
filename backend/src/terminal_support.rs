@@ -65,6 +65,20 @@ pub(crate) async fn cleanup_terminal_sessions(state: AppState) {
     emit_terminals_updated(&state).await;
 }
 
+pub(crate) fn spawn_terminal_cleanup_loop(
+    state: AppState,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            cleanup_terminal_sessions(state.clone()).await;
+        }
+    })
+}
+
 pub(crate) async fn get_terminal_session(
     state: &AppState,
     terminal_id: &str,

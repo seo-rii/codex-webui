@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
     body::{Body, to_bytes},
     extract::{
-        FromRequest, Multipart, Request, State,
+        ConnectInfo, FromRequest, Multipart, Request, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{
@@ -296,9 +296,12 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             .await
             .context("failed to bind public listener")?;
 
-        let server_result = axum::serve(listener, router)
-            .await
-            .context("axum server terminated unexpectedly");
+        let server_result = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .context("axum server terminated unexpectedly");
         let _ = state.app_servers.close_all().await;
         server_result
     }

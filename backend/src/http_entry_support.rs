@@ -5,12 +5,21 @@ pub(crate) async fn handle_http(
     jar: CookieJar,
     request: Request,
 ) -> Response {
-    let mut response = handle_http_inner(state, jar, request).await;
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0);
+    let mut response = handle_http_inner(state, jar, request, peer_addr).await;
     apply_security_headers(response.headers_mut());
     response
 }
 
-async fn handle_http_inner(state: AppState, jar: CookieJar, request: Request) -> Response {
+async fn handle_http_inner(
+    state: AppState,
+    jar: CookieJar,
+    request: Request,
+    peer_addr: Option<SocketAddr>,
+) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
     let headers = request.headers().clone();
@@ -233,9 +242,11 @@ codex_webui_pending_server_requests {pending_server_request_count}\n",
             }
 
             if route_path.starts_with("/api/auth/") {
-                return handle_auth_http(state, jar, method, route_path, headers, request)
-                    .await
-                    .into_response();
+                return handle_auth_http(
+                    state, jar, method, route_path, headers, request, peer_addr,
+                )
+                .await
+                .into_response();
             }
 
             if route_path == "/api/account" || route_path.starts_with("/api/account/") {

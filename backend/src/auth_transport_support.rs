@@ -14,6 +14,7 @@ pub(crate) async fn handle_auth_http(
     route_path: String,
     headers: HeaderMap,
     request: Request,
+    peer_addr: Option<SocketAddr>,
 ) -> Response {
     let origin = extract_origin(&headers);
     let cors_origin = allowed_cors_origin(&state.config, &origin);
@@ -37,7 +38,9 @@ pub(crate) async fn handle_auth_http(
     }
 
     let result = match (method, route_path.as_str()) {
-        (Method::POST, "/api/auth/login") => auth_login(state.clone(), jar, headers, request).await,
+        (Method::POST, "/api/auth/login") => {
+            auth_login(state.clone(), jar, headers, request, peer_addr).await
+        }
         (Method::POST, "/api/auth/logout") => Ok(auth_logout(&state.config, jar)),
         (Method::POST, "/api/auth/profile") => {
             let Some(auth) = auth_context(&state.config, &jar) else {
@@ -93,6 +96,7 @@ async fn auth_login(
     jar: CookieJar,
     headers: HeaderMap,
     request: Request,
+    peer_addr: Option<SocketAddr>,
 ) -> std::result::Result<Response, String> {
     let secure_request = request_is_secure(&state.config, &headers);
     let body = match read_limited_body(request, SMALL_JSON_BODY_LIMIT, "login request body").await {
@@ -104,18 +108,21 @@ async fn auth_login(
         hcaptcha_token: None,
     });
     let password = payload.password.unwrap_or_default();
-    let identifier = if state.config.trust_proxy_headers {
+    let forwarded_ip = if state.config.trust_proxy_headers {
         headers
             .get("x-forwarded-for")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(',').next())
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or("unknown")
-            .to_string()
+            .and_then(|value| value.parse::<std::net::IpAddr>().ok())
     } else {
-        "unknown".to_string()
+        None
     };
+    let remote_ip = forwarded_ip.or_else(|| peer_addr.map(|addr| addr.ip()));
+    let identifier = remote_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "local".to_string());
 
     if !check_rate_limit(&state, &identifier).await {
         return Ok(json_error(
@@ -147,8 +154,8 @@ async fn auth_login(
             ("secret", hcaptcha_secret_key.to_string()),
             ("response", hcaptcha_token.to_string()),
         ];
-        if identifier != "unknown" {
-            verification_payload.push(("remoteip", identifier.clone()));
+        if let Some(remote_ip) = remote_ip {
+            verification_payload.push(("remoteip", remote_ip.to_string()));
         }
 
         let verification_response = state

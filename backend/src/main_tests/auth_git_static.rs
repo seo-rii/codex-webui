@@ -730,6 +730,7 @@ async fn auth_cookies_are_scoped_to_base_path() {
         "/api/auth/logout".to_string(),
         HeaderMap::new(),
         request,
+        None,
     )
     .await;
     let set_cookies = response
@@ -772,10 +773,37 @@ async fn auth_login_rejects_oversized_json_body() {
         "/api/auth/login".to_string(),
         HeaderMap::new(),
         request,
+        None,
     )
     .await;
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_login_rate_limit_uses_peer_address_when_proxy_headers_are_untrusted() {
+    let sandbox = unique_test_dir("auth-login-peer-rate-limit");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let peer_addr: SocketAddr = "203.0.113.10:44123".parse().unwrap();
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .extension(ConnectInfo(peer_addr))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({ "password": "wrong" }).to_string()))
+        .unwrap();
+
+    let response = handle_http(State(state.clone()), CookieJar::new(), request).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let attempts = state.login_attempts.lock().await;
+    assert!(attempts.contains_key("203.0.113.10"));
+    assert!(!attempts.contains_key("unknown"));
+
     let _ = fs::remove_dir_all(sandbox);
 }
 

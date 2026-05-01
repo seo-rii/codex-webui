@@ -184,7 +184,6 @@ pub(crate) fn attachment_payload_from_record(record: &StoredAttachmentRecord) ->
     json!({
         "id": record.id,
         "originalName": record.original_name,
-        "path": record.path.clone().unwrap_or_default(),
         "mimeType": record
             .mime_type
             .clone()
@@ -411,10 +410,20 @@ pub(crate) async fn delete_attachment_payload(
         attachment_id,
         &target.original_name,
     );
-    let _ = tokio::join!(
+    let (file_result, meta_result) = tokio::join!(
         tokio_fs::remove_file(file_path),
         tokio_fs::remove_file(meta_path),
     );
+    for result in [file_result, meta_result] {
+        if let Err(error) = result
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to delete attachment: {error}"),
+            ));
+        }
+    }
     emit_attachments_updated(state, profile_id, session_id).await?;
     Ok(json!({ "ok": true }))
 }

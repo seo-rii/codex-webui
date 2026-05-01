@@ -188,6 +188,46 @@ async fn delete_attachment_payload_removes_attachment_files() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_attachment_payload_reports_storage_delete_failures() {
+    let sandbox = unique_test_dir("attachment-delete-failure");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let runtime_profile = resolve_runtime_profile(&state.config, "default");
+    let uploads_dir = runtime_profile.data_dir.join("uploads").join("thread-1");
+    fs::create_dir_all(&uploads_dir).unwrap();
+    let stored_file = uploads_dir.join("att-1-notes.md");
+    let stored_meta = uploads_dir.join("att-1-notes.md.json");
+    fs::create_dir_all(&stored_file).unwrap();
+    fs::write(
+        &stored_meta,
+        serde_json::to_vec(&json!({
+            "id": "att-1",
+            "originalName": "notes.md",
+            "path": stored_file.display().to_string(),
+            "mimeType": "text/markdown",
+            "size": 5,
+            "kind": "file",
+            "createdAt": "2026-04-20T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = delete_attachment_payload(&state, "default", "thread-1", "att-1")
+        .await
+        .expect_err("directory-backed attachment file should not report success");
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(stored_file.exists());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_cleanup_removes_orphan_files_and_metadata() {
     let sandbox = unique_test_dir("attachment-cleanup");
     let workspace = sandbox.join("workspace");
@@ -298,6 +338,11 @@ async fn upload_attachments_store_files_without_internal_backend() {
         .cloned()
         .unwrap_or_default();
     assert_eq!(returned.len(), 2);
+    assert!(
+        returned
+            .iter()
+            .all(|attachment| attachment.get("path").is_none())
+    );
 
     let stored = list_session_attachment_records(&state, "default", "thread-1")
         .await

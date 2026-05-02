@@ -226,8 +226,10 @@ pub(crate) async fn get_catalog_payload(state: &AppState, profile_id: &str) -> A
         .display()
         .to_string();
 
-    if let Some(cached) = state.catalog_cache.lock().await.get(&codex_home).cloned() {
-        if cached.created_at.elapsed() < CATALOG_CACHE_TTL {
+    {
+        let mut cache = state.catalog_cache.lock().await;
+        cache.retain(|_, cached| cached.created_at.elapsed() < CATALOG_CACHE_TTL);
+        if let Some(cached) = cache.get(&codex_home).cloned() {
             return Ok(cached.payload);
         }
     }
@@ -240,13 +242,29 @@ pub(crate) async fn get_catalog_payload(state: &AppState, profile_id: &str) -> A
             .await
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
-    state.catalog_cache.lock().await.insert(
-        codex_home,
-        CachedCatalog {
-            created_at: Instant::now(),
-            payload: payload.clone(),
-        },
-    );
+    {
+        let mut cache = state.catalog_cache.lock().await;
+        cache.insert(
+            codex_home,
+            CachedCatalog {
+                created_at: Instant::now(),
+                payload: payload.clone(),
+            },
+        );
+        if cache.len() > CATALOG_CACHE_MAX_ENTRIES {
+            let mut entries = cache
+                .iter()
+                .map(|(key, cached)| (key.clone(), cached.created_at))
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|(_, created_at)| *created_at);
+            for (key, _) in entries {
+                if cache.len() <= CATALOG_CACHE_MAX_ENTRIES {
+                    break;
+                }
+                cache.remove(&key);
+            }
+        }
+    }
 
     Ok(payload)
 }

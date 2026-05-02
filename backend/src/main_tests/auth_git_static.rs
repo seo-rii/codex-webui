@@ -1685,6 +1685,40 @@ async fn git_operation_locks_prune_idle_entries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_cache_prunes_old_entries_at_cap() {
+    let sandbox = unique_test_dir("catalog-cache-cap");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    for index in 0..(CATALOG_CACHE_MAX_ENTRIES + 10) {
+        let profile_codex_home = sandbox.join(format!("codex-home-{index}"));
+        fs::create_dir_all(&profile_codex_home).unwrap();
+        config.profiles.insert(
+            format!("profile-{index}"),
+            RuntimeProfile {
+                label: format!("Profile {index}"),
+                codex_home: profile_codex_home,
+                data_dir: sandbox.join(format!("data-{index}")),
+            },
+        );
+    }
+    state.config = Arc::new(config);
+
+    for index in 0..(CATALOG_CACHE_MAX_ENTRIES + 10) {
+        get_catalog_payload(&state, &format!("profile-{index}"))
+            .await
+            .unwrap();
+    }
+
+    assert!(state.catalog_cache.lock().await.len() <= CATALOG_CACHE_MAX_ENTRIES);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_stage_and_unstage_treat_file_path_as_literal_pathspec() {
     let sandbox = unique_test_dir("git-literal-pathspec");
     let workspace = sandbox.join("workspace");

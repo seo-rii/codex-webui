@@ -641,13 +641,14 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
             .get(header::HeaderName::from_static("x-frame-options")),
         Some(&HeaderValue::from_static("DENY"))
     );
-    assert!(
-        health_response
-            .headers()
-            .get(header::HeaderName::from_static("content-security-policy"))
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.contains("frame-ancestors 'none'"))
-    );
+    let csp = health_response
+        .headers()
+        .get(header::HeaderName::from_static("content-security-policy"))
+        .and_then(|value| value.to_str().ok())
+        .expect("CSP header should be present");
+    assert!(csp.contains("frame-ancestors 'none'"));
+    assert!(csp.contains("script-src 'self'"));
+    assert!(!csp.contains("script-src 'self' 'unsafe-inline'"));
     let health_body = to_bytes(health_response.into_body(), usize::MAX)
         .await
         .unwrap();

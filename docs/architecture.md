@@ -254,6 +254,7 @@ The trust boundary is narrow:
 - cross-origin browser access must be explicitly allowed
 - cookie paths are scoped to the configured base path
 - unsafe HTTP mutations reject cross-origin requests unless the origin is explicitly trusted
+- CSP disallows inline scripts while retaining inline styles for Svelte-generated and existing component styles
 - WebSocket upgrades validate Origin separately from HTTP CORS
 - default viewer access is transcript-oriented; code, terminal, audit, config, and Git file reads remain admin-only
 - file reads/writes deny common secret paths and bound preview sizes

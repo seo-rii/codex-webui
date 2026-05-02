@@ -291,10 +291,25 @@ async fn owner_config_blocks_admin_from_owner_only_websocket_methods() {
         "git/worktrees/remove",
         &json!({ "force": true })
     ));
+    assert!(ws_method_requires_owner(
+        "system/shutdown/force",
+        &json!({})
+    ));
     assert!(!ws_method_requires_owner(
         "git/worktrees/remove",
         &json!({ "force": false })
     ));
+    assert!(
+        authorize_ws_method(
+            &state.config,
+            UserRole::Admin,
+            "system/shutdown/force",
+            &json!({})
+        )
+        .expect_err("admin should not force shutdown when owner role is configured")
+        .to_string()
+        .contains("OWNER_REQUIRED")
+    );
     assert!(
         authorize_ws_method(
             &state.config,

@@ -235,6 +235,22 @@ pub(crate) async fn execute_scheduled_shutdown(state: &AppState, profile_id: &st
     }
 }
 
+pub(crate) async fn force_scheduled_shutdown_payload(
+    state: &AppState,
+    profile_id: &str,
+) -> ApiResult<Value> {
+    let (available, _) = system_shutdown_capability(&state.config).await;
+    if !available {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "System shutdown is unavailable for this server user.",
+        ));
+    }
+
+    execute_scheduled_shutdown(state, profile_id).await;
+    Ok(json!({ "ok": true }))
+}
+
 pub(crate) async fn arm_scheduled_shutdown(
     state: &AppState,
     profile_id: &str,

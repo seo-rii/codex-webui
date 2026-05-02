@@ -37,6 +37,7 @@ pub(crate) fn ws_method_requires_owner(method: &str, params: &Value) -> bool {
             | "terminal/close"
             | "terminal/subscribe"
             | "terminal/unsubscribe"
+            | "system/shutdown/force"
     ) || (matches!(
         method,
         "session/create" | "session/savePreferences" | "turn/send" | "arena/start"

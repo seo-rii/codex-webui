@@ -863,6 +863,9 @@ pub(crate) async fn execute_ws_method(
             let terminal_id = require_string(&params, "terminalId")?;
             close_terminal(state.clone(), &terminal_id).await
         }
+        "system/shutdown/force" => force_scheduled_shutdown_payload(state, &auth.profile_id)
+            .await
+            .map_err(anyhow::Error::from),
         "session/subscribe" => {
             let session_id = require_session_id(&params, "sessionId")?;
             subscribe_session(

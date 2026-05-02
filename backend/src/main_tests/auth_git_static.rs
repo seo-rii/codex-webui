@@ -708,6 +708,10 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
     assert!(csp.contains("frame-ancestors 'none'"));
     assert!(csp.contains("script-src 'self'"));
     assert!(!csp.contains("script-src 'self' 'unsafe-inline'"));
+    assert!(
+        csp.contains("connect-src 'self' https://hcaptcha.com https://*.hcaptcha.com ws: wss:")
+    );
+    assert!(!csp.contains("connect-src 'self' ws: wss: http: https:"));
     let health_body = to_bytes(health_response.into_body(), usize::MAX)
         .await
         .unwrap();

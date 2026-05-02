@@ -1197,6 +1197,66 @@ async fn scheduled_shutdown_records_blocked_reason_for_pending_queue() {
 }
 
 #[tokio::test]
+async fn scheduled_shutdown_records_blocked_reason_when_runtime_status_check_fails() {
+    let sandbox = unique_test_dir("shutdown-active-check-failure");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let missing_codex = sandbox.join("missing-codex-bin");
+    let mut config = (*state.config).clone();
+    config.system_shutdown_enabled = true;
+    config.system_shutdown_command_override = Some("/bin/true".to_string());
+    config.codex_bin = missing_codex.display().to_string();
+    state.config = Arc::new(config);
+    state.app_servers = AppServerManager::new(AppServerClientConfig {
+        codex_bin: missing_codex.display().to_string(),
+        ..AppServerClientConfig::default()
+    });
+
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(global) = ui_state.get_mut("global").and_then(Value::as_object_mut) else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "global state is missing",
+            ));
+        };
+        global.insert("shutdownAfterQueueCompletes".to_string(), json!(true));
+        global.insert("shutdownAfterQueueCompletesPrimed".to_string(), json!(true));
+        global.insert("scheduledShutdown".to_string(), Value::Null);
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    maybe_schedule_global_shutdown(&state, "default", None).await;
+
+    let blocked_state = with_ui_state_read(&state, "default", |ui_state| {
+        Ok((
+            ui_state
+                .get("global")
+                .and_then(|value| value.get("scheduledShutdown"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            ui_state
+                .get("global")
+                .and_then(|value| value.get("scheduledShutdownBlockedReason"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ))
+    })
+    .await
+    .unwrap();
+
+    assert!(blocked_state.0.is_null());
+    assert_eq!(blocked_state.1.as_deref(), Some("activeWork"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn syncs_codex_toml_with_preferences_for_plan_mode() {
     let sandbox = unique_test_dir("sync-codex-toml");
     let codex_home = sandbox.join("codex-home");

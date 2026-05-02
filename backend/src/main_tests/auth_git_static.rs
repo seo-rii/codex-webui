@@ -99,6 +99,40 @@ async fn owner_password_authenticates_as_owner_role() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test]
+async fn revoked_auth_cookie_is_rejected_server_side() {
+    let sandbox = unique_test_dir("auth-cookie-revocation");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let jar = issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Admin).unwrap();
+
+    assert_eq!(
+        auth_context(&state.config, &jar).map(|auth| auth.role),
+        Some(UserRole::Admin)
+    );
+    assert!(revoke_auth_cookie(&state.config, &jar));
+    assert!(auth_context(&state.config, &jar).is_none());
+    assert!(
+        state
+            .config
+            .data_dir
+            .join("auth-revocations.jsonl")
+            .exists()
+    );
+
+    let fresh_jar =
+        issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Admin).unwrap();
+    assert_eq!(
+        auth_context(&state.config, &fresh_jar).map(|auth| auth.role),
+        Some(UserRole::Admin)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn public_host_rejects_plaintext_password_env_values() {
     let sandbox = unique_test_dir("public-host-plaintext-passwords");

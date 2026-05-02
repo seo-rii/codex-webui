@@ -1,5 +1,15 @@
 use super::*;
 
+static REVOKED_AUTH_SESSIONS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, AuthRevocationStore>>,
+> = std::sync::OnceLock::new();
+
+#[derive(Default)]
+struct AuthRevocationStore {
+    loaded: bool,
+    entries: HashMap<String, u128>,
+}
+
 pub(crate) fn issue_auth_cookie(
     config: &Config,
     jar: CookieJar,
@@ -109,6 +119,164 @@ pub(crate) fn make_auth_token(config: &Config, role: UserRole) -> Result<String>
     Ok(format!("{payload}.{signature}"))
 }
 
+fn parse_auth_token(config: &Config, token: &str) -> Option<(UserRole, String, u128)> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 4 && parts.len() != 5 {
+        return None;
+    }
+    let payload = parts[..parts.len() - 1].join(".");
+    let Ok(expected) = sign(config, &payload) else {
+        return None;
+    };
+    if expected
+        .as_bytes()
+        .ct_eq(parts[parts.len() - 1].as_bytes())
+        .unwrap_u8()
+        != 1
+    {
+        return None;
+    }
+    let expires = parts[1].parse::<u128>().ok()?;
+    if now_millis() >= expires {
+        return None;
+    }
+    let (role, nonce) = if parts.len() == 5 {
+        let role = match parts[2] {
+            "owner" => UserRole::Owner,
+            "viewer" => UserRole::Viewer,
+            _ => UserRole::Admin,
+        };
+        (role, parts[3])
+    } else {
+        (UserRole::Admin, parts[2])
+    };
+    if nonce.is_empty() {
+        return None;
+    }
+    Some((role, nonce.to_string(), expires))
+}
+
+fn auth_revocations_path(config: &Config) -> PathBuf {
+    config.data_dir.join("auth-revocations.jsonl")
+}
+
+fn prune_revoked_auth_sessions(entries: &mut HashMap<String, u128>, now: u128) {
+    entries.retain(|_, expires| *expires > now);
+    if entries.len() <= AUTH_REVOKED_SESSION_MAX_ENTRIES {
+        return;
+    }
+
+    let mut oldest = entries
+        .iter()
+        .map(|(nonce, expires)| (nonce.clone(), *expires))
+        .collect::<Vec<_>>();
+    oldest.sort_by_key(|(_, expires)| *expires);
+    for (nonce, _) in oldest {
+        if entries.len() <= AUTH_REVOKED_SESSION_MAX_ENTRIES {
+            break;
+        }
+        entries.remove(&nonce);
+    }
+}
+
+fn load_revoked_auth_sessions(config: &Config, store: &mut AuthRevocationStore, now: u128) {
+    if store.loaded {
+        prune_revoked_auth_sessions(&mut store.entries, now);
+        return;
+    }
+    store.loaded = true;
+    let Ok(raw) = fs::read_to_string(auth_revocations_path(config)) else {
+        prune_revoked_auth_sessions(&mut store.entries, now);
+        return;
+    };
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(nonce) = entry
+            .get("nonce")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(expires) = entry.get("expires").and_then(Value::as_u64) else {
+            continue;
+        };
+        let expires = expires as u128;
+        if expires > now {
+            store.entries.insert(nonce.to_string(), expires);
+        }
+    }
+    prune_revoked_auth_sessions(&mut store.entries, now);
+}
+
+fn revoked_auth_sessions() -> &'static std::sync::Mutex<HashMap<String, AuthRevocationStore>> {
+    REVOKED_AUTH_SESSIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn auth_revocation_store_key(config: &Config) -> String {
+    config.data_dir.display().to_string()
+}
+
+fn auth_session_is_revoked(config: &Config, nonce: &str, expires: u128) -> bool {
+    let now = now_millis();
+    let Ok(mut stores) = revoked_auth_sessions().lock() else {
+        return false;
+    };
+    let store = stores
+        .entry(auth_revocation_store_key(config))
+        .or_insert_with(AuthRevocationStore::default);
+    load_revoked_auth_sessions(config, store, now);
+    store
+        .entries
+        .get(nonce)
+        .is_some_and(|revoked_expires| *revoked_expires == expires)
+}
+
+pub(crate) fn revoke_auth_cookie(config: &Config, jar: &CookieJar) -> bool {
+    let Some((_, nonce, expires)) = jar
+        .get(AUTH_COOKIE)
+        .and_then(|cookie| parse_auth_token(config, cookie.value()))
+    else {
+        return false;
+    };
+    let now = now_millis();
+    let Ok(mut stores) = revoked_auth_sessions().lock() else {
+        return false;
+    };
+    let store = stores
+        .entry(auth_revocation_store_key(config))
+        .or_insert_with(AuthRevocationStore::default);
+    load_revoked_auth_sessions(config, store, now);
+    store.entries.insert(nonce.clone(), expires);
+    prune_revoked_auth_sessions(&mut store.entries, now);
+    drop(stores);
+
+    if let Some(parent) = auth_revocations_path(config).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let entry = json!({
+        "nonce": nonce,
+        "expires": expires,
+        "revokedAt": now,
+    });
+    if let Ok(line) = serde_json::to_string(&entry) {
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(auth_revocations_path(config))
+        {
+            let mut record = Vec::with_capacity(line.len() + 1);
+            record.extend_from_slice(line.as_bytes());
+            record.push(b'\n');
+            let _ = std::io::Write::write_all(&mut file, &record);
+        }
+    }
+    true
+}
+
 pub(crate) fn make_csrf_token(config: &Config) -> Result<String> {
     let nonce = Uuid::new_v4().simple().to_string();
     let payload = format!("csrf.{nonce}");
@@ -206,37 +374,13 @@ pub(crate) async fn select_profile(
 
 pub(crate) fn auth_context(config: &Config, jar: &CookieJar) -> Option<AuthContext> {
     let role = if let Some(cookie) = jar.get(AUTH_COOKIE) {
-        let token = cookie.value();
-        let parts: Vec<&str> = token.split('.').collect();
-        if parts.len() != 4 && parts.len() != 5 {
-            return None;
-        }
-        let payload = parts[..parts.len() - 1].join(".");
-        let Ok(expected) = sign(config, &payload) else {
+        let Some((role, nonce, expires)) = parse_auth_token(config, cookie.value()) else {
             return None;
         };
-        if expected
-            .as_bytes()
-            .ct_eq(parts[parts.len() - 1].as_bytes())
-            .unwrap_u8()
-            != 1
-        {
+        if auth_session_is_revoked(config, &nonce, expires) {
             return None;
         }
-        let expires = parts[1].parse::<u128>().ok()?;
-        if now_millis() >= expires {
-            return None;
-        }
-
-        if parts.len() == 5 {
-            match parts[2] {
-                "owner" => UserRole::Owner,
-                "viewer" => UserRole::Viewer,
-                _ => UserRole::Admin,
-            }
-        } else {
-            UserRole::Admin
-        }
+        role
     } else if authless_admin_allowed(config) {
         UserRole::Admin
     } else {

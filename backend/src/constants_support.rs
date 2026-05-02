@@ -7,6 +7,7 @@ pub(crate) const CSRF_HEADER: &str = "x-codex-webui-csrf";
 pub(crate) const LOGIN_WINDOW_MS: u128 = 10 * 60 * 1000;
 pub(crate) const LOGIN_MAX_ATTEMPTS: usize = 8;
 pub(crate) const LOGIN_RATE_LIMIT_MAX_IDENTIFIERS: usize = 4096;
+pub(crate) const AUTH_REVOKED_SESSION_MAX_ENTRIES: usize = 8192;
 pub(crate) const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 pub(crate) const RESPONSE_CACHE_MAX_ENTRIES: usize = 2048;
 pub(crate) const RESPONSE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;

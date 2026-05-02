@@ -275,6 +275,7 @@ async fn auth_login(
 }
 
 fn auth_logout(config: &Config, jar: CookieJar) -> Response {
+    revoke_auth_cookie(config, &jar);
     let mut cookie = Cookie::new(AUTH_COOKIE, "");
     cookie.set_path(auth_cookie_path(config));
     cookie.set_max_age(CookieDuration::seconds(0));

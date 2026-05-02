@@ -706,6 +706,19 @@ async fn unsafe_http_api_mutations_reject_cross_origin_requests() {
     let response = handle_http(State(state.clone()), CookieJar::new(), no_origin_loopback).await;
     assert_ne!(response.status(), StatusCode::FORBIDDEN);
 
+    let mut strict_state = state.clone();
+    let mut strict_config = (*strict_state.config).clone();
+    strict_config.require_origin_header = true;
+    strict_state.config = Arc::new(strict_config);
+    let no_origin_strict = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::HOST, "127.0.0.1:4173")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = handle_http(State(strict_state), CookieJar::new(), no_origin_strict).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
     let mut external_state = state.clone();
     let mut external_config = (*external_state.config).clone();
     external_config.public_host = "0.0.0.0".to_string();

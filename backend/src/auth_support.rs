@@ -330,7 +330,7 @@ pub(crate) fn request_origin_allowed(
     peer_addr: Option<SocketAddr>,
 ) -> bool {
     let Some(origin) = extract_origin(headers) else {
-        return public_host_is_loopback(config);
+        return !config.require_origin_header && public_host_is_loopback(config);
     };
     if allowed_cors_origin(config, &Some(origin.clone())).is_some() {
         return true;

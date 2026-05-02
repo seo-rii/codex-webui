@@ -257,6 +257,7 @@ The trust boundary is narrow:
 - CSP disallows inline scripts while retaining inline styles for Svelte-generated and existing component styles
 - WebSocket upgrades validate Origin separately from HTTP CORS
 - cookie-authenticated HTTP mutations require a matching CSRF cookie/header token, except for initial login and instance-token maintenance hooks
+- `CODEX_WEBUI_REQUIRE_ORIGIN_HEADER=true` can make Origin headers mandatory for unsafe HTTP methods even on loopback deployments
 - default viewer access is transcript-oriented; code, terminal, audit, config, and Git file reads remain admin-only
 - file reads/writes deny common secret paths and bound preview sizes
 - forwarded headers are ignored unless `CODEX_WEBUI_TRUST_PROXY_HEADERS=true` and the peer is loopback or matches `CODEX_WEBUI_TRUSTED_PROXY_CIDRS`

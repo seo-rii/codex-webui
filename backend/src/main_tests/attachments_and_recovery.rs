@@ -375,6 +375,42 @@ async fn upload_attachments_store_files_without_internal_backend() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_attachments_rejects_total_decoded_size_limit() {
+    let sandbox = unique_test_dir("attachment-upload-total-limit");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let mut state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let mut config = (*state.config).clone();
+    config.max_upload_bytes = 4;
+    state.config = Arc::new(config);
+
+    let files = (0..5)
+        .map(|index| UploadFilePayload {
+            name: format!("note-{index}.txt"),
+            mime_type: Some("text/plain".to_string()),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(b"note"),
+        })
+        .collect::<Vec<_>>();
+    let error = upload_attachments(&state, "default", "thread-1", files)
+        .await
+        .expect_err("aggregate upload size should be capped");
+
+    assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        list_session_attachment_records(&state, "default", "thread-1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_attachments_http_handlers_use_rust_storage() {
     let sandbox = unique_test_dir("attachment-http-rust");
     let workspace = sandbox.join("workspace");

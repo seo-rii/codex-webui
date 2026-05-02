@@ -18,10 +18,7 @@ pub(crate) async fn handle_session_attachments_api_http(
             if !role_has_admin_access(auth.role) {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
-            let max_total_upload_bytes = state
-                .config
-                .max_upload_bytes
-                .saturating_mul(MAX_ATTACHMENTS_PER_REQUEST as u64);
+            let max_total_upload_bytes = max_total_attachment_upload_bytes(&state.config);
             if request
                 .headers()
                 .get(header::CONTENT_LENGTH)
@@ -46,6 +43,7 @@ pub(crate) async fn handle_session_attachments_api_http(
             };
             let mut multipart = multipart;
             let mut stored = Vec::new();
+            let mut total_size = 0_u64;
             let uploads_dir = session_uploads_dir(&state, &auth.profile_id, session_id);
             if let Err(error) = tokio_fs::create_dir_all(&uploads_dir).await {
                 return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
@@ -101,6 +99,14 @@ pub(crate) async fn handle_session_attachments_api_http(
                         let _ = tokio_fs::remove_file(&temp_path).await;
                         return json_error(error.status, &error.message);
                     }
+                    let next_total_size = total_size.saturating_add(chunk.len() as u64);
+                    if let Err(error) =
+                        validate_total_attachment_size(&state.config, next_total_size)
+                    {
+                        let _ = tokio_fs::remove_file(&temp_path).await;
+                        return json_error(error.status, &error.message);
+                    }
+                    total_size = next_total_size;
                     if let Err(error) = temp_file.write_all(&chunk).await {
                         let _ = tokio_fs::remove_file(&temp_path).await;
                         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());

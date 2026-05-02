@@ -124,6 +124,7 @@ pub(crate) fn attachment_limit_error_message(max_upload_bytes: u64) -> String {
 }
 
 pub(crate) const MAX_ATTACHMENTS_PER_REQUEST: usize = 20;
+pub(crate) const MAX_TOTAL_ATTACHMENT_UPLOAD_MULTIPLIER: u64 = 4;
 
 pub(crate) fn attachment_count_limit_error() -> ApiError {
     api_error(
@@ -137,6 +138,24 @@ pub(crate) fn validate_attachment_size(config: &Config, size: u64) -> ApiResult<
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             attachment_limit_error_message(config.max_upload_bytes),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn max_total_attachment_upload_bytes(config: &Config) -> u64 {
+    config
+        .max_upload_bytes
+        .saturating_mul(MAX_TOTAL_ATTACHMENT_UPLOAD_MULTIPLIER)
+        .max(config.max_upload_bytes)
+}
+
+pub(crate) fn validate_total_attachment_size(config: &Config, size: u64) -> ApiResult<()> {
+    let max_total = max_total_attachment_upload_bytes(config);
+    if size > max_total {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            attachment_limit_error_message(max_total),
         ));
     }
     Ok(())
@@ -215,6 +234,12 @@ pub(crate) async fn save_uploaded_attachment_records(
     tokio_fs::create_dir_all(&uploads_dir)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+    let total_size = uploads
+        .iter()
+        .map(|upload| upload.bytes.len() as u64)
+        .fold(0_u64, u64::saturating_add);
+    validate_total_attachment_size(&state.config, total_size)?;
 
     for upload in uploads {
         if upload.bytes.is_empty() {

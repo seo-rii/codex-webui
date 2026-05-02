@@ -436,6 +436,7 @@ pub(crate) async fn upload_attachments(
     }
 
     let mut uploads = Vec::new();
+    let mut total_decoded_size = 0_u64;
     for file in files {
         let max_encoded_len = (((state.config.max_upload_bytes as usize).saturating_add(2)) / 3)
             .saturating_mul(4)
@@ -450,6 +451,8 @@ pub(crate) async fn upload_attachments(
             .decode(file.data_base64)
             .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
         validate_attachment_size(&state.config, bytes.len() as u64)?;
+        total_decoded_size = total_decoded_size.saturating_add(bytes.len() as u64);
+        validate_total_attachment_size(&state.config, total_decoded_size)?;
         uploads.push(AttachmentUploadPayload {
             name: file.name,
             mime_type: file.mime_type,

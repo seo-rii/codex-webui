@@ -247,6 +247,11 @@ async fn cache_profile_ui_state(state: &AppState, profile_id: &str, ui_state: Va
 async fn write_profile_ui_state(config: &Config, profile_id: &str, ui_state: &Value) -> Result<()> {
     let path = profile_ui_state_path(config, profile_id);
     let bytes = serde_json::to_vec_pretty(ui_state).context("failed to serialize ui-state")?;
+    if let Ok(previous_bytes) = tokio_fs::read(&path).await {
+        write_file_atomically(&path.with_extension("json.bak"), previous_bytes)
+            .await
+            .context("failed to write ui-state backup")?;
+    }
     write_file_atomically(&path, bytes)
         .await
         .context("failed to write ui-state file")?;

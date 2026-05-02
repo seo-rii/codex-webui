@@ -41,6 +41,7 @@ async fn handle_http_inner(
                         | "/api/config"
                         | "/api/directories"
                         | "/api/editor"
+                        | "/api/catalog"
                         | "/api/git/repositories"
                 ) || route_path.starts_with("/api/git/")
             };

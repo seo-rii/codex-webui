@@ -110,11 +110,15 @@ The CLI starts the Rust gateway as a detached background process and injects the
 - `CODEX_WEBUI_SESSION_SECRET`
 - `CODEX_WEBUI_INSTANCE_TOKEN`
 - `CODEX_WEBUI_CORS_ALLOWED_ORIGINS`
+- `CODEX_WEBUI_WEBHOOK_ALLOWED_HOSTS`
 
 Plaintext password variables are only suitable for loopback development. The
 gateway rejects `CODEX_WEBUI_PASSWORD`, `CODEX_WEBUI_OWNER_PASSWORD`, and
 `CODEX_WEBUI_VIEWER_PASSWORD` when `HOST` is non-loopback; use the hash
 variables for any exposed, tunneled, or reverse-proxied deployment.
+Set `CODEX_WEBUI_WEBHOOK_ALLOWED_HOSTS` for public deployments that enable
+Slack or generic webhooks; it accepts exact host names and `*.example.com`
+wildcards.
 
 At runtime the public base path is owned by Rust, not baked permanently into the shipped SPA:
 

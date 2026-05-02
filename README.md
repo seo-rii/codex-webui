@@ -269,6 +269,7 @@ The Rust gateway honors a focused set of `CODEX_WEBUI_*` environment variables. 
 - `CODEX_WEBUI_HCAPTCHA_SITE_KEY`
 - `CODEX_WEBUI_HCAPTCHA_SECRET_KEY`
 - `CODEX_WEBUI_CORS_ALLOWED_ORIGINS`
+- `CODEX_WEBUI_WEBHOOK_ALLOWED_HOSTS`
 - `CODEX_WEBUI_TRUST_PROXY_HEADERS`
 - `CODEX_WEBUI_INSTANCE_TOKEN` for CLI-owned health verification of background processes
 - `CODEX_WEBUI_ALLOWED_ROOTS`
@@ -301,6 +302,8 @@ See [.env.example](./.env.example) for a concise example set.
 - Leave `CODEX_WEBUI_TRUST_PROXY_HEADERS` unset unless the gateway only receives traffic from a trusted reverse proxy that controls `X-Forwarded-*` headers. When enabling it behind a non-loopback proxy, set `CODEX_WEBUI_TRUSTED_PROXY_CIDRS`.
 - Externally bound deployments reject unsafe HTTP mutations that omit `Origin`; keep API clients on loopback or send a trusted Origin.
 - WebSocket upgrades check `Origin` against same-origin or configured CORS origins; do not rely on HTTP CORS alone when exposing the gateway.
+- Cookie-authenticated HTTP mutations use a double-submit CSRF token; non-browser automation should prefer WebSocket RPC or explicitly carry the issued CSRF cookie/header pair.
+- Set `CODEX_WEBUI_WEBHOOK_ALLOWED_HOSTS` when webhook delivery is enabled in exposed deployments, so Slack/generic notification webhooks can only target known outbound hosts.
 - Login and JSON mutation bodies are size-limited, attachment uploads are streamed with per-file/request/profile storage caps, and large file/diff previews are bounded.
 - User-facing HTTP and WebSocket errors redact common token-shaped values and the host user's home directory; detailed diagnostics go to server logs instead.
 - Use the viewer password for observation-only access instead of sharing the admin password when multiple humans need browser visibility.

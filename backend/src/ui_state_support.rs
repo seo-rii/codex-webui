@@ -218,12 +218,22 @@ async fn read_cached_profile_ui_state(state: &AppState, profile_id: &str) -> Res
     }
 
     let ui_state = read_profile_ui_state(&state.config, profile_id).await?;
-    state
-        .ui_state_cache
-        .lock()
-        .await
-        .insert(profile_id.to_string(), ui_state.clone());
+    cache_profile_ui_state(state, profile_id, ui_state.clone()).await;
     Ok(ui_state)
+}
+
+async fn cache_profile_ui_state(state: &AppState, profile_id: &str, ui_state: Value) {
+    let mut cache = state.ui_state_cache.lock().await;
+    if !cache.contains_key(profile_id) && cache.len() >= UI_STATE_CACHE_MAX_ENTRIES {
+        if let Some(evicted_profile_id) = cache
+            .keys()
+            .find(|cached_profile_id| cached_profile_id.as_str() != profile_id)
+            .cloned()
+        {
+            cache.remove(&evicted_profile_id);
+        }
+    }
+    cache.insert(profile_id.to_string(), ui_state);
 }
 
 async fn write_profile_ui_state(config: &Config, profile_id: &str, ui_state: &Value) -> Result<()> {
@@ -356,11 +366,7 @@ where
     write_profile_ui_state(&state.config, &resolved_profile_id, &ui_state)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    state
-        .ui_state_cache
-        .lock()
-        .await
-        .insert(resolved_profile_id, ui_state);
+    cache_profile_ui_state(state, &resolved_profile_id, ui_state).await;
     Ok(result)
 }
 

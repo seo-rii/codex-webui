@@ -14,6 +14,7 @@ pub(crate) const STATIC_ASSET_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const SESSION_THREAD_CACHE_MAX_ENTRIES: usize = 512;
 pub(crate) const SESSION_SEARCH_TEXT_CACHE_MAX_ENTRIES: usize = 512;
 pub(crate) const SESSION_SEARCH_TEXT_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const UI_STATE_CACHE_MAX_ENTRIES: usize = 64;
 pub(crate) const WS_MAX_CONCURRENT_REQUESTS: usize = 32;
 pub(crate) const WS_MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const WS_OUTBOUND_QUEUE_CAPACITY: usize = 1024;

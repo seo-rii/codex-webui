@@ -616,6 +616,50 @@ async fn ui_state_writes_leave_no_atomic_temp_files() {
 }
 
 #[tokio::test]
+async fn ui_state_cache_is_bounded_across_profiles() {
+    let sandbox = unique_test_dir("ui-state-cache-cap");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let base_profile = state
+        .config
+        .profiles
+        .get("default")
+        .cloned()
+        .expect("default profile should exist");
+    let mut config = (*state.config).clone();
+    let mut profiles = std::collections::HashMap::new();
+    for index in 0..(UI_STATE_CACHE_MAX_ENTRIES + 8) {
+        let profile_id = format!("profile-{index}");
+        let mut profile = base_profile.clone();
+        profile.data_dir = sandbox.join("profiles").join(&profile_id);
+        profiles.insert(profile_id, profile);
+    }
+    config.default_profile_id = "profile-0".to_string();
+    config.profiles = profiles;
+    state.config = Arc::new(config);
+
+    for index in 0..(UI_STATE_CACHE_MAX_ENTRIES + 8) {
+        let profile_id = format!("profile-{index}");
+        with_ui_state_write(&state, &profile_id, |ui_state| {
+            ui_state["sessionMetaByThreadId"]["thread"]["title"] = json!(profile_id);
+            Ok(())
+        })
+        .await
+        .expect("profile ui-state should save");
+    }
+
+    let cache = state.ui_state_cache.lock().await;
+    assert!(cache.len() <= UI_STATE_CACHE_MAX_ENTRIES);
+    assert!(cache.contains_key(&format!("profile-{}", UI_STATE_CACHE_MAX_ENTRIES + 7)));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn arming_shutdown_while_idle_waits_for_future_activity() {
     let sandbox = unique_test_dir("shutdown-idle-arming");
     let workspace = sandbox.join("workspace");

@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
@@ -12,7 +13,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
@@ -41,6 +44,7 @@ pub struct AppServerClientConfig {
     pub extra_env: HashMap<String, String>,
     pub controller_threads: usize,
     pub request_timeout: Duration,
+    pub handoff_dir: Option<PathBuf>,
 }
 
 impl Default for AppServerClientConfig {
@@ -54,6 +58,7 @@ impl Default for AppServerClientConfig {
             extra_env: HashMap::new(),
             controller_threads: default_controller_thread_count(),
             request_timeout: default_request_timeout(),
+            handoff_dir: None,
         }
     }
 }
@@ -99,6 +104,23 @@ struct ProcessState {
     stdin: Arc<Mutex<ChildStdin>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: JoinHandle<()>,
+}
+
+#[derive(Clone, Debug)]
+struct HandoffPaths {
+    socket_path: PathBuf,
+    meta_path: PathBuf,
+    log_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HandoffMeta {
+    pid: u32,
+    profile_id: String,
+    socket_path: String,
+    codex_bin: String,
+    codex_home: String,
+    started_at_ms: u128,
 }
 
 struct AppServerControllerRuntime {
@@ -343,14 +365,21 @@ impl AppServerClient {
 
     async fn spawn_process(&self) -> Result<ProcessState> {
         let mut command = Command::new(&self.inner.config.codex_bin);
+        if let Some(handoff_paths) = self.ensure_handoff_server_running().await? {
+            command
+                .arg("app-server")
+                .arg("proxy")
+                .arg("--sock")
+                .arg(&handoff_paths.socket_path);
+        } else {
+            command.arg("app-server").arg("--listen").arg("stdio://");
+        }
+
         command
-            .arg("app-server")
-            .arg("--listen")
-            .arg("stdio://")
             .env("CODEX_HOME", &self.inner.profile.codex_home)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         for (key, value) in &self.inner.config.extra_env {
             command.env(key, value);
@@ -380,6 +409,111 @@ impl AppServerClient {
             shutdown_tx: Some(shutdown_tx),
             join_handle,
         })
+    }
+
+    async fn ensure_handoff_server_running(&self) -> Result<Option<HandoffPaths>> {
+        let Some(paths) = handoff_paths(&self.inner.config, &self.inner.profile) else {
+            return Ok(None);
+        };
+
+        #[cfg(not(unix))]
+        {
+            let _ = paths;
+            return Ok(None);
+        }
+
+        #[cfg(unix)]
+        {
+            if handoff_socket_is_live(&paths.socket_path).await {
+                return Ok(Some(paths));
+            }
+
+            if let Some(parent) = paths.socket_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            if let Some(parent) = paths.meta_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            let _ = tokio::fs::remove_file(&paths.socket_path).await;
+
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&paths.log_path)
+                .with_context(|| format!("failed to open {}", paths.log_path.display()))?;
+            let log_for_stderr = log
+                .try_clone()
+                .with_context(|| format!("failed to clone {}", paths.log_path.display()))?;
+
+            let mut command = Command::new(&self.inner.config.codex_bin);
+            command
+                .arg("app-server")
+                .arg("--listen")
+                .arg(format!("unix://{}", paths.socket_path.display()))
+                .env("CODEX_HOME", &self.inner.profile.codex_home)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log))
+                .stderr(Stdio::from(log_for_stderr));
+
+            for (key, value) in &self.inner.config.extra_env {
+                command.env(key, value);
+            }
+
+            #[cfg(unix)]
+            {
+                command.process_group(0);
+            }
+
+            let child = command.spawn().with_context(|| {
+                format!(
+                    "failed to spawn persistent {} app-server",
+                    self.inner.config.codex_bin
+                )
+            })?;
+            let pid = child.id().unwrap_or_default();
+            drop(child);
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while tokio::time::Instant::now() < deadline {
+                if handoff_socket_is_live(&paths.socket_path).await {
+                    let meta = HandoffMeta {
+                        pid,
+                        profile_id: self.inner.profile.id.clone(),
+                        socket_path: paths.socket_path.display().to_string(),
+                        codex_bin: self.inner.config.codex_bin.clone(),
+                        codex_home: self.inner.profile.codex_home.display().to_string(),
+                        started_at_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis(),
+                    };
+                    let encoded = serde_json::to_vec_pretty(&meta)
+                        .context("failed to encode app-server handoff metadata")?;
+                    tokio::fs::write(&paths.meta_path, encoded)
+                        .await
+                        .with_context(|| {
+                            format!("failed to write {}", paths.meta_path.display())
+                        })?;
+                    info!(
+                        profile_id = %self.inner.profile.id,
+                        pid,
+                        socket = %paths.socket_path.display(),
+                        "started persistent codex app-server for restart handoff"
+                    );
+                    return Ok(Some(paths));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            Err(anyhow!(
+                "persistent codex app-server did not open {}",
+                paths.socket_path.display()
+            ))
+        }
     }
 }
 
@@ -411,7 +545,9 @@ impl AppServerManager {
     pub async fn close_profile(&self, profile_id: &str) -> Result<()> {
         let client = self.clients.lock().await.remove(profile_id);
         if let Some(client) = client {
+            let profile = client.inner.profile.clone();
             client.close().await?;
+            stop_handoff_server(&self.config, &profile).await?;
         }
         Ok(())
     }
@@ -430,10 +566,139 @@ impl AppServerManager {
         };
 
         for client in clients {
+            let profile = client.inner.profile.clone();
+            client.close().await?;
+            stop_handoff_server(&self.config, &profile).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn detach_all(&self) -> Result<()> {
+        let clients = {
+            let mut clients = self.clients.lock().await;
+            clients
+                .drain()
+                .map(|(_, client)| client)
+                .collect::<Vec<_>>()
+        };
+
+        for client in clients {
             client.close().await?;
         }
         Ok(())
     }
+}
+
+fn handoff_paths(
+    config: &AppServerClientConfig,
+    profile: &AppServerProfile,
+) -> Option<HandoffPaths> {
+    let handoff_dir = config.handoff_dir.as_ref()?;
+    #[cfg(not(unix))]
+    {
+        let _ = profile;
+        let _ = handoff_dir;
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let mut hasher = Sha256::new();
+        hasher.update(profile.id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(profile.codex_home.display().to_string().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(handoff_dir.display().to_string().as_bytes());
+        let digest = hasher.finalize();
+        let suffix = digest
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let safe_profile = profile
+            .id
+            .chars()
+            .map(|ch| match ch {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => ch,
+                _ => '-',
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string();
+        let safe_profile = if safe_profile.is_empty() {
+            "default".to_string()
+        } else {
+            safe_profile
+        };
+        let socket_path = env::temp_dir()
+            .join("codex-webui-app-server")
+            .join(format!("{suffix}.sock"));
+        Some(HandoffPaths {
+            socket_path,
+            meta_path: handoff_dir.join(format!("{safe_profile}-{suffix}.json")),
+            log_path: handoff_dir.join(format!("{safe_profile}-{suffix}.log")),
+        })
+    }
+}
+
+#[cfg(unix)]
+async fn handoff_socket_is_live(socket_path: &Path) -> bool {
+    use tokio::net::UnixStream;
+
+    timeout(Duration::from_millis(250), UnixStream::connect(socket_path))
+        .await
+        .is_ok_and(|result| result.is_ok())
+}
+
+#[cfg(unix)]
+async fn stop_handoff_server(
+    config: &AppServerClientConfig,
+    profile: &AppServerProfile,
+) -> Result<()> {
+    let Some(paths) = handoff_paths(config, profile) else {
+        return Ok(());
+    };
+    let Some(meta) = tokio::fs::read(&paths.meta_path)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<HandoffMeta>(&bytes).ok())
+    else {
+        let _ = tokio::fs::remove_file(&paths.socket_path).await;
+        return Ok(());
+    };
+
+    if !handoff_socket_is_live(&paths.socket_path).await {
+        let _ = tokio::fs::remove_file(&paths.socket_path).await;
+        let _ = tokio::fs::remove_file(&paths.meta_path).await;
+        return Ok(());
+    }
+
+    if meta.pid > 0 {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(meta.pid.to_string())
+            .status()
+            .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if handoff_socket_is_live(&paths.socket_path).await {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(meta.pid.to_string())
+                .status()
+                .await;
+        }
+    }
+
+    let _ = tokio::fs::remove_file(&paths.socket_path).await;
+    let _ = tokio::fs::remove_file(&paths.meta_path).await;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn stop_handoff_server(
+    _config: &AppServerClientConfig,
+    _profile: &AppServerProfile,
+) -> Result<()> {
+    Ok(())
 }
 
 impl AppServerControllerRuntime {
@@ -685,9 +950,11 @@ fn classify_incoming_message(line: &str) -> Result<Option<IncomingMessage>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppServerNotification, AppServerRequest, IncomingMessage, classify_incoming_message,
+        AppServerClientConfig, AppServerNotification, AppServerProfile, AppServerRequest,
+        IncomingMessage, classify_incoming_message, handoff_paths,
     };
     use serde_json::json;
+    use std::path::PathBuf;
 
     #[test]
     fn classifies_notifications() {
@@ -770,5 +1037,35 @@ mod tests {
                 .to_string()),
             })
         );
+    }
+
+    #[test]
+    fn handoff_paths_are_stable_per_profile() {
+        let config = AppServerClientConfig {
+            handoff_dir: Some(PathBuf::from("/tmp/codex-webui-handoff-test")),
+            ..AppServerClientConfig::default()
+        };
+        let profile = AppServerProfile {
+            id: "default".to_string(),
+            codex_home: PathBuf::from("/tmp/codex-home"),
+        };
+
+        let first = handoff_paths(&config, &profile);
+        let second = handoff_paths(&config, &profile);
+
+        #[cfg(unix)]
+        {
+            let first = first.expect("handoff should be available on unix");
+            let second = second.expect("handoff should be available on unix");
+            assert_eq!(first.socket_path, second.socket_path);
+            assert!(first.socket_path.to_string_lossy().ends_with(".sock"));
+            assert!(first.meta_path.to_string_lossy().contains("default"));
+        }
+
+        #[cfg(not(unix))]
+        {
+            assert!(first.is_none());
+            assert!(second.is_none());
+        }
     }
 }

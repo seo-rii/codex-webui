@@ -92,6 +92,7 @@ pub(crate) struct Config {
     pub(crate) cors_allowed_origins: Vec<String>,
     pub(crate) trust_proxy_headers: bool,
     pub(crate) instance_token: Option<String>,
+    pub(crate) app_server_handoff_enabled: bool,
 }
 
 impl Config {
@@ -198,6 +199,14 @@ impl Config {
                 )
             }),
             instance_token: optional_env("CODEX_WEBUI_INSTANCE_TOKEN"),
+            app_server_handoff_enabled: env::var("CODEX_WEBUI_APP_SERVER_HANDOFF")
+                .map(|value| {
+                    !matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "no" | "off"
+                    )
+                })
+                .unwrap_or(true),
         })
     }
 }

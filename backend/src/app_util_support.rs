@@ -39,17 +39,37 @@ pub(crate) fn owner_role_configured(config: &Config) -> bool {
             .is_some_and(|value| !value.is_empty())
 }
 
-pub(crate) fn role_has_owner_access(config: &Config, role: UserRole) -> bool {
+pub(crate) fn web_auth_configured(config: &Config) -> bool {
+    [
+        config.password.as_deref(),
+        config.password_hash.as_deref(),
+        config.owner_password.as_deref(),
+        config.owner_password_hash.as_deref(),
+        config.viewer_password.as_deref(),
+        config.viewer_password_hash.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .any(|value| !value.is_empty())
+}
+
+pub(crate) fn public_host_is_loopback(config: &Config) -> bool {
     let host = config.public_host.trim().trim_matches(['[', ']']);
-    let owner_required_by_host = if host.eq_ignore_ascii_case("localhost") {
-        false
-    } else {
-        host.parse::<std::net::IpAddr>()
-            .map(|ip| !ip.is_loopback())
-            .unwrap_or(true)
-    };
-    let owner_required =
-        owner_role_configured(config) || config.system_shutdown_enabled || owner_required_by_host;
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+pub(crate) fn authless_admin_allowed(config: &Config) -> bool {
+    !web_auth_configured(config) && public_host_is_loopback(config)
+}
+
+pub(crate) fn role_has_owner_access(config: &Config, role: UserRole) -> bool {
+    let owner_required = owner_role_configured(config) || !public_host_is_loopback(config);
     !owner_required || matches!(role, UserRole::Owner)
 }
 

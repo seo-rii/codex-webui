@@ -241,6 +241,38 @@ codex_webui_pending_server_requests {pending_server_request_count}\n",
                 return response;
             }
 
+            if route_path == "/api/admin/restart-handoff/prepare" {
+                if method != Method::POST {
+                    return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+                }
+                let token_matches = headers
+                    .get("x-codex-webui-instance-token")
+                    .and_then(|value| value.to_str().ok())
+                    .zip(state.config.instance_token.as_deref())
+                    .is_some_and(|(provided, expected)| {
+                        !expected.is_empty() && provided.trim() == expected
+                    });
+                if !token_matches {
+                    return json_error(StatusCode::FORBIDDEN, "Instance token is required.");
+                }
+                state
+                    .preserve_app_servers_on_shutdown
+                    .store(true, Ordering::SeqCst);
+                let mut response = Json(json!({
+                    "ok": true,
+                    "appServerClients": state.app_servers.client_count().await
+                }))
+                .into_response();
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
             if route_path.starts_with("/api/auth/") {
                 return handle_auth_http(
                     state, jar, method, route_path, headers, request, peer_addr,

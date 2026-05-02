@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -42,6 +43,7 @@ pub(crate) struct AppState {
     pub(crate) pending_server_requests:
         Arc<Mutex<HashMap<String, HashMap<String, PendingServerRequestEntry>>>>,
     pub(crate) shutdown_timers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    pub(crate) preserve_app_servers_on_shutdown: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]

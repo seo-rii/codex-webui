@@ -93,6 +93,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
             cors_allowed_origins: Vec::new(),
             trust_proxy_headers: false,
             instance_token: None,
+            app_server_handoff_enabled: false,
         }),
         app_servers: AppServerManager::new(AppServerClientConfig::default()),
         http: reqwest::Client::new(),
@@ -118,6 +119,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
         pending_turn_starts: Arc::new(Mutex::new(HashSet::new())),
         pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
         shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
+        preserve_app_servers_on_shutdown: Arc::new(AtomicBool::new(false)),
     }
 }
 

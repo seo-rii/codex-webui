@@ -114,6 +114,7 @@ function defaultConfigValues() {
     sessionSecret: createSessionSecret(),
     corsAllowedOrigins: [],
     backendBinaryPath: "",
+    appServerHandoff: true,
     tunnel: defaultTunnelConfigValues()
   };
 }
@@ -238,6 +239,7 @@ function normalizeConfig(rawConfig = {}) {
     corsAllowedOrigins: Array.isArray(rawConfig.corsAllowedOrigins) ? rawConfig.corsAllowedOrigins : defaults.corsAllowedOrigins,
     ownerPasswordHash: String(rawConfig.ownerPasswordHash ?? rawConfig.owner_password_hash ?? defaults.ownerPasswordHash).trim(),
     backendBinaryPath: expandHome(String(rawConfig.backendBinaryPath ?? defaults.backendBinaryPath)),
+    appServerHandoff: rawConfig.appServerHandoff === undefined ? defaults.appServerHandoff : rawConfig.appServerHandoff !== false,
     tunnel: normalizeTunnelConfig(rawConfig.tunnel)
   };
 }
@@ -480,6 +482,7 @@ async function verifyServerInstance(config, meta) {
   const timeout = setTimeout(() => controller.abort(), 1500);
   try {
     const response = await fetch(`${buildBaseUrl(config)}/healthz`, {
+      credentials: "include",
       headers: {
         "x-codex-webui-instance-token": token
       },
@@ -490,6 +493,30 @@ async function verifyServerInstance(config, meta) {
     }
     const payload = await response.json();
     return payload?.instanceTokenMatched === true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function prepareRestartHandoff(config, meta) {
+  const token = String(meta?.instanceToken ?? "").trim();
+  if (!token) {
+    return false;
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1500);
+  try {
+    const response = await fetch(`${buildBaseUrl(config)}/api/admin/restart-handoff/prepare`, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "x-codex-webui-instance-token": token
+      },
+      signal: controller.signal
+    });
+    return response.ok;
   } catch {
     return false;
   } finally {
@@ -530,6 +557,17 @@ function buildPublicWorkspaceUrl(baseUrl, config) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForProcessExit(pid, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isRunning(pid)) {
+      return true;
+    }
+    await sleep(100);
+  }
+  return !isRunning(pid);
 }
 
 function extractTunnelPublicUrl(logText) {
@@ -1056,6 +1094,7 @@ async function startServer(config) {
       CODEX_WEBUI_HCAPTCHA_SECRET_KEY: String(config.hcaptchaSecretKey ?? ""),
       CODEX_WEBUI_SESSION_SECRET: String(config.sessionSecret),
       CODEX_WEBUI_INSTANCE_TOKEN: instanceToken,
+      CODEX_WEBUI_APP_SERVER_HANDOFF: config.appServerHandoff === false ? "false" : "true",
       CODEX_WEBUI_CORS_ALLOWED_ORIGINS: config.corsAllowedOrigins.join(",")
     }
   });
@@ -1083,16 +1122,26 @@ async function stopServer(config) {
     return { stopped: false, unsafe: true, pid: status.pid };
   }
   process.kill(status.pid, "SIGTERM");
+  const exited = await waitForProcessExit(status.pid, 10000);
+  if (!exited) {
+    throw new Error(`Timed out waiting for codex-webui PID ${status.pid} to stop.`);
+  }
   await clearServerStateFiles();
   return { stopped: true, pid: status.pid };
 }
 
 async function restartServer(config) {
+  const status = await readServerStatus(config);
+  if (status.pid && status.running && !status.verified) {
+    throw new Error(`Refusing to restart: PID ${status.pid} could not be verified as this codex-webui instance.`);
+  }
+  const handoffPrepared = status.verified ? await prepareRestartHandoff(config, status.meta) : false;
   const stopResult = await stopServer(config);
   if (stopResult.unsafe) {
     throw new Error(`Refusing to restart: PID ${stopResult.pid} could not be verified as this codex-webui instance.`);
   }
-  return startServer(config);
+  const started = await startServer(config);
+  return { ...started, handoffPrepared };
 }
 
 function printTunnelUsage() {
@@ -1161,7 +1210,7 @@ function printCommandHelp() {
   console.log("Commands:");
   console.log("  codex-webui config   Re-run the interactive setup");
   console.log("  codex-webui status   Show the background server state");
-  console.log("  codex-webui restart  Restart the background server");
+  console.log("  codex-webui restart  Restart the background server with Codex session handoff when available");
   console.log("  codex-webui stop     Stop the background server");
   console.log("  codex-webui tunnel start   Start a cloudflared/ngrok tunnel");
   console.log("  codex-webui tunnel status  Show the current tunnel state");
@@ -1318,6 +1367,9 @@ async function main() {
 
   if (command === "restart") {
     const result = await restartServer(config);
+    if (result.handoffPrepared === false) {
+      console.log("Restart handoff was not prepared; active Codex app-server sessions may restart.");
+    }
     printUsage(config, result.pid, false);
     return;
   }

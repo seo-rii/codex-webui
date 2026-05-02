@@ -132,39 +132,42 @@ pub(crate) async fn select_profile(
 }
 
 pub(crate) fn auth_context(config: &Config, jar: &CookieJar) -> Option<AuthContext> {
-    let Some(cookie) = jar.get(AUTH_COOKIE) else {
-        return None;
-    };
-    let token = cookie.value();
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 4 && parts.len() != 5 {
-        return None;
-    }
-    let payload = parts[..parts.len() - 1].join(".");
-    let Ok(expected) = sign(config, &payload) else {
-        return None;
-    };
-    if expected
-        .as_bytes()
-        .ct_eq(parts[parts.len() - 1].as_bytes())
-        .unwrap_u8()
-        != 1
-    {
-        return None;
-    }
-    let expires = parts[1].parse::<u128>().ok()?;
-    if now_millis() >= expires {
-        return None;
-    }
-
-    let role = if parts.len() == 5 {
-        match parts[2] {
-            "owner" => UserRole::Owner,
-            "viewer" => UserRole::Viewer,
-            _ => UserRole::Admin,
+    let role = if let Some(cookie) = jar.get(AUTH_COOKIE) {
+        let token = cookie.value();
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 4 && parts.len() != 5 {
+            return None;
         }
-    } else {
+        let payload = parts[..parts.len() - 1].join(".");
+        let Ok(expected) = sign(config, &payload) else {
+            return None;
+        };
+        if expected
+            .as_bytes()
+            .ct_eq(parts[parts.len() - 1].as_bytes())
+            .unwrap_u8()
+            != 1
+        {
+            return None;
+        }
+        let expires = parts[1].parse::<u128>().ok()?;
+        if now_millis() >= expires {
+            return None;
+        }
+
+        if parts.len() == 5 {
+            match parts[2] {
+                "owner" => UserRole::Owner,
+                "viewer" => UserRole::Viewer,
+                _ => UserRole::Admin,
+            }
+        } else {
+            UserRole::Admin
+        }
+    } else if authless_admin_allowed(config) {
         UserRole::Admin
+    } else {
+        return None;
     };
 
     let profile_id = jar
@@ -362,6 +365,10 @@ pub(crate) fn verify_password_pair(
 }
 
 pub(crate) fn authenticate_role(config: &Config, input: &str) -> Result<Option<UserRole>> {
+    if authless_admin_allowed(config) {
+        return Ok(Some(UserRole::Admin));
+    }
+
     if (config.owner_password.is_some() || config.owner_password_hash.is_some())
         && verify_password_pair(
             config.owner_password.as_ref(),

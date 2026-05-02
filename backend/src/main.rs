@@ -5,7 +5,10 @@ use std::{
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -248,6 +251,9 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             app_servers: AppServerManager::new(AppServerClientConfig {
                 codex_bin: config.codex_bin.clone(),
                 stderr_log_path: Some(runtime_logs_dir(&config).join("codex-app-server.log")),
+                handoff_dir: config
+                    .app_server_handoff_enabled
+                    .then(|| config.data_dir.join("app-server-handoff")),
                 ..AppServerClientConfig::default()
             }),
             http,
@@ -273,6 +279,7 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             pending_turn_starts: Arc::new(Mutex::new(HashSet::new())),
             pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
             shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
+            preserve_app_servers_on_shutdown: Arc::new(AtomicBool::new(false)),
         };
 
         tokio::spawn(restore_automation_schedules(state.clone()));
@@ -300,9 +307,17 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .context("axum server terminated unexpectedly");
-        let _ = state.app_servers.close_all().await;
+        if state
+            .preserve_app_servers_on_shutdown
+            .load(Ordering::SeqCst)
+        {
+            let _ = state.app_servers.detach_all().await;
+        } else {
+            let _ = state.app_servers.close_all().await;
+        }
         server_result
     }
     .await;
@@ -317,6 +332,35 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
     }
 
     result
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            warn!("failed to install ctrl-c handler: {error}");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                warn!("failed to install SIGTERM handler: {error}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 #[cfg(test)]
 mod main_tests;

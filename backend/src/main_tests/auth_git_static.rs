@@ -183,7 +183,7 @@ async fn owner_config_blocks_admin_from_owner_only_websocket_methods() {
 }
 
 #[test]
-fn external_or_shutdown_modes_require_configured_owner_role_for_owner_actions() {
+fn external_or_configured_owner_modes_require_owner_role_for_owner_actions() {
     let sandbox = unique_test_dir("owner-secure-mode");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -200,8 +200,71 @@ fn external_or_shutdown_modes_require_configured_owner_role_for_owner_actions() 
 
     config.public_host = "127.0.0.1".to_string();
     config.system_shutdown_enabled = true;
+    assert!(role_has_owner_access(&config, UserRole::Admin));
+
+    config.owner_password = Some("owner-secret".to_string());
     assert!(!role_has_owner_access(&config, UserRole::Admin));
     assert!(role_has_owner_access(&config, UserRole::Owner));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_loopback_without_auth_config_defaults_to_admin() {
+    let sandbox = unique_test_dir("local-authless-admin");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+
+    let auth = auth_context(&state.config, &CookieJar::new())
+        .expect("local loopback without auth config should default to admin");
+    assert_eq!(auth.role, UserRole::Admin);
+    assert_eq!(
+        authenticate_role(&state.config, "").unwrap(),
+        Some(UserRole::Admin)
+    );
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/config")
+        .body(Body::empty())
+        .unwrap();
+    let response = handle_http(State(state), CookieJar::new(), request).await;
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_host_without_auth_config_still_requires_authentication() {
+    let sandbox = unique_test_dir("external-auth-required");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    config.public_host = "0.0.0.0".to_string();
+    state.config = Arc::new(config);
+
+    assert!(auth_context(&state.config, &CookieJar::new()).is_none());
+    assert!(
+        authenticate_role(&state.config, "")
+            .unwrap_err()
+            .to_string()
+            .contains("Set CODEX_WEBUI_PASSWORD_HASH")
+    );
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/config")
+        .body(Body::empty())
+        .unwrap();
+    let response = handle_http(State(state), CookieJar::new(), request).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -502,6 +565,7 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
     let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
     let mut config = (*state.config).clone();
     config.instance_token = Some("probe-token".to_string());
+    config.password = Some("admin-secret".to_string());
     state.config = Arc::new(config);
     fs::create_dir_all(&state.config.data_dir).unwrap();
 
@@ -589,7 +653,7 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
         .uri("/metrics")
         .body(Body::empty())
         .unwrap();
-    let metrics_response = handle_http(State(state), jar, metrics_request).await;
+    let metrics_response = handle_http(State(state.clone()), jar, metrics_request).await;
     assert_eq!(metrics_response.status(), StatusCode::OK);
     assert_eq!(
         metrics_response
@@ -609,6 +673,40 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
     let metrics_text = String::from_utf8(metrics_body.to_vec()).unwrap();
     assert!(metrics_text.contains("codex_webui_profiles 1"));
     assert!(metrics_text.contains("codex_webui_response_cache_entries 0"));
+
+    let denied_handoff_request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/admin/restart-handoff/prepare")
+        .header("x-codex-webui-instance-token", "wrong-token")
+        .body(Body::empty())
+        .unwrap();
+    let denied_handoff_response = handle_http(
+        State(state.clone()),
+        CookieJar::new(),
+        denied_handoff_request,
+    )
+    .await;
+    assert_eq!(denied_handoff_response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !state
+            .preserve_app_servers_on_shutdown
+            .load(Ordering::SeqCst)
+    );
+
+    let handoff_request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/admin/restart-handoff/prepare")
+        .header("x-codex-webui-instance-token", "probe-token")
+        .body(Body::empty())
+        .unwrap();
+    let handoff_response =
+        handle_http(State(state.clone()), CookieJar::new(), handoff_request).await;
+    assert_eq!(handoff_response.status(), StatusCode::OK);
+    assert!(
+        state
+            .preserve_app_servers_on_shutdown
+            .load(Ordering::SeqCst)
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -660,7 +758,10 @@ async fn viewer_http_routes_match_websocket_authorization_policy() {
     let codex_home = sandbox.join("codex-home");
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
-    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    config.password = Some("admin-secret".to_string());
+    state.config = Arc::new(config);
     let jar = issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Viewer).unwrap();
 
     for (method, uri) in [
@@ -812,7 +913,10 @@ async fn auth_login_rate_limit_uses_peer_address_when_proxy_headers_are_untruste
     let codex_home = sandbox.join("codex-home");
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
-    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    config.password = Some("admin-secret".to_string());
+    state.config = Arc::new(config);
     let peer_addr: SocketAddr = "203.0.113.10:44123".parse().unwrap();
     let request = Request::builder()
         .method(Method::POST)

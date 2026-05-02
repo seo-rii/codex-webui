@@ -22,7 +22,8 @@ fn default_ui_state_value() -> Value {
             "shutdownAfterQueueCompletes": false,
             "shutdownAfterQueueCompletesPrimed": false,
             "scheduledShutdown": Value::Null,
-            "scheduledShutdownBlockedReason": Value::Null
+            "scheduledShutdownBlockedReason": Value::Null,
+            "dataRecoveryEvents": []
         },
         "notifications": {
             "items": [],
@@ -65,7 +66,8 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
                 "shutdownAfterQueueCompletes": false,
                 "shutdownAfterQueueCompletesPrimed": false,
                 "scheduledShutdown": Value::Null,
-                "scheduledShutdownBlockedReason": Value::Null
+                "scheduledShutdownBlockedReason": Value::Null,
+                "dataRecoveryEvents": []
             }),
         );
     }
@@ -85,6 +87,12 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
             .is_some_and(|value| value.is_null() || value.is_string())
         {
             global.insert("scheduledShutdownBlockedReason".to_string(), Value::Null);
+        }
+        if !global
+            .get("dataRecoveryEvents")
+            .is_some_and(Value::is_array)
+        {
+            global.insert("dataRecoveryEvents".to_string(), json!([]));
         }
     }
 
@@ -135,6 +143,43 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
         if !is_valid {
             root.insert(key.to_string(), default_value);
         }
+    }
+}
+
+fn append_data_recovery_event(
+    ui_state: &mut Value,
+    kind: &str,
+    path: &std::path::Path,
+    backup_path: &std::path::Path,
+    restored_from_backup: bool,
+    source_backup_path: Option<&std::path::Path>,
+) {
+    ensure_ui_state_sections(ui_state);
+    let Some(events) = ui_state
+        .get_mut("global")
+        .and_then(Value::as_object_mut)
+        .and_then(|global| global.get_mut("dataRecoveryEvents"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    events.insert(
+        0,
+        json!({
+            "id": Uuid::new_v4().to_string(),
+            "kind": kind,
+            "at": now_unix_ms(),
+            "path": path.display().to_string(),
+            "backupPath": backup_path.display().to_string(),
+            "sourceBackupPath": source_backup_path
+                .map(|path| Value::String(path.display().to_string()))
+                .unwrap_or(Value::Null),
+            "restoredFromBackup": restored_from_backup
+        }),
+    );
+    if events.len() > 20 {
+        events.truncate(20);
     }
 }
 
@@ -227,6 +272,14 @@ async fn read_profile_ui_state(config: &Config, profile_id: &str) -> Result<Valu
             if let Ok(backup_raw) = tokio_fs::read_to_string(&stable_backup_path).await {
                 if let Ok(mut recovered) = serde_json::from_str::<Value>(&backup_raw) {
                     ensure_ui_state_sections(&mut recovered);
+                    append_data_recovery_event(
+                        &mut recovered,
+                        "uiState",
+                        &path,
+                        &backup_path,
+                        true,
+                        Some(&stable_backup_path),
+                    );
                     write_file_atomically(
                         &path,
                         serde_json::to_vec_pretty(&recovered)
@@ -237,7 +290,8 @@ async fn read_profile_ui_state(config: &Config, profile_id: &str) -> Result<Valu
                     return Ok(recovered);
                 }
             }
-            let fallback = default_ui_state_value();
+            let mut fallback = default_ui_state_value();
+            append_data_recovery_event(&mut fallback, "uiState", &path, &backup_path, false, None);
             write_file_atomically(
                 &path,
                 serde_json::to_vec_pretty(&fallback).expect("default ui-state should serialize"),

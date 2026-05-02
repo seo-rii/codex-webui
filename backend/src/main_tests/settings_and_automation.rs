@@ -960,7 +960,36 @@ async fn corrupt_ui_state_recovers_from_previous_snapshot() {
     );
     let active_raw =
         fs::read_to_string(&ui_state_path).expect("active ui-state should be restored");
-    assert!(serde_json::from_str::<Value>(&active_raw).is_ok());
+    let active_state: Value =
+        serde_json::from_str(&active_raw).expect("active ui-state should be valid JSON");
+    let recovery_events = active_state
+        .get("global")
+        .and_then(|value| value.get("dataRecoveryEvents"))
+        .and_then(Value::as_array)
+        .expect("ui-state recovery should be recorded");
+    let recovery_event = recovery_events
+        .first()
+        .expect("at least one recovery event should be recorded");
+    assert_eq!(
+        recovery_event.get("kind").and_then(Value::as_str),
+        Some("uiState")
+    );
+    assert_eq!(
+        recovery_event
+            .get("restoredFromBackup")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let config_payload = get_config_payload(&state, "default")
+        .await
+        .expect("config payload should surface recovery events");
+    let surfaced_events = config_payload
+        .get("startup")
+        .and_then(|value| value.get("dataRecoveryEvents"))
+        .and_then(Value::as_array)
+        .expect("config startup payload should include recovery events");
+    assert_eq!(surfaced_events.len(), 1);
 
     let _ = fs::remove_dir_all(sandbox);
 }

@@ -277,6 +277,16 @@ export type StartupScheduledShutdownAlert = {
   delaySeconds: number;
 };
 
+export type StartupDataRecoveryEvent = {
+  id: string;
+  kind: string;
+  at: number;
+  path: string;
+  backupPath: string;
+  sourceBackupPath: string | null;
+  restoredFromBackup: boolean;
+};
+
 export type NotificationEventType = "sessionCompleted" | "sessionAttention" | "queueDispatchFailed" | "shutdownScheduled";
 
 export type NotificationSettings = {
@@ -338,6 +348,7 @@ export type AppConfigPayload = {
     pausedQueues: StartupPausedQueueAlert[];
     scheduledShutdown: StartupScheduledShutdownAlert | null;
     scheduledShutdownBlockedReason?: "queuedWork" | "activeWork" | string | null;
+    dataRecoveryEvents?: StartupDataRecoveryEvent[];
   };
   notifications: {
     unreadCount: number;

@@ -226,13 +226,14 @@ Before publishing, check:
 2. `pnpm build`
 3. `pnpm verify:static-build`
 4. `pnpm verify:api-parity`
-5. `pnpm build:cross`
-6. `pnpm check`
-7. `cargo check --manifest-path backend/Cargo.toml`
-8. `pnpm exec playwright test e2e/base-path.spec.ts`
-9. `package.json` includes `bin`, `build`, `dist`, and docs
-10. `node ./bin/codex-webui.mjs` works from a clean checkout
-11. `npx .` or a packed tarball works on a machine that does not rely on local build artifacts by accident
+5. `pnpm verify:security-regressions`
+6. `pnpm build:cross`
+7. `pnpm check`
+8. `cargo check --manifest-path backend/Cargo.toml`
+9. `pnpm exec playwright test e2e/base-path.spec.ts`
+10. `package.json` includes `bin`, `build`, `dist`, and docs
+11. `node ./bin/codex-webui.mjs` works from a clean checkout
+12. `npx .` or a packed tarball works on a machine that does not rely on local build artifacts by accident
 
 ## Recommended Smoke Tests
 

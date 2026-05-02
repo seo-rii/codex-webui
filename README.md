@@ -129,6 +129,7 @@ For migration regression checks, run:
 ```bash
 pnpm verify:static-build
 pnpm verify:api-parity
+pnpm verify:security-regressions
 ```
 
 The CLI prints the workspace root URL and the login experience is handled inline by the workspace shell.
@@ -340,6 +341,7 @@ pnpm check
 pnpm build
 pnpm verify:static-build
 pnpm verify:api-parity
+pnpm verify:security-regressions
 cargo check --manifest-path backend/Cargo.toml
 ```
 

@@ -2,6 +2,16 @@ use super::*;
 
 pub(crate) async fn git_operation_lock(state: &AppState, repo_root: &str) -> Arc<Mutex<()>> {
     let mut locks = state.git_operation_locks.lock().await;
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    if !locks.contains_key(repo_root) && locks.len() >= GIT_OPERATION_LOCK_MAX_ENTRIES {
+        if let Some(idle_key) = locks
+            .iter()
+            .find(|(_, lock)| Arc::strong_count(lock) == 1)
+            .map(|(key, _)| key.clone())
+        {
+            locks.remove(&idle_key);
+        }
+    }
     Arc::clone(
         locks
             .entry(repo_root.to_string())

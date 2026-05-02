@@ -1666,6 +1666,25 @@ async fn git_repo_root_must_remain_inside_allowed_roots() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_operation_locks_prune_idle_entries() {
+    let sandbox = unique_test_dir("git-operation-lock-prune");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+
+    for index in 0..(GIT_OPERATION_LOCK_MAX_ENTRIES + 10) {
+        let _ = git_operation_lock(&state, &format!("/tmp/repo-{index}")).await;
+    }
+
+    let locks = state.git_operation_locks.lock().await;
+    assert!(locks.len() <= 1);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_stage_and_unstage_treat_file_path_as_literal_pathspec() {
     let sandbox = unique_test_dir("git-literal-pathspec");
     let workspace = sandbox.join("workspace");

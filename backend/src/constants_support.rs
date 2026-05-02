@@ -26,6 +26,7 @@ pub(crate) const WS_OUTBOUND_QUEUE_CAPACITY: usize = 1024;
 pub(crate) const TEXT_FILE_PREVIEW_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
 pub(crate) const GIT_DIFF_PREVIEW_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const GIT_DIFF_PREVIEW_MAX_FILES: usize = 200;
+pub(crate) const GIT_OPERATION_LOCK_MAX_ENTRIES: usize = 512;
 pub(crate) const CHILD_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const GLOBAL_RELAY_KEY: &str = "__global__";
 pub(crate) const CODEX_NPM_PACKAGE: &str = "@openai/codex";

@@ -334,6 +334,7 @@ fn append_vary(headers: &mut HeaderMap, value: &str) {
 pub(crate) async fn check_rate_limit(state: &AppState, identifier: &str) -> bool {
     let now = now_millis();
     let mut attempts = state.login_attempts.lock().await;
+    prune_login_attempts(&mut attempts, now, identifier);
     let history = attempts.entry(identifier.to_string()).or_default();
     history.retain(|entry| now.saturating_sub(*entry) < LOGIN_WINDOW_MS);
     history.len() < LOGIN_MAX_ATTEMPTS
@@ -342,6 +343,7 @@ pub(crate) async fn check_rate_limit(state: &AppState, identifier: &str) -> bool
 pub(crate) async fn record_login_failure(state: &AppState, identifier: &str) {
     let now = now_millis();
     let mut attempts = state.login_attempts.lock().await;
+    prune_login_attempts(&mut attempts, now, identifier);
     let history = attempts.entry(identifier.to_string()).or_default();
     history.retain(|entry| now.saturating_sub(*entry) < LOGIN_WINDOW_MS);
     history.push(now);
@@ -349,6 +351,40 @@ pub(crate) async fn record_login_failure(state: &AppState, identifier: &str) {
 
 pub(crate) async fn clear_login_failures(state: &AppState, identifier: &str) {
     state.login_attempts.lock().await.remove(identifier);
+}
+
+fn prune_login_attempts(
+    attempts: &mut HashMap<String, Vec<u128>>,
+    now: u128,
+    protected_identifier: &str,
+) {
+    attempts.retain(|_, history| {
+        history.retain(|entry| now.saturating_sub(*entry) < LOGIN_WINDOW_MS);
+        !history.is_empty()
+    });
+    if attempts.len() < LOGIN_RATE_LIMIT_MAX_IDENTIFIERS
+        || attempts.contains_key(protected_identifier)
+    {
+        return;
+    }
+
+    let mut buckets = attempts
+        .iter()
+        .filter(|(identifier, _)| identifier.as_str() != protected_identifier)
+        .map(|(identifier, history)| {
+            (
+                identifier.clone(),
+                history.iter().copied().max().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    buckets.sort_by_key(|(_, newest_attempt)| *newest_attempt);
+    for (identifier, _) in buckets {
+        if attempts.len() < LOGIN_RATE_LIMIT_MAX_IDENTIFIERS {
+            break;
+        }
+        attempts.remove(&identifier);
+    }
 }
 
 pub(crate) fn verify_password_pair(

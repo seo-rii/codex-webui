@@ -1109,6 +1109,36 @@ async fn auth_login_rate_limit_uses_peer_address_when_proxy_headers_are_untruste
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_rate_limit_identifier_store_is_bounded() {
+    let sandbox = unique_test_dir("auth-login-rate-limit-cap");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let now = now_millis();
+
+    {
+        let mut attempts = state.login_attempts.lock().await;
+        for index in 0..LOGIN_RATE_LIMIT_MAX_IDENTIFIERS {
+            attempts.insert(
+                format!("198.51.100.{index}"),
+                vec![now.saturating_sub((LOGIN_RATE_LIMIT_MAX_IDENTIFIERS - index) as u128)],
+            );
+        }
+    }
+
+    record_login_failure(&state, "203.0.113.42").await;
+
+    let attempts = state.login_attempts.lock().await;
+    assert!(attempts.len() <= LOGIN_RATE_LIMIT_MAX_IDENTIFIERS);
+    assert!(attempts.contains_key("203.0.113.42"));
+    assert!(!attempts.contains_key("198.51.100.0"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn maps_session_item_notifications_for_stream_clients() {
     let mapped = map_app_server_session_notification(&AppServerNotification {

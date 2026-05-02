@@ -238,7 +238,20 @@ pub(crate) async fn execute_scheduled_shutdown(state: &AppState, profile_id: &st
 pub(crate) async fn force_scheduled_shutdown_payload(
     state: &AppState,
     profile_id: &str,
+    params: &Value,
 ) -> ApiResult<Value> {
+    if params
+        .get("confirmation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        != Some("force-shutdown")
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Forced system shutdown requires confirmation.",
+        ));
+    }
+
     let (available, _) = system_shutdown_capability(&state.config).await;
     if !available {
         return Err(api_error(

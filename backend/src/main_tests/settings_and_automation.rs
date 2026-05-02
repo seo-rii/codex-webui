@@ -1131,6 +1131,29 @@ async fn arming_shutdown_while_idle_waits_for_future_activity() {
 }
 
 #[tokio::test]
+async fn forced_shutdown_requires_explicit_confirmation_phrase() {
+    let sandbox = unique_test_dir("shutdown-force-confirmation");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    config.system_shutdown_enabled = true;
+    config.system_shutdown_command_override = Some("/bin/true".to_string());
+    state.config = Arc::new(config);
+
+    let error = force_scheduled_shutdown_payload(&state, "default", &json!({}))
+        .await
+        .expect_err("forced shutdown should require a confirmation phrase");
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(error.message.contains("requires confirmation"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn restore_runtime_profile_state_does_not_schedule_shutdown_without_new_work() {
     let sandbox = unique_test_dir("shutdown-restore-idle");
     let workspace = sandbox.join("workspace");

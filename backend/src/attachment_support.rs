@@ -118,7 +118,7 @@ fn attachment_kind_for_mime(mime_type: &str) -> &'static str {
     }
 }
 
-fn human_readable_byte_limit(bytes: u64) -> String {
+pub(crate) fn human_readable_byte_limit(bytes: u64) -> String {
     if bytes < 1024 * 1024 {
         format!("{bytes} bytes")
     } else {

@@ -637,6 +637,55 @@ async fn websocket_session_methods_reject_invalid_session_ids() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_attachment_upload_rejects_large_base64_payload_before_decoding() {
+    let sandbox = unique_test_dir("ws-attachment-large-payload");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let encoded_size =
+        (((WS_ATTACHMENT_UPLOAD_MAX_DECODED_BYTES as usize) + 1) * 4 / 3).saturating_add(8);
+
+    let error = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &AuthContext {
+            role: UserRole::Admin,
+            profile_id: "default".to_string(),
+        },
+        "attachments/upload",
+        json!({
+            "sessionId": "thread-1",
+            "files": [
+                {
+                    "name": "large.bin",
+                    "mime_type": "application/octet-stream",
+                    "data_base64": "A".repeat(encoded_size)
+                }
+            ]
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("WebSocket attachment uploads are limited"));
+    assert!(
+        list_session_attachment_records(&state, "default", "thread-1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_recovery_ws_method_recovers_rollout_file() {
     let sandbox = unique_test_dir("session-recovery-ws");
     let workspace = sandbox.join("workspace");

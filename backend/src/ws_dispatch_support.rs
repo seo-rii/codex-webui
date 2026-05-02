@@ -542,6 +542,30 @@ pub(crate) async fn execute_ws_method(
                 .get("files")
                 .cloned()
                 .ok_or_else(|| anyhow!("files is required"))?;
+            let effective_ws_upload_limit = max_total_attachment_upload_bytes(&state.config)
+                .min(WS_ATTACHMENT_UPLOAD_MAX_DECODED_BYTES);
+            let mut estimated_decoded_total = 0_u64;
+            if let Some(entries) = files.as_array() {
+                for entry in entries {
+                    let Some(data_base64) = entry
+                        .get("data_base64")
+                        .or_else(|| entry.get("dataBase64"))
+                        .and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    let estimated_decoded_size =
+                        ((data_base64.len() as u64).saturating_add(3) / 4).saturating_mul(3);
+                    estimated_decoded_total =
+                        estimated_decoded_total.saturating_add(estimated_decoded_size);
+                    if estimated_decoded_total > effective_ws_upload_limit {
+                        return Err(anyhow!(
+                            "WebSocket attachment uploads are limited to {}. Use the HTTP upload endpoint for larger files.",
+                            human_readable_byte_limit(effective_ws_upload_limit)
+                        ));
+                    }
+                }
+            }
             let files: Vec<UploadFilePayload> = serde_json::from_value(files)?;
             upload_attachments(state, &auth.profile_id, &session_id, files)
                 .await

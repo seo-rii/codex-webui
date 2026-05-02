@@ -1,5 +1,7 @@
 use super::*;
 
+const UI_STATE_SCHEMA_VERSION: u64 = 1;
+
 pub(crate) fn default_notification_settings_value() -> Value {
     json!({
         "enabledEventTypes": [
@@ -15,6 +17,7 @@ pub(crate) fn default_notification_settings_value() -> Value {
 
 fn default_ui_state_value() -> Value {
     json!({
+        "schemaVersion": UI_STATE_SCHEMA_VERSION,
         "global": {
             "shutdownAfterQueueCompletes": false,
             "shutdownAfterQueueCompletesPrimed": false,
@@ -49,6 +52,10 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
         *ui_state = default_ui_state_value();
         return;
     };
+
+    if root.get("schemaVersion").and_then(Value::as_u64) != Some(UI_STATE_SCHEMA_VERSION) {
+        root.insert("schemaVersion".to_string(), json!(UI_STATE_SCHEMA_VERSION));
+    }
 
     if !root.get("global").is_some_and(Value::is_object) {
         root.insert(

@@ -700,6 +700,29 @@ async fn ui_state_writes_leave_no_atomic_temp_files() {
 }
 
 #[tokio::test]
+async fn ui_state_read_adds_current_schema_version() {
+    let sandbox = unique_test_dir("ui-state-schema-version");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+    fs::write(&ui_state_path, "{}").unwrap();
+
+    let loaded = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .expect("ui state should load");
+
+    assert_eq!(loaded.get("schemaVersion").and_then(Value::as_u64), Some(1));
+    assert!(loaded.get("queuesByThreadId").is_some_and(Value::is_object));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn ui_state_writes_preserve_previous_snapshot() {
     let sandbox = unique_test_dir("ui-state-backup");
     let workspace = sandbox.join("workspace");

@@ -110,6 +110,7 @@ pub(crate) struct PendingServerRequestEntry {
     pub(crate) method: String,
     pub(crate) params: Value,
     pub(crate) created_at: String,
+    pub(crate) created_at_ms: u64,
 }
 
 pub(crate) struct TerminalSession {

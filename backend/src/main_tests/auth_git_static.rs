@@ -1719,6 +1719,55 @@ async fn catalog_cache_prunes_old_entries_at_cap() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_server_requests_are_capped_per_session() {
+    let sandbox = unique_test_dir("pending-server-request-cap");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let runtime_key = runtime_session_key("default", "thread-1");
+
+    {
+        let mut pending = state.pending_server_requests.lock().await;
+        let entries = pending.entry(runtime_key.clone()).or_default();
+        for index in 0..PENDING_SERVER_REQUEST_MAX_PER_SESSION {
+            entries.insert(
+                format!("request-{index}"),
+                PendingServerRequestEntry {
+                    raw_id: json!(format!("request-{index}")),
+                    method: "item/commandExecution/requestApproval".to_string(),
+                    params: json!({ "threadId": "thread-1" }),
+                    created_at: index.to_string(),
+                    created_at_ms: index as u64,
+                },
+            );
+        }
+    }
+
+    handle_profile_server_request(
+        &state,
+        "default",
+        &backend::codex_app_server::AppServerRequest {
+            id: json!("request-new"),
+            method: "item/commandExecution/requestApproval".to_string(),
+            params: json!({ "threadId": "thread-1" }),
+        },
+    )
+    .await;
+
+    let pending = state.pending_server_requests.lock().await;
+    let entries = pending
+        .get(&runtime_key)
+        .expect("pending request bucket should exist");
+    assert!(entries.len() <= PENDING_SERVER_REQUEST_MAX_PER_SESSION);
+    assert!(entries.contains_key("request-new"));
+    assert!(!entries.contains_key("request-0"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_stage_and_unstage_treat_file_path_as_literal_pathspec() {
     let sandbox = unique_test_dir("git-literal-pathspec");
     let workspace = sandbox.join("workspace");

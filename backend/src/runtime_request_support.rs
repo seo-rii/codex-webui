@@ -115,21 +115,35 @@ pub(crate) async fn handle_profile_server_request(
         resolve_runtime_profile_entry(&state.config, profile_id).0,
         &session_id,
     );
-    state
-        .pending_server_requests
-        .lock()
-        .await
-        .entry(runtime_key)
-        .or_default()
-        .insert(
+    let created_at_ms = now_unix_ms();
+    {
+        let mut pending_requests = state.pending_server_requests.lock().await;
+        let entries = pending_requests.entry(runtime_key).or_default();
+        entries.insert(
             request_id.clone(),
             PendingServerRequestEntry {
                 raw_id: request.id.clone(),
                 method: request.method.clone(),
                 params: request.params.clone(),
                 created_at: now_rfc3339(),
+                created_at_ms,
             },
         );
+        if entries.len() > PENDING_SERVER_REQUEST_MAX_PER_SESSION {
+            let mut ordered = entries
+                .iter()
+                .filter(|(id, _)| id.as_str() != request_id)
+                .map(|(id, pending)| (id.clone(), pending.created_at_ms))
+                .collect::<Vec<_>>();
+            ordered.sort_by_key(|(_, created_at)| *created_at);
+            for (id, _) in ordered {
+                if entries.len() <= PENDING_SERVER_REQUEST_MAX_PER_SESSION {
+                    break;
+                }
+                entries.remove(&id);
+            }
+        }
+    }
 
     emit_session_notification(
         state,

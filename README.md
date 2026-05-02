@@ -296,6 +296,7 @@ See [.env.example](./.env.example) for a concise example set.
 - Leave cookies on `SameSite=Strict` unless you explicitly need cross-site browser sessions.
 - Run behind HTTPS in production.
 - Leave `CODEX_WEBUI_TRUST_PROXY_HEADERS` unset unless the gateway only receives traffic from a trusted reverse proxy that controls `X-Forwarded-*` headers. When enabling it behind a non-loopback proxy, set `CODEX_WEBUI_TRUSTED_PROXY_CIDRS`.
+- Externally bound deployments reject unsafe HTTP mutations that omit `Origin`; keep API clients on loopback or send a trusted Origin.
 - WebSocket upgrades check `Origin` against same-origin or configured CORS origins; do not rely on HTTP CORS alone when exposing the gateway.
 - Login and JSON mutation bodies are size-limited, attachment uploads are streamed with per-file/request caps, and large file/diff previews are bounded.
 - User-facing HTTP and WebSocket errors redact common token-shaped values and the host user's home directory; detailed diagnostics go to server logs instead.

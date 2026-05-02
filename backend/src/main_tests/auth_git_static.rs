@@ -582,8 +582,30 @@ async fn unsafe_http_api_mutations_reject_cross_origin_requests() {
         .header(header::ORIGIN, "http://127.0.0.1:4173")
         .body(Body::from("{}"))
         .unwrap();
-    let response = handle_http(State(state), CookieJar::new(), same_origin).await;
+    let response = handle_http(State(state.clone()), CookieJar::new(), same_origin).await;
     assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+    let no_origin_loopback = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::HOST, "127.0.0.1:4173")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = handle_http(State(state.clone()), CookieJar::new(), no_origin_loopback).await;
+    assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+    let mut external_state = state.clone();
+    let mut external_config = (*external_state.config).clone();
+    external_config.public_host = "0.0.0.0".to_string();
+    external_state.config = Arc::new(external_config);
+    let no_origin_external = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::HOST, "example.com")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = handle_http(State(external_state), CookieJar::new(), no_origin_external).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     let _ = fs::remove_dir_all(sandbox);
 }

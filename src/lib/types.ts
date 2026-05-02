@@ -337,6 +337,7 @@ export type AppConfigPayload = {
   startup: {
     pausedQueues: StartupPausedQueueAlert[];
     scheduledShutdown: StartupScheduledShutdownAlert | null;
+    scheduledShutdownBlockedReason?: "queuedWork" | "activeWork" | string | null;
   };
   notifications: {
     unreadCount: number;

@@ -101,10 +101,32 @@ pub(crate) async fn clear_scheduled_shutdown(state: &AppState, profile_id: &str)
             ));
         };
         global.insert("scheduledShutdown".to_string(), Value::Null);
+        global.insert("scheduledShutdownBlockedReason".to_string(), Value::Null);
         Ok(())
     })
     .await;
     emit_runtime_profile_config_updated(state, profile_id).await;
+}
+
+async fn set_scheduled_shutdown_blocked_reason(
+    state: &AppState,
+    profile_id: &str,
+    reason: Option<&str>,
+) {
+    let _ = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(global) = ui_state.get_mut("global").and_then(Value::as_object_mut) else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "global state is missing",
+            ));
+        };
+        global.insert(
+            "scheduledShutdownBlockedReason".to_string(),
+            reason.map(Value::from).unwrap_or(Value::Null),
+        );
+        Ok(())
+    })
+    .await;
 }
 
 pub(crate) async fn cancel_scheduled_shutdown_for_activity(state: &AppState, profile_id: &str) {
@@ -172,6 +194,7 @@ pub(crate) async fn execute_scheduled_shutdown(state: &AppState, profile_id: &st
             ));
         };
         global.insert("scheduledShutdown".to_string(), Value::Null);
+        global.insert("scheduledShutdownBlockedReason".to_string(), Value::Null);
         Ok(())
     })
     .await;
@@ -303,9 +326,14 @@ pub(crate) async fn maybe_schedule_global_shutdown(
         arm_scheduled_shutdown(state, profile_id, scheduled_shutdown).await;
         return;
     }
-    if has_outstanding_queued_work(state, profile_id).await
-        || has_active_work_across_threads(state, profile_id).await
-    {
+    if has_outstanding_queued_work(state, profile_id).await {
+        set_scheduled_shutdown_blocked_reason(state, profile_id, Some("queuedWork")).await;
+        emit_runtime_profile_config_updated(state, profile_id).await;
+        return;
+    }
+    if has_active_work_across_threads(state, profile_id).await {
+        set_scheduled_shutdown_blocked_reason(state, profile_id, Some("activeWork")).await;
+        emit_runtime_profile_config_updated(state, profile_id).await;
         return;
     }
 
@@ -322,6 +350,7 @@ pub(crate) async fn maybe_schedule_global_shutdown(
             ));
         };
         global.insert("scheduledShutdown".to_string(), scheduled_shutdown.clone());
+        global.insert("scheduledShutdownBlockedReason".to_string(), Value::Null);
         Ok(())
     })
     .await

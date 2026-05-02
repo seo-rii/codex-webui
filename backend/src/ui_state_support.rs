@@ -18,7 +18,8 @@ fn default_ui_state_value() -> Value {
         "global": {
             "shutdownAfterQueueCompletes": false,
             "shutdownAfterQueueCompletesPrimed": false,
-            "scheduledShutdown": Value::Null
+            "scheduledShutdown": Value::Null,
+            "scheduledShutdownBlockedReason": Value::Null
         },
         "notifications": {
             "items": [],
@@ -55,7 +56,8 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
             json!({
                 "shutdownAfterQueueCompletes": false,
                 "shutdownAfterQueueCompletesPrimed": false,
-                "scheduledShutdown": Value::Null
+                "scheduledShutdown": Value::Null,
+                "scheduledShutdownBlockedReason": Value::Null
             }),
         );
     }
@@ -69,6 +71,12 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
                 "shutdownAfterQueueCompletesPrimed".to_string(),
                 json!(false),
             );
+        }
+        if !global
+            .get("scheduledShutdownBlockedReason")
+            .is_some_and(|value| value.is_null() || value.is_string())
+        {
+            global.insert("scheduledShutdownBlockedReason".to_string(), Value::Null);
         }
     }
 

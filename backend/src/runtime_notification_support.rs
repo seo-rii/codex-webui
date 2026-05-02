@@ -255,7 +255,7 @@ async fn send_notification_webhook_with_retries(
 
 pub(crate) async fn emit_runtime_profile_config_updated(state: &AppState, profile_id: &str) {
     let (shutdown_available, _) = system_shutdown_capability(&state.config).await;
-    let (shutdown_after_queue_completes, scheduled_shutdown) =
+    let (shutdown_after_queue_completes, scheduled_shutdown, scheduled_shutdown_blocked_reason) =
         match with_ui_state_read(state, profile_id, |ui_state| {
             Ok((
                 ui_state
@@ -266,6 +266,11 @@ pub(crate) async fn emit_runtime_profile_config_updated(state: &AppState, profil
                 ui_state
                     .get("global")
                     .and_then(|value| value.get("scheduledShutdown"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                ui_state
+                    .get("global")
+                    .and_then(|value| value.get("scheduledShutdownBlockedReason"))
                     .cloned()
                     .unwrap_or(Value::Null),
             ))
@@ -303,7 +308,8 @@ pub(crate) async fn emit_runtime_profile_config_updated(state: &AppState, profil
             },
             "startup": {
                 "pausedQueues": paused_queues,
-                "scheduledShutdown": next_scheduled_shutdown
+                "scheduledShutdown": next_scheduled_shutdown,
+                "scheduledShutdownBlockedReason": scheduled_shutdown_blocked_reason
             }
         }),
     )
@@ -599,6 +605,7 @@ pub(crate) async fn restore_persisted_shutdown_state(
                 json!(false),
             );
             global.insert("scheduledShutdown".to_string(), Value::Null);
+            global.insert("scheduledShutdownBlockedReason".to_string(), Value::Null);
             Ok(())
         })
         .await?;
@@ -642,6 +649,7 @@ pub(crate) async fn restore_persisted_shutdown_state(
                 json!(false),
             );
             global.insert("scheduledShutdown".to_string(), Value::Null);
+            global.insert("scheduledShutdownBlockedReason".to_string(), Value::Null);
             Ok(())
         })
         .await?;

@@ -301,6 +301,11 @@ pub(crate) async fn get_config_payload(state: &AppState, profile_id: &str) -> Ap
                     .and_then(|value| value.get("scheduledShutdown"))
                     .cloned()
                     .unwrap_or(Value::Null),
+                ui_state
+                    .get("global")
+                    .and_then(|value| value.get("scheduledShutdownBlockedReason"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
             ))
         }),
     );
@@ -324,6 +329,7 @@ pub(crate) async fn get_config_payload(state: &AppState, profile_id: &str) -> Ap
         notification_settings,
         shutdown_after_queue_completes,
         scheduled_shutdown,
+        scheduled_shutdown_blocked_reason,
     ) = ui_state_result?;
 
     let next_scheduled_shutdown = if shutdown_available
@@ -396,7 +402,8 @@ pub(crate) async fn get_config_payload(state: &AppState, profile_id: &str) -> Ap
         },
         "startup": {
             "pausedQueues": paused_queues,
-            "scheduledShutdown": next_scheduled_shutdown
+            "scheduledShutdown": next_scheduled_shutdown,
+            "scheduledShutdownBlockedReason": scheduled_shutdown_blocked_reason
         },
         "notifications": {
             "unreadCount": notifications.get("unreadCount").cloned().unwrap_or_else(|| json!(0)),

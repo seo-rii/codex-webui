@@ -18,13 +18,13 @@ pub(crate) async fn subscribe_session(
             match receiver.recv().await {
                 Ok(event) => {
                     if stream_out_tx
-                        .send(ServerEnvelope::Event {
+                        .try_send(ServerEnvelope::Event {
                             session_id: session_key.clone(),
                             event,
                         })
-                        .await
                         .is_err()
                     {
+                        warn!("dropping session subscription for slow websocket client");
                         break;
                     }
                 }
@@ -76,13 +76,13 @@ pub(crate) async fn subscribe_terminal(
             match receiver.recv().await {
                 Ok(event) => {
                     if out_tx
-                        .send(ServerEnvelope::TerminalEvent {
+                        .try_send(ServerEnvelope::TerminalEvent {
                             terminal_id: terminal_key.clone(),
                             event,
                         })
-                        .await
                         .is_err()
                     {
+                        warn!("dropping terminal subscription for slow websocket client");
                         break;
                     }
                 }
@@ -116,10 +116,10 @@ pub(crate) async fn subscribe_global(
             match receiver.recv().await {
                 Ok(event) => {
                     if out_tx
-                        .send(ServerEnvelope::GlobalEvent { event })
-                        .await
+                        .try_send(ServerEnvelope::GlobalEvent { event })
                         .is_err()
                     {
+                        warn!("dropping global subscription for slow websocket client");
                         break;
                     }
                 }

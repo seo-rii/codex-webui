@@ -219,6 +219,39 @@ async fn owner_config_blocks_admin_from_owner_only_websocket_methods() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_profile_request_slots_are_bounded() {
+    let sandbox = unique_test_dir("ws-profile-slots");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+
+    let mut permits = Vec::new();
+    for _ in 0..WS_MAX_PROFILE_CONCURRENT_REQUESTS {
+        permits.push(
+            try_acquire_profile_ws_request_slot(&state, "default")
+                .await
+                .expect("slot should be available within profile limit"),
+        );
+    }
+    assert!(
+        try_acquire_profile_ws_request_slot(&state, "default")
+            .await
+            .is_none()
+    );
+
+    permits.pop();
+    assert!(
+        try_acquire_profile_ws_request_slot(&state, "default")
+            .await
+            .is_some()
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn external_or_configured_owner_modes_require_owner_role_for_owner_actions() {
     let sandbox = unique_test_dir("owner-secure-mode");

@@ -30,6 +30,7 @@ pub(crate) struct AppState {
     pub(crate) pinned_git_repositories: Arc<Mutex<HashMap<String, Value>>>,
     pub(crate) git_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub(crate) inflight_requests: Arc<Mutex<HashMap<String, InflightRequest>>>,
+    pub(crate) profile_request_slots: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     pub(crate) quota_cache: Arc<Mutex<HashMap<String, CachedQuota>>>,
     pub(crate) relays: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
     pub(crate) terminals: Arc<Mutex<HashMap<String, Arc<TerminalSession>>>>,

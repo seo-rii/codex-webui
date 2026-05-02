@@ -138,6 +138,20 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
     writer.abort();
 }
 
+pub(crate) async fn try_acquire_profile_ws_request_slot(
+    state: &AppState,
+    profile_id: &str,
+) -> Option<OwnedSemaphorePermit> {
+    let slots = {
+        let mut profile_slots = state.profile_request_slots.lock().await;
+        profile_slots
+            .entry(profile_id.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(WS_MAX_PROFILE_CONCURRENT_REQUESTS)))
+            .clone()
+    };
+    slots.try_acquire_owned().ok()
+}
+
 async fn handle_ws_message(
     state: &AppState,
     out_tx: &mpsc::Sender<ServerEnvelope>,
@@ -207,6 +221,25 @@ async fn handle_ws_message(
                     return Ok(());
                 }
             }
+
+            let Some(_profile_permit) =
+                try_acquire_profile_ws_request_slot(state, &auth.profile_id).await
+            else {
+                resolve_inflight_request(
+                    state,
+                    &request_key,
+                    ServerEnvelope::Response {
+                        id,
+                        ok: false,
+                        result: None,
+                        error: Some(
+                            "Too many concurrent websocket requests for this profile.".to_string(),
+                        ),
+                    },
+                )
+                .await;
+                return Ok(());
+            };
 
             let audit_target = summarize_audit_target(&params);
             let started_at = Instant::now();

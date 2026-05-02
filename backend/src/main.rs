@@ -47,7 +47,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     runtime::Builder as TokioRuntimeBuilder,
-    sync::{Mutex, broadcast, mpsc},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc},
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -267,6 +267,7 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             pinned_git_repositories: Arc::new(Mutex::new(HashMap::new())),
             git_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             inflight_requests: Arc::new(Mutex::new(HashMap::new())),
+            profile_request_slots: Arc::new(Mutex::new(HashMap::new())),
             quota_cache: Arc::new(Mutex::new(HashMap::new())),
             relays: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),

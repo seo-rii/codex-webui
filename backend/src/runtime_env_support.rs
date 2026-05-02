@@ -152,57 +152,41 @@ pub(crate) async fn run_command_with_timeout(
     {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(error)) => {
-            #[cfg(unix)]
-            if let Some(pid) = child_pid {
-                let group = format!("-{pid}");
-                let _ = Command::new("kill")
-                    .args(["-TERM", "--", group.as_str()])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                let _ = Command::new("kill")
-                    .args(["-KILL", "--", group.as_str()])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .await;
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            terminate_child_process_group(&mut child, child_pid).await;
             Err(error).with_context(|| format!("failed to wait for `{command}`"))
         }
         Err(_) => {
-            #[cfg(unix)]
-            if let Some(pid) = child_pid {
-                let group = format!("-{pid}");
-                let _ = Command::new("kill")
-                    .args(["-TERM", "--", group.as_str()])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                let _ = Command::new("kill")
-                    .args(["-KILL", "--", group.as_str()])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .await;
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            terminate_child_process_group(&mut child, child_pid).await;
             Err(anyhow!("`{command}` timed out"))
         }
     }
 }
 
-async fn read_child_pipe_limited<R>(mut reader: R, label: &str) -> Result<Vec<u8>>
+pub(crate) async fn terminate_child_process_group(child: &mut Child, child_pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = child_pid {
+        let group = format!("-{pid}");
+        let _ = Command::new("kill")
+            .args(["-TERM", "--", group.as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", group.as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+pub(crate) async fn read_child_pipe_limited<R>(mut reader: R, label: &str) -> Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {

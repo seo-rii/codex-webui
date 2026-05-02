@@ -52,8 +52,12 @@ async fn run_gh_text_payload(repo_path: &str, args: Vec<String>) -> ApiResult<St
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
 
-    let child = command.spawn().map_err(|error| {
+    let mut child = command.spawn().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             api_error(
                 StatusCode::BAD_REQUEST,
@@ -63,11 +67,49 @@ async fn run_gh_text_payload(repo_path: &str, args: Vec<String>) -> ApiResult<St
             api_error(StatusCode::BAD_REQUEST, error.to_string())
         }
     })?;
+    let child_pid = child.id();
+    let stdout = child.stdout.take().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "failed to capture gh command stdout.",
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "failed to capture gh command stderr.",
+        )
+    })?;
 
-    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
-        .await
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "`gh` timed out"))?
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let output = match tokio::time::timeout(Duration::from_secs(30), async {
+        let (status, stdout, stderr) = tokio::try_join!(
+            async {
+                child
+                    .wait()
+                    .await
+                    .with_context(|| "failed to wait for gh command")
+            },
+            read_child_pipe_limited(stdout, "stdout"),
+            read_child_pipe_limited(stderr, "stderr")
+        )?;
+        Result::<std::process::Output>::Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            terminate_child_process_group(&mut child, child_pid).await;
+            return Err(api_error(StatusCode::BAD_REQUEST, error.to_string()));
+        }
+        Err(_) => {
+            terminate_child_process_group(&mut child, child_pid).await;
+            return Err(api_error(StatusCode::BAD_REQUEST, "`gh` timed out"));
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

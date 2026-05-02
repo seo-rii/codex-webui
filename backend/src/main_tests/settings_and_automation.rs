@@ -182,6 +182,41 @@ async fn command_runner_rejects_oversized_output() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn command_runner_timeout_kills_spawned_process_group() {
+    let sandbox = unique_test_dir("command-timeout-process-group");
+    fs::create_dir_all(&sandbox).unwrap();
+    let pid_path = sandbox.join("child.pid");
+    let escaped_pid_path = pid_path.to_string_lossy().replace('\'', "'\\''");
+    let script = format!("sleep 30 & echo $! > '{escaped_pid_path}'; wait");
+
+    let error = run_command_with_timeout(
+        "sh",
+        vec!["-c".to_string(), script],
+        Duration::from_millis(150),
+    )
+    .await
+    .expect_err("command should time out");
+
+    assert!(format!("{error:#}").contains("timed out"));
+    let child_pid = fs::read_to_string(&pid_path)
+        .expect("script should write child pid")
+        .trim()
+        .to_string();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let probe = run_command_with_timeout(
+        "kill",
+        vec!["-0".to_string(), child_pid],
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("probe should run");
+    assert!(!probe.status.success());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn rejects_editable_file_writes_through_symlinked_parent() {
     let sandbox = unique_test_dir("editor-symlink-parent");
     let workspace = sandbox.join("workspace");

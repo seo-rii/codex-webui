@@ -52,6 +52,7 @@
       failedInitialize: m.failed_to_initialize_terminal(),
       connecting: m.connecting_to_terminal(),
       loading: m.status_loading(),
+      hostShellWarning: m.terminal_host_shell_warning(),
       attachContext: m.attach_terminal_context(),
       attachRequiresThread: m.terminal_context_requires_thread()
     };
@@ -340,6 +341,10 @@
     <div class="error-banner small">{errorText}</div>
   {/if}
 
+  <div class="terminal-shell__safety-note" role="note">
+    {ui.hostShellWarning}
+  </div>
+
   <div class="terminal-shell__body">
     {#if loading}
       <div class="placeholder-card">{ui.connecting}</div>
@@ -371,8 +376,8 @@
 <style>
   .terminal-shell {
     display: grid;
-    grid-template-rows: auto minmax(0, 1fr) auto;
-    gap: 1rem;
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    gap: 0.75rem;
     min-height: 0;
     overflow: hidden;
     padding: 1rem;
@@ -439,6 +444,15 @@
 
   .terminal-shell__attach-button:not(:disabled):active {
     transform: scale(0.99);
+  }
+
+  .terminal-shell__safety-note {
+    border: 1px solid color-mix(in srgb, var(--accent, #d85e2a) 24%, var(--line));
+    border-radius: 0.9rem;
+    background: color-mix(in srgb, var(--accent, #d85e2a) 7%, var(--panel-soft));
+    color: color-mix(in srgb, var(--ink) 86%, var(--accent, #d85e2a));
+    padding: 0.48rem 0.65rem;
+    font: 650 0.73rem/1.35 var(--font-ui);
   }
 
   .terminal-shell__body {

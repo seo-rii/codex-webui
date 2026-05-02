@@ -150,6 +150,7 @@
   "connecting_to_terminal": "Connecting to terminal...",
   "failed_to_send_terminal_input": "Failed to send terminal input.",
   "failed_to_initialize_terminal": "Failed to initialize terminal.",
+  "terminal_host_shell_warning": "This terminal runs as the server user on the host. Avoid pasting commands you do not trust.",
   "status_loading": "loading",
   "exit_code": "exit {code}",
   "git": "Git",

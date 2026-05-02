@@ -150,6 +150,7 @@
   "connecting_to_terminal": "터미널에 연결하는 중...",
   "failed_to_send_terminal_input": "터미널 입력 전송에 실패했습니다.",
   "failed_to_initialize_terminal": "터미널 초기화에 실패했습니다.",
+  "terminal_host_shell_warning": "이 터미널은 서버 호스트의 사용자 권한으로 실행됩니다. 신뢰하지 않는 명령은 붙여넣지 마세요.",
   "status_loading": "불러오는 중",
   "exit_code": "종료 코드 {code}",
   "git": "Git",

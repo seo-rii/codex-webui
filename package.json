@@ -30,6 +30,7 @@
     "build:cross": "node ./scripts/build-cross.mjs",
     "verify:api-parity": "node ./scripts/verify-api-parity.mjs",
     "verify:static-build": "node ./scripts/verify-static-build.mjs",
+    "verify:security-regressions": "node ./scripts/verify-security-regressions.mjs",
     "verify:tunnel-safety": "node ./scripts/verify-tunnel-safety.mjs",
     "gateway:dev": "cargo run --manifest-path backend/Cargo.toml",
     "gateway:check": "cargo check --manifest-path backend/Cargo.toml",

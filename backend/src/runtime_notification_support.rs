@@ -190,32 +190,41 @@ async fn deliver_notification_webhooks(
         } else {
             "webhookUrl"
         };
-        if let Err(error) =
-            validate_notification_webhook_resolves_public_str(&state.config, &url, field).await
+        let pinned_addrs = match resolve_notification_webhook_public_addrs(
+            &state.config,
+            &url,
+            field,
+        )
+        .await
         {
-            record_notification_webhook_failure(
-                &state,
-                &profile_id,
-                &notification,
-                field,
-                &error.message,
-            )
-            .await;
-            append_runtime_error_log(
-                &state.config,
-                "notification-webhook",
-                "webhook delivery skipped invalid URL",
-                json!({
-                    "profileId": profile_id,
-                    "notificationId": notification.get("id").cloned().unwrap_or(Value::Null),
-                    "eventType": notification.get("type").cloned().unwrap_or(Value::Null),
-                    "field": field,
-                    "error": redact_user_facing_error(&error.message)
-                }),
-            );
-            continue;
-        }
-        if let Err(error) = send_notification_webhook_with_retries(&state, &url, &payload).await {
+            Ok(pinned_addrs) => pinned_addrs,
+            Err(error) => {
+                record_notification_webhook_failure(
+                    &state,
+                    &profile_id,
+                    &notification,
+                    field,
+                    &error.message,
+                )
+                .await;
+                append_runtime_error_log(
+                    &state.config,
+                    "notification-webhook",
+                    "webhook delivery skipped invalid URL",
+                    json!({
+                        "profileId": profile_id,
+                        "notificationId": notification.get("id").cloned().unwrap_or(Value::Null),
+                        "eventType": notification.get("type").cloned().unwrap_or(Value::Null),
+                        "field": field,
+                        "error": redact_user_facing_error(&error.message)
+                    }),
+                );
+                continue;
+            }
+        };
+        if let Err(error) =
+            send_notification_webhook_with_retries(&state, &url, &payload, pinned_addrs).await
+        {
             record_notification_webhook_failure(
                 &state,
                 &profile_id,
@@ -244,13 +253,25 @@ async fn send_notification_webhook_with_retries(
     state: &AppState,
     url: &str,
     payload: &Value,
+    pinned_addrs: Option<(String, Vec<std::net::SocketAddr>)>,
 ) -> Result<()> {
+    let http = if let Some((host, addrs)) = pinned_addrs {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .resolve_to_addrs(&host, &addrs)
+            .build()
+            .context("failed to build pinned webhook client")?
+    } else {
+        state.http.clone()
+    };
     let mut last_error: Option<anyhow::Error> = None;
     for (attempt, delay_ms) in [0_u64, 500, 2_000].into_iter().enumerate() {
         if delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
-        match state.http.post(url).json(payload).send().await {
+        match http.post(url).json(payload).send().await {
             Ok(response) if response.status().is_success() => return Ok(()),
             Ok(response) => {
                 last_error = Some(anyhow!(

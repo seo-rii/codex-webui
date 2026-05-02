@@ -465,6 +465,28 @@ async fn notification_settings_enforce_webhook_host_allowlist() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notification_webhook_resolution_skips_dns_pinning_for_literal_public_ip() {
+    let sandbox = unique_test_dir("notifications-webhook-literal-ip");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+
+    let pinned = resolve_notification_webhook_public_addrs(
+        &state.config,
+        "https://93.184.216.34/hook",
+        "webhookUrl",
+    )
+    .await
+    .expect("public literal IP should pass URL policy without DNS lookup");
+
+    assert!(pinned.is_none());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test]
 async fn notification_webhook_failures_are_persisted_in_profile_state() {
     let sandbox = unique_test_dir("notification-webhook-failure-history");

@@ -431,11 +431,11 @@ pub(crate) fn notification_webhook_ip_is_private_or_local(ip: std::net::IpAddr) 
         }
 }
 
-pub(crate) async fn validate_notification_webhook_resolves_public_str(
+pub(crate) async fn resolve_notification_webhook_public_addrs(
     config: &Config,
     raw: &str,
     field: &str,
-) -> ApiResult<()> {
+) -> ApiResult<Option<(String, Vec<std::net::SocketAddr>)>> {
     validate_notification_webhook_url_str(raw, field)?;
     validate_notification_webhook_host_allowlist(config, raw, field)?;
     let url = reqwest::Url::parse(raw).map_err(|_| {
@@ -451,7 +451,7 @@ pub(crate) async fn validate_notification_webhook_resolves_public_str(
         ));
     };
     if host.parse::<std::net::IpAddr>().is_ok() {
-        return Ok(());
+        return Ok(None);
     }
     let port = url.port_or_known_default().unwrap_or(443);
     let resolved = tokio::time::timeout(
@@ -472,6 +472,7 @@ pub(crate) async fn validate_notification_webhook_resolves_public_str(
         )
     })?;
     let mut saw_address = false;
+    let mut public_addrs = Vec::new();
     for socket_addr in resolved {
         saw_address = true;
         if notification_webhook_ip_is_private_or_local(socket_addr.ip()) {
@@ -480,6 +481,7 @@ pub(crate) async fn validate_notification_webhook_resolves_public_str(
                 format!("{field} resolves to a private or local address."),
             ));
         }
+        public_addrs.push(socket_addr);
     }
     if !saw_address {
         return Err(api_error(
@@ -487,5 +489,5 @@ pub(crate) async fn validate_notification_webhook_resolves_public_str(
             format!("{field} host could not be resolved."),
         ));
     }
-    Ok(())
+    Ok(Some((host.to_string(), public_addrs)))
 }

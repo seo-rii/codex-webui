@@ -134,6 +134,39 @@ async fn revoked_auth_cookie_is_rejected_server_side() {
 }
 
 #[test]
+fn persisted_auth_revocation_file_is_loaded_on_first_auth_check() {
+    let sandbox = unique_test_dir("auth-cookie-revocation-reload");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let jar = issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Admin).unwrap();
+    let token = jar.get(AUTH_COOKIE).unwrap().value();
+    let token_parts = token.split('.').collect::<Vec<_>>();
+    let expires = token_parts[1].parse::<u128>().unwrap();
+    let nonce = token_parts[3];
+    fs::create_dir_all(&state.config.data_dir).unwrap();
+    fs::write(
+        state.config.data_dir.join("auth-revocations.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "nonce": nonce,
+                "expires": expires,
+                "revokedAt": now_millis()
+            }))
+            .unwrap()
+        ),
+    )
+    .unwrap();
+
+    assert!(auth_context(&state.config, &jar).is_none());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[test]
 fn public_host_rejects_plaintext_password_env_values() {
     let sandbox = unique_test_dir("public-host-plaintext-passwords");
     let workspace = sandbox.join("workspace");

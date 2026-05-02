@@ -302,6 +302,56 @@ async fn attachment_cleanup_removes_orphan_files_and_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_cleanup_retains_recent_orphans_until_min_age() {
+    let sandbox = unique_test_dir("attachment-cleanup-retention");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let runtime_profile = resolve_runtime_profile(&state.config, "default");
+    let uploads_dir = runtime_profile.data_dir.join("uploads").join("thread-1");
+    fs::create_dir_all(&uploads_dir).unwrap();
+    let recent_orphan_file = uploads_dir.join("recent-orphan.bin");
+    let recent_orphan_meta = uploads_dir.join("att-recent-missing.bin.json");
+    fs::write(&recent_orphan_file, "orphan").unwrap();
+    fs::write(
+        &recent_orphan_meta,
+        serde_json::to_vec(&json!({
+            "id": "att-recent",
+            "originalName": "missing.bin",
+            "path": uploads_dir.join("missing.bin").display().to_string(),
+            "mimeType": "application/octet-stream",
+            "size": 6,
+            "kind": "file",
+            "createdAt": "1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let retained =
+        cleanup_attachment_orphans_payload(&state, "default", false, 24 * 60 * 60 * 1000)
+            .await
+            .unwrap();
+    assert_eq!(retained.get("orphanFiles").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        retained.get("orphanMetadata").and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        retained.get("removedPaths").and_then(Value::as_u64),
+        Some(0)
+    );
+    assert!(recent_orphan_file.exists());
+    assert!(recent_orphan_meta.exists());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_attachments_store_files_without_internal_backend() {
     let sandbox = unique_test_dir("attachment-upload-rust");
     let workspace = sandbox.join("workspace");

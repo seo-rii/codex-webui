@@ -93,6 +93,20 @@ pub(crate) fn ensure_not_sensitive_file_path(path: &Path) -> ApiResult<()> {
     Ok(())
 }
 
+fn ensure_codex_home_file_policy(codex_home: &Path, candidate: &Path) -> ApiResult<()> {
+    if !path_is_within(codex_home, candidate) {
+        return Ok(());
+    }
+    let config_path = normalize_path(codex_home.join("config.toml"));
+    if candidate == config_path {
+        return Ok(());
+    }
+    Err(api_error(
+        StatusCode::FORBIDDEN,
+        "Only config.toml is editable inside CODEX_HOME.",
+    ))
+}
+
 pub(crate) async fn list_directories_payload(
     state: &AppState,
     current_path: Option<&str>,
@@ -190,10 +204,13 @@ pub(crate) async fn resolve_editable_file_path(
     let candidate = resolve_input_path(&state.config.project_root, file_path);
     ensure_not_sensitive_file_path(&candidate)?;
     let existing = tokio_fs::canonicalize(&candidate).await.ok();
-    let path_to_check = existing.unwrap_or_else(|| candidate.clone());
+    let path_to_check = normalize_path(existing.unwrap_or_else(|| candidate.clone()));
     ensure_not_sensitive_file_path(&path_to_check)?;
 
     let roots = editable_file_roots(state, profile_id).await;
+    let profile_codex_home =
+        real_path_safe(&resolve_runtime_profile(&state.config, profile_id).codex_home).await;
+    ensure_codex_home_file_policy(&profile_codex_home, &path_to_check)?;
 
     if !roots
         .iter()

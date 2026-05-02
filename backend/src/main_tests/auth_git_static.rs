@@ -480,9 +480,12 @@ fn websocket_origin_allows_same_origin_and_configured_cors_only() {
         header::ORIGIN,
         HeaderValue::from_static("http://127.0.0.1:4173"),
     );
+    let loopback_peer: SocketAddr = "127.0.0.1:51234".parse().unwrap();
+    let remote_peer: SocketAddr = "203.0.113.10:51234".parse().unwrap();
     assert!(websocket_origin_allowed(
         &state.config,
-        &same_origin_headers
+        &same_origin_headers,
+        Some(loopback_peer)
     ));
 
     let mut forwarded_https_headers = same_origin_headers.clone();
@@ -491,21 +494,43 @@ fn websocket_origin_allows_same_origin_and_configured_cors_only() {
         HeaderValue::from_static("https://127.0.0.1:4173"),
     );
     forwarded_https_headers.insert("x-forwarded-proto", HeaderValue::from_static("https, http"));
-    assert!(!request_is_secure(&state.config, &forwarded_https_headers));
+    assert!(!request_is_secure(
+        &state.config,
+        &forwarded_https_headers,
+        Some(loopback_peer)
+    ));
     assert!(!websocket_origin_allowed(
         &state.config,
-        &forwarded_https_headers
+        &forwarded_https_headers,
+        Some(loopback_peer)
     ));
 
     let mut trusted_proxy_config = (*state.config).clone();
     trusted_proxy_config.trust_proxy_headers = true;
     assert!(request_is_secure(
         &trusted_proxy_config,
-        &forwarded_https_headers
+        &forwarded_https_headers,
+        Some(loopback_peer)
     ));
     assert!(websocket_origin_allowed(
         &trusted_proxy_config,
-        &forwarded_https_headers
+        &forwarded_https_headers,
+        Some(loopback_peer)
+    ));
+    assert!(!request_is_secure(
+        &trusted_proxy_config,
+        &forwarded_https_headers,
+        Some(remote_peer)
+    ));
+
+    trusted_proxy_config.trusted_proxy_cidrs = vec![TrustedProxyNet {
+        addr: "203.0.113.0".parse().unwrap(),
+        prefix: 24,
+    }];
+    assert!(request_is_secure(
+        &trusted_proxy_config,
+        &forwarded_https_headers,
+        Some(remote_peer)
     ));
 
     let mut rejected_headers = same_origin_headers.clone();
@@ -513,12 +538,20 @@ fn websocket_origin_allows_same_origin_and_configured_cors_only() {
         header::ORIGIN,
         HeaderValue::from_static("https://attacker.example"),
     );
-    assert!(!websocket_origin_allowed(&state.config, &rejected_headers));
+    assert!(!websocket_origin_allowed(
+        &state.config,
+        &rejected_headers,
+        Some(loopback_peer)
+    ));
 
     let mut config = (*state.config).clone();
     config.cors_allowed_origins = vec!["https://attacker.example".to_string()];
     state.config = Arc::new(config);
-    assert!(websocket_origin_allowed(&state.config, &rejected_headers));
+    assert!(websocket_origin_allowed(
+        &state.config,
+        &rejected_headers,
+        Some(loopback_peer)
+    ));
 
     let _ = fs::remove_dir_all(sandbox);
 }

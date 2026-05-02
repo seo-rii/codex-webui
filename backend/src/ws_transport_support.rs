@@ -6,11 +6,12 @@ tokio::task_local! {
 
 pub(crate) async fn handle_ws(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     jar: CookieJar,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !websocket_origin_allowed(&state.config, &headers) {
+    if !websocket_origin_allowed(&state.config, &headers, Some(peer_addr)) {
         let mut response =
             (StatusCode::FORBIDDEN, "WebSocket origin is not allowed.").into_response();
         apply_security_headers(response.headers_mut());

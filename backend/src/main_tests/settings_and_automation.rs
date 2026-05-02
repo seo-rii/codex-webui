@@ -81,6 +81,40 @@ async fn rejects_sensitive_editable_files_inside_profile_home() {
 }
 
 #[tokio::test]
+async fn codex_home_editor_access_is_limited_to_config_toml() {
+    let sandbox = unique_test_dir("editor-codex-home-allowlist");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home.clone());
+    let allowed_config = codex_home.join("config.toml");
+    write_editable_file_payload(
+        &state,
+        "default",
+        allowed_config.to_str().unwrap(),
+        "model = 'gpt-5.4'\n",
+    )
+    .await
+    .expect("config.toml should remain editable");
+
+    let other_file = codex_home.join("notes.md");
+    fs::write(&other_file, "# private\n").unwrap();
+    let error = read_editable_file_payload(&state, "default", other_file.to_str().unwrap())
+        .await
+        .expect_err("non-config files in CODEX_HOME must be blocked");
+
+    assert_eq!(error.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        error.message,
+        "Only config.toml is editable inside CODEX_HOME."
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn rejects_oversized_editable_file_previews() {
     let sandbox = unique_test_dir("editor-large-preview");
     let workspace = sandbox.join("workspace");
@@ -310,6 +344,15 @@ async fn notification_settings_reject_local_webhook_urls() {
     assert!(
         validate_notification_webhook_url_str("https://example.com/hook", "webhookUrl").is_ok()
     );
+    assert!(notification_webhook_ip_is_private_or_local(
+        "10.0.0.5".parse().unwrap()
+    ));
+    assert!(notification_webhook_ip_is_private_or_local(
+        "fd00::1".parse().unwrap()
+    ));
+    assert!(!notification_webhook_ip_is_private_or_local(
+        "93.184.216.34".parse().unwrap()
+    ));
 
     let _ = fs::remove_dir_all(sandbox);
 }

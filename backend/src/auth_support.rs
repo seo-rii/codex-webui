@@ -88,8 +88,9 @@ pub(crate) async fn select_profile(
     headers: HeaderMap,
     request: Request,
     auth: AuthContext,
+    peer_addr: Option<SocketAddr>,
 ) -> std::result::Result<Response, String> {
-    let secure_request = request_is_secure(&config, &headers);
+    let secure_request = request_is_secure(&config, &headers, peer_addr);
     let payload = match read_json_body(request, SMALL_JSON_BODY_LIMIT, "profile request body").await
     {
         Ok(payload) => payload,
@@ -187,8 +188,28 @@ pub(crate) fn sign(config: &Config, payload: &str) -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
 }
 
-pub(crate) fn request_is_secure(config: &Config, headers: &HeaderMap) -> bool {
+pub(crate) fn forwarded_headers_allowed(config: &Config, peer_addr: Option<SocketAddr>) -> bool {
     if !config.trust_proxy_headers {
+        return false;
+    }
+    let Some(peer_ip) = peer_addr.map(|addr| addr.ip()) else {
+        return false;
+    };
+    if config.trusted_proxy_cidrs.is_empty() {
+        return peer_ip.is_loopback();
+    }
+    config
+        .trusted_proxy_cidrs
+        .iter()
+        .any(|proxy| proxy.contains(peer_ip))
+}
+
+pub(crate) fn request_is_secure(
+    config: &Config,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+) -> bool {
+    if !forwarded_headers_allowed(config, peer_addr) {
         return false;
     }
     if let Some(forwarded) = headers
@@ -223,11 +244,19 @@ pub(crate) fn allowed_cors_origin(config: &Config, origin: &Option<String>) -> O
     }
 }
 
-pub(crate) fn websocket_origin_allowed(config: &Config, headers: &HeaderMap) -> bool {
-    request_origin_allowed(config, headers)
+pub(crate) fn websocket_origin_allowed(
+    config: &Config,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+) -> bool {
+    request_origin_allowed(config, headers, peer_addr)
 }
 
-pub(crate) fn request_origin_allowed(config: &Config, headers: &HeaderMap) -> bool {
+pub(crate) fn request_origin_allowed(
+    config: &Config,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+) -> bool {
     let Some(origin) = extract_origin(headers) else {
         return true;
     };
@@ -243,7 +272,7 @@ pub(crate) fn request_origin_allowed(config: &Config, headers: &HeaderMap) -> bo
     else {
         return false;
     };
-    let scheme = if request_is_secure(config, headers) {
+    let scheme = if request_is_secure(config, headers, peer_addr) {
         "https"
     } else {
         "http"

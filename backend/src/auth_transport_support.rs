@@ -46,7 +46,7 @@ pub(crate) async fn handle_auth_http(
             let Some(auth) = auth_context(&state.config, &jar) else {
                 return json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
             };
-            select_profile(state.config.clone(), jar, headers, request, auth).await
+            select_profile(state.config.clone(), jar, headers, request, auth, peer_addr).await
         }
         (Method::GET, "/api/auth/session") => {
             let auth = auth_context(&state.config, &jar);
@@ -98,7 +98,7 @@ async fn auth_login(
     request: Request,
     peer_addr: Option<SocketAddr>,
 ) -> std::result::Result<Response, String> {
-    let secure_request = request_is_secure(&state.config, &headers);
+    let secure_request = request_is_secure(&state.config, &headers, peer_addr);
     let body = match read_limited_body(request, SMALL_JSON_BODY_LIMIT, "login request body").await {
         Ok(body) => body,
         Err(error) => return Ok(json_error(error.status, &error.message)),
@@ -108,7 +108,7 @@ async fn auth_login(
         hcaptcha_token: None,
     });
     let password = payload.password.unwrap_or_default();
-    let forwarded_ip = if state.config.trust_proxy_headers {
+    let forwarded_ip = if forwarded_headers_allowed(&state.config, peer_addr) {
         headers
             .get("x-forwarded-for")
             .and_then(|value| value.to_str().ok())

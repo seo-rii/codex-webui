@@ -71,7 +71,7 @@ async fn handle_http_inner(
                     method,
                     Method::POST | Method::PUT | Method::PATCH | Method::DELETE
                 )
-                && !request_origin_allowed(&state.config, &headers)
+                && !request_origin_allowed(&state.config, &headers, peer_addr)
             {
                 return (StatusCode::FORBIDDEN, "Request origin is not allowed.").into_response();
             }

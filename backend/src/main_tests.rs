@@ -92,6 +92,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
             cookie_secure_mode: CookieSecureMode::Auto,
             cors_allowed_origins: Vec::new(),
             trust_proxy_headers: false,
+            trusted_proxy_cidrs: Vec::new(),
             instance_token: None,
             app_server_handoff_enabled: false,
         }),

@@ -190,7 +190,7 @@ async fn deliver_notification_webhooks(
         } else {
             "webhookUrl"
         };
-        if let Err(error) = validate_notification_webhook_url_str(&url, field) {
+        if let Err(error) = validate_notification_webhook_resolves_public_str(&url, field).await {
             append_runtime_error_log(
                 &state.config,
                 "notification-webhook",
@@ -348,7 +348,7 @@ async fn session_has_cached_runtime_activity(state: &AppState, runtime_key: &str
         || state.pending_turn_starts.lock().await.contains(runtime_key)
 }
 
-async fn set_runtime_session_status(
+pub(crate) async fn set_runtime_session_status(
     state: &AppState,
     profile_id: &str,
     session_id: &str,

@@ -295,7 +295,7 @@ See [.env.example](./.env.example) for a concise example set.
 - Set `CODEX_WEBUI_ALLOWED_ROOTS` explicitly and restrict it to the smallest practical set; the gateway does not infer broad fallback roots.
 - Leave cookies on `SameSite=Strict` unless you explicitly need cross-site browser sessions.
 - Run behind HTTPS in production.
-- Leave `CODEX_WEBUI_TRUST_PROXY_HEADERS` unset unless the gateway only receives traffic from a trusted reverse proxy that controls `X-Forwarded-*` headers.
+- Leave `CODEX_WEBUI_TRUST_PROXY_HEADERS` unset unless the gateway only receives traffic from a trusted reverse proxy that controls `X-Forwarded-*` headers. When enabling it behind a non-loopback proxy, set `CODEX_WEBUI_TRUSTED_PROXY_CIDRS`.
 - WebSocket upgrades check `Origin` against same-origin or configured CORS origins; do not rely on HTTP CORS alone when exposing the gateway.
 - Login and JSON mutation bodies are size-limited, attachment uploads are streamed with per-file/request caps, and large file/diff previews are bounded.
 - User-facing HTTP and WebSocket errors redact common token-shaped values and the host user's home directory; detailed diagnostics go to server logs instead.
@@ -305,7 +305,8 @@ See [.env.example](./.env.example) for a concise example set.
 - If `ownerPasswordHash` is configured, host-level controls require owner login rather than ordinary admin login.
 - System shutdown support is disabled by default and must be explicitly enabled.
 - The shutdown control is global to the running server, so all connected clients see the same armed and scheduled state.
-- Notification webhook URLs are validated when settings are saved and again immediately before delivery, so stale or corrupted state cannot silently post to local/private targets.
+- File editor access to `CODEX_HOME` is limited to `config.toml`; broader project files must be under explicit allowed roots.
+- Notification webhook URLs are validated when settings are saved and DNS-checked again immediately before delivery, so stale or corrupted state cannot silently post to local/private targets.
 
 ## Development
 

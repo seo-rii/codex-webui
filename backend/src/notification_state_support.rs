@@ -285,16 +285,7 @@ pub(crate) fn validate_notification_webhook_url_str(raw: &str, field: &str) -> A
         ));
     }
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if ip.is_loopback()
-            || ip.is_unspecified()
-            || ip.is_multicast()
-            || match ip {
-                std::net::IpAddr::V4(value) => value.is_private() || value.is_link_local(),
-                std::net::IpAddr::V6(value) => {
-                    value.is_unique_local() || value.is_unicast_link_local()
-                }
-            }
-        {
+        if notification_webhook_ip_is_private_or_local(ip) {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
                 format!("{field} cannot target a private or local address."),
@@ -313,4 +304,71 @@ fn validate_notification_webhook_url(candidate: Option<&Value>, field: &str) -> 
         return Ok(());
     };
     validate_notification_webhook_url_str(raw, field)
+}
+
+pub(crate) fn notification_webhook_ip_is_private_or_local(ip: std::net::IpAddr) -> bool {
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || match ip {
+            std::net::IpAddr::V4(value) => value.is_private() || value.is_link_local(),
+            std::net::IpAddr::V6(value) => value.is_unique_local() || value.is_unicast_link_local(),
+        }
+}
+
+pub(crate) async fn validate_notification_webhook_resolves_public_str(
+    raw: &str,
+    field: &str,
+) -> ApiResult<()> {
+    validate_notification_webhook_url_str(raw, field)?;
+    let url = reqwest::Url::parse(raw).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("{field} must be a valid URL."),
+        )
+    })?;
+    let Some(host) = url.host_str() else {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("{field} must include a host."),
+        ));
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let port = url.port_or_known_default().unwrap_or(443);
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("{field} DNS lookup timed out."),
+        )
+    })?
+    .map_err(|_| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("{field} host could not be resolved."),
+        )
+    })?;
+    let mut saw_address = false;
+    for socket_addr in resolved {
+        saw_address = true;
+        if notification_webhook_ip_is_private_or_local(socket_addr.ip()) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!("{field} resolves to a private or local address."),
+            ));
+        }
+    }
+    if !saw_address {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("{field} host could not be resolved."),
+        ));
+    }
+    Ok(())
 }

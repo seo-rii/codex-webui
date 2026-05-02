@@ -257,7 +257,9 @@ The trust boundary is narrow:
 - WebSocket upgrades validate Origin separately from HTTP CORS
 - default viewer access is transcript-oriented; code, terminal, audit, config, and Git file reads remain admin-only
 - file reads/writes deny common secret paths and bound preview sizes
-- webhook URLs must use HTTPS and cannot target localhost, `.local`, or private/link-local IP literal targets; delivery revalidates the persisted URL before sending
+- forwarded headers are ignored unless `CODEX_WEBUI_TRUST_PROXY_HEADERS=true` and the peer is loopback or matches `CODEX_WEBUI_TRUSTED_PROXY_CIDRS`
+- file reads/writes inside `CODEX_HOME` are restricted to `config.toml`; other workspace file access must come from explicit allowed roots
+- webhook URLs must use HTTPS and cannot target localhost, `.local`, or private/link-local IP literal targets; delivery also DNS-checks the persisted URL before sending
 
 The model is designed to reduce accidental exposure, not to make an untrusted multi-tenant Codex host safe by default.
 

@@ -91,6 +91,7 @@ pub(crate) struct Config {
     pub(crate) cookie_secure_mode: CookieSecureMode,
     pub(crate) cors_allowed_origins: Vec<String>,
     pub(crate) trust_proxy_headers: bool,
+    pub(crate) trusted_proxy_cidrs: Vec<TrustedProxyNet>,
     pub(crate) instance_token: Option<String>,
     pub(crate) app_server_handoff_enabled: bool,
 }
@@ -198,6 +199,9 @@ impl Config {
                     "1" | "true" | "yes" | "on"
                 )
             }),
+            trusted_proxy_cidrs: parse_trusted_proxy_cidrs(
+                env::var("CODEX_WEBUI_TRUSTED_PROXY_CIDRS").ok(),
+            )?,
             instance_token: optional_env("CODEX_WEBUI_INSTANCE_TOKEN"),
             app_server_handoff_enabled: env::var("CODEX_WEBUI_APP_SERVER_HANDOFF")
                 .map(|value| {
@@ -216,6 +220,38 @@ pub(crate) struct RuntimeProfile {
     pub(crate) label: String,
     pub(crate) codex_home: PathBuf,
     pub(crate) data_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TrustedProxyNet {
+    pub(crate) addr: std::net::IpAddr,
+    pub(crate) prefix: u8,
+}
+
+impl TrustedProxyNet {
+    pub(crate) fn contains(&self, candidate: std::net::IpAddr) -> bool {
+        match (self.addr, candidate) {
+            (std::net::IpAddr::V4(network), std::net::IpAddr::V4(candidate)) => {
+                let prefix = self.prefix.min(32);
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
+                (u32::from(network) & mask) == (u32::from(candidate) & mask)
+            }
+            (std::net::IpAddr::V6(network), std::net::IpAddr::V6(candidate)) => {
+                let prefix = self.prefix.min(128);
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
+                (u128::from(network) & mask) == (u128::from(candidate) & mask)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -862,6 +898,41 @@ fn parse_cors_origins(value: Option<String>) -> Result<Vec<String>> {
         .filter(|entry| !entry.is_empty())
         .map(|entry| normalize_origin(entry).ok_or_else(|| anyhow!("Invalid CORS origin: {entry}")))
         .collect()
+}
+
+fn parse_trusted_proxy_cidrs(value: Option<String>) -> Result<Vec<TrustedProxyNet>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let mut proxies = Vec::new();
+    for entry in value.split([',', ';', ' ']).map(str::trim) {
+        if entry.is_empty() {
+            continue;
+        }
+        let (addr_raw, prefix_raw) = entry
+            .split_once('/')
+            .map(|(addr, prefix)| (addr, Some(prefix)))
+            .unwrap_or((entry, None));
+        let addr = addr_raw
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .with_context(|| format!("invalid trusted proxy CIDR address: {entry}"))?;
+        let max_prefix = match addr {
+            std::net::IpAddr::V4(_) => 32,
+            std::net::IpAddr::V6(_) => 128,
+        };
+        let prefix = match prefix_raw {
+            Some(raw) => raw
+                .parse::<u8>()
+                .with_context(|| format!("invalid trusted proxy CIDR prefix: {entry}"))?,
+            None => max_prefix,
+        };
+        if prefix > max_prefix {
+            return Err(anyhow!("invalid trusted proxy CIDR prefix: {entry}"));
+        }
+        proxies.push(TrustedProxyNet { addr, prefix });
+    }
+    Ok(proxies)
 }
 
 fn resolve_codex_home() -> Result<PathBuf> {

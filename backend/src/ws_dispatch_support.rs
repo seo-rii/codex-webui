@@ -877,9 +877,13 @@ pub(crate) async fn execute_ws_method(
         }
         "session/unsubscribe" => {
             let session_id = require_session_id(&params, "sessionId")?;
-            let mut current = subscriptions.lock().await;
-            if let Some(handle) = current.remove(&session_relay_key(&auth.profile_id, &session_id))
-            {
+            let relay_key = session_relay_key(&auth.profile_id, &session_id);
+            let handle = {
+                let mut current = subscriptions.lock().await;
+                current.remove(&relay_key)
+            };
+            if let Some(handle) = handle {
+                prune_unsubscribed_session_relay(state, &auth.profile_id, &session_id).await;
                 handle.abort();
             }
             Ok(json!({ "subscribed": false, "sessionId": session_id }))

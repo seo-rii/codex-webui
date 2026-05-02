@@ -626,6 +626,41 @@ async fn terminal_create_rejects_session_limit_before_spawning() {
 }
 
 #[tokio::test]
+async fn session_relay_pruning_removes_idle_stream_relay() {
+    let sandbox = unique_test_dir("session-relay-prune");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let relay = ensure_stream_relay(&state, "default", "thread-1")
+        .await
+        .expect("relay should be created");
+    let receiver = relay.subscribe();
+    prune_unused_session_relay(&state, "default", "thread-1").await;
+    assert!(
+        state
+            .relays
+            .lock()
+            .await
+            .contains_key(&session_relay_key("default", "thread-1"))
+    );
+
+    drop(receiver);
+    prune_unused_session_relay(&state, "default", "thread-1").await;
+    assert!(
+        !state
+            .relays
+            .lock()
+            .await
+            .contains_key(&session_relay_key("default", "thread-1"))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn theme_settings_round_trip_through_rust_store() {
     let sandbox = unique_test_dir("theme-settings");
     let workspace = sandbox.join("workspace");

@@ -10,6 +10,8 @@ pub(crate) async fn subscribe_session(
     let relay = ensure_stream_relay(&state, &profile_id, &session_id).await?;
     let mut receiver = relay.subscribe();
     let session_key = session_id.clone();
+    let profile_key = profile_id.clone();
+    let cleanup_state = state.clone();
     let stream_out_tx = out_tx.clone();
     let handle = tokio::spawn(async move {
         loop {
@@ -32,6 +34,8 @@ pub(crate) async fn subscribe_session(
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
+        drop(receiver);
+        prune_unused_session_relay(&cleanup_state, &profile_key, &session_key).await;
     });
 
     let mut current = subscriptions.lock().await;
@@ -163,6 +167,39 @@ pub(crate) async fn session_stream_has_subscribers(
         .await
         .get(&session_relay_key(resolved_profile_id, session_id))
         .is_some_and(|relay| relay.receiver_count() > 0)
+}
+
+pub(crate) async fn prune_unused_session_relay(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) {
+    prune_session_relay_with_receiver_limit(state, profile_id, session_id, 0).await;
+}
+
+pub(crate) async fn prune_unsubscribed_session_relay(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) {
+    prune_session_relay_with_receiver_limit(state, profile_id, session_id, 1).await;
+}
+
+async fn prune_session_relay_with_receiver_limit(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    max_receivers: usize,
+) {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let relay_key = session_relay_key(resolved_profile_id, session_id);
+    let mut relays = state.relays.lock().await;
+    if relays
+        .get(&relay_key)
+        .is_some_and(|relay| relay.receiver_count() <= max_receivers)
+    {
+        relays.remove(&relay_key);
+    }
 }
 
 pub(crate) async fn ensure_global_relay(

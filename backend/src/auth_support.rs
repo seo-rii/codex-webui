@@ -41,6 +41,33 @@ pub(crate) fn issue_profile_cookie(
     Ok(jar.add(cookie))
 }
 
+pub(crate) fn issue_csrf_cookie(
+    config: &Config,
+    jar: CookieJar,
+    secure_request: bool,
+) -> Result<CookieJar> {
+    let secure = resolve_cookie_secure(config, secure_request)?;
+    let cookie_value = make_csrf_token(config)?;
+    let mut cookie = Cookie::new(CSRF_COOKIE, cookie_value);
+    cookie.set_path(auth_cookie_path(config));
+    cookie.set_http_only(false);
+    cookie.set_same_site(match config.cookie_same_site {
+        SameSiteMode::Strict => SameSite::Strict,
+        SameSiteMode::Lax => SameSite::Lax,
+        SameSiteMode::None => SameSite::None,
+    });
+    cookie.set_secure(secure);
+    cookie.set_max_age(CookieDuration::days(7));
+    Ok(jar.add(cookie))
+}
+
+pub(crate) fn clear_csrf_cookie(config: &Config, jar: CookieJar) -> CookieJar {
+    let mut cookie = Cookie::new(CSRF_COOKIE, "");
+    cookie.set_path(auth_cookie_path(config));
+    cookie.set_max_age(CookieDuration::seconds(0));
+    jar.remove(cookie)
+}
+
 pub(crate) fn auth_cookie_path(config: &Config) -> String {
     if config.base_path.is_empty() {
         "/".to_string()
@@ -80,6 +107,51 @@ pub(crate) fn make_auth_token(config: &Config, role: UserRole) -> Result<String>
     let payload = format!("{now}.{expires}.{}.{}", user_role_label(role), nonce);
     let signature = sign(config, &payload)?;
     Ok(format!("{payload}.{signature}"))
+}
+
+pub(crate) fn make_csrf_token(config: &Config) -> Result<String> {
+    let nonce = Uuid::new_v4().simple().to_string();
+    let payload = format!("csrf.{nonce}");
+    let signature = sign(config, &payload)?;
+    Ok(format!("{nonce}.{signature}"))
+}
+
+pub(crate) fn verify_csrf_token(config: &Config, jar: &CookieJar, headers: &HeaderMap) -> bool {
+    let Some(cookie_token) = jar.get(CSRF_COOKIE).map(|cookie| cookie.value().trim()) else {
+        return false;
+    };
+    let Some(header_token) = headers
+        .get(CSRF_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    else {
+        return false;
+    };
+    if cookie_token.is_empty()
+        || header_token.is_empty()
+        || cookie_token
+            .as_bytes()
+            .ct_eq(header_token.as_bytes())
+            .unwrap_u8()
+            != 1
+    {
+        return false;
+    }
+
+    let mut parts = cookie_token.split('.');
+    let Some(nonce) = parts.next() else {
+        return false;
+    };
+    let Some(signature) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() || nonce.is_empty() || signature.is_empty() {
+        return false;
+    }
+    let Ok(expected) = sign(config, &format!("csrf.{nonce}")) else {
+        return false;
+    };
+    expected.as_bytes().ct_eq(signature.as_bytes()).unwrap_u8() == 1
 }
 
 pub(crate) async fn select_profile(

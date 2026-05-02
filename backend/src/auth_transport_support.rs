@@ -54,16 +54,31 @@ pub(crate) async fn handle_auth_http(
                 .as_ref()
                 .map(|context| context.profile_id.as_str())
                 .unwrap_or(&state.config.default_profile_id);
+            let role = auth.as_ref().map(|context| match context.role {
+                UserRole::Owner => "owner",
+                UserRole::Admin => "admin",
+                UserRole::Viewer => "viewer",
+            });
+            let next_jar = match if auth.is_some() {
+                issue_csrf_cookie(
+                    &state.config,
+                    jar,
+                    request_is_secure(&state.config, &headers, peer_addr),
+                )
+            } else {
+                Ok(jar)
+            } {
+                Ok(next_jar) => next_jar,
+                Err(error) => {
+                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                }
+            };
             Ok((
-                jar,
+                next_jar,
                 Json(json!({
                     "authenticated": auth.is_some(),
                     "activeProfileId": active_profile_id,
-                    "role": auth.map(|context| match context.role {
-                        UserRole::Owner => "owner",
-                        UserRole::Admin => "admin",
-                        UserRole::Viewer => "viewer",
-                    }),
+                    "role": role,
                     "hcaptcha": {
                         "enabled": state.config.hcaptcha_enabled(),
                         "siteKey": state.config.hcaptcha_site_key(),
@@ -234,6 +249,8 @@ async fn auth_login(
     clear_login_failures(&state, &identifier).await;
     let next_jar = issue_auth_cookie(&state.config, jar, secure_request, role)
         .map_err(|error| error.to_string())?;
+    let next_jar = issue_csrf_cookie(&state.config, next_jar, secure_request)
+        .map_err(|error| error.to_string())?;
     let _ = append_audit_log(
         &state.config,
         AuditLogEntry {
@@ -265,7 +282,7 @@ fn auth_logout(config: &Config, jar: CookieJar) -> Response {
     profile_cookie.set_path(auth_cookie_path(config));
     profile_cookie.set_max_age(CookieDuration::seconds(0));
     (
-        jar.remove(cookie).remove(profile_cookie),
+        clear_csrf_cookie(config, jar.remove(cookie).remove(profile_cookie)),
         Json(json!({ "ok": true })),
     )
         .into_response()

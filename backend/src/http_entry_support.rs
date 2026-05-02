@@ -77,6 +77,29 @@ async fn handle_http_inner(
                 return (StatusCode::FORBIDDEN, "Request origin is not allowed.").into_response();
             }
 
+            if route_path.starts_with("/api/")
+                && matches!(
+                    method,
+                    Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+                )
+                && route_path != "/api/auth/login"
+                && route_path != "/api/admin/restart-handoff/prepare"
+                && jar.get(AUTH_COOKIE).is_some()
+                && auth_context(&state.config, &jar).is_some()
+                && !verify_csrf_token(&state.config, &jar, &headers)
+            {
+                let mut response =
+                    json_error(StatusCode::FORBIDDEN, "CSRF token is missing or invalid.");
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
             if route_path == "/healthz" {
                 let instance_token_matched = headers
                     .get("x-codex-webui-instance-token")

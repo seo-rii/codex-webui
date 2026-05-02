@@ -63,10 +63,35 @@ function apiPath(pathname: string) {
   return `${base}/api${normalized}`;
 }
 
+function readCookie(name: string) {
+  if (typeof document === "undefined") {
+    return null;
+  }
+  const encodedName = `${encodeURIComponent(name)}=`;
+  return (
+    document.cookie
+      .split(";")
+      .map((entry) => entry.trim())
+      .find((entry) => entry.startsWith(encodedName))
+      ?.slice(encodedName.length) ?? null
+  );
+}
+
 async function request<T>(input: string, init?: RequestInit) {
   const headers = new Headers(init?.headers ?? {});
   if (!(init?.body instanceof FormData) && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
+  }
+  const method = (init?.method ?? "GET").toUpperCase();
+  if (
+    ["POST", "PUT", "PATCH", "DELETE"].includes(method) &&
+    !input.includes("/api/auth/login") &&
+    !headers.has("x-codex-webui-csrf")
+  ) {
+    const token = readCookie("codex_webui_csrf");
+    if (token) {
+      headers.set("x-codex-webui-csrf", decodeURIComponent(token));
+    }
   }
 
   const response = await fetch(input, {

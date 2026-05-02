@@ -2,6 +2,8 @@ use super::*;
 
 pub(crate) const AUTH_COOKIE: &str = "codex_webui_auth";
 pub(crate) const PROFILE_COOKIE: &str = "codex_webui_profile";
+pub(crate) const CSRF_COOKIE: &str = "codex_webui_csrf";
+pub(crate) const CSRF_HEADER: &str = "x-codex-webui-csrf";
 pub(crate) const LOGIN_WINDOW_MS: u128 = 10 * 60 * 1000;
 pub(crate) const LOGIN_MAX_ATTEMPTS: usize = 8;
 pub(crate) const LOGIN_RATE_LIMIT_MAX_IDENTIFIERS: usize = 4096;

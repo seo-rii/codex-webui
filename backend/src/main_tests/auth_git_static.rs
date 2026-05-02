@@ -1015,6 +1015,16 @@ async fn auth_cookies_are_scoped_to_base_path() {
         jar.get(PROFILE_COOKIE).and_then(|cookie| cookie.path()),
         Some("/absproxy/4173")
     );
+    let jar = issue_csrf_cookie(&config, jar, false).unwrap();
+    assert_eq!(
+        jar.get(CSRF_COOKIE).and_then(|cookie| cookie.path()),
+        Some("/absproxy/4173")
+    );
+    assert!(
+        clear_csrf_cookie(&config, jar.clone())
+            .get(CSRF_COOKIE)
+            .is_none()
+    );
 
     state.config = Arc::new(config);
     let request = Request::builder()
@@ -1043,6 +1053,53 @@ async fn auth_cookies_are_scoped_to_base_path() {
             .iter()
             .all(|cookie| cookie.contains("Path=/absproxy/4173"))
     );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_http_mutations_require_csrf_token() {
+    let sandbox = unique_test_dir("http-csrf-token");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let jar = issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Admin).unwrap();
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/profile")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({ "profileId": "default" }).to_string()))
+        .unwrap();
+    let response = handle_http(State(state.clone()), jar.clone(), request).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let csrf_jar = issue_csrf_cookie(&state.config, jar, false).unwrap();
+    let csrf_token = csrf_jar
+        .get(CSRF_COOKIE)
+        .expect("csrf cookie should be issued")
+        .value()
+        .to_string();
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/profile")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(CSRF_HEADER, csrf_token)
+        .body(Body::from(json!({ "profileId": "default" }).to_string()))
+        .unwrap();
+    let response = handle_http(State(state.clone()), csrf_jar, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let login_request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({ "password": "" }).to_string()))
+        .unwrap();
+    let login_response = handle_http(State(state.clone()), CookieJar::new(), login_request).await;
+    assert_ne!(login_response.status(), StatusCode::FORBIDDEN);
 
     let _ = fs::remove_dir_all(sandbox);
 }

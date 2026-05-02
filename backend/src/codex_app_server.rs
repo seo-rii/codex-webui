@@ -493,7 +493,7 @@ impl AppServerClient {
                     };
                     let encoded = serde_json::to_vec_pretty(&meta)
                         .context("failed to encode app-server handoff metadata")?;
-                    tokio::fs::write(&paths.meta_path, encoded)
+                    write_bytes_atomically(&paths.meta_path, &encoded)
                         .await
                         .with_context(|| {
                             format!("failed to write {}", paths.meta_path.display())
@@ -888,6 +888,55 @@ fn append_text_log_line(path: &Path, message: &str) {
     }
 }
 
+async fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("target path has no parent: {}", path.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("state");
+    let temp_path = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
+    let result = async {
+        let mut file = tokio::fs::File::create(&temp_path)
+            .await
+            .with_context(|| format!("failed to create {}", temp_path.display()))?;
+        file.write_all(bytes)
+            .await
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        file.sync_all()
+            .await
+            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+        drop(file);
+        tokio::fs::rename(&temp_path, path)
+            .await
+            .with_context(|| format!("failed to rename {}", temp_path.display()))?;
+        if let Ok(parent_dir) = fs::File::open(parent) {
+            let _ = parent_dir.sync_all();
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
+    result
+}
+
 fn classify_incoming_message(line: &str) -> Result<Option<IncomingMessage>> {
     let payload: Value = serde_json::from_str(line).context("invalid json-rpc payload")?;
     let Some(object) = payload.as_object() else {
@@ -951,7 +1000,7 @@ fn classify_incoming_message(line: &str) -> Result<Option<IncomingMessage>> {
 mod tests {
     use super::{
         AppServerClientConfig, AppServerNotification, AppServerProfile, AppServerRequest,
-        IncomingMessage, classify_incoming_message, handoff_paths,
+        IncomingMessage, classify_incoming_message, handoff_paths, write_bytes_atomically,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -1067,5 +1116,35 @@ mod tests {
             assert!(first.is_none());
             assert!(second.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn handoff_metadata_write_is_atomic() {
+        let dir = std::env::temp_dir().join(format!(
+            "codex-webui-handoff-atomic-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("default.json");
+
+        write_bytes_atomically(&path, br#"{"pid":1}"#)
+            .await
+            .expect("metadata should write atomically");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("metadata should be readable"),
+            r#"{"pid":1}"#
+        );
+
+        let leftovers = std::fs::read_dir(&dir)
+            .expect("metadata directory should exist")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".default.json.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

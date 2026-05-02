@@ -918,7 +918,7 @@ async function waitForTunnelPublicUrl(pid, timeoutMs = 10000) {
   return null;
 }
 
-async function startTunnel(config, cliOptions) {
+async function startTunnel(config, cliOptions, preparedLaunch = null) {
   await ensureStateDir();
   const existing = await readTunnelStatus(config);
   if (existing.running) {
@@ -926,8 +926,10 @@ async function startTunnel(config, cliOptions) {
   }
 
   const tunnelOptions = mergeTunnelOptions(config, cliOptions);
-  const launch = buildTunnelLaunch(config, tunnelOptions);
-  await confirmTunnelSafety(config, cliOptions, launch);
+  const launch = preparedLaunch ?? buildTunnelLaunch(config, tunnelOptions);
+  if (!preparedLaunch) {
+    await confirmTunnelSafety(config, cliOptions, launch);
+  }
   await fs.mkdir(path.dirname(tunnelLogPath), { recursive: true });
   await writeFileAtomic(tunnelLogPath, "");
 
@@ -1175,9 +1177,17 @@ async function runTunnel(config, argv) {
     return;
   }
 
+  const existingTunnel = await readTunnelStatus(config);
+  let launch = null;
+  if (!existingTunnel.running) {
+    const tunnelOptions = mergeTunnelOptions(config, options);
+    launch = buildTunnelLaunch(config, tunnelOptions);
+    await confirmTunnelSafety(config, options, launch);
+  }
+
   const server = await startServer(config);
   console.log(`Server running at ${buildUrl(config)} (pid ${server.pid})`);
-  const status = await startTunnel(config, options);
+  const status = await startTunnel(config, options, launch);
   if (status) {
     if (options.json) {
       console.log(JSON.stringify(status, null, 2));

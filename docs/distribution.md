@@ -178,7 +178,8 @@ Behavior:
 
 Before opening a public tunnel, the CLI prints a safety checklist covering the
 configured owner password, hCaptcha, allowed roots, and public route. Interactive
-runs require typing `expose`; non-interactive runs must pass `--yes` or set
+runs require the `Type "expose"` prompt to be answered with `expose`;
+non-interactive runs must pass `--yes` or set
 `CODEX_WEBUI_TUNNEL_ASSUME_YES=true`. This is intentional because a tunnel
 exposes Codex control, Git operations, file tools, runtime actions, and host
 terminals outside localhost.

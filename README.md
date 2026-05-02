@@ -312,6 +312,7 @@ See [.env.example](./.env.example) for a concise example set.
 - Git actions are intentionally gated on explicit repository selection.
 - Pull, branch switch, and worktree removal are blocked while a live or pending Codex turn is using that repository.
 - If `ownerPasswordHash` is configured, host-level controls require owner login rather than ordinary admin login.
+- Terminal tabs run shell processes with the host user privileges of the gateway process; allowed roots only constrain the initial working directory and UI file tools, not arbitrary shell commands.
 - System shutdown support is disabled by default and must be explicitly enabled.
 - The shutdown control is global to the running server, so all connected clients see the same armed and scheduled state.
 - File editor access to `CODEX_HOME` is limited to `config.toml`; broader project files must be under explicit allowed roots.

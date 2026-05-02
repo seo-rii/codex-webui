@@ -200,6 +200,7 @@ The Rust gateway owns terminal processes.
 - terminal tabs survive browser reloads while the gateway stays up
 - terminal input/output is streamed incrementally over WebSocket
 - terminal creation is capped, idle/exited sessions are cleaned up, and Unix shutdown targets the process group with TERM followed by KILL if the group ignores TERM
+- terminal sessions run as the same host user as the gateway; the terminal feature is not a filesystem sandbox and should be paired with external OS/container isolation for untrusted or public deployments
 
 The terminal lifecycle is intentionally separate from Codex thread lifecycle.
 

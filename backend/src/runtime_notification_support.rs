@@ -190,7 +190,9 @@ async fn deliver_notification_webhooks(
         } else {
             "webhookUrl"
         };
-        if let Err(error) = validate_notification_webhook_resolves_public_str(&url, field).await {
+        if let Err(error) =
+            validate_notification_webhook_resolves_public_str(&state.config, &url, field).await
+        {
             append_runtime_error_log(
                 &state.config,
                 "notification-webhook",

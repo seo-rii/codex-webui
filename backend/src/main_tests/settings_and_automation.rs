@@ -416,6 +416,55 @@ async fn notification_settings_reject_local_webhook_urls() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test]
+async fn notification_settings_enforce_webhook_host_allowlist() {
+    let sandbox = unique_test_dir("notifications-webhook-allowlist");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    config.webhook_allowed_hosts = vec![
+        "hooks.example.com".to_string(),
+        "*.trusted.example".to_string(),
+    ];
+    state.config = Arc::new(config);
+
+    let error = update_notification_settings_payload(
+        &state,
+        "default",
+        json!({
+            "webhookUrl": "https://evil.example.com/hook"
+        }),
+    )
+    .await
+    .expect_err("unlisted webhook host should be rejected");
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.message, "webhookUrl host is not allowed.");
+
+    let settings = update_notification_settings_payload(
+        &state,
+        "default",
+        json!({
+            "webhookUrl": "https://hooks.example.com/hook",
+            "slackWebhookUrl": "https://team.trusted.example/hook"
+        }),
+    )
+    .await
+    .expect("listed and wildcard webhook hosts should be accepted");
+    assert_eq!(
+        settings
+            .get("settings")
+            .and_then(|value| value.get("webhookUrl"))
+            .and_then(Value::as_str),
+        Some("https://hooks.example.com/hook")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn notification_webhook_deliveries_build_generic_and_slack_payloads() {
     let notification = json!({

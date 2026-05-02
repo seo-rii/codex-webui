@@ -184,8 +184,12 @@ pub(crate) async fn update_notification_settings_payload(
     profile_id: &str,
     patch: Value,
 ) -> ApiResult<Value> {
-    validate_notification_webhook_url(patch.get("slackWebhookUrl"), "slackWebhookUrl")?;
-    validate_notification_webhook_url(patch.get("webhookUrl"), "webhookUrl")?;
+    validate_notification_webhook_url(
+        &state.config,
+        patch.get("slackWebhookUrl"),
+        "slackWebhookUrl",
+    )?;
+    validate_notification_webhook_url(&state.config, patch.get("webhookUrl"), "webhookUrl")?;
 
     let payload = with_ui_state_write(state, profile_id, |ui_state| {
         let notifications = ui_state
@@ -295,7 +299,11 @@ pub(crate) fn validate_notification_webhook_url_str(raw: &str, field: &str) -> A
     Ok(())
 }
 
-fn validate_notification_webhook_url(candidate: Option<&Value>, field: &str) -> ApiResult<()> {
+fn validate_notification_webhook_url(
+    config: &Config,
+    candidate: Option<&Value>,
+    field: &str,
+) -> ApiResult<()> {
     let Some(raw) = candidate
         .and_then(Value::as_str)
         .map(str::trim)
@@ -303,7 +311,51 @@ fn validate_notification_webhook_url(candidate: Option<&Value>, field: &str) -> 
     else {
         return Ok(());
     };
-    validate_notification_webhook_url_str(raw, field)
+    validate_notification_webhook_url_str(raw, field)?;
+    validate_notification_webhook_host_allowlist(config, raw, field)
+}
+
+fn notification_webhook_host_allowed(allowed_hosts: &[String], host: &str) -> bool {
+    if allowed_hosts.is_empty() {
+        return true;
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    allowed_hosts.iter().any(|allowed| {
+        if let Some(suffix) = allowed.strip_prefix("*.") {
+            host.ends_with(&format!(".{suffix}"))
+        } else {
+            host == *allowed
+        }
+    })
+}
+
+pub(crate) fn validate_notification_webhook_host_allowlist(
+    config: &Config,
+    raw: &str,
+    field: &str,
+) -> ApiResult<()> {
+    if config.webhook_allowed_hosts.is_empty() {
+        return Ok(());
+    }
+    let url = reqwest::Url::parse(raw).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("{field} must be a valid URL."),
+        )
+    })?;
+    let Some(host) = url.host_str() else {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("{field} must include a host."),
+        ));
+    };
+    if notification_webhook_host_allowed(&config.webhook_allowed_hosts, host) {
+        return Ok(());
+    }
+    Err(api_error(
+        StatusCode::BAD_REQUEST,
+        format!("{field} host is not allowed."),
+    ))
 }
 
 pub(crate) fn notification_webhook_ip_is_private_or_local(ip: std::net::IpAddr) -> bool {
@@ -317,10 +369,12 @@ pub(crate) fn notification_webhook_ip_is_private_or_local(ip: std::net::IpAddr) 
 }
 
 pub(crate) async fn validate_notification_webhook_resolves_public_str(
+    config: &Config,
     raw: &str,
     field: &str,
 ) -> ApiResult<()> {
     validate_notification_webhook_url_str(raw, field)?;
+    validate_notification_webhook_host_allowlist(config, raw, field)?;
     let url = reqwest::Url::parse(raw).map_err(|_| {
         api_error(
             StatusCode::BAD_REQUEST,

@@ -93,6 +93,7 @@ pub(crate) struct Config {
     pub(crate) cors_allowed_origins: Vec<String>,
     pub(crate) trust_proxy_headers: bool,
     pub(crate) trusted_proxy_cidrs: Vec<TrustedProxyNet>,
+    pub(crate) webhook_allowed_hosts: Vec<String>,
     pub(crate) instance_token: Option<String>,
     pub(crate) app_server_handoff_enabled: bool,
 }
@@ -210,6 +211,9 @@ impl Config {
             }),
             trusted_proxy_cidrs: parse_trusted_proxy_cidrs(
                 env::var("CODEX_WEBUI_TRUSTED_PROXY_CIDRS").ok(),
+            )?,
+            webhook_allowed_hosts: parse_webhook_allowed_hosts(
+                env::var("CODEX_WEBUI_WEBHOOK_ALLOWED_HOSTS").ok(),
             )?,
             instance_token: optional_env("CODEX_WEBUI_INSTANCE_TOKEN"),
             app_server_handoff_enabled: env::var("CODEX_WEBUI_APP_SERVER_HANDOFF")
@@ -979,6 +983,31 @@ fn parse_trusted_proxy_cidrs(value: Option<String>) -> Result<Vec<TrustedProxyNe
         proxies.push(TrustedProxyNet { addr, prefix });
     }
     Ok(proxies)
+}
+
+fn parse_webhook_allowed_hosts(value: Option<String>) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let mut hosts = Vec::new();
+    for entry in value.split([',', ';', ' ']).map(str::trim) {
+        if entry.is_empty() {
+            continue;
+        }
+        let normalized = entry.trim_end_matches('.').to_ascii_lowercase();
+        let host = normalized.strip_prefix("*.").unwrap_or(&normalized);
+        if host.is_empty()
+            || host.contains('/')
+            || host.contains(':')
+            || host.chars().any(char::is_whitespace)
+        {
+            return Err(anyhow!("invalid webhook allowed host: {entry}"));
+        }
+        hosts.push(normalized);
+    }
+    hosts.sort();
+    hosts.dedup();
+    Ok(hosts)
 }
 
 fn resolve_codex_home() -> Result<PathBuf> {

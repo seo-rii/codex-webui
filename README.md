@@ -261,6 +261,8 @@ The Rust gateway honors a focused set of `CODEX_WEBUI_*` environment variables. 
 
 - `CODEX_WEBUI_PASSWORD_HASH`
 - `CODEX_WEBUI_PASSWORD`
+- `CODEX_WEBUI_OWNER_PASSWORD_HASH`
+- `CODEX_WEBUI_OWNER_PASSWORD`
 - `CODEX_WEBUI_VIEWER_PASSWORD_HASH`
 - `CODEX_WEBUI_VIEWER_PASSWORD`
 - `CODEX_WEBUI_SESSION_SECRET`
@@ -287,7 +289,7 @@ See [.env.example](./.env.example) for a concise example set.
 
 ## Security Notes
 
-- Prefer `CODEX_WEBUI_PASSWORD_HASH` over plaintext password variables.
+- Prefer `CODEX_WEBUI_PASSWORD_HASH`, `CODEX_WEBUI_OWNER_PASSWORD_HASH`, and `CODEX_WEBUI_VIEWER_PASSWORD_HASH` over plaintext password variables. Plaintext password variables are rejected when the gateway binds to a non-loopback `HOST`.
 - Prefer config or environment variables for hCaptcha secrets; command-line flags can leak through shell history and process inspection.
 - If you need read-only browser access, prefer `CODEX_WEBUI_VIEWER_PASSWORD_HASH` over the plaintext viewer password variable.
 - Set `CODEX_WEBUI_SESSION_SECRET` to a unique random value of at least 32 bytes per deployment; the gateway will not fall back to a password-derived cookie signing key.

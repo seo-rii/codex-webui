@@ -155,7 +155,7 @@ impl Config {
         let codex_home = resolve_codex_home()?;
         let (default_profile_id, profiles) = parse_runtime_profiles(&codex_home, &data_dir)?;
 
-        Ok(Self {
+        let config = Self {
             project_root,
             allowed_roots,
             default_profile_id,
@@ -211,8 +211,45 @@ impl Config {
                     )
                 })
                 .unwrap_or(true),
-        })
+        };
+        validate_plaintext_password_policy(&config)?;
+        Ok(config)
     }
+}
+
+pub(crate) fn validate_plaintext_password_policy(config: &Config) -> Result<()> {
+    if public_host_is_loopback(config) {
+        return Ok(());
+    }
+
+    let plaintext_vars = [
+        ("CODEX_WEBUI_PASSWORD", config.password.as_deref()),
+        (
+            "CODEX_WEBUI_OWNER_PASSWORD",
+            config.owner_password.as_deref(),
+        ),
+        (
+            "CODEX_WEBUI_VIEWER_PASSWORD",
+            config.viewer_password.as_deref(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|_| name)
+    })
+    .collect::<Vec<_>>();
+
+    if plaintext_vars.is_empty() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "Plaintext password environment variables are not allowed when HOST is non-loopback. Use password hash variables instead: {}.",
+        plaintext_vars.join(", ")
+    ))
 }
 
 #[derive(Clone, Debug)]

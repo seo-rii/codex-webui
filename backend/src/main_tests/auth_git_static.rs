@@ -100,6 +100,43 @@ async fn owner_password_authenticates_as_owner_role() {
 }
 
 #[test]
+fn public_host_rejects_plaintext_password_env_values() {
+    let sandbox = unique_test_dir("public-host-plaintext-passwords");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let mut config = (*test_state(workspace.clone(), vec![workspace], codex_home).config).clone();
+    config.public_host = "0.0.0.0".to_string();
+    config.password = Some("admin-secret".to_string());
+    config.owner_password = Some("owner-secret".to_string());
+    config.viewer_password = Some("viewer-secret".to_string());
+
+    let error = validate_plaintext_password_policy(&config)
+        .expect_err("public host should reject plaintext secrets");
+    let message = error.to_string();
+    assert!(message.contains("CODEX_WEBUI_PASSWORD"));
+    assert!(message.contains("CODEX_WEBUI_OWNER_PASSWORD"));
+    assert!(message.contains("CODEX_WEBUI_VIEWER_PASSWORD"));
+
+    config.password = None;
+    config.owner_password = None;
+    config.viewer_password = None;
+    config.password_hash = Some("scrypt$v1$salt$key".to_string());
+    config.owner_password_hash = Some("scrypt$v1$salt$key".to_string());
+    config.viewer_password_hash = Some("scrypt$v1$salt$key".to_string());
+    validate_plaintext_password_policy(&config)
+        .expect("public host should allow hash-only secrets");
+
+    config.public_host = "127.0.0.1".to_string();
+    config.password = Some("admin-secret".to_string());
+    validate_plaintext_password_policy(&config)
+        .expect("loopback host should keep local plaintext setup support");
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[test]
 fn auth_cookie_round_trips_owner_role() {
     let sandbox = unique_test_dir("owner-cookie-role");
     let workspace = sandbox.join("workspace");

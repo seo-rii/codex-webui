@@ -103,11 +103,18 @@ The CLI starts the Rust gateway as a detached background process and injects the
 - `CODEX_WEBUI_PROFILES_JSON`
 - `CODEX_WEBUI_ALLOWED_ROOTS`
 - `CODEX_WEBUI_PASSWORD_HASH`
+- `CODEX_WEBUI_OWNER_PASSWORD_HASH`
+- `CODEX_WEBUI_VIEWER_PASSWORD_HASH`
 - `CODEX_WEBUI_HCAPTCHA_SITE_KEY`
 - `CODEX_WEBUI_HCAPTCHA_SECRET_KEY`
 - `CODEX_WEBUI_SESSION_SECRET`
 - `CODEX_WEBUI_INSTANCE_TOKEN`
 - `CODEX_WEBUI_CORS_ALLOWED_ORIGINS`
+
+Plaintext password variables are only suitable for loopback development. The
+gateway rejects `CODEX_WEBUI_PASSWORD`, `CODEX_WEBUI_OWNER_PASSWORD`, and
+`CODEX_WEBUI_VIEWER_PASSWORD` when `HOST` is non-loopback; use the hash
+variables for any exposed, tunneled, or reverse-proxied deployment.
 
 At runtime the public base path is owned by Rust, not baked permanently into the shipped SPA:
 

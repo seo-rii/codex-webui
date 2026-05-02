@@ -26,7 +26,8 @@ fn default_ui_state_value() -> Value {
         },
         "notifications": {
             "items": [],
-            "settings": default_notification_settings_value()
+            "settings": default_notification_settings_value(),
+            "webhookFailures": []
         },
         "sessionMetaByThreadId": {},
         "savedSessionFilters": [],
@@ -92,7 +93,8 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
             "notifications".to_string(),
             json!({
                 "items": [],
-                "settings": default_notification_settings_value()
+                "settings": default_notification_settings_value(),
+                "webhookFailures": []
             }),
         );
     }
@@ -100,6 +102,12 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
     if let Some(notifications) = root.get_mut("notifications").and_then(Value::as_object_mut) {
         if !notifications.get("items").is_some_and(Value::is_array) {
             notifications.insert("items".to_string(), json!([]));
+        }
+        if !notifications
+            .get("webhookFailures")
+            .is_some_and(Value::is_array)
+        {
+            notifications.insert("webhookFailures".to_string(), json!([]));
         }
         let normalized_settings =
             normalize_notification_settings_value(notifications.get("settings"));

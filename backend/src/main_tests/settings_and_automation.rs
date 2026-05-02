@@ -465,6 +465,50 @@ async fn notification_settings_enforce_webhook_host_allowlist() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test]
+async fn notification_webhook_failures_are_persisted_in_profile_state() {
+    let sandbox = unique_test_dir("notification-webhook-failure-history");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let notification = json!({
+        "id": "notification-1",
+        "type": "sessionCompleted"
+    });
+    record_notification_webhook_failure(
+        &state,
+        "default",
+        &notification,
+        "webhookUrl",
+        "failed with token sk-secret and /home/example/path",
+    )
+    .await;
+
+    let payload = get_notifications_payload(&state, "default", 20)
+        .await
+        .expect("notifications payload should load");
+    let failure = payload
+        .get("webhookFailures")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .expect("webhook failure should be persisted");
+    assert_eq!(
+        failure.get("notificationId").and_then(Value::as_str),
+        Some("notification-1")
+    );
+    let error = failure
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(!error.contains("sk-secret"));
+    assert!(!error.contains("/home/example/path"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn notification_webhook_deliveries_build_generic_and_slack_payloads() {
     let notification = json!({

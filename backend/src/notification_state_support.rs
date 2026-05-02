@@ -9,6 +9,15 @@ fn ui_state_notification_items(ui_state: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+fn ui_state_webhook_failures(ui_state: &Value) -> Vec<Value> {
+    ui_state
+        .get("notifications")
+        .and_then(|value| value.get("webhookFailures"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
 pub(crate) fn unread_notification_count(items: &[Value]) -> usize {
     items
         .iter()
@@ -36,12 +45,66 @@ pub(crate) async fn get_notifications_payload(
     limit: usize,
 ) -> ApiResult<Value> {
     with_ui_state_read(state, profile_id, |ui_state| {
-        Ok(notifications_payload_from_items(
-            ui_state_notification_items(ui_state),
-            limit,
-        ))
+        let mut payload =
+            notifications_payload_from_items(ui_state_notification_items(ui_state), limit);
+        payload["webhookFailures"] = Value::Array(
+            ui_state_webhook_failures(ui_state)
+                .into_iter()
+                .take(40)
+                .collect(),
+        );
+        Ok(payload)
     })
     .await
+}
+
+pub(crate) async fn record_notification_webhook_failure(
+    state: &AppState,
+    profile_id: &str,
+    notification: &Value,
+    field: &str,
+    error: &str,
+) {
+    let entry = json!({
+        "id": Uuid::new_v4().to_string(),
+        "createdAt": now_unix_ms(),
+        "notificationId": notification.get("id").cloned().unwrap_or(Value::Null),
+        "eventType": notification.get("type").cloned().unwrap_or(Value::Null),
+        "field": field,
+        "error": redact_user_facing_error(error),
+    });
+    let payload = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(failures) = ui_state
+            .get_mut("notifications")
+            .and_then(Value::as_object_mut)
+            .and_then(|notifications| notifications.get_mut("webhookFailures"))
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "notification webhook failure state is missing",
+            ));
+        };
+        failures.insert(0, entry.clone());
+        if failures.len() > 40 {
+            failures.truncate(40);
+        }
+        Ok(json!({
+            "webhookFailures": failures.clone()
+        }))
+    })
+    .await;
+
+    if let Ok(payload) = payload {
+        emit_profile_config_updated(
+            state,
+            profile_id,
+            json!({
+                "notifications": payload
+            }),
+        )
+        .await;
+    }
 }
 
 pub(crate) async fn mark_notifications_read_payload(

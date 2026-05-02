@@ -511,6 +511,22 @@ pub(crate) fn redact_user_facing_error(message: &str) -> String {
             redacted = redacted.replace(home, "~");
         }
     }
+    for path_prefix in ["/home/", "/Users/"] {
+        loop {
+            let Some(index) = redacted.find(path_prefix) else {
+                break;
+            };
+            let value_end = redacted[index..]
+                .char_indices()
+                .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | '}'))
+                .map(|(offset, _)| index + offset)
+                .unwrap_or(redacted.len());
+            if value_end <= index {
+                break;
+            }
+            redacted.replace_range(index..value_end, "~");
+        }
+    }
 
     let lowered = redacted.to_ascii_lowercase();
     while let Some(index) = lowered.find("bearer ") {
@@ -528,6 +544,27 @@ pub(crate) fn redact_user_facing_error(message: &str) -> String {
             break;
         } else {
             break;
+        }
+    }
+
+    for token_prefix in ["sk-"] {
+        loop {
+            let lowered = redacted.to_ascii_lowercase();
+            let Some(index) = lowered.find(token_prefix) else {
+                break;
+            };
+            let value_end = redacted[index..]
+                .char_indices()
+                .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | '}'))
+                .map(|(offset, _)| index + offset)
+                .unwrap_or(redacted.len());
+            if redacted[index..].starts_with("[redacted]") {
+                break;
+            }
+            if value_end <= index {
+                break;
+            }
+            redacted.replace_range(index..value_end, "[redacted]");
         }
     }
 

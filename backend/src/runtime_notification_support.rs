@@ -193,6 +193,14 @@ async fn deliver_notification_webhooks(
         if let Err(error) =
             validate_notification_webhook_resolves_public_str(&state.config, &url, field).await
         {
+            record_notification_webhook_failure(
+                &state,
+                &profile_id,
+                &notification,
+                field,
+                &error.message,
+            )
+            .await;
             append_runtime_error_log(
                 &state.config,
                 "notification-webhook",
@@ -208,6 +216,14 @@ async fn deliver_notification_webhooks(
             continue;
         }
         if let Err(error) = send_notification_webhook_with_retries(&state, &url, &payload).await {
+            record_notification_webhook_failure(
+                &state,
+                &profile_id,
+                &notification,
+                field,
+                &error.to_string(),
+            )
+            .await;
             append_runtime_error_log(
                 &state.config,
                 "notification-webhook",

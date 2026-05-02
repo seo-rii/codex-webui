@@ -208,6 +208,20 @@ async fn read_profile_ui_state(config: &Config, profile_id: &str) -> Result<Valu
         Err(_) => {
             let backup_path = path.with_extension(format!("json.corrupt-{}", now_millis()));
             let _ = tokio_fs::rename(&path, &backup_path).await;
+            let stable_backup_path = path.with_extension("json.bak");
+            if let Ok(backup_raw) = tokio_fs::read_to_string(&stable_backup_path).await {
+                if let Ok(mut recovered) = serde_json::from_str::<Value>(&backup_raw) {
+                    ensure_ui_state_sections(&mut recovered);
+                    write_file_atomically(
+                        &path,
+                        serde_json::to_vec_pretty(&recovered)
+                            .expect("recovered ui-state should serialize"),
+                    )
+                    .await
+                    .context("failed to restore ui-state from backup")?;
+                    return Ok(recovered);
+                }
+            }
             let fallback = default_ui_state_value();
             write_file_atomically(
                 &path,

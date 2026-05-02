@@ -738,6 +738,50 @@ async fn ui_state_writes_preserve_previous_snapshot() {
 }
 
 #[tokio::test]
+async fn corrupt_ui_state_recovers_from_previous_snapshot() {
+    let sandbox = unique_test_dir("ui-state-backup-restore");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["sessionMetaByThreadId"]["thread-1"]["title"] = json!("Recover me");
+        Ok(())
+    })
+    .await
+    .expect("first ui-state write should save");
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["sessionMetaByThreadId"]["thread-1"]["title"] = json!("Current");
+        Ok(())
+    })
+    .await
+    .expect("second ui-state write should create backup");
+
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    fs::write(&ui_state_path, b"{broken json").expect("test should corrupt active ui-state");
+    state.ui_state_cache.lock().await.clear();
+
+    let restored = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .expect("ui-state should recover from backup");
+    assert_eq!(
+        restored
+            .get("sessionMetaByThreadId")
+            .and_then(|value| value.get("thread-1"))
+            .and_then(|value| value.get("title"))
+            .and_then(Value::as_str),
+        Some("Recover me")
+    );
+    let active_raw =
+        fs::read_to_string(&ui_state_path).expect("active ui-state should be restored");
+    assert!(serde_json::from_str::<Value>(&active_raw).is_ok());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn ui_state_cache_is_bounded_across_profiles() {
     let sandbox = unique_test_dir("ui-state-cache-cap");
     let workspace = sandbox.join("workspace");

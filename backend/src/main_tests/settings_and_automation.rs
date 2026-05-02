@@ -705,6 +705,66 @@ async fn session_relay_pruning_removes_idle_stream_relay() {
 }
 
 #[tokio::test]
+async fn session_subscription_drops_slow_outbound_client() {
+    let sandbox = unique_test_dir("session-relay-slow-client");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let (out_tx, _out_rx) = mpsc::channel(1);
+    let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    subscribe_session(
+        state.clone(),
+        out_tx,
+        subscriptions.clone(),
+        "default".to_string(),
+        "thread-1".to_string(),
+    )
+    .await
+    .expect("subscription should start");
+
+    let relay = {
+        state
+            .relays
+            .lock()
+            .await
+            .get(&session_relay_key("default", "thread-1"))
+            .cloned()
+            .expect("relay should exist while subscribed")
+    };
+    relay
+        .send(json!({ "kind": "delta" }))
+        .expect("relay event should publish to subscription");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !state
+                .relays
+                .lock()
+                .await
+                .contains_key(&session_relay_key("default", "thread-1"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("slow outbound client should be dropped and relay pruned");
+    assert!(
+        subscriptions
+            .lock()
+            .await
+            .contains_key(&session_relay_key("default", "thread-1")),
+        "subscription registry cleanup is handled by websocket disconnect paths"
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn theme_settings_round_trip_through_rust_store() {
     let sandbox = unique_test_dir("theme-settings");
     let workspace = sandbox.join("workspace");

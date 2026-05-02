@@ -372,8 +372,21 @@ pub(crate) async fn read_editable_file_payload(
 ) -> ApiResult<Value> {
     let resolved_path = resolve_editable_file_path(state, profile_id, file_path).await?;
     ensure_text_file_preview_size(&resolved_path).await?;
-    let content = match tokio_fs::read_to_string(&resolved_path).await {
-        Ok(content) => content,
+    let content = match tokio_fs::read(&resolved_path).await {
+        Ok(bytes) => {
+            if bytes.contains(&0) {
+                return Err(api_error(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "The selected file appears to be binary and cannot be previewed.",
+                ));
+            }
+            String::from_utf8(bytes).map_err(|_| {
+                api_error(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "The selected file is not valid UTF-8 text.",
+                )
+            })?
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(_) => {
             return Err(api_error(

@@ -139,6 +139,30 @@ async fn rejects_oversized_editable_file_previews() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test]
+async fn rejects_binary_editable_file_previews() {
+    let sandbox = unique_test_dir("editor-binary-preview");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let binary_path = workspace.join("image.bin");
+    fs::write(&binary_path, [0, 1, 2, 3, 4]).unwrap();
+    let error = read_editable_file_payload(&state, "default", binary_path.to_str().unwrap())
+        .await
+        .expect_err("binary files should not be loaded into editor preview");
+
+    assert_eq!(error.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        error.message,
+        "The selected file appears to be binary and cannot be previewed."
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn command_runner_rejects_oversized_output() {

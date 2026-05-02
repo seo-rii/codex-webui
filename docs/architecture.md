@@ -84,7 +84,7 @@ It is responsible for:
 Uploads are a deliberate exception to the WebSocket-first rule:
 
 - browser sends `multipart/form-data`
-- Rust stores the upload and associates it with the target session
+- Rust streams the upload to disk, enforces per-file/request/profile storage limits, and associates it with the target session
 
 ## Why Rust + app-server
 

@@ -74,6 +74,7 @@ pub(crate) struct Config {
     pub(crate) public_port: u16,
     pub(crate) codex_bin: String,
     pub(crate) max_upload_bytes: u64,
+    pub(crate) max_attachment_storage_bytes: u64,
     pub(crate) git_discovery_depth: u64,
     pub(crate) system_shutdown_enabled: bool,
     pub(crate) system_shutdown_delay_seconds: u64,
@@ -127,12 +128,19 @@ impl Config {
             .unwrap_or_else(|_| cwd.join(".data"));
         let public_host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let public_port = parse_port(env::var("PORT").ok(), 4173)?;
-        let max_upload_bytes = env::var("CODEX_WEBUI_MAX_UPLOAD_MB")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| *value > 0.0)
-            .map(|value| (value * 1024.0 * 1024.0).round() as u64)
-            .unwrap_or(20 * 1024 * 1024);
+        let parse_mb_env = |name: &str, fallback: u64| {
+            env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| *value > 0.0)
+                .map(|value| (value * 1024.0 * 1024.0).round() as u64)
+                .unwrap_or(fallback)
+        };
+        let max_upload_bytes = parse_mb_env("CODEX_WEBUI_MAX_UPLOAD_MB", 20 * 1024 * 1024);
+        let max_attachment_storage_bytes = parse_mb_env(
+            "CODEX_WEBUI_MAX_ATTACHMENT_STORAGE_MB",
+            max_upload_bytes.saturating_mul(100).max(max_upload_bytes),
+        );
         let git_discovery_depth = env::var("CODEX_WEBUI_GIT_DISCOVERY_DEPTH")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -167,6 +175,7 @@ impl Config {
             public_port,
             codex_bin: env::var("CODEX_WEBUI_CODEX_BIN").unwrap_or_else(|_| "codex".to_string()),
             max_upload_bytes,
+            max_attachment_storage_bytes,
             git_discovery_depth,
             system_shutdown_enabled: env::var("CODEX_WEBUI_ENABLE_SYSTEM_SHUTDOWN")
                 .is_ok_and(|value| value == "true"),

@@ -118,9 +118,27 @@ fn attachment_kind_for_mime(mime_type: &str) -> &'static str {
     }
 }
 
+fn human_readable_byte_limit(bytes: u64) -> String {
+    if bytes < 1024 * 1024 {
+        format!("{bytes} bytes")
+    } else {
+        let mb = ((bytes as f64) / (1024.0 * 1024.0)).round() as u64;
+        format!("{mb}MB")
+    }
+}
+
 pub(crate) fn attachment_limit_error_message(max_upload_bytes: u64) -> String {
-    let max_upload_mb = ((max_upload_bytes as f64) / (1024.0 * 1024.0)).round() as u64;
-    format!("Upload exceeds the {max_upload_mb}MB limit.")
+    format!(
+        "Upload exceeds the {} limit.",
+        human_readable_byte_limit(max_upload_bytes)
+    )
+}
+
+pub(crate) fn attachment_storage_quota_error_message(max_storage_bytes: u64) -> String {
+    format!(
+        "Attachment storage exceeds the {} profile quota.",
+        human_readable_byte_limit(max_storage_bytes)
+    )
 }
 
 pub(crate) const MAX_ATTACHMENTS_PER_REQUEST: usize = 20;
@@ -156,6 +174,75 @@ pub(crate) fn validate_total_attachment_size(config: &Config, size: u64) -> ApiR
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             attachment_limit_error_message(max_total),
+        ));
+    }
+    Ok(())
+}
+
+async fn profile_attachment_storage_size(state: &AppState, profile_id: &str) -> ApiResult<u64> {
+    let uploads_root = resolve_runtime_profile(&state.config, profile_id)
+        .data_dir
+        .join("uploads");
+    let mut pending = vec![uploads_root];
+    let mut total = 0_u64;
+
+    while let Some(path) = pending.pop() {
+        let mut entries = match tokio_fs::read_dir(&path).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error.to_string(),
+                ));
+            }
+        };
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        {
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with(".upload-")
+                || file_name.starts_with(".codex-webui-attachment-")
+            {
+                continue;
+            }
+
+            let metadata = entry
+                .metadata()
+                .await
+                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            total = total.saturating_add(metadata.len());
+        }
+    }
+
+    Ok(total)
+}
+
+pub(crate) async fn validate_attachment_storage_quota(
+    state: &AppState,
+    profile_id: &str,
+    incoming_bytes: u64,
+) -> ApiResult<()> {
+    let used = profile_attachment_storage_size(state, profile_id).await?;
+    if used.saturating_add(incoming_bytes) > state.config.max_attachment_storage_bytes {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            attachment_storage_quota_error_message(state.config.max_attachment_storage_bytes),
         ));
     }
     Ok(())
@@ -240,6 +327,7 @@ pub(crate) async fn save_uploaded_attachment_records(
         .map(|upload| upload.bytes.len() as u64)
         .fold(0_u64, u64::saturating_add);
     validate_total_attachment_size(&state.config, total_size)?;
+    validate_attachment_storage_quota(state, profile_id, total_size).await?;
 
     for upload in uploads {
         if upload.bytes.is_empty() {
@@ -311,6 +399,7 @@ pub(crate) async fn store_uploaded_attachment_file(
     source_path: &Path,
 ) -> ApiResult<StoredAttachmentRecord> {
     validate_attachment_size(&state.config, size)?;
+    validate_attachment_storage_quota(state, profile_id, size).await?;
     let uploads_dir = resolve_runtime_profile(&state.config, profile_id)
         .data_dir
         .join("uploads")

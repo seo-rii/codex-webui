@@ -279,6 +279,7 @@ The Rust gateway honors a focused set of `CODEX_WEBUI_*` environment variables. 
 - `CODEX_WEBUI_DEFAULT_PROFILE_ID`
 - `CODEX_WEBUI_PROFILES_JSON`
 - `CODEX_WEBUI_MAX_UPLOAD_MB`
+- `CODEX_WEBUI_MAX_ATTACHMENT_STORAGE_MB`
 - `CODEX_WEBUI_DEFAULT_*` session defaults such as model, sandbox, approval, speed, effort, network, and steering resume mode
 - `CODEX_WEBUI_GIT_DISCOVERY_DEPTH`
 - `CODEX_WEBUI_ENABLE_SYSTEM_SHUTDOWN`
@@ -300,7 +301,7 @@ See [.env.example](./.env.example) for a concise example set.
 - Leave `CODEX_WEBUI_TRUST_PROXY_HEADERS` unset unless the gateway only receives traffic from a trusted reverse proxy that controls `X-Forwarded-*` headers. When enabling it behind a non-loopback proxy, set `CODEX_WEBUI_TRUSTED_PROXY_CIDRS`.
 - Externally bound deployments reject unsafe HTTP mutations that omit `Origin`; keep API clients on loopback or send a trusted Origin.
 - WebSocket upgrades check `Origin` against same-origin or configured CORS origins; do not rely on HTTP CORS alone when exposing the gateway.
-- Login and JSON mutation bodies are size-limited, attachment uploads are streamed with per-file/request caps, and large file/diff previews are bounded.
+- Login and JSON mutation bodies are size-limited, attachment uploads are streamed with per-file/request/profile storage caps, and large file/diff previews are bounded.
 - User-facing HTTP and WebSocket errors redact common token-shaped values and the host user's home directory; detailed diagnostics go to server logs instead.
 - Use the viewer password for observation-only access instead of sharing the admin password when multiple humans need browser visibility.
 - Git actions are intentionally gated on explicit repository selection.

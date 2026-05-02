@@ -411,6 +411,53 @@ async fn upload_attachments_rejects_total_decoded_size_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_attachments_rejects_profile_storage_quota() {
+    let sandbox = unique_test_dir("attachment-upload-storage-quota");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let mut state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let mut config = (*state.config).clone();
+    config.max_upload_bytes = 8;
+    config.max_attachment_storage_bytes = 8;
+    state.config = Arc::new(config);
+
+    let existing_dir = resolve_runtime_profile(&state.config, "default")
+        .data_dir
+        .join("uploads")
+        .join("thread-0");
+    fs::create_dir_all(&existing_dir).unwrap();
+    fs::write(existing_dir.join("existing.txt"), b"123456").unwrap();
+
+    let files = vec![UploadFilePayload {
+        name: "note.txt".to_string(),
+        mime_type: Some("text/plain".to_string()),
+        data_base64: base64::engine::general_purpose::STANDARD.encode(b"note"),
+    }];
+    let error = upload_attachments(&state, "default", "thread-1", files)
+        .await
+        .expect_err("profile storage quota should be enforced");
+
+    assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        error
+            .message
+            .contains("Attachment storage exceeds the 8 bytes profile quota.")
+    );
+    assert!(
+        list_session_attachment_records(&state, "default", "thread-1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_attachments_http_handlers_use_rust_storage() {
     let sandbox = unique_test_dir("attachment-http-rust");
     let workspace = sandbox.join("workspace");

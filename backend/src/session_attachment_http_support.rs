@@ -106,6 +106,13 @@ pub(crate) async fn handle_session_attachments_api_http(
                         let _ = tokio_fs::remove_file(&temp_path).await;
                         return json_error(error.status, &error.message);
                     }
+                    if let Err(error) =
+                        validate_attachment_storage_quota(&state, &auth.profile_id, next_total_size)
+                            .await
+                    {
+                        let _ = tokio_fs::remove_file(&temp_path).await;
+                        return json_error(error.status, &error.message);
+                    }
                     total_size = next_total_size;
                     if let Err(error) = temp_file.write_all(&chunk).await {
                         let _ = tokio_fs::remove_file(&temp_path).await;

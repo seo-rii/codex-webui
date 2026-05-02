@@ -69,7 +69,9 @@ pub(crate) fn authless_admin_allowed(config: &Config) -> bool {
 }
 
 pub(crate) fn role_has_owner_access(config: &Config, role: UserRole) -> bool {
-    let owner_required = owner_role_configured(config) || !public_host_is_loopback(config);
+    let owner_required = owner_role_configured(config)
+        || !public_host_is_loopback(config)
+        || config.system_shutdown_enabled;
     !owner_required || matches!(role, UserRole::Owner)
 }
 

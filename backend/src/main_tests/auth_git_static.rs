@@ -186,6 +186,30 @@ fn auth_cookie_round_trips_owner_role() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[test]
+fn system_shutdown_enabled_requires_owner_for_owner_only_actions() {
+    let sandbox = unique_test_dir("shutdown-owner-required");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+
+    assert!(role_has_owner_access(&config, UserRole::Admin));
+    config.system_shutdown_enabled = true;
+    assert!(!role_has_owner_access(&config, UserRole::Admin));
+    assert!(role_has_owner_access(&config, UserRole::Owner));
+    assert!(
+        authorize_ws_method(&config, UserRole::Admin, "terminal/create", &json!({}))
+            .expect_err("shutdown-enabled deployments should require owner preflight")
+            .to_string()
+            .contains("OWNER_REQUIRED")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owner_config_blocks_admin_from_owner_only_websocket_methods() {
     let sandbox = unique_test_dir("owner-only-ws-method");

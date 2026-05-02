@@ -139,7 +139,15 @@ pub(crate) async fn read_json_body(
     label: &str,
 ) -> ApiResult<Value> {
     let body = read_limited_body(request, limit, label).await?;
-    Ok(serde_json::from_slice(&body).unwrap_or_else(|_| json!({})))
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(json!({}));
+    }
+    serde_json::from_slice(&body).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("{label} must be valid JSON."),
+        )
+    })
 }
 
 pub(crate) const USAGE_LIMIT_EXCEEDED_CODE: &str = "USAGE_LIMIT_EXCEEDED";

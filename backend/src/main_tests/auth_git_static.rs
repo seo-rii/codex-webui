@@ -1118,6 +1118,31 @@ async fn authenticated_http_mutations_require_csrf_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_http_body_reader_rejects_malformed_non_empty_payloads() {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/test")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{not valid json"))
+        .unwrap();
+    let error = read_json_body(request, SMALL_JSON_BODY_LIMIT, "test body")
+        .await
+        .expect_err("malformed JSON should be rejected");
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.message, "test body must be valid JSON.");
+
+    let empty_request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/test")
+        .body(Body::from(" \n\t "))
+        .unwrap();
+    let empty_payload = read_json_body(empty_request, SMALL_JSON_BODY_LIMIT, "test body")
+        .await
+        .expect("empty JSON body should preserve compatibility");
+    assert_eq!(empty_payload, json!({}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_login_rejects_oversized_json_body() {
     let sandbox = unique_test_dir("auth-login-body-limit");
     let workspace = sandbox.join("workspace");

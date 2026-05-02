@@ -447,6 +447,48 @@ async fn websocket_inflight_requests_reject_id_reuse_with_different_payloads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_inflight_requests_limit_join_waiters() {
+    let sandbox = unique_test_dir("ws-inflight-waiter-cap");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let request_key = request_cache_key("default", "client-id", UserRole::Admin);
+    let params_hash = request_params_hash(&json!({ "value": 1 }));
+    let (first_tx, _first_rx) = mpsc::channel(8);
+
+    assert!(matches!(
+        register_inflight_request(&state, &request_key, "session/get", &params_hash, &first_tx)
+            .await,
+        InflightRequestRegistration::Started
+    ));
+
+    for _ in 1..INFLIGHT_REQUEST_MAX_WAITERS {
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(matches!(
+            register_inflight_request(&state, &request_key, "session/get", &params_hash, &tx).await,
+            InflightRequestRegistration::Joined
+        ));
+    }
+
+    let (overflow_tx, _overflow_rx) = mpsc::channel(8);
+    assert!(matches!(
+        register_inflight_request(
+            &state,
+            &request_key,
+            "session/get",
+            &params_hash,
+            &overflow_tx
+        )
+        .await,
+        InflightRequestRegistration::Full
+    ));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_response_cache_prunes_oldest_entries_at_cap() {
     let sandbox = unique_test_dir("ws-cache-cap");
     let workspace = sandbox.join("workspace");

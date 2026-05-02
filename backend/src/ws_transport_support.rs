@@ -220,6 +220,17 @@ async fn handle_ws_message(
                         .await;
                     return Ok(());
                 }
+                InflightRequestRegistration::Full => {
+                    let _ = out_tx
+                        .send(ServerEnvelope::Response {
+                            id,
+                            ok: false,
+                            result: None,
+                            error: Some("Too many in-flight websocket requests.".to_string()),
+                        })
+                        .await;
+                    return Ok(());
+                }
             }
 
             let Some(_profile_permit) =

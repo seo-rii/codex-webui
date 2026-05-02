@@ -57,6 +57,7 @@ pub(crate) struct CachedResponse {
 }
 
 pub(crate) struct InflightRequest {
+    pub(crate) created_at: Instant,
     pub(crate) method: String,
     pub(crate) params_hash: String,
     pub(crate) waiters: Vec<mpsc::Sender<ServerEnvelope>>,

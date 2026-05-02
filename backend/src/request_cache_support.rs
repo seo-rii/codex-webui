@@ -10,6 +10,7 @@ pub(crate) enum InflightRequestRegistration {
     Started,
     Joined,
     Conflict,
+    Full,
 }
 
 pub(crate) async fn cached_response(
@@ -91,19 +92,29 @@ pub(crate) async fn register_inflight_request(
     out_tx: &mpsc::Sender<ServerEnvelope>,
 ) -> InflightRequestRegistration {
     let mut inflight = state.inflight_requests.lock().await;
-    inflight.retain(|_, request| !request.waiters.is_empty());
+    inflight.retain(|_, request| {
+        !request.waiters.is_empty() && request.created_at.elapsed() < INFLIGHT_REQUEST_TTL
+    });
 
     if let Some(request) = inflight.get_mut(request_id) {
         if request.method != method || request.params_hash != params_hash {
             return InflightRequestRegistration::Conflict;
         }
+        if request.waiters.len() >= INFLIGHT_REQUEST_MAX_WAITERS {
+            return InflightRequestRegistration::Full;
+        }
         request.waiters.push(out_tx.clone());
         return InflightRequestRegistration::Joined;
+    }
+
+    if inflight.len() >= INFLIGHT_REQUEST_MAX_ENTRIES {
+        return InflightRequestRegistration::Full;
     }
 
     inflight.insert(
         request_id.to_string(),
         InflightRequest {
+            created_at: Instant::now(),
             method: method.to_string(),
             params_hash: params_hash.to_string(),
             waiters: vec![out_tx.clone()],

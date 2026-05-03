@@ -852,6 +852,7 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
     let mut config = (*state.config).clone();
     config.instance_token = Some("probe-token".to_string());
     config.password = Some("admin-secret".to_string());
+    config.restart_command = Some("true".to_string());
     state.config = Arc::new(config);
     fs::create_dir_all(&state.config.data_dir).unwrap();
 
@@ -984,6 +985,53 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
             .load(Ordering::SeqCst)
     );
 
+    let owner_jar =
+        issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Owner).unwrap();
+    let owner_handoff_without_csrf = Request::builder()
+        .method(Method::POST)
+        .uri("/api/admin/restart-handoff/prepare")
+        .body(Body::empty())
+        .unwrap();
+    let owner_handoff_without_csrf_response = handle_http(
+        State(state.clone()),
+        owner_jar.clone(),
+        owner_handoff_without_csrf,
+    )
+    .await;
+    assert_eq!(
+        owner_handoff_without_csrf_response.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        !state
+            .preserve_app_servers_on_shutdown
+            .load(Ordering::SeqCst)
+    );
+
+    let owner_jar = issue_csrf_cookie(&state.config, owner_jar, false).unwrap();
+    let csrf_token = owner_jar
+        .get(CSRF_COOKIE)
+        .expect("csrf cookie should be issued")
+        .value()
+        .to_string();
+    let owner_handoff_request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/admin/restart-handoff/prepare")
+        .header(CSRF_HEADER, csrf_token)
+        .body(Body::empty())
+        .unwrap();
+    let owner_handoff_response =
+        handle_http(State(state.clone()), owner_jar, owner_handoff_request).await;
+    assert_eq!(owner_handoff_response.status(), StatusCode::OK);
+    assert!(
+        state
+            .preserve_app_servers_on_shutdown
+            .load(Ordering::SeqCst)
+    );
+
+    state
+        .preserve_app_servers_on_shutdown
+        .store(false, Ordering::SeqCst);
     let handoff_request = Request::builder()
         .method(Method::POST)
         .uri("/api/admin/restart-handoff/prepare")
@@ -997,6 +1045,36 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
         state
             .preserve_app_servers_on_shutdown
             .load(Ordering::SeqCst)
+    );
+
+    state
+        .preserve_app_servers_on_shutdown
+        .store(false, Ordering::SeqCst);
+    *state.restart_plan.lock().await = None;
+    let restart_jar =
+        issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Owner).unwrap();
+    let restart_jar = issue_csrf_cookie(&state.config, restart_jar, false).unwrap();
+    let restart_csrf_token = restart_jar
+        .get(CSRF_COOKIE)
+        .expect("csrf cookie should be issued")
+        .value()
+        .to_string();
+    let restart_request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/admin/restart")
+        .header(CSRF_HEADER, restart_csrf_token)
+        .body(Body::empty())
+        .unwrap();
+    let restart_response = handle_http(State(state.clone()), restart_jar, restart_request).await;
+    assert_eq!(restart_response.status(), StatusCode::OK);
+    assert!(
+        state
+            .preserve_app_servers_on_shutdown
+            .load(Ordering::SeqCst)
+    );
+    assert!(
+        state.restart_plan.lock().await.is_none(),
+        "replacement gateway should be spawned before shutdown begins instead of waiting for graceful connections to drain"
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -1123,6 +1201,7 @@ async fn auth_cookies_are_scoped_to_base_path() {
     let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
     let mut config = (*state.config).clone();
     config.base_path = "/absproxy/4173".to_string();
+    config.owner_password = Some("owner-secret".to_string());
 
     let jar = issue_auth_cookie(&config, CookieJar::new(), false, UserRole::Admin).unwrap();
     assert_eq!(
@@ -1146,6 +1225,40 @@ async fn auth_cookies_are_scoped_to_base_path() {
     );
 
     state.config = Arc::new(config);
+    let login_request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({ "password": "owner-secret" }).to_string(),
+        ))
+        .unwrap();
+    let login_response = handle_auth_http(
+        state.clone(),
+        CookieJar::new(),
+        Method::POST,
+        "/api/auth/login".to_string(),
+        HeaderMap::new(),
+        login_request,
+        None,
+    )
+    .await;
+    assert_eq!(login_response.status(), StatusCode::OK);
+    let login_set_cookies = login_response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert!(login_set_cookies.iter().any(|cookie| {
+        cookie.contains("codex_webui_auth=") && cookie.contains("Path=/absproxy/4173")
+    }));
+    assert!(
+        login_set_cookies
+            .iter()
+            .any(|cookie| { cookie.contains("codex_webui_auth=") && cookie.contains("Path=/;") })
+    );
+
     let request = Request::builder()
         .method(Method::POST)
         .uri("/api/auth/logout")
@@ -1170,7 +1283,22 @@ async fn auth_cookies_are_scoped_to_base_path() {
     assert!(
         set_cookies
             .iter()
-            .all(|cookie| cookie.contains("Path=/absproxy/4173"))
+            .any(|cookie| cookie.contains("Path=/absproxy/4173"))
+    );
+    assert!(
+        set_cookies
+            .iter()
+            .any(|cookie| cookie.contains("codex_webui_auth=") && cookie.contains("Path=/;"))
+    );
+    assert!(
+        set_cookies
+            .iter()
+            .any(|cookie| cookie.contains("codex_webui_profile=") && cookie.contains("Path=/;"))
+    );
+    assert!(
+        set_cookies
+            .iter()
+            .any(|cookie| cookie.contains("codex_webui_csrf=") && cookie.contains("Path=/;"))
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -2230,12 +2358,12 @@ async fn static_asset_handler_rewrites_base_path_and_uses_spa_fallbacks() {
     fs::create_dir_all(&codex_home).unwrap();
     fs::write(
         static_dir.join("index.html"),
-        "<html><body>/__CODEX_WEBUI_BASE__/index</body></html>",
+        "<html><body>/__CODEX_WEBUI_BASE__/index<script>window.__boot = true;</script></body></html>",
     )
     .unwrap();
     fs::write(
         static_dir.join("200.html"),
-        "<html><body>/__CODEX_WEBUI_BASE__/fallback</body></html>",
+        "<html><body>/__CODEX_WEBUI_BASE__/fallback<script>window.__fallback = true;</script></body></html>",
     )
     .unwrap();
     fs::write(
@@ -2268,6 +2396,8 @@ async fn static_asset_handler_rewrites_base_path_and_uses_spa_fallbacks() {
     assert!(content_security_policy.contains("object-src 'none'"));
     assert!(content_security_policy.contains("base-uri 'none'"));
     assert!(content_security_policy.contains("frame-ancestors 'none'"));
+    assert!(content_security_policy.contains("'sha256-"));
+    assert!(!content_security_policy.contains("script-src 'self' 'unsafe-inline'"));
     assert_eq!(
         root_response
             .headers()

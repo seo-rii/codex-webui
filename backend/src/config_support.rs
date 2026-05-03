@@ -97,6 +97,7 @@ pub(crate) struct Config {
     pub(crate) webhook_allowed_hosts: Vec<String>,
     pub(crate) instance_token: Option<String>,
     pub(crate) app_server_handoff_enabled: bool,
+    pub(crate) restart_command: Option<String>,
 }
 
 impl Config {
@@ -225,17 +226,38 @@ impl Config {
                 env::var("CODEX_WEBUI_WEBHOOK_ALLOWED_HOSTS").ok(),
             )?,
             instance_token: optional_env("CODEX_WEBUI_INSTANCE_TOKEN"),
-            app_server_handoff_enabled: env::var("CODEX_WEBUI_APP_SERVER_HANDOFF")
-                .map(|value| {
-                    !matches!(
-                        value.trim().to_ascii_lowercase().as_str(),
-                        "0" | "false" | "no" | "off"
-                    )
-                })
-                .unwrap_or(true),
+            app_server_handoff_enabled: parse_app_server_handoff_enabled(
+                env::var("CODEX_WEBUI_APP_SERVER_HANDOFF").ok(),
+            ),
+            restart_command: optional_env("CODEX_WEBUI_RESTART_COMMAND"),
         };
         validate_plaintext_password_policy(&config)?;
         Ok(config)
+    }
+}
+
+fn parse_app_server_handoff_enabled(value: Option<String>) -> bool {
+    value
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_app_server_handoff_enabled;
+
+    #[test]
+    fn app_server_handoff_is_opt_in() {
+        assert!(!parse_app_server_handoff_enabled(None));
+        assert!(!parse_app_server_handoff_enabled(Some("false".to_string())));
+        assert!(!parse_app_server_handoff_enabled(Some("0".to_string())));
+        assert!(parse_app_server_handoff_enabled(Some("true".to_string())));
+        assert!(parse_app_server_handoff_enabled(Some("on".to_string())));
     }
 }
 

@@ -85,6 +85,9 @@ pub(crate) struct SessionSummaryUiSnapshot {
     pub(crate) active_thread_ids: HashSet<String>,
 }
 
+const ACTIVE_SESSION_STATUS_RECONCILE_AFTER_MS: u64 = 5_000;
+const ACTIVE_SESSION_STATUS_RECONCILE_LIMIT: usize = 32;
+
 pub(crate) fn session_filter_from_value(filter: Option<&Value>) -> SessionFilterCriteria {
     let mut tags = filter
         .and_then(|value| value.get("tags"))
@@ -476,17 +479,137 @@ pub(crate) async fn read_session_summary_ui_snapshot(
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
         .0
         .to_string();
+    let runtime_status_by_thread_id = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("runtimeStatusByThreadId")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default())
+    })
+    .await?;
+    let runtime_key_prefix = format!("profile::{resolved_profile_id}::session-runtime::");
+    let now_ms = now_unix_ms();
+    let mut reconcile_candidates = Vec::new();
+    let mut reconcile_candidate_ids = HashSet::new();
+    {
+        let active_turns = state.active_turns.lock().await;
+        for runtime_key in active_turns.keys() {
+            let Some(session_id) = runtime_key.strip_prefix(&runtime_key_prefix) else {
+                continue;
+            };
+            let Some(status_updated_at) = runtime_status_by_thread_id
+                .get(session_id)
+                .and_then(|value| value.get("updatedAt"))
+                .and_then(Value::as_u64)
+            else {
+                continue;
+            };
+            if now_ms.saturating_sub(status_updated_at) < ACTIVE_SESSION_STATUS_RECONCILE_AFTER_MS {
+                continue;
+            }
+            if reconcile_candidate_ids.insert(session_id.to_string()) {
+                reconcile_candidates.push((runtime_key.clone(), session_id.to_string()));
+            }
+            if reconcile_candidates.len() >= ACTIVE_SESSION_STATUS_RECONCILE_LIMIT {
+                break;
+            }
+        }
+    }
+    {
+        let pending_turn_starts = state.pending_turn_starts.lock().await;
+        for runtime_key in pending_turn_starts.iter() {
+            if reconcile_candidates.len() >= ACTIVE_SESSION_STATUS_RECONCILE_LIMIT {
+                break;
+            }
+            let Some(session_id) = runtime_key.strip_prefix(&runtime_key_prefix) else {
+                continue;
+            };
+            let Some(status_updated_at) = runtime_status_by_thread_id
+                .get(session_id)
+                .and_then(|value| value.get("updatedAt"))
+                .and_then(Value::as_u64)
+            else {
+                continue;
+            };
+            if now_ms.saturating_sub(status_updated_at) < ACTIVE_SESSION_STATUS_RECONCILE_AFTER_MS {
+                continue;
+            }
+            if reconcile_candidate_ids.insert(session_id.to_string()) {
+                reconcile_candidates.push((runtime_key.clone(), session_id.to_string()));
+            }
+        }
+    }
+    if reconcile_candidates.len() < ACTIVE_SESSION_STATUS_RECONCILE_LIMIT {
+        for (session_id, status_value) in &runtime_status_by_thread_id {
+            if reconcile_candidates.len() >= ACTIVE_SESSION_STATUS_RECONCILE_LIMIT {
+                break;
+            }
+            let status = normalized_thread_status(Some(status_value));
+            if !status.as_deref().is_some_and(is_live_thread_status) {
+                continue;
+            }
+            let status_updated_at = status_value
+                .get("updatedAt")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            if now_ms.saturating_sub(status_updated_at) < ACTIVE_SESSION_STATUS_RECONCILE_AFTER_MS {
+                continue;
+            }
+            if reconcile_candidate_ids.insert(session_id.clone()) {
+                reconcile_candidates.push((
+                    runtime_session_key(&resolved_profile_id, session_id),
+                    session_id.clone(),
+                ));
+            }
+        }
+    }
+    for (runtime_key, session_id) in reconcile_candidates {
+        let Ok(thread) = read_thread_payload(state, profile_id, &session_id, true).await else {
+            continue;
+        };
+        let thread_status =
+            normalized_thread_status(thread.get("status")).unwrap_or_else(|| "unknown".to_string());
+        let active_turn_id = thread
+            .get("turns")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .and_then(active_turn_id_from_turns);
+        if is_live_thread_status(&thread_status) {
+            if let Some(turn_id) = active_turn_id {
+                state.active_turns.lock().await.insert(runtime_key, turn_id);
+            }
+            continue;
+        }
+
+        state.active_turns.lock().await.remove(&runtime_key);
+        state.pending_turn_starts.lock().await.remove(&runtime_key);
+        with_ui_state_write(state, profile_id, |ui_state| {
+            let Some(runtime_status_by_thread_id) = ui_state
+                .get_mut("runtimeStatusByThreadId")
+                .and_then(Value::as_object_mut)
+            else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "runtime status state is missing",
+                ));
+            };
+            runtime_status_by_thread_id.insert(
+                session_id.clone(),
+                json!({
+                    "status": thread_status,
+                    "updatedAt": now_unix_ms()
+                }),
+            );
+            Ok(())
+        })
+        .await?;
+    }
     let mut active_thread_ids = state
         .active_turns
         .lock()
         .await
         .keys()
-        .filter_map(|key| {
-            key.strip_prefix(&format!(
-                "profile::{resolved_profile_id}::session-runtime::"
-            ))
-            .map(str::to_string)
-        })
+        .filter_map(|key| key.strip_prefix(&runtime_key_prefix).map(str::to_string))
         .collect::<HashSet<_>>();
     active_thread_ids.extend(
         state
@@ -494,12 +617,7 @@ pub(crate) async fn read_session_summary_ui_snapshot(
             .lock()
             .await
             .iter()
-            .filter_map(|key| {
-                key.strip_prefix(&format!(
-                    "profile::{resolved_profile_id}::session-runtime::"
-                ))
-                .map(str::to_string)
-            }),
+            .filter_map(|key| key.strip_prefix(&runtime_key_prefix).map(str::to_string)),
     );
 
     with_ui_state_read(state, profile_id, |ui_state| {
@@ -543,7 +661,7 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                 .get("runtimeStatusByThreadId")
                 .and_then(Value::as_object)
                 .cloned()
-                .unwrap_or_default(),
+                .unwrap_or_else(|| runtime_status_by_thread_id.clone()),
             queue_counts_by_thread_id,
             active_thread_ids,
         })

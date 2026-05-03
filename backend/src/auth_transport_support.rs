@@ -95,6 +95,8 @@ pub(crate) async fn handle_auth_http(
         Err(error_message) => json_error(StatusCode::UNAUTHORIZED, &error_message),
     };
 
+    append_legacy_root_auth_cookie_clears(&state.config, &mut response);
+
     if let Some(origin_value) = cors_origin {
         apply_cors_headers(
             response.headers_mut(),
@@ -282,9 +284,11 @@ fn auth_logout(config: &Config, jar: CookieJar) -> Response {
     let mut profile_cookie = Cookie::new(PROFILE_COOKIE, "");
     profile_cookie.set_path(auth_cookie_path(config));
     profile_cookie.set_max_age(CookieDuration::seconds(0));
-    (
+    let mut response = (
         clear_csrf_cookie(config, jar.remove(cookie).remove(profile_cookie)),
         Json(json!({ "ok": true })),
     )
-        .into_response()
+        .into_response();
+    append_current_path_auth_cookie_clears(config, &mut response);
+    response
 }

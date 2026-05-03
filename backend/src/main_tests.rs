@@ -98,6 +98,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
             webhook_allowed_hosts: Vec::new(),
             instance_token: None,
             app_server_handoff_enabled: false,
+            restart_command: None,
         }),
         app_servers: AppServerManager::new(AppServerClientConfig::default()),
         http: reqwest::Client::new(),
@@ -125,6 +126,8 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
         pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
         shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
         preserve_app_servers_on_shutdown: Arc::new(AtomicBool::new(false)),
+        shutdown_notify: Arc::new(Notify::new()),
+        restart_plan: Arc::new(Mutex::new(None)),
     }
 }
 

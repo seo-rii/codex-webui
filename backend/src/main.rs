@@ -47,7 +47,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     runtime::Builder as TokioRuntimeBuilder,
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc},
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -82,6 +82,7 @@ mod queue_runtime_support;
 mod relay_support;
 mod request_cache_support;
 mod rollout_recovery_support;
+mod restart_support;
 mod runtime_env_support;
 mod runtime_notification_support;
 mod runtime_request_support;
@@ -143,6 +144,7 @@ use queue_runtime_support::*;
 use relay_support::*;
 use request_cache_support::*;
 use rollout_recovery_support::*;
+use restart_support::*;
 use runtime_env_support::*;
 use runtime_notification_support::*;
 use runtime_request_support::*;
@@ -281,6 +283,8 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
             shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
             preserve_app_servers_on_shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(Notify::new()),
+            restart_plan: Arc::new(Mutex::new(None)),
         };
 
         tokio::spawn(restore_automation_schedules(state.clone()));
@@ -308,9 +312,10 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(state.shutdown_notify.clone()))
         .await
         .context("axum server terminated unexpectedly");
+        let restart_plan = state.restart_plan.lock().await.take();
         if state
             .preserve_app_servers_on_shutdown
             .load(Ordering::SeqCst)
@@ -318,6 +323,11 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             let _ = state.app_servers.detach_all().await;
         } else {
             let _ = state.app_servers.close_all().await;
+        }
+        if let Some(plan) = restart_plan {
+            spawn_gateway_restart(&config, plan)
+                .await
+                .context("failed to start replacement gateway")?;
         }
         server_result
     }
@@ -335,7 +345,7 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
     result
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(shutdown_notify: Arc<Notify>) {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
             warn!("failed to install ctrl-c handler: {error}");
@@ -359,6 +369,7 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
+        _ = shutdown_notify.notified() => {},
         _ = ctrl_c => {},
         _ = terminate => {},
     }

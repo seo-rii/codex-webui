@@ -83,7 +83,6 @@ async fn handle_http_inner(
                     Method::POST | Method::PUT | Method::PATCH | Method::DELETE
                 )
                 && route_path != "/api/auth/login"
-                && route_path != "/api/admin/restart-handoff/prepare"
                 && jar.get(AUTH_COOKIE).is_some()
                 && auth_context(&state.config, &jar).is_some()
                 && !verify_csrf_token(&state.config, &jar, &headers)
@@ -276,8 +275,13 @@ codex_webui_pending_server_requests {pending_server_request_count}\n",
                     .is_some_and(|(provided, expected)| {
                         !expected.is_empty() && provided.trim() == expected
                     });
-                if !token_matches {
-                    return json_error(StatusCode::FORBIDDEN, "Instance token is required.");
+                let auth_allowed = auth_context(&state.config, &jar)
+                    .is_some_and(|auth| role_has_owner_access(&state.config, auth.role));
+                if !token_matches && !auth_allowed {
+                    return json_error(
+                        StatusCode::FORBIDDEN,
+                        "Instance token or owner role is required.",
+                    );
                 }
                 state
                     .preserve_app_servers_on_shutdown
@@ -287,6 +291,30 @@ codex_webui_pending_server_requests {pending_server_request_count}\n",
                     "appServerClients": state.app_servers.client_count().await
                 }))
                 .into_response();
+                if let Some(origin_value) = cors_origin {
+                    apply_cors_headers(
+                        response.headers_mut(),
+                        &origin_value,
+                        requested_headers.as_deref(),
+                    );
+                }
+                return response;
+            }
+
+            if route_path == "/api/admin/restart" {
+                if method != Method::POST {
+                    return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+                }
+                let Some(auth) = auth_context(&state.config, &jar) else {
+                    return json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
+                };
+                if !role_has_owner_access(&state.config, auth.role) {
+                    return json_error(StatusCode::FORBIDDEN, "This action requires the owner role.");
+                }
+                let mut response = match prepare_gateway_restart_payload(&state).await {
+                    Ok(payload) => Json(payload).into_response(),
+                    Err(error) => json_error(error.status, &error.message),
+                };
                 if let Some(origin_value) = cors_origin {
                     apply_cors_headers(
                         response.headers_mut(),

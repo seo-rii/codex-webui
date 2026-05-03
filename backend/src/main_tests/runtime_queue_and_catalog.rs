@@ -341,6 +341,121 @@ async fn session_list_shows_completed_when_runtime_completion_beats_stale_thread
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_list_reconciles_stale_running_status_without_opening_thread() {
+    let sandbox = unique_test_dir("session-list-stale-running-reconcile");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-1",
+                    "name": "Status sync",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 20,
+                    "status": "completed",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "completed",
+                            "error": Value::Null,
+                            "startedAt": 10,
+                            "completedAt": 20,
+                            "durationMs": 10,
+                            "items": []
+                        }
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    state.active_turns.lock().await.insert(
+        runtime_session_key("default", "thread-1"),
+        "turn-1".to_string(),
+    );
+    state
+        .pending_turn_starts
+        .lock()
+        .await
+        .insert(runtime_session_key("default", "thread-1"));
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        runtime_status_by_thread_id.insert(
+            "thread-1".to_string(),
+            json!({
+                "status": "running",
+                "updatedAt": now_unix_ms().saturating_sub(10_000)
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let first = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .and_then(|sessions| sessions.first())
+        .cloned()
+        .expect("expected seeded session");
+    assert_eq!(first.get("id").and_then(Value::as_str), Some("thread-1"));
+    assert_eq!(
+        first.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert!(
+        state
+            .active_turns
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-1"))
+            .is_none()
+    );
+    assert!(
+        !state
+            .pending_turn_starts
+            .lock()
+            .await
+            .contains(&runtime_session_key("default", "thread-1"))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn older_turn_completion_does_not_override_newer_active_turn() {
     let sandbox = unique_test_dir("session-list-active-turn-wins");
     let workspace = sandbox.join("workspace");
@@ -1360,6 +1475,205 @@ async fn queue_drain_waits_while_turn_start_is_pending() {
     assert_eq!(
         drained.get("items").and_then(Value::as_array).map(Vec::len),
         Some(0)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_drain_waits_while_cached_active_turn_is_recent() {
+    let sandbox = unique_test_dir("queue-recent-active-turn");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-recent-active";
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Recent active turn",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "running",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    state.active_turns.lock().await.insert(
+        runtime_session_key("default", session_id),
+        "turn-still-settling".to_string(),
+    );
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        runtime_status_by_thread_id.insert(
+            session_id.to_string(),
+            json!({
+                "status": "running",
+                "updatedAt": now_unix_ms()
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    enqueue_session_queue_payload(
+        &state,
+        "default",
+        session_id,
+        "Do not dispatch while the active turn may still be settling.",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let queue = get_session_queue_payload(&state, "default", session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.get("items").and_then(Value::as_array).map(Vec::len),
+        Some(1)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_drain_clears_stale_cached_active_turn_and_dispatches() {
+    let sandbox = unique_test_dir("queue-stale-active-turn");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-stale-active";
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Stale active turn",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 10,
+                    "status": "running",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    state.active_turns.lock().await.insert(
+        runtime_session_key("default", session_id),
+        "turn-missed-completion".to_string(),
+    );
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        runtime_status_by_thread_id.insert(
+            session_id.to_string(),
+            json!({
+                "status": "running",
+                "updatedAt": now_unix_ms().saturating_sub(6_000)
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    enqueue_session_queue_payload(
+        &state,
+        "default",
+        session_id,
+        "Dispatch after stale active cache is reconciled.",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..20 {
+        let queue = get_session_queue_payload(&state, "default", session_id)
+            .await
+            .unwrap();
+        if queue
+            .get("items")
+            .and_then(Value::as_array)
+            .is_none_or(|items| items.is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let queue_after = get_session_queue_payload(&state, "default", session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue_after
+            .get("items")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    let thread = read_thread_payload(&state, "default", session_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        thread
+            .get("lastTurnStart")
+            .and_then(|value| value.get("input"))
+            .and_then(Value::as_array)
+            .and_then(|input| input.first())
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str),
+        Some("Dispatch after stale active cache is reconciled.")
     );
 
     let _ = fs::remove_dir_all(sandbox);

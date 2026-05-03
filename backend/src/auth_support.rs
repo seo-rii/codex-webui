@@ -78,6 +78,40 @@ pub(crate) fn clear_csrf_cookie(config: &Config, jar: CookieJar) -> CookieJar {
     jar.remove(cookie)
 }
 
+pub(crate) fn append_legacy_root_auth_cookie_clears(config: &Config, response: &mut Response) {
+    if auth_cookie_path(config) == "/" {
+        return;
+    }
+    append_auth_cookie_clears_for_path(config, response, "/");
+}
+
+pub(crate) fn append_current_path_auth_cookie_clears(config: &Config, response: &mut Response) {
+    let path = auth_cookie_path(config);
+    append_auth_cookie_clears_for_path(config, response, &path);
+}
+
+fn append_auth_cookie_clears_for_path(config: &Config, response: &mut Response, path: &str) {
+    for name in [AUTH_COOKIE, PROFILE_COOKIE, CSRF_COOKIE] {
+        let mut cookie = Cookie::new(name, "");
+        cookie.set_path(path.to_string());
+        cookie.set_max_age(CookieDuration::seconds(0));
+        cookie.set_same_site(match config.cookie_same_site {
+            SameSiteMode::Strict => SameSite::Strict,
+            SameSiteMode::Lax => SameSite::Lax,
+            SameSiteMode::None => SameSite::None,
+        });
+        if config.cookie_secure_mode == CookieSecureMode::Always {
+            cookie.set_secure(true);
+        }
+        if name != CSRF_COOKIE {
+            cookie.set_http_only(true);
+        }
+        if let Ok(value) = HeaderValue::from_str(&cookie.to_string()) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
+}
+
 pub(crate) fn auth_cookie_path(config: &Config) -> String {
     if config.base_path.is_empty() {
         "/".to_string()

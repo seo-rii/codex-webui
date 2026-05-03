@@ -1,6 +1,7 @@
 use super::*;
 
 const QUEUE_DRAIN_RETRY_DELAYS_MS: [u64; 6] = [250, 750, 1_500, 3_000, 5_000, 10_000];
+const QUEUE_ACTIVE_RECONCILE_AFTER_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionTurnActivity {
@@ -196,9 +197,6 @@ async fn session_turn_activity(
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
     let runtime_key = runtime_session_key(resolved_profile_id, session_id);
     let cached_active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
-    if cached_active_turn_id.is_some() {
-        return SessionTurnActivity::Active;
-    }
 
     let thread = match read_thread_payload(state, profile_id, session_id, true).await {
         Ok(payload) => payload,
@@ -225,6 +223,22 @@ async fn session_turn_activity(
     }
 
     if cached_active_turn_id.is_some() {
+        let runtime_status_updated_at = with_ui_state_read(state, profile_id, |ui_state| {
+            Ok(ui_state
+                .get("runtimeStatusByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id))
+                .and_then(|entry| entry.get("updatedAt"))
+                .and_then(Value::as_u64))
+        })
+        .await
+        .ok()
+        .flatten();
+        if runtime_status_updated_at.is_some_and(|updated_at| {
+            now_unix_ms().saturating_sub(updated_at) < QUEUE_ACTIVE_RECONCILE_AFTER_MS
+        }) {
+            return SessionTurnActivity::Active;
+        }
         state.active_turns.lock().await.remove(&runtime_key);
     }
     SessionTurnActivity::Idle
@@ -284,7 +298,10 @@ async fn maybe_drain_queue_with_attempt(
             return;
         }
         match session_turn_activity(state, profile_id, session_id).await {
-            SessionTurnActivity::Active => return,
+            SessionTurnActivity::Active => {
+                schedule_queue_drain_retry(state, profile_id, session_id, attempt);
+                return;
+            }
             SessionTurnActivity::Unknown => {
                 schedule_queue_drain_retry(state, profile_id, session_id, attempt);
                 return;

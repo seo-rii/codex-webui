@@ -144,7 +144,7 @@ async fn load_static_asset(
 }
 
 fn static_asset_response(asset: CachedStaticAsset) -> Response {
-    let mut response = Response::new(Body::from(asset.bytes));
+    let mut response = Response::new(Body::from(asset.bytes.clone()));
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
@@ -154,6 +154,40 @@ fn static_asset_response(asset: CachedStaticAsset) -> Response {
         header::CACHE_CONTROL,
         HeaderValue::from_static(asset.cache_control),
     );
+    if asset.content_type.starts_with("text/html") {
+        let mut csp = String::from("default-src 'self'; script-src 'self'");
+        if let Ok(html) = std::str::from_utf8(&asset.bytes) {
+            let mut offset = 0;
+            while let Some(script_start) = html[offset..].find("<script") {
+                let script_start = offset + script_start;
+                let Some(tag_end) = html[script_start..].find('>') else {
+                    break;
+                };
+                let tag_end = script_start + tag_end;
+                let attributes = html[script_start + "<script".len()..tag_end].to_ascii_lowercase();
+                let content_start = tag_end + 1;
+                let Some(close_start) = html[content_start..].find("</script>") else {
+                    break;
+                };
+                let close_start = content_start + close_start;
+                if !attributes.contains("src=") {
+                    let script = &html[content_start..close_start];
+                    if !script.trim().is_empty() {
+                        let digest = <Sha256 as sha2::Digest>::digest(script.as_bytes());
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(digest);
+                        csp.push_str(" 'sha256-");
+                        csp.push_str(&encoded);
+                        csp.push('\'');
+                    }
+                }
+                offset = close_start + "</script>".len();
+            }
+        }
+        csp.push_str(" https://hcaptcha.com https://*.hcaptcha.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http: https:; font-src 'self' data:; connect-src 'self' https://hcaptcha.com https://*.hcaptcha.com ws: wss:; worker-src 'self' blob:; frame-src https://hcaptcha.com https://*.hcaptcha.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+        if let Ok(value) = HeaderValue::from_str(&csp) {
+            headers.insert(header::HeaderName::from_static("content-security-policy"), value);
+        }
+    }
     apply_security_headers(headers);
     response
 }

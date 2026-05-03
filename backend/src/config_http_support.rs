@@ -399,6 +399,10 @@ pub(crate) async fn get_config_payload(state: &AppState, profile_id: &str) -> Ap
             "discoveryDepth": state.config.git_discovery_depth
         },
         "autostart": autostart,
+        "gateway": {
+            "restartAvailable": build_gateway_restart_plan(&state.config).is_ok(),
+            "restartCommandConfigured": state.config.restart_command.is_some()
+        },
         "systemShutdown": {
             "available": shutdown_available,
             "delaySeconds": state.config.system_shutdown_delay_seconds,

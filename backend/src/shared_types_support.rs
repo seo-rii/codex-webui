@@ -45,6 +45,16 @@ pub(crate) struct AppState {
         Arc<Mutex<HashMap<String, HashMap<String, PendingServerRequestEntry>>>>,
     pub(crate) shutdown_timers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(crate) preserve_app_servers_on_shutdown: Arc<AtomicBool>,
+    pub(crate) shutdown_notify: Arc<Notify>,
+    pub(crate) restart_plan: Arc<Mutex<Option<RestartPlan>>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RestartPlan {
+    pub(crate) command: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) mode: &'static str,
 }
 
 #[derive(Clone)]

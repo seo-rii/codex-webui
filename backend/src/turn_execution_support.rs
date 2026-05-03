@@ -178,12 +178,6 @@ pub(crate) async fn send_turn_payload(
         resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
-    state
-        .pending_turn_starts
-        .lock()
-        .await
-        .insert(runtime_key.clone());
-
     let result = async {
         let attachments =
             resolve_selected_attachment_records(state, profile_id, session_id, attachment_ids)
@@ -193,6 +187,28 @@ pub(crate) async fn send_turn_payload(
         if trimmed_prompt.is_empty() && attachments.is_empty() {
             return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
         }
+
+        state
+            .pending_turn_starts
+            .lock()
+            .await
+            .insert(runtime_key.clone());
+        set_runtime_session_status(state, profile_id, session_id, "running").await;
+        emit_session_summary_updated(state, profile_id, session_id, None, Some("running")).await;
+        emit_session_notification(
+            state,
+            profile_id,
+            session_id,
+            json!({
+                "kind": "notification",
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": session_id,
+                    "status": "running"
+                }
+            }),
+        )
+        .await;
 
         cancel_scheduled_shutdown_for_activity(state, profile_id).await;
 
@@ -395,7 +411,10 @@ pub(crate) async fn send_turn_payload(
     .await;
 
     if result.is_err() {
-        state.pending_turn_starts.lock().await.remove(&runtime_key);
+        let was_pending = state.pending_turn_starts.lock().await.remove(&runtime_key);
+        if was_pending {
+            emit_session_summary_updated(state, profile_id, session_id, None, None).await;
+        }
     }
     result
 }

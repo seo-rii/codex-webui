@@ -83,6 +83,8 @@
     quotaBusy,
     runtime,
     runtimeBusyAction,
+    gatewayRestartAvailable = true,
+    gatewayRestartBusy = false,
     showPwaInstall = false,
     pwaInstalled = false,
     pwaInstallBusy = false,
@@ -101,6 +103,7 @@
     onSystemShutdownArmedChange,
     onInstallRuntime,
     onUpdateRuntime,
+    onRestartGateway,
     onThemeModeChange,
     onStartAccountLogin,
     onSelectProfile,
@@ -158,7 +161,9 @@
     quota: CodexQuotaStatus | null;
     quotaBusy: boolean;
     runtime: CodexRuntimeStatus | null;
-    runtimeBusyAction: "install" | "update" | "check" | null;
+    runtimeBusyAction: "install" | "update" | "check" | "status" | null;
+    gatewayRestartAvailable?: boolean;
+    gatewayRestartBusy?: boolean;
     showPwaInstall?: boolean;
     pwaInstalled?: boolean;
     pwaInstallBusy?: boolean;
@@ -177,6 +182,7 @@
     onSystemShutdownArmedChange: (armed: boolean) => void;
     onInstallRuntime: () => void;
     onUpdateRuntime: () => void;
+    onRestartGateway: () => void;
     onThemeModeChange: (mode: ThemeMode) => void;
     onStartAccountLogin: (type: "chatgpt" | "chatgptDeviceCode") => void;
     onSelectProfile: (profileId: string) => void;
@@ -254,6 +260,7 @@
       quota5h: m.quota_5h(),
       quotaWeekly: m.quota_weekly(),
       runtime: m.runtime(),
+      loading: m.loading(),
       version: m.version(),
       binary: m.binary(),
       shutdownAfterQueueCompletes: m.shutdown_after_queue_completes(),
@@ -262,6 +269,9 @@
       check: m.check(),
       update: m.update(),
       install: m.install(),
+      restartWebui: m.restart_webui(),
+      restartingWebui: m.restarting_webui(),
+      restartWebuiDescription: m.restart_webui_description(),
       installApp: m.install_app(),
       installingApp: m.installing_app(),
       appInstalled: m.app_installed(),
@@ -1422,14 +1432,40 @@
             <div class="sidebar-flyout-surface rounded-xl border border-gray-100 bg-gray-50 p-3 space-y-3">
               <div class="flex justify-between text-xs">
                 <span class="text-gray-500">{ui.version}</span>
-                <span class="font-semibold text-gray-700">{runtime?.version ?? ui.missing}</span>
+                <span class="font-semibold text-gray-700">
+                  {#if runtimeBusyAction === "status" && !runtime}
+                    <span class="inline-flex items-center gap-1.5 text-gray-400">
+                      <RefreshCw size={10} class="animate-spin" />
+                      {ui.loading}
+                    </span>
+                  {:else}
+                    {runtime?.version ?? ui.missing}
+                  {/if}
+                </span>
               </div>
               <div class="flex justify-between text-xs">
                 <span class="text-gray-500">{ui.binary}</span>
                 <code class="sidebar-flyout-code rounded border border-gray-200 bg-white px-1.5 py-0.5 text-[10px]">{runtime?.configuredBin ?? "codex"}</code>
               </div>
               <div class="flex gap-2 pt-1">
-                {#if !runtime?.installed}
+                {#if runtimeBusyAction === "status" && !runtime}
+                  <button
+                    class="flex-1 px-3 py-1.5 bg-white border border-gray-200 rounded-lg text-[10px] font-bold text-gray-500 transition-all flex items-center justify-center gap-1.5"
+                    disabled
+                  >
+                    <RefreshCw size={10} class="animate-spin" />
+                    {ui.loading}
+                  </button>
+                {:else if runtime === null}
+                  <button
+                    class="flex-1 px-3 py-1.5 bg-white border border-gray-200 rounded-lg text-[10px] font-bold text-gray-600 hover:bg-gray-50 hover:border-gray-300 transition-all flex items-center justify-center gap-1.5"
+                    disabled={runtimeBusyAction === "check" || runtimeBusyAction === "status"}
+                    onclick={onRefreshRuntime}
+                  >
+                    <RefreshCw size={10} class={runtimeBusyAction === "check" ? 'animate-spin' : ''} />
+                    {ui.check}
+                  </button>
+                {:else if !runtime.installed}
                   <button
                     class="flex-1 px-3 py-1.5 bg-amber-600 rounded-lg text-[10px] font-bold text-white hover:bg-amber-700 transition-all flex items-center justify-center gap-1.5 shadow-sm"
                     disabled={readOnly || !runtime?.npmAvailable || runtimeBusyAction === "install"}
@@ -1450,13 +1486,25 @@
                 {:else}
                   <button 
                     class="flex-1 px-3 py-1.5 bg-white border border-gray-200 rounded-lg text-[10px] font-bold text-gray-600 hover:bg-gray-50 hover:border-gray-300 transition-all flex items-center justify-center gap-1.5"
-                    disabled={runtimeBusyAction === "check"}
+                    disabled={runtimeBusyAction === "check" || runtimeBusyAction === "status"}
                     onclick={onRefreshRuntime}
                   >
                     <RefreshCw size={10} class={runtimeBusyAction === "check" ? 'animate-spin' : ''} />
                     {ui.check}
                   </button>
                 {/if}
+              </div>
+              <div class="border-t border-gray-200/70 pt-2">
+                <button
+                  class="w-full px-3 py-1.5 bg-white border border-gray-200 rounded-lg text-[10px] font-bold text-gray-600 hover:bg-gray-50 hover:border-gray-300 transition-all flex items-center justify-center gap-1.5 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={readOnly || gatewayRestartBusy || !gatewayRestartAvailable}
+                  onclick={onRestartGateway}
+                  title={ui.restartWebuiDescription}
+                  type="button"
+                >
+                  <RefreshCw size={10} class={gatewayRestartBusy ? 'animate-spin' : ''} />
+                  {gatewayRestartBusy ? ui.restartingWebui : ui.restartWebui}
+                </button>
               </div>
             </div>
           </div>

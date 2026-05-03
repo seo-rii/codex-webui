@@ -205,7 +205,11 @@ const mergeResponseCookies = (response) => {
         : [];
 
   for (const rawCookie of setCookies) {
-    const firstPart = String(rawCookie).split(";")[0]?.trim();
+    const parts = String(rawCookie)
+      .split(";")
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const firstPart = parts[0];
     if (!firstPart) {
       continue;
     }
@@ -213,13 +217,29 @@ const mergeResponseCookies = (response) => {
     if (separatorIndex <= 0) {
       continue;
     }
-    cookieJar.set(firstPart.slice(0, separatorIndex), firstPart.slice(separatorIndex + 1));
+    const name = firstPart.slice(0, separatorIndex);
+    const value = firstPart.slice(separatorIndex + 1);
+    const expires = parts
+      .find((part) => part.toLowerCase().startsWith("expires="))
+      ?.slice("expires=".length);
+    const maxAge = parts
+      .find((part) => part.toLowerCase().startsWith("max-age="))
+      ?.slice("max-age=".length);
+    const expired =
+      value === "" ||
+      maxAge === "0" ||
+      (expires ? Number.isFinite(Date.parse(expires)) && Date.parse(expires) <= Date.now() : false);
+    if (expired) {
+      continue;
+    }
+    cookieJar.set(name, value);
   }
 };
 
 if (options.password.trim()) {
   const loginResponse = await fetch(buildUrl("/api/auth/login"), {
     method: "POST",
+    credentials: "include",
     headers: {
       "content-type": "application/json",
       ...(getCookieHeader() ? { cookie: getCookieHeader() } : {})
@@ -241,6 +261,7 @@ if (options.password.trim()) {
 if (options.profile.trim()) {
   const profileResponse = await fetch(buildUrl("/api/auth/profile"), {
     method: "POST",
+    credentials: "include",
     headers: {
       "content-type": "application/json",
       ...(getCookieHeader() ? { cookie: getCookieHeader() } : {})

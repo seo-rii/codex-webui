@@ -20,7 +20,7 @@ function normalizeVersionPayload(payload: AppVersionPayload) {
 async function readCurrentAppVersion() {
   const response = await fetch(appVersionUrl(), {
     cache: "no-store",
-    credentials: "same-origin",
+    credentials: "include",
     headers: {
       accept: "application/json"
     }

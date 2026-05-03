@@ -339,6 +339,10 @@ export type AppConfigPayload = {
     provider: AutostartProvider | null;
     location: string | null;
   };
+  gateway: {
+    restartAvailable: boolean;
+    restartCommandConfigured: boolean;
+  };
   systemShutdown: {
     available: boolean;
     delaySeconds: number;
@@ -649,6 +653,13 @@ export type CodexRuntimeActionPayload = {
   ok: true;
   message: string;
   runtime: CodexRuntimeStatus;
+};
+
+export type GatewayRestartPayload = {
+  ok: true;
+  handoffPrepared: boolean;
+  restartScheduled: boolean;
+  mode: "command" | "current-binary" | string;
 };
 
 export type CodexQuotaWindow = {

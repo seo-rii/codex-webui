@@ -17,6 +17,7 @@ import type {
   DirectoryPayload,
   EditableFilePayload,
   GlobalStreamEvent,
+  GatewayRestartPayload,
   GitCommitDiffPayload,
   GitFilePayload,
   GitFileReferencePayload,
@@ -282,6 +283,13 @@ export const api = {
 
   updateRuntime() {
     return ws.request<CodexRuntimeActionPayload>("runtime/update");
+  },
+
+  restartGateway() {
+    return request<GatewayRestartPayload>(apiPath("/admin/restart"), {
+      method: "POST",
+      body: JSON.stringify({})
+    });
   },
 
   getSessions(

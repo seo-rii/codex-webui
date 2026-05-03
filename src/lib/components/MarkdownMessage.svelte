@@ -7,10 +7,14 @@
 
   let {
     text = "",
-    compact = false
+    compact = false,
+    maxInitialChars = null,
+    expandLabel = "Show full message"
   }: {
     text?: string | null;
     compact?: boolean;
+    maxInitialChars?: number | null;
+    expandLabel?: string;
   } = $props();
 
   const dispatch = createEventDispatcher<{
@@ -19,6 +23,7 @@
     };
   }>();
   let rootElement = $state<HTMLDivElement | null>(null);
+  let expanded = $state(false);
 
   const lowlight = createLowlight(common);
   const codeCopyResetTimers = new WeakMap<HTMLButtonElement, number>();
@@ -160,11 +165,22 @@
     renderer
   });
 
+  const normalizedText = $derived(text ?? "");
+  const shouldTruncate = $derived(
+    typeof maxInitialChars === "number" &&
+      maxInitialChars > 0 &&
+      normalizedText.length > maxInitialChars &&
+      !expanded
+  );
+  const visibleText = $derived(
+    shouldTruncate ? `${normalizedText.slice(0, maxInitialChars ?? 0).trimEnd()}\n\n...` : normalizedText
+  );
+
   const html = $derived.by(() => {
-    if (!text?.trim()) {
+    if (!visibleText.trim()) {
       return "";
     }
-    const parsed = marked.parse(text) as string;
+    const parsed = marked.parse(visibleText) as string;
     if (typeof document === "undefined") {
       return parsed;
     }
@@ -314,6 +330,11 @@
 
 <div bind:this={rootElement} class={`markdown-body ${compact ? "markdown-body--compact" : ""}`}>
   {@html html}
+  {#if shouldTruncate}
+    <button class="markdown-body__expand" onclick={() => { expanded = true; }} type="button">
+      {expandLabel}
+    </button>
+  {/if}
 </div>
 
 <style>
@@ -329,6 +350,29 @@
 
   .markdown-body :global(p:last-child) {
     margin-bottom: 0;
+  }
+
+  .markdown-body__expand {
+    margin-top: 0.75rem;
+    display: inline-flex;
+    align-items: center;
+    border-radius: 999px;
+    border: 1px solid rgba(245, 158, 11, 0.28);
+    background: rgba(255, 251, 235, 0.84);
+    padding: 0.35rem 0.7rem;
+    color: rgb(180 83 9);
+    font-size: 0.72rem;
+    font-weight: 700;
+    transition:
+      background-color 160ms ease,
+      border-color 160ms ease,
+      color 160ms ease;
+  }
+
+  .markdown-body__expand:hover {
+    border-color: rgba(245, 158, 11, 0.42);
+    background: rgba(254, 243, 199, 0.96);
+    color: rgb(146 64 14);
   }
 
   .markdown-body :global(h1),
@@ -430,12 +474,24 @@
   .markdown-body :global(.code-block) {
     border-color: var(--markdown-code-block-border, rgb(229 231 235)) !important;
     background: var(--markdown-code-block-bg, rgb(249 250 251 / 0.5)) !important;
+    overflow: visible !important;
   }
 
   .markdown-body :global(.code-block > div:first-child) {
+    position: sticky;
+    top: var(--markdown-code-header-sticky-top, 0.45rem);
+    z-index: 14;
+    border-top-left-radius: inherit;
+    border-top-right-radius: inherit;
     border-bottom-color: var(--markdown-code-block-border, rgb(229 231 235)) !important;
     background: var(--markdown-code-block-header-bg, rgb(243 244 246 / 0.6)) !important;
+    backdrop-filter: blur(12px);
     color: var(--markdown-code-block-header-fg, rgb(107 114 128)) !important;
+  }
+
+  .markdown-body :global(.code-block pre) {
+    border-bottom-left-radius: inherit;
+    border-bottom-right-radius: inherit;
   }
 
   .markdown-body :global(.code-copy-button) {
@@ -563,6 +619,18 @@
     --markdown-code-copy-copied-border: rgb(52 211 153 / 0.38);
     --markdown-code-copy-copied-bg: rgb(6 78 59 / 0.46);
     --markdown-code-copy-copied-fg: rgb(167 243 208);
+  }
+
+  :global(:root[data-theme="dark"]) .markdown-body__expand {
+    border-color: rgb(245 158 11 / 0.34);
+    background: rgb(69 39 10 / 0.42);
+    color: rgb(252 211 77);
+  }
+
+  :global(:root[data-theme="dark"]) .markdown-body__expand:hover {
+    border-color: rgb(245 158 11 / 0.48);
+    background: rgb(92 53 15 / 0.56);
+    color: rgb(254 240 138);
   }
 
   :global(:root[data-theme="dark"]) .markdown-body :global(a) {

@@ -230,7 +230,8 @@
   let titleDraft = $state("");
   let browserOpen = $state(false);
   let browserBusy = $state(false);
-  let runtimeBusyAction = $state<"install" | "update" | "check" | null>(null);
+  let runtimeBusyAction = $state<"install" | "update" | "check" | "status" | null>(null);
+  let gatewayRestartBusy = $state(false);
   let quotaBusy = $state(false);
   let quotaRefreshPromise: Promise<void> | null = null;
   let quotaForceRefreshQueued = false;
@@ -244,6 +245,8 @@
   let loadingItemDetails = $state<Record<string, boolean>>({});
   let itemDetailErrors = $state<Record<string, string>>({});
   let expandedTurnLogs = $state<Record<string, boolean>>({});
+  let turnEntryRenderLimits = $state<Record<string, number>>({});
+  let expandedLargeOutputs = $state<Record<string, boolean>>({});
   let loadingTurns = $state<Record<string, boolean>>({});
   let turnLoadErrors = $state<Record<string, string>>({});
   let sessionSearchQuery = $state("");
@@ -390,6 +393,14 @@
         key: string;
         items: CodexItem[];
       };
+  type TurnRenderModel = {
+    userItems: CodexItem[];
+    finalAgentItem: CodexItem | null;
+    collapsedItems: CodexItem[];
+    collapsedEntries: RenderableTurnEntry[];
+    visibleSummaryEntries: RenderableTurnEntry[];
+    fullEntries: RenderableTurnEntry[];
+  };
 
   const rawRequestPlaceholder = '{"action":"decline","content":null}';
   const readOnlyParsedCommandTypes = new Set(["read", "list_files", "search"]);
@@ -402,9 +413,16 @@
   const staleSessionCatchupHiddenThresholdMs = 45_000;
   const staleSessionCatchupEventThreshold = 40;
   const staleSessionCatchupWindowMs = 7_500;
+  const activeSessionStatusPollMs = 5_000;
+  const initialTurnEntryRenderLimit = 80;
+  const turnEntryRenderIncrement = 80;
+  const largeMarkdownInitialChars = 18_000;
+  const compactMarkdownInitialChars = 8_000;
+  const toolOutputInitialChars = 24_000;
   const composerTextareaMinHeight = 52;
   const sessionQueryParamKey = "session";
   const notificationPromptStorageKey = "codex-webui.notifications.permission-prompted";
+  const sendOnEnterPreferenceStorageKey = "codex-webui.composer.send-on-enter";
   let loginHcaptchaScriptPromise: Promise<void> | null = null;
 
   const ui = $derived.by(() => {
@@ -431,6 +449,8 @@
       appInstallIosHint: m.app_install_ios_hint(),
       appInstalledNotice: m.app_installed_notice(),
       appInstallPromptDismissed: m.app_install_prompt_dismissed(),
+      restartingWebui: m.restarting_webui(),
+      restartWebuiNotice: m.restart_webui_notice(),
       language: m.language(),
       close: m.close(),
       newThread: m.new_thread(),
@@ -665,6 +685,14 @@
       contextCompression: m.context_compression(),
       contextCompressionInProgress: m.context_compression_in_progress(),
       contextCompressionCompleted: m.context_compression_completed(),
+      showOlderWorkItems: (count: number) =>
+        locale === "ko" ? `이전 작업 과정 ${count}개 더 보기` : `Show ${count} older work items`,
+      showFullMessage: locale === "ko" ? "전체 메시지 보기" : "Show full message",
+      showFullOutput: locale === "ko" ? "전체 출력 보기" : "Show full output",
+      outputTruncatedPrefix: (count: number) =>
+        locale === "ko"
+          ? `... 이전 출력 ${count.toLocaleString()}자 생략 ...`
+          : `... ${count.toLocaleString()} earlier characters hidden ...`,
       stopped: m.stopped()
     };
   });
@@ -830,14 +858,78 @@
     return getDisplayThreadTitle(state.thread.name, deriveConversationSummaryPreview(state.thread.preview, state.thread.turns));
   }
 
+  function readLocalSendOnEnterPreference() {
+    if (typeof window === "undefined") {
+      return null;
+    }
+    let stored: string | null = null;
+    try {
+      stored = window.localStorage.getItem(sendOnEnterPreferenceStorageKey);
+    } catch {
+      return null;
+    }
+    if (stored === "true") {
+      return true;
+    }
+    if (stored === "false") {
+      return false;
+    }
+    return null;
+  }
+
+  function persistLocalSendOnEnterPreference(value: boolean) {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      window.localStorage.setItem(sendOnEnterPreferenceStorageKey, value ? "true" : "false");
+    } catch {
+      return;
+    }
+  }
+
+  function applyLocalSendOnEnterPreference(preferences: SessionPreferences): SessionPreferences {
+    const localValue = readLocalSendOnEnterPreference();
+    if (localValue === null || preferences.sendOnEnter === localValue) {
+      return preferences;
+    }
+    return {
+      ...preferences,
+      sendOnEnter: localValue
+    };
+  }
+
+  function applyLocalComposerPreferencesToConfig(nextConfig: AppConfigPayload): AppConfigPayload {
+    const nextDefaults = applyLocalSendOnEnterPreference(nextConfig.defaults);
+    if (nextDefaults === nextConfig.defaults) {
+      return nextConfig;
+    }
+    return {
+      ...nextConfig,
+      defaults: nextDefaults
+    };
+  }
+
+  function applyLocalComposerPreferencesToConversation(state: ConversationState): ConversationState {
+    const nextPreferences = applyLocalSendOnEnterPreference(state.preferences);
+    if (nextPreferences === state.preferences) {
+      return state;
+    }
+    return {
+      ...state,
+      preferences: nextPreferences
+    };
+  }
+
   function createDraftConversation(preferences: SessionPreferences, title: string | null = null): ConversationState {
     const now = Date.now();
+    const nextPreferences = applyLocalSendOnEnterPreference(preferences);
     return {
       thread: {
         id: "",
         preview: "",
         name: title,
-        cwd: preferences.cwd,
+        cwd: nextPreferences.cwd,
         status: "idle",
         createdAt: now,
         updatedAt: now,
@@ -847,7 +939,7 @@
         turns: []
       },
       preferences: {
-        ...preferences
+        ...nextPreferences
       },
       selectedSkills: [],
       attachments: [],
@@ -889,6 +981,7 @@
       title?: string | null;
     } = {}
   ) {
+    sessionSelectionVersion += 1;
     clearHydrationRefresh();
     disconnectStream();
     dismissLastComposerPromptChip();
@@ -902,6 +995,8 @@
     loadingItemDetails = {};
     itemDetailErrors = {};
     expandedTurnLogs = {};
+    turnEntryRenderLimits = {};
+    expandedLargeOutputs = {};
     loadingTurns = {};
     turnLoadErrors = {};
     draft = options.draftText ?? "";
@@ -1213,6 +1308,7 @@
   let sessionListCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionDetailCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionListRequestVersion = 0;
+  let sessionSelectionVersion = 0;
   const itemDetailRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const lazyWorkspaceLoads = new Map<LazyWorkspaceKind, Promise<void>>();
   let transcriptElement = $state<HTMLDivElement | undefined>(undefined);
@@ -1412,7 +1508,25 @@
 
   const running = $derived.by(() => {
     const currentConversation = conversation;
-    return hasConversationLiveTurn(currentConversation);
+    return Boolean(
+      hasConversationLiveTurn(currentConversation) || isLiveConversationStatus(currentConversation?.thread.status)
+    );
+  });
+  const sessionListNeedsActiveStatusPolling = $derived.by(() => {
+    if (authenticated !== true) {
+      return false;
+    }
+
+    if (
+      conversation &&
+      (hasConversationLiveTurn(conversation) ||
+        isLiveConversationStatus(conversation.thread.status) ||
+        conversation.queue.items.length > 0)
+    ) {
+      return true;
+    }
+
+    return sessions.some((session) => isLiveConversationStatus(session.status) || session.queueCount > 0);
   });
   const queueModeActive = $derived.by(() => canQueueComposerMessage());
   const lastComposerHistoryPrompt = $derived.by(() => lastComposerPromptChip?.prompt ?? "");
@@ -2447,6 +2561,37 @@
     if (titleDraft !== nextDisplayTitle) {
       titleDraft = nextDisplayTitle;
     }
+  });
+
+  $effect(() => {
+    if (typeof window === "undefined" || !sessionListNeedsActiveStatusPolling) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      if (
+        authenticated !== true ||
+        sessionsBusy ||
+        connectionState !== "connected" ||
+        (typeof document !== "undefined" && document.hidden)
+      ) {
+        return;
+      }
+
+      scheduleSessionRefresh(0);
+      if (
+        selectedSessionId &&
+        conversation?.thread.id === selectedSessionId &&
+        isLiveConversationStatus(conversation.thread.status) &&
+        !loadingDetail
+      ) {
+        scheduleSelectedSessionStateRefresh(selectedSessionId, 0);
+      }
+    }, activeSessionStatusPollMs);
+
+    return () => {
+      window.clearInterval(timer);
+    };
   });
 
   $effect(() => {
@@ -3655,6 +3800,7 @@
   }
 
   function resetWorkspaceState() {
+    sessionSelectionVersion += 1;
     disconnectStream();
     clearHydrationRefresh();
 
@@ -3721,6 +3867,8 @@
     loadingItemDetails = {};
     itemDetailErrors = {};
     expandedTurnLogs = {};
+    turnEntryRenderLimits = {};
+    expandedLargeOutputs = {};
     loadingTurns = {};
     turnLoadErrors = {};
     resetSessionTurnSearch();
@@ -3822,18 +3970,13 @@
       webRole = authSession.role ?? "admin";
       loginMessage = "";
       ensureGlobalStreamSubscription();
-      runtime = await api.getRuntimeStatus();
-      if (!runtime.installed) {
-        resetWorkspaceState();
-        loading = false;
-        return;
-      }
+      void refreshRuntimeStatus(false, { silent: true });
 
       const requestedSessionId = getRequestedSessionIdFromUrl();
       const [nextConfig] = await Promise.all([api.getConfig(), refreshSessions()]);
-      config = nextConfig;
-      syncConfiguredTheme(nextConfig);
-      syncStartupAlertModal(nextConfig);
+      config = applyLocalComposerPreferencesToConfig(nextConfig);
+      syncConfiguredTheme(config);
+      syncStartupAlertModal(config);
       void refreshQuota(false);
       void refreshAccountState(false);
       void refreshNotifications();
@@ -4100,6 +4243,8 @@
       return true;
     }
 
+    const selectionVersion = sessionSelectionVersion + 1;
+    sessionSelectionVersion = selectionVersion;
     clearHydrationRefresh();
     dismissLastComposerPromptChip();
     resetSessionTurnSearch();
@@ -4114,6 +4259,8 @@
     loadingItemDetails = {};
     itemDetailErrors = {};
     expandedTurnLogs = {};
+    turnEntryRenderLimits = {};
+    expandedLargeOutputs = {};
     loadingTurns = {};
     turnLoadErrors = {};
     for (const timer of itemDetailRefreshTimers.values()) {
@@ -4153,7 +4300,7 @@
 
       if (detailCacheKey) {
         const cachedEntry = await readSessionDetailCache(detailCacheKey);
-        if (selectedSessionId !== sessionId) {
+        if (selectedSessionId !== sessionId || sessionSelectionVersion !== selectionVersion) {
           return false;
         }
         if (cachedEntry) {
@@ -4166,8 +4313,8 @@
         }
       }
 
-      const nextConversation = await refreshSelectedSessionState(sessionId, turnLimit, true, knownVersion);
-      if (selectedSessionId !== sessionId || !nextConversation) {
+      const nextConversation = await refreshSelectedSessionState(sessionId, turnLimit, true, knownVersion, false, selectionVersion);
+      if (selectedSessionId !== sessionId || sessionSelectionVersion !== selectionVersion || !nextConversation) {
         return false;
       }
       const hasOnlyLiveTurnShell =
@@ -4180,10 +4327,10 @@
         clearHydrationRefresh();
         hydrationRefreshTimer = setTimeout(() => {
           hydrationRefreshTimer = null;
-          if (selectedSessionId !== sessionId) {
+          if (selectedSessionId !== sessionId || sessionSelectionVersion !== selectionVersion) {
             return;
           }
-          void refreshSelectedSessionState(sessionId, olderTurnPageSize).catch(() => {});
+          void refreshSelectedSessionState(sessionId, olderTurnPageSize, false, sessionDetailCacheVersion, false, selectionVersion).catch(() => {});
         }, 250);
       } else {
         clearHydrationRefresh();
@@ -4191,15 +4338,17 @@
       syncSelectedSessionInUrl(sessionId);
       return true;
     } catch (error) {
-      disconnectStream();
-      clearHydrationRefresh();
-      errorText = describeError(error);
-      if (selectedSessionId === sessionId) {
+      if (selectedSessionId === sessionId && sessionSelectionVersion === selectionVersion) {
+        disconnectStream();
+        clearHydrationRefresh();
+        errorText = describeError(error);
         syncSelectedSessionInUrl(null);
       }
       return false;
     } finally {
-      loadingDetail = false;
+      if (selectedSessionId === sessionId && sessionSelectionVersion === selectionVersion) {
+        loadingDetail = false;
+      }
     }
   }
 
@@ -4273,7 +4422,9 @@
           };
         }
 
-        conversation = normalizeConversationExecutionState(applyStreamEvent(conversation, payload));
+        conversation = applyLocalComposerPreferencesToConversation(
+          normalizeConversationExecutionState(applyStreamEvent(conversation, payload))
+        );
         markConversationCacheDirty();
         if (
           pendingQueueModeSessionId === sessionId &&
@@ -4496,7 +4647,7 @@
       delete nextPendingEvents[sessionId];
       pendingSessionEvents = nextPendingEvents;
     }
-    nextConversation = normalizeConversationExecutionState(nextConversation);
+    nextConversation = applyLocalComposerPreferencesToConversation(normalizeConversationExecutionState(nextConversation));
     const mergedQueue = mergeQueueSnapshot(sessionQueueSnapshotsBySessionId[sessionId], nextConversation.queue);
     if (mergedQueue !== nextConversation.queue) {
       nextConversation = {
@@ -4612,7 +4763,8 @@
     turnLimit: number,
     loadDraft = false,
     knownVersion: string | null = sessionDetailCacheVersion,
-    replaceWithRecentWindow = false
+    replaceWithRecentWindow = false,
+    selectionVersion: number | null = null
   ) {
     const knownTurnVersions =
       !replaceWithRecentWindow && knownVersion && sessionDetailStateHash && conversation?.thread.id === sessionId
@@ -4627,6 +4779,9 @@
       knownTurnVersions,
       knownStateHash
     );
+    if (selectionVersion !== null && sessionSelectionVersion !== selectionVersion) {
+      return null;
+    }
     if (isCacheValidationResponse(detail)) {
       sessionDetailCacheVersion = detail.cacheVersion;
       if (selectedSessionId !== sessionId || !conversation || conversation.thread.id !== sessionId) {
@@ -4660,6 +4815,9 @@
       const fallbackDetail = patchedDetail
         ? null
         : await api.getSession(sessionId, turnLimit);
+      if (selectionVersion !== null && sessionSelectionVersion !== selectionVersion) {
+        return null;
+      }
       const nextDetail = patchedDetail ?? fallbackDetail;
       if (!nextDetail || isCacheValidationResponse(nextDetail) || isSessionDetailPatchResponse(nextDetail)) {
         return null;
@@ -4741,13 +4899,9 @@
       }
 
       ensureGlobalStreamSubscription();
-      runtime = await api.getRuntimeStatus();
-      if (!runtime.installed) {
-        resetWorkspaceState();
-        return;
-      }
+      void refreshRuntimeStatus(false, { silent: true });
 
-      config = await api.getConfig();
+      config = applyLocalComposerPreferencesToConfig(await api.getConfig());
       syncConfiguredTheme(config);
       syncStartupAlertModal(config);
       await refreshSessions(shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null);
@@ -4794,16 +4948,15 @@
         if (
           summary.id === selectedSessionId &&
           conversation &&
-          conversation.thread.id === summary.id &&
-          !hasConversationLiveTurn(conversation) &&
-          !isLiveConversationStatus(summary.status)
+          conversation.thread.id === summary.id
         ) {
+          const nextStatus = summary.status ?? conversation.thread.status;
           conversation = {
             ...conversation,
-            activeTurnId: null,
+            activeTurnId: isLiveConversationStatus(nextStatus) ? conversation.activeTurnId : null,
             thread: {
               ...conversation.thread,
-              status: summary.status
+              status: nextStatus
             }
           };
           markConversationCacheDirty();
@@ -4822,7 +4975,7 @@
 
     if (event.method === "codex-webui/configUpdated") {
       if (config) {
-        config = {
+        config = applyLocalComposerPreferencesToConfig({
           ...config,
           defaults: (event.params.defaults as SessionPreferences | undefined) ?? config.defaults,
           autostart:
@@ -4857,7 +5010,7 @@
                 ...(event.params.startup as Partial<AppConfigPayload["startup"]>)
               }
             : config.startup
-        } as ThemedConfigPayload;
+        } as ThemedConfigPayload);
         syncConfiguredTheme(config);
         syncStartupAlertModal(config);
       }
@@ -5172,6 +5325,19 @@
       return;
     }
 
+    if (typeof patch.sendOnEnter === "boolean") {
+      persistLocalSendOnEnterPreference(patch.sendOnEnter);
+      if (config) {
+        config = {
+          ...config,
+          defaults: {
+            ...config.defaults,
+            sendOnEnter: patch.sendOnEnter
+          }
+        };
+      }
+    }
+
     conversation = {
       ...conversation,
       preferences: {
@@ -5180,7 +5346,9 @@
       }
     };
     markConversationCacheDirty();
-    schedulePreferenceSave();
+    if (getSelectedSessionBinding() || typeof patch.sendOnEnter !== "boolean" || Object.keys(patch).length > 1) {
+      schedulePreferenceSave();
+    }
   }
 
   function setPreference<Key extends keyof SessionPreferences>(key: Key, value: SessionPreferences[Key]) {
@@ -5295,16 +5463,16 @@
           return;
         }
         const saved = await api.savePreferences(sessionId, currentBinding.state.preferences);
-        const nextConfig = await api.getConfig();
+        const nextConfig = applyLocalComposerPreferencesToConfig(await api.getConfig());
         if (conversation?.thread.id === sessionId) {
           conversation = {
             ...conversation,
-            preferences: saved
+            preferences: applyLocalSendOnEnterPreference(saved)
           };
           markConversationCacheDirty();
         }
         config = nextConfig;
-        syncConfiguredTheme(nextConfig);
+        syncConfiguredTheme(config);
         await refreshSessions(shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null);
       } catch (error) {
         errorText = describeError(error);
@@ -5318,10 +5486,10 @@
       return;
     }
     try {
-      const nextConfig = await api.saveSystemShutdownAfterQueueCompletes(armed);
+      const nextConfig = applyLocalComposerPreferencesToConfig(await api.saveSystemShutdownAfterQueueCompletes(armed));
       config = nextConfig;
-      syncConfiguredTheme(nextConfig);
-      syncStartupAlertModal(nextConfig, Boolean(nextConfig.startup.scheduledShutdown));
+      syncConfiguredTheme(config);
+      syncStartupAlertModal(config, Boolean(config.startup.scheduledShutdown));
     } catch (error) {
       errorText = describeError(error);
     }
@@ -5378,10 +5546,10 @@
       return;
     }
     try {
-      const nextConfig = await api.saveAutostartEnabled(enabled);
+      const nextConfig = applyLocalComposerPreferencesToConfig(await api.saveAutostartEnabled(enabled));
       config = nextConfig;
-      syncConfiguredTheme(nextConfig);
-      syncStartupAlertModal(nextConfig);
+      syncConfiguredTheme(config);
+      syncStartupAlertModal(config);
     } catch (error) {
       errorText = describeError(error);
     }
@@ -5393,9 +5561,9 @@
       return;
     }
     try {
-      const nextConfig = await api.saveThemeSettings(theme);
+      const nextConfig = applyLocalComposerPreferencesToConfig(await api.saveThemeSettings(theme));
       config = nextConfig;
-      syncConfiguredTheme(nextConfig);
+      syncConfiguredTheme(config);
       noticeText = m.theme_saved();
     } catch (error) {
       errorText = describeError(error);
@@ -6548,14 +6716,20 @@
     }
   }
 
-  async function refreshRuntimeStatus(checkForUpdate = false) {
-    runtimeBusyAction = checkForUpdate ? "check" : null;
+  async function refreshRuntimeStatus(checkForUpdate = false, options: { silent?: boolean } = {}) {
+    const nextBusyAction: typeof runtimeBusyAction = checkForUpdate ? "check" : "status";
+    if (runtimeBusyAction === "install" || runtimeBusyAction === "update") {
+      return;
+    }
+    runtimeBusyAction = nextBusyAction;
     try {
       runtime = checkForUpdate ? await api.checkRuntimeUpdate() : await api.getRuntimeStatus();
     } catch (error) {
-      errorText = describeError(error);
+      if (!options.silent) {
+        errorText = describeError(error);
+      }
     } finally {
-      if (runtimeBusyAction === "check") {
+      if (runtimeBusyAction === nextBusyAction) {
         runtimeBusyAction = null;
       }
     }
@@ -6674,6 +6848,29 @@
       errorText = describeError(error);
     } finally {
       runtimeBusyAction = null;
+    }
+  }
+
+  async function restartGateway() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    if (gatewayRestartBusy) {
+      return;
+    }
+    gatewayRestartBusy = true;
+    errorText = "";
+
+    try {
+      await api.restartGateway();
+      noticeText = ui.restartWebuiNotice;
+      window.setTimeout(() => {
+        api.reconnectNow();
+      }, 2500);
+    } catch (error) {
+      errorText = describeError(error);
+      gatewayRestartBusy = false;
     }
   }
 
@@ -7438,7 +7635,11 @@
 
         const userText = normalizeMessageForComparison(getUserText(item));
         const attachmentNames = getUserAttachmentNames(item);
-        const textMatches = targetPrompt.length > 0 && userText === targetPrompt;
+        const textMatches =
+          targetPrompt.length > 0 &&
+          (userText === targetPrompt ||
+            userText.endsWith(` ${targetPrompt}`) ||
+            (targetPrompt.length >= 24 && userText.includes(targetPrompt)));
         const attachmentMatches =
           targetAttachments.size > 0 && attachmentNames.some((attachmentName) => targetAttachments.has(attachmentName.trim()));
 
@@ -8176,13 +8377,13 @@
     for (const item of items) {
       if (isReadOnlyShellCommand(item)) {
         flushFileChangeBuffer();
-        readOnlyBuffer = [...readOnlyBuffer, item];
+        readOnlyBuffer.push(item);
         continue;
       }
 
       if (item.type === "fileChange") {
         flushReadOnlyBuffer();
-        fileChangeBuffer = [...fileChangeBuffer, item];
+        fileChangeBuffer.push(item);
         continue;
       }
 
@@ -8198,6 +8399,81 @@
     flushReadOnlyBuffer();
     flushFileChangeBuffer();
     return entries;
+  }
+
+  const turnRenderModelCache = new WeakMap<CodexTurn, TurnRenderModel>();
+
+  function getTurnRenderModel(turn: CodexTurn): TurnRenderModel {
+    const cached = turnRenderModelCache.get(turn);
+    if (cached) {
+      return cached;
+    }
+
+    let finalAgentItem: CodexItem | null = null;
+    const userItems: CodexItem[] = [];
+    const collapsedItems: CodexItem[] = [];
+    const summaryItems: CodexItem[] = [];
+
+    for (const item of turn.items) {
+      if (item.type === "userMessage") {
+        userItems.push(item);
+      }
+      if (item.type === "agentMessage") {
+        finalAgentItem = item;
+      }
+      if (item.type === "fileChange" || item.type === "imageGeneration") {
+        summaryItems.push(item);
+      }
+    }
+
+    if (finalAgentItem) {
+      for (const item of turn.items) {
+        if (
+          item.type !== "userMessage" &&
+          !isInternalTranscriptItem(item) &&
+          item.type !== "fileChange" &&
+          item.type !== "imageGeneration" &&
+          item.id !== finalAgentItem.id
+        ) {
+          collapsedItems.push(item);
+        }
+      }
+    }
+
+    const model: TurnRenderModel = {
+      userItems,
+      finalAgentItem,
+      collapsedItems,
+      collapsedEntries: getRenderableTurnEntries(collapsedItems),
+      visibleSummaryEntries: getRenderableTurnEntries(summaryItems),
+      fullEntries: getRenderableTurnEntries(turn.items.filter((item) => item.type !== "userMessage" && !isInternalTranscriptItem(item)))
+    };
+    turnRenderModelCache.set(turn, model);
+    return model;
+  }
+
+  function getTurnEntryRenderLimit(turnId: string) {
+    return turnEntryRenderLimits[turnId] ?? initialTurnEntryRenderLimit;
+  }
+
+  function getVisibleTurnEntries(turnId: string, entries: RenderableTurnEntry[]) {
+    const limit = getTurnEntryRenderLimit(turnId);
+    if (entries.length <= limit) {
+      return entries;
+    }
+    return entries.slice(entries.length - limit);
+  }
+
+  function getHiddenTurnEntryCount(turnId: string, entries: RenderableTurnEntry[]) {
+    return Math.max(0, entries.length - getTurnEntryRenderLimit(turnId));
+  }
+
+  function showMoreTurnEntries(turnId: string, entries: RenderableTurnEntry[]) {
+    const currentLimit = getTurnEntryRenderLimit(turnId);
+    turnEntryRenderLimits = {
+      ...turnEntryRenderLimits,
+      [turnId]: Math.min(entries.length, currentLimit + turnEntryRenderIncrement)
+    };
   }
 
   function handleTranscriptWheel() {
@@ -8762,6 +9038,32 @@
     return JSON.stringify(item, null, 2);
   }
 
+  function getOutputPreviewKey(turnId: string, outputId: string) {
+    return `${turnId}:${outputId}:output`;
+  }
+
+  function getHiddenOutputCharCount(output: string, outputKey: string, maxChars = toolOutputInitialChars) {
+    if (expandedLargeOutputs[outputKey] || output.length <= maxChars) {
+      return 0;
+    }
+    return output.length - maxChars;
+  }
+
+  function getCappedOutputText(output: string, outputKey: string, maxChars = toolOutputInitialChars) {
+    const hiddenCount = getHiddenOutputCharCount(output, outputKey, maxChars);
+    if (hiddenCount <= 0) {
+      return output;
+    }
+    return `${ui.outputTruncatedPrefix(hiddenCount)}\n${output.slice(-maxChars)}`;
+  }
+
+  function expandLargeOutput(outputKey: string) {
+    expandedLargeOutputs = {
+      ...expandedLargeOutputs,
+      [outputKey]: true
+    };
+  }
+
   function isTurnRunning(turnId: string) {
     return getConversationLiveTurn()?.id === turnId;
   }
@@ -8791,29 +9093,11 @@
   }
 
   function getFinalAgentItem(turn: ConversationState["thread"]["turns"][number]) {
-    for (let index = turn.items.length - 1; index >= 0; index -= 1) {
-      const item = turn.items[index];
-      if (item.type === "agentMessage") {
-        return item;
-      }
-    }
-    return null;
+    return getTurnRenderModel(turn).finalAgentItem;
   }
 
   function getCollapsedTurnItems(turn: ConversationState["thread"]["turns"][number]) {
-    const finalAgentItem = getFinalAgentItem(turn);
-    if (!finalAgentItem) {
-      return [] as CodexItem[];
-    }
-
-    return turn.items.filter(
-      (item) =>
-        item.type !== "userMessage" &&
-        !isInternalTranscriptItem(item) &&
-        item.type !== "fileChange" &&
-        item.type !== "imageGeneration" &&
-        item.id !== finalAgentItem.id
-    );
+    return getTurnRenderModel(turn).collapsedItems;
   }
 
   function isInternalTranscriptItem(item: CodexItem) {
@@ -8831,9 +9115,7 @@
       return [] as RenderableTurnEntry[];
     }
 
-    return getRenderableTurnEntries(
-      turn.items.filter((item) => item.type === "fileChange" || item.type === "imageGeneration")
-    );
+    return getTurnRenderModel(turn).visibleSummaryEntries;
   }
 
   function getFileChangeEntryKey(turnId: string, itemId: string, change: FileChangeView) {
@@ -8853,11 +9135,11 @@
   }
 
   function getCollapsedTurnEntries(turn: ConversationState["thread"]["turns"][number]) {
-    return getRenderableTurnEntries(getCollapsedTurnItems(turn));
+    return getTurnRenderModel(turn).collapsedEntries;
   }
 
   function getTurnEntries(turn: ConversationState["thread"]["turns"][number]) {
-    return getRenderableTurnEntries(turn.items.filter((item) => item.type !== "userMessage" && !isInternalTranscriptItem(item)));
+    return getTurnRenderModel(turn).fullEntries;
   }
 
   function getCollapsedTurnProgressCount(turn: ConversationState["thread"]["turns"][number]) {
@@ -8865,14 +9147,15 @@
       return turn.hiddenItemCount + (conversation?.livePlans[turn.id] ? 1 : 0) + (conversation?.liveDiffs[turn.id] ? 1 : 0);
     }
     return (
-      getCollapsedTurnEntries(turn).length +
+      getTurnRenderModel(turn).collapsedEntries.length +
       (conversation?.livePlans[turn.id] ? 1 : 0) +
       (conversation?.liveDiffs[turn.id] ? 1 : 0)
     );
   }
 
   function shouldCollapseTurnLogs(turn: ConversationState["thread"]["turns"][number]) {
-    return !isTurnRunning(turn.id) && Boolean(getFinalAgentItem(turn)) && getCollapsedTurnProgressCount(turn) > 0;
+    const model = getTurnRenderModel(turn);
+    return !isTurnRunning(turn.id) && Boolean(model.finalAgentItem) && getCollapsedTurnProgressCount(turn) > 0;
   }
 
   function isTurnLogExpanded(turnId: string) {
@@ -9381,6 +9664,8 @@
       {quotaBusy}
       {runtime}
       {runtimeBusyAction}
+      gatewayRestartAvailable={config?.gateway.restartAvailable ?? false}
+      {gatewayRestartBusy}
       showPwaInstall={showPwaInstallAction}
       {pwaInstalled}
       {pwaInstallBusy}
@@ -9447,6 +9732,9 @@
       }}
       onUpdateRuntime={() => {
         void updateCodex();
+      }}
+      onRestartGateway={() => {
+        void restartGateway();
       }}
       onThemeModeChange={changeThemeMode}
       onSearchQueryChange={updateSessionSearchQuery}
@@ -9602,6 +9890,8 @@
                 {/if}
 
                 {#each conversation.thread.turns as turn (turn.id)}
+                  {@const turnModel = getTurnRenderModel(turn)}
+                  {@const collapsedProgressCount = getCollapsedTurnProgressCount(turn)}
                   <div
                     class={`space-y-8 rounded-[1.75rem] px-3 py-3 transition-[background-color,box-shadow,border-color] duration-300 animate-in fade-in slide-in-from-bottom-4 ${
                       sessionTurnSearchFocusedTurnId === turn.id
@@ -9610,7 +9900,7 @@
                     }`}
                     data-turn-id={turn.id}
                   >
-                    {#each turn.items.filter((item) => item.type === "userMessage") as item (item.id)}
+                    {#each turnModel.userItems as item (item.id)}
                       <div class="flex flex-col items-end gap-2 max-w-[85%] ml-auto group/user-message">
                         <div class="flex items-center gap-1 opacity-0 group-hover/user-message:opacity-100 transition-opacity">
                           <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors" onclick={() => void copyMessageText(getUserText(item))} title={ui.copyMessage} type="button"><Copy size={13} /></button>
@@ -9619,7 +9909,7 @@
                           <button class="p-1.5 rounded-lg text-gray-400 hover:text-amber-700 hover:bg-amber-50 transition-colors" onclick={() => void forkCurrentThread("handoff", { turnId: turn.id, messageText: getUserText(item) })} title={ui.handoffToNewThread} type="button"><ArrowRightLeft size={13} /></button>
                         </div>
                         <div class="px-5 py-3 bg-gray-100 rounded-2xl text-gray-800 shadow-sm border border-gray-200/50">
-                          <MarkdownMessage compact on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={getUserText(item)} />
+                          <MarkdownMessage compact expandLabel={ui.showFullMessage} maxInitialChars={compactMarkdownInitialChars} on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={getUserText(item)} />
                           {#if getUserAttachmentNames(item).length > 0}
                             <div class="mt-3 flex flex-wrap gap-2">
                               {#each getUserAttachmentNames(item) as name}<span class="px-2 py-1 bg-white/80 rounded-lg border border-gray-200 text-[10px] font-bold text-gray-600 flex items-center gap-1.5"><FileText size={10} />{name}</span>{/each}
@@ -9632,7 +9922,7 @@
                     {#if optimisticAnchorTurnId === turn.id && visibleOptimisticMessage}
                       <div class="flex flex-col items-end gap-3 max-w-[85%] ml-auto opacity-70">
                         <div class="px-5 py-3 bg-gray-100 rounded-2xl text-gray-800 shadow-sm border border-gray-200/50">
-                          <MarkdownMessage compact text={visibleOptimisticMessage.prompt} />
+                          <MarkdownMessage compact expandLabel={ui.showFullMessage} maxInitialChars={compactMarkdownInitialChars} text={visibleOptimisticMessage.prompt} />
                         </div>
                       </div>
                     {/if}
@@ -9641,7 +9931,7 @@
                       <div class="flex-shrink-0 w-8 h-8 rounded-lg bg-amber-600 text-white flex items-center justify-center shadow-sm mt-1"><Bot size={18} /></div>
                       <div class="flex-1 min-w-0 space-y-6">
                         {#if shouldCollapseTurnLogs(turn)}
-                          {#if getCollapsedTurnProgressCount(turn) > 0}
+                          {#if collapsedProgressCount > 0}
                             <div class="turn-card-shell border border-gray-100 rounded-xl bg-gray-50/50 overflow-hidden">
                               <button
                                 class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-4 py-3 hover:bg-gray-100/50 transition-colors"
@@ -9650,7 +9940,7 @@
                               >
                                 <div class="flex items-center gap-3">
                                   <div class="p-1.5 bg-white border border-gray-200 rounded-lg text-gray-400"><History size={14} /></div>
-                                  <span class="text-xs font-bold text-gray-600 tracking-tight uppercase">{m.work_steps_count({ count: String(getCollapsedTurnProgressCount(turn)) })}</span>
+                                  <span class="text-xs font-bold text-gray-600 tracking-tight uppercase">{m.work_steps_count({ count: String(collapsedProgressCount) })}</span>
                                 </div>
                                 <ChevronDown size={14} class="text-gray-400 {isTurnLogExpanded(turn.id) ? 'rotate-180' : ''} transition-transform" />
                               </button>
@@ -9658,14 +9948,26 @@
                                 <div class="turn-card-expand p-4 pt-0 space-y-4 bg-white/50 border-t border-gray-100" transition:slide|local={{ duration: 220 }}>
                                   {#if isTurnLoading(turn.id)}<div class="py-4 flex items-center justify-center gap-2 text-xs text-gray-400"><RefreshCw size={12} class="animate-spin" />{m.loading()}</div>
                                   {:else if getTurnLoadError(turn.id)}<div class="p-3 bg-red-50 text-red-600 rounded-xl text-xs">{getTurnLoadError(turn.id)}</div>
-                                  {:else}{#each getCollapsedTurnEntries(turn) as entry (entry.key)}{@render renderTurnEntry(turn.id, entry, 1)}{/each}{/if}
+                                  {:else}
+                                    {@const collapsedEntries = turnModel.collapsedEntries}
+                                    {@const hiddenCollapsedEntryCount = getHiddenTurnEntryCount(turn.id, collapsedEntries)}
+                                    {@const visibleCollapsedEntries = getVisibleTurnEntries(turn.id, collapsedEntries)}
+                                    {@render renderHiddenTurnEntriesControl(turn.id, hiddenCollapsedEntryCount, collapsedEntries)}
+                                    {#each visibleCollapsedEntries as entry (entry.key)}{@render renderTurnEntry(turn.id, entry, 1)}{/each}
+                                  {/if}
                                 </div>
                               {/if}
                             </div>
                           {/if}
-                          {#each getVisibleSummaryEntries(turn) as entry (entry.key)}{@render renderTurnEntry(turn.id, entry, 0)}{/each}
-                          {#if getFinalAgentItem(turn)}{@render renderTurnItem(turn.id, getFinalAgentItem(turn)!, 0)}{/if}
-                        {:else}{#each getTurnEntries(turn) as entry (entry.key)}{@render renderTurnEntry(turn.id, entry, 0)}{/each}{/if}
+                          {#each turnModel.visibleSummaryEntries as entry (entry.key)}{@render renderTurnEntry(turn.id, entry, 0)}{/each}
+                          {#if turnModel.finalAgentItem}{@render renderTurnItem(turn.id, turnModel.finalAgentItem, 0)}{/if}
+                        {:else}
+                          {@const fullEntries = turnModel.fullEntries}
+                          {@const hiddenFullEntryCount = getHiddenTurnEntryCount(turn.id, fullEntries)}
+                          {@const visibleFullEntries = getVisibleTurnEntries(turn.id, fullEntries)}
+                          {@render renderHiddenTurnEntriesControl(turn.id, hiddenFullEntryCount, fullEntries)}
+                          {#each visibleFullEntries as entry (entry.key)}{@render renderTurnEntry(turn.id, entry, 0)}{/each}
+                        {/if}
                         
                         {#if conversation.livePlans[turn.id] && turn.id !== conversation.activeTurnId}
                           <div class="turn-card-shell border border-amber-100 rounded-xl bg-amber-50/30 overflow-hidden">
@@ -9742,7 +10044,7 @@
                 {#if standaloneOptimisticMessage}
                   <div class="flex flex-col items-end gap-3 max-w-[85%] ml-auto opacity-70">
                     <div class="px-5 py-3 bg-gray-100 rounded-2xl text-gray-800 shadow-sm border border-gray-200/50">
-                      <MarkdownMessage compact text={standaloneOptimisticMessage.prompt} />
+                      <MarkdownMessage compact expandLabel={ui.showFullMessage} maxInitialChars={compactMarkdownInitialChars} text={standaloneOptimisticMessage.prompt} />
                     </div>
                   </div>
                 {/if}
@@ -10689,7 +10991,7 @@
                 webRole={webRole}
                 readOnly={readOnlyRole}
                 onConfigSaved={async () => {
-                  config = await api.getConfig();
+                  config = applyLocalComposerPreferencesToConfig(await api.getConfig());
                   syncConfiguredTheme(config);
                   syncStartupAlertModal(config);
                 }}
@@ -11622,6 +11924,41 @@
     box-shadow: 0 16px 32px -26px rgba(2, 6, 23, 0.74);
   }
 
+  :global(:root[data-theme="dark"]) .turn-card-load-more {
+    border-color: rgba(71, 85, 105, 0.42) !important;
+    background: rgba(15, 23, 42, 0.76) !important;
+    color: #94a3b8 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .turn-card-load-more:hover {
+    border-color: rgba(245, 158, 11, 0.34) !important;
+    background: rgba(69, 39, 10, 0.28) !important;
+    color: #fbbf24 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .large-output-preview pre {
+    border-color: rgba(71, 85, 105, 0.54) !important;
+    background: rgba(15, 23, 42, 0.82) !important;
+    color: #cbd5e1 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .large-output-preview > div {
+    border-color: rgba(71, 85, 105, 0.42) !important;
+    background: rgba(15, 23, 42, 0.64) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .large-output-expand {
+    border-color: rgba(71, 85, 105, 0.58) !important;
+    background: rgba(15, 23, 42, 0.82) !important;
+    color: #cbd5e1 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .large-output-expand:hover {
+    border-color: rgba(245, 158, 11, 0.38) !important;
+    background: rgba(69, 39, 10, 0.34) !important;
+    color: #fbbf24 !important;
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .thinking-indicator::after {
       animation: none;
@@ -11638,6 +11975,42 @@
   }
 
 </style>
+
+{#snippet renderHiddenTurnEntriesControl(turnId: string, hiddenCount: number, entries: RenderableTurnEntry[])}
+  {#if hiddenCount > 0}
+    <button
+      class="turn-card-load-more flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-gray-200 bg-white/70 px-3 py-2 text-[11px] font-bold text-gray-500 transition-colors hover:border-amber-200 hover:bg-amber-50/70 hover:text-amber-700"
+      onclick={() => showMoreTurnEntries(turnId, entries)}
+      type="button"
+    >
+      <ChevronDown size={13} />
+      <span>{ui.showOlderWorkItems(hiddenCount)}</span>
+    </button>
+  {/if}
+{/snippet}
+
+{#snippet renderCappedOutput(output: string, outputKey: string, compact = false)}
+  {@const hiddenOutputCharCount = getHiddenOutputCharCount(output, outputKey)}
+  <div class="large-output-preview">
+    {#if compact}
+      <pre class="max-h-60 overflow-x-auto rounded-lg border border-gray-200 bg-white p-2.5 text-[10px] font-mono leading-relaxed text-gray-600">{getCappedOutputText(output, outputKey)}</pre>
+    {:else}
+      <pre class="bg-gray-50 p-3 text-[11px] font-mono leading-relaxed text-gray-700 overflow-x-auto">{getCappedOutputText(output, outputKey)}</pre>
+    {/if}
+    {#if hiddenOutputCharCount > 0}
+      <div class="border-t border-gray-100 bg-white/80 px-3 py-2">
+        <button
+          class="large-output-expand inline-flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-[10px] font-bold text-gray-600 transition-colors hover:border-amber-200 hover:bg-amber-50 hover:text-amber-700"
+          onclick={() => expandLargeOutput(outputKey)}
+          type="button"
+        >
+          <ChevronDown size={12} />
+          <span>{ui.showFullOutput}</span>
+        </button>
+      </div>
+    {/if}
+  </div>
+{/snippet}
 
 {#snippet renderDiffLoadingCard(label: string)}
   <div class="space-y-3 p-4 sm:p-5">
@@ -11663,7 +12036,7 @@
       <div class="flex justify-end opacity-0 group-hover/agent-message:opacity-100 transition-opacity">
         <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors" onclick={() => void copyMessageText(String(item.text ?? ""))} title={ui.copyReply} type="button"><Copy size={13} /></button>
       </div>
-      <div class="prose prose-sm max-w-none text-gray-800 leading-relaxed animate-in fade-in slide-in-from-left-2 duration-700"><MarkdownMessage on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={String(item.text ?? "")} /></div>
+      <div class="prose prose-sm max-w-none text-gray-800 leading-relaxed animate-in fade-in slide-in-from-left-2 duration-700"><MarkdownMessage expandLabel={ui.showFullMessage} maxInitialChars={largeMarkdownInitialChars} on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={String(item.text ?? "")} /></div>
     </div>
   {:else if item.type === "imageGeneration"}
     {@const imageSrc = getImageGenerationSource(item)}
@@ -11726,14 +12099,14 @@
       <div class="space-y-3 bg-white/85 px-4 py-3">
         {#if String(item.text ?? "").trim()}
           <div class="rounded-xl border border-amber-100 bg-white px-3 py-3">
-            <MarkdownMessage compact on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={String(item.text ?? "")} />
+            <MarkdownMessage compact expandLabel={ui.showFullMessage} maxInitialChars={compactMarkdownInitialChars} on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={String(item.text ?? "")} />
           </div>
         {/if}
         {#if Array.isArray(item.summary) && item.summary.length > 0}
           <div class="space-y-2">
             {#each item.summary as summaryEntry, index (`${item.id}:summary:${index}`)}
               <div class="rounded-xl border border-amber-100/70 bg-amber-50/60 px-3 py-2.5 text-sm leading-relaxed text-gray-700">
-                <MarkdownMessage compact on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={summaryEntry} />
+                <MarkdownMessage compact expandLabel={ui.showFullMessage} maxInitialChars={compactMarkdownInitialChars} on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={summaryEntry} />
               </div>
             {/each}
           </div>
@@ -11804,7 +12177,7 @@
           {:else if getItemDetailError(turnId, item.id)}<div class="p-4 bg-red-50 text-red-600 text-xs border-t border-red-100">{getItemDetailError(turnId, item.id)}</div>
           {:else if item.type === "fileChange" && getFileChangeViews(item).length > 0}
             <div class="p-0 space-y-0">{#each getFileChangeViews(item) as change}<div class="border-b border-gray-100 last:border-0"><button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-4 py-1.75 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel + 1} onclick={() => toggleFileChangeEntry(turnId, item.id, change)}><div class="flex items-center gap-2"><span class="text-[10px] font-mono font-bold text-gray-600">{change.path}</span><span class="px-1.5 py-0.5 bg-gray-100 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{change.kind}</span></div><ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turnId, item.id, change) ? 'rotate-180' : ''} transition-transform" /></button>{#if isFileChangeEntryExpanded(turnId, item.id, change)}<div class="turn-card-expand bg-gray-50 p-0 border-t border-gray-100" transition:slide|local={{ duration: 180 }}>{#if change.renderable}<LazyMonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-3 text-[10px] font-mono text-gray-600 overflow-x-auto">{change.diff}</pre>{/if}</div>{/if}</div>{/each}</div>
-          {:else if getDeferredToolBody(item)}<pre class="bg-gray-50 p-3 text-[11px] font-mono leading-relaxed text-gray-700 overflow-x-auto">{getDeferredToolBody(item)}</pre>
+          {:else if getDeferredToolBody(item)}{@render renderCappedOutput(getDeferredToolBody(item), getOutputPreviewKey(turnId, item.id))}
           {:else}<div class="p-4 text-gray-400 text-xs italic text-center">{ui.noAdditionalOutput}</div>{/if}
         </div>
       {/if}
@@ -11827,7 +12200,7 @@
       <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-2.5 px-3 py-2.25 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel} onclick={() => void toggleReadOnlyCommandGroup(turnId, entry.key, entry.items)}><div class="flex min-w-0 flex-1 items-center gap-2.5"><div class="shrink-0 rounded-lg bg-gray-100 p-1.5 text-gray-400">{#if getReadOnlyCommandGroupKind(entry.items) === "git"}<GitBranch size={14} />{:else}<Search size={14} />{/if}</div><div class="min-w-0 flex-1 text-left"><h4 class="truncate text-[11px] font-bold leading-tight text-gray-900">{getReadOnlyCommandGroupLabel(entry.items)}</h4><p class="mt-0.5 truncate text-[10px] font-medium text-gray-500">{summarizeReadOnlyCommandGroup(entry.items)}</p></div></div><div class="flex shrink-0 items-center gap-2"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{ui.opsCount(entry.items.length)}</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
       {#if isItemExpanded(turnId, entry.key)}
         <div class="turn-card-expand border-t border-gray-100 bg-gray-50/30" transition:slide|local={{ duration: 220 }}>{#if isItemDetailLoading(turnId, entry.key)}<div class="flex justify-center p-5 text-xs italic text-gray-400 animate-pulse">{ui.readingFileData}</div>
-          {:else}<div class="p-0">{#each entry.items as commandItem}<div class="border-b border-gray-100 p-3 last:border-0"><div class="mb-1.5 flex items-center justify-between"><span class="text-[10px] font-bold uppercase tracking-widest text-gray-500">{summarizeCommand(commandItem)}</span>{#if commandItem.exitCode !== null}<span class="text-[9px] font-mono text-gray-400">Exit {commandItem.exitCode}</span>{/if}</div><pre class="max-h-60 overflow-x-auto rounded-lg border border-gray-200 bg-white p-2.5 text-[10px] font-mono leading-relaxed text-gray-600">{String(commandItem.aggregatedOutput ?? "")}</pre></div>{/each}</div>{/if}</div>
+          {:else}<div class="p-0">{#each entry.items as commandItem}<div class="border-b border-gray-100 p-3 last:border-0"><div class="mb-1.5 flex items-center justify-between"><span class="text-[10px] font-bold uppercase tracking-widest text-gray-500">{summarizeCommand(commandItem)}</span>{#if commandItem.exitCode !== null}<span class="text-[9px] font-mono text-gray-400">Exit {commandItem.exitCode}</span>{/if}</div>{@render renderCappedOutput(String(commandItem.aggregatedOutput ?? ""), getOutputPreviewKey(turnId, `${entry.key}:${commandItem.id}`), true)}</div>{/each}</div>{/if}</div>
       {/if}
     </div>
   {:else}

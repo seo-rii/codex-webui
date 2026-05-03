@@ -26,6 +26,14 @@ function isDynamicEndpoint(url) {
   return url.pathname.includes("/api/") || url.pathname.endsWith("/ws") || url.pathname.endsWith("/_app/version.json");
 }
 
+function isResponseInsideScope(response) {
+  try {
+    return new URL(response.url).pathname.startsWith(getScopePath());
+  } catch {
+    return false;
+  }
+}
+
 self.addEventListener("install", (event) => {
   self.skipWaiting();
   event.waitUntil(
@@ -75,8 +83,11 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(
       caches.open(CACHE_NAME).then(async (cache) => {
         try {
-          const response = await fetch(request, { cache: "no-store" });
-          if (response.ok) {
+          const response = await fetch(request, { cache: "no-store", credentials: "include" });
+          if (response.redirected && !isResponseInsideScope(response)) {
+            return Response.redirect(response.url, 302);
+          }
+          if (response.ok && isResponseInsideScope(response)) {
             await cache.put(getAppShellUrl(), response.clone());
           }
           return response;
@@ -99,7 +110,7 @@ self.addEventListener("fetch", (event) => {
         url.pathname.endsWith("/manifest.webmanifest") ||
         url.pathname.endsWith("/_app/env.js");
       const cached = isShellMetadata ? null : await cache.match(request);
-      const networkPromise = fetch(request)
+      const networkPromise = fetch(request, { credentials: "include" })
         .then(async (response) => {
           if (response.ok && !isShellMetadata) {
             await cache.put(request, response.clone());

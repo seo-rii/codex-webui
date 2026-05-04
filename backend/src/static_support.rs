@@ -185,7 +185,10 @@ fn static_asset_response(asset: CachedStaticAsset) -> Response {
         }
         csp.push_str(" https://hcaptcha.com https://*.hcaptcha.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http: https:; font-src 'self' data:; connect-src 'self' https://hcaptcha.com https://*.hcaptcha.com ws: wss:; worker-src 'self' blob:; frame-src https://hcaptcha.com https://*.hcaptcha.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
         if let Ok(value) = HeaderValue::from_str(&csp) {
-            headers.insert(header::HeaderName::from_static("content-security-policy"), value);
+            headers.insert(
+                header::HeaderName::from_static("content-security-policy"),
+                value,
+            );
         }
     }
     apply_security_headers(headers);

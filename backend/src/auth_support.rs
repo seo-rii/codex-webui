@@ -79,15 +79,52 @@ pub(crate) fn clear_csrf_cookie(config: &Config, jar: CookieJar) -> CookieJar {
 }
 
 pub(crate) fn append_legacy_root_auth_cookie_clears(config: &Config, response: &mut Response) {
-    if auth_cookie_path(config) == "/" {
-        return;
+    for path in legacy_auth_cookie_clear_paths(config) {
+        append_auth_cookie_clears_for_path(config, response, &path);
     }
-    append_auth_cookie_clears_for_path(config, response, "/");
 }
 
 pub(crate) fn append_current_path_auth_cookie_clears(config: &Config, response: &mut Response) {
-    let path = auth_cookie_path(config);
-    append_auth_cookie_clears_for_path(config, response, &path);
+    for path in auth_cookie_clear_paths(config) {
+        append_auth_cookie_clears_for_path(config, response, &path);
+    }
+}
+
+fn legacy_auth_cookie_clear_paths(config: &Config) -> Vec<String> {
+    auth_cookie_clear_paths(config)
+        .into_iter()
+        .filter(|path| path != &auth_cookie_path(config))
+        .collect()
+}
+
+fn auth_cookie_clear_paths(config: &Config) -> Vec<String> {
+    let current = auth_cookie_path(config);
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_path = |path: String| {
+        if !path.trim().is_empty() && seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    };
+
+    push_path(current.clone());
+    let normalized = current.trim_end_matches('/');
+    if normalized != "/" {
+        let mut cursor = normalized.to_string();
+        loop {
+            let Some(index) = cursor.rfind('/') else {
+                break;
+            };
+            if index == 0 {
+                push_path("/".to_string());
+                break;
+            }
+            cursor.truncate(index);
+            push_path(cursor.clone());
+        }
+    }
+    push_path("/".to_string());
+    paths
 }
 
 fn append_auth_cookie_clears_for_path(config: &Config, response: &mut Response, path: &str) {
@@ -95,6 +132,7 @@ fn append_auth_cookie_clears_for_path(config: &Config, response: &mut Response, 
         let mut cookie = Cookie::new(name, "");
         cookie.set_path(path.to_string());
         cookie.set_max_age(CookieDuration::seconds(0));
+        cookie.set_expires(time::OffsetDateTime::UNIX_EPOCH);
         cookie.set_same_site(match config.cookie_same_site {
             SameSiteMode::Strict => SameSite::Strict,
             SameSiteMode::Lax => SameSite::Lax,
@@ -270,12 +308,33 @@ fn auth_session_is_revoked(config: &Config, nonce: &str, expires: u128) -> bool 
 }
 
 pub(crate) fn revoke_auth_cookie(config: &Config, jar: &CookieJar) -> bool {
-    let Some((_, nonce, expires)) = jar
-        .get(AUTH_COOKIE)
-        .and_then(|cookie| parse_auth_token(config, cookie.value()))
-    else {
+    jar.get(AUTH_COOKIE)
+        .is_some_and(|cookie| revoke_auth_token_value(config, cookie.value()))
+}
+
+pub(crate) fn revoke_auth_cookies_from_headers(
+    config: &Config,
+    jar: &CookieJar,
+    headers: &HeaderMap,
+) -> bool {
+    let mut revoked = revoke_auth_cookie(config, jar);
+    for token in auth_cookie_values_from_headers(headers) {
+        revoked |= revoke_auth_token_value(config, &token);
+    }
+    revoked
+}
+
+fn revoke_auth_token_value(config: &Config, token: &str) -> bool {
+    let Some((_, nonce, expires)) = parse_auth_token(config, token) else {
         return false;
     };
+    revoke_auth_token(config, nonce, expires)
+}
+
+fn revoke_auth_token(config: &Config, nonce: String, expires: u128) -> bool {
+    if auth_session_is_revoked(config, &nonce, expires) {
+        return true;
+    }
     let now = now_millis();
     let Ok(mut stores) = revoked_auth_sessions().lock() else {
         return false;
@@ -406,14 +465,17 @@ pub(crate) async fn select_profile(
         .into_response())
 }
 
+#[cfg(test)]
 pub(crate) fn auth_context(config: &Config, jar: &CookieJar) -> Option<AuthContext> {
-    let role = if let Some(cookie) = jar.get(AUTH_COOKIE) {
-        let Some((role, nonce, expires)) = parse_auth_token(config, cookie.value()) else {
-            return None;
-        };
-        if auth_session_is_revoked(config, &nonce, expires) {
-            return None;
-        }
+    auth_context_from_headers(config, jar, &HeaderMap::new())
+}
+
+pub(crate) fn auth_context_from_headers(
+    config: &Config,
+    jar: &CookieJar,
+    headers: &HeaderMap,
+) -> Option<AuthContext> {
+    let role = if let Some(role) = strongest_auth_role(config, jar, headers) {
         role
     } else if authless_admin_allowed(config) {
         UserRole::Admin
@@ -428,6 +490,57 @@ pub(crate) fn auth_context(config: &Config, jar: &CookieJar) -> Option<AuthConte
         .unwrap_or_else(|| config.default_profile_id.clone());
 
     Some(AuthContext { role, profile_id })
+}
+
+fn strongest_auth_role(config: &Config, jar: &CookieJar, headers: &HeaderMap) -> Option<UserRole> {
+    let mut selected = jar
+        .get(AUTH_COOKIE)
+        .and_then(|cookie| valid_auth_cookie_role(config, cookie.value()));
+
+    for token in auth_cookie_values_from_headers(headers) {
+        let Some(role) = valid_auth_cookie_role(config, &token) else {
+            continue;
+        };
+        if selected.is_none_or(|current| user_role_strength(role) > user_role_strength(current)) {
+            selected = Some(role);
+        }
+    }
+
+    selected
+}
+
+fn valid_auth_cookie_role(config: &Config, token: &str) -> Option<UserRole> {
+    let (role, nonce, expires) = parse_auth_token(config, token)?;
+    if auth_session_is_revoked(config, &nonce, expires) {
+        return None;
+    }
+    Some(role)
+}
+
+fn auth_cookie_values_from_headers(headers: &HeaderMap) -> Vec<String> {
+    let mut values = Vec::new();
+    for header_value in headers.get_all(header::COOKIE).iter() {
+        let Ok(cookie_header) = header_value.to_str() else {
+            continue;
+        };
+        for part in cookie_header.split(';') {
+            let Some((name, value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if name.trim() == AUTH_COOKIE {
+                values.push(value.trim().to_string());
+            }
+        }
+    }
+    values
+}
+
+fn user_role_strength(role: UserRole) -> u8 {
+    match role {
+        UserRole::Owner => 3,
+        UserRole::Admin => 2,
+        UserRole::Viewer => 1,
+    }
 }
 
 pub(crate) fn sign(config: &Config, payload: &str) -> Result<String> {

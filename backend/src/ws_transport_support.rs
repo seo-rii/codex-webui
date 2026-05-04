@@ -18,7 +18,7 @@ pub(crate) async fn handle_ws(
         return response;
     }
 
-    let Some(auth) = auth_context(&state.config, &jar) else {
+    let Some(auth) = auth_context_from_headers(&state.config, &jar, &headers) else {
         let mut response = (StatusCode::UNAUTHORIZED, "Authentication required.").into_response();
         apply_security_headers(response.headers_mut());
         return response;

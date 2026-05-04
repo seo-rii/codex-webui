@@ -3925,10 +3925,7 @@
     loginHcaptchaToken = "";
     loginHcaptchaWidgetId = null;
     notificationsBusy = false;
-    releaseGlobalStream?.();
-    releaseGlobalStream = null;
-    api.disconnect();
-    connectionState = "idle";
+    resetRealtimeConnectionForAuthChange();
   }
 
   function ensureGlobalStreamSubscription() {
@@ -4499,6 +4496,14 @@
   function disconnectStream() {
     releaseSessionStream?.();
     releaseSessionStream = null;
+  }
+
+  function resetRealtimeConnectionForAuthChange() {
+    disconnectStream();
+    releaseGlobalStream?.();
+    releaseGlobalStream = null;
+    api.disconnect();
+    connectionState = "idle";
   }
 
   function clearHydrationRefresh() {
@@ -6608,6 +6613,7 @@
 
     try {
       const loginResult = await api.login(loginPassword.trim(), loginHcaptchaToken || null);
+      resetRealtimeConnectionForAuthChange();
       loginPassword = "";
       authenticated = true;
       webRole = loginResult.role ?? "admin";
@@ -6707,7 +6713,7 @@
 
     try {
       await api.selectAuthProfile(profileId);
-      api.disconnect();
+      resetRealtimeConnectionForAuthChange();
       resetWorkspaceState();
       authenticated = true;
       await bootstrap();

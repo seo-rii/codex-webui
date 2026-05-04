@@ -41,15 +41,15 @@ pub(crate) async fn handle_auth_http(
         (Method::POST, "/api/auth/login") => {
             auth_login(state.clone(), jar, headers, request, peer_addr).await
         }
-        (Method::POST, "/api/auth/logout") => Ok(auth_logout(&state.config, jar)),
+        (Method::POST, "/api/auth/logout") => Ok(auth_logout(&state.config, jar, &headers)),
         (Method::POST, "/api/auth/profile") => {
-            let Some(auth) = auth_context(&state.config, &jar) else {
+            let Some(auth) = auth_context_from_headers(&state.config, &jar, &headers) else {
                 return json_error(StatusCode::UNAUTHORIZED, "Authentication required.");
             };
             select_profile(state.config.clone(), jar, headers, request, auth, peer_addr).await
         }
         (Method::GET, "/api/auth/session") => {
-            let auth = auth_context(&state.config, &jar);
+            let auth = auth_context_from_headers(&state.config, &jar, &headers);
             let active_profile_id = auth
                 .as_ref()
                 .map(|context| context.profile_id.as_str())
@@ -276,8 +276,8 @@ async fn auth_login(
         .into_response())
 }
 
-fn auth_logout(config: &Config, jar: CookieJar) -> Response {
-    revoke_auth_cookie(config, &jar);
+fn auth_logout(config: &Config, jar: CookieJar, headers: &HeaderMap) -> Response {
+    revoke_auth_cookies_from_headers(config, &jar, headers);
     let mut cookie = Cookie::new(AUTH_COOKIE, "");
     cookie.set_path(auth_cookie_path(config));
     cookie.set_max_age(CookieDuration::seconds(0));

@@ -106,7 +106,10 @@ async fn revoked_auth_cookie_is_rejected_server_side() {
     let codex_home = sandbox.join("codex-home");
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
-    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    config.owner_password = Some("owner-secret".to_string());
+    state.config = Arc::new(config);
     let jar = issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Admin).unwrap();
 
     assert_eq!(
@@ -215,6 +218,99 @@ fn auth_cookie_round_trips_owner_role() {
     let auth = auth_context(&config, &jar).expect("owner cookie should authenticate");
 
     assert_eq!(auth.role, UserRole::Owner);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[test]
+fn duplicate_auth_cookie_headers_prefer_owner_role() {
+    let sandbox = unique_test_dir("duplicate-auth-cookie-owner-role");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let config = (*test_state(workspace.clone(), vec![workspace], codex_home).config).clone();
+    let admin_jar = issue_auth_cookie(&config, CookieJar::new(), false, UserRole::Admin).unwrap();
+    let owner_jar = issue_auth_cookie(&config, CookieJar::new(), false, UserRole::Owner).unwrap();
+    let admin_token = admin_jar
+        .get(AUTH_COOKIE)
+        .expect("admin auth cookie should be issued")
+        .value()
+        .to_string();
+    let owner_token = owner_jar
+        .get(AUTH_COOKIE)
+        .expect("owner auth cookie should be issued")
+        .value()
+        .to_string();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        HeaderValue::from_str(&format!(
+            "{AUTH_COOKIE}={admin_token}; {AUTH_COOKIE}={owner_token}"
+        ))
+        .unwrap(),
+    );
+
+    let auth = auth_context_from_headers(&config, &admin_jar, &headers)
+        .expect("duplicate auth cookies should authenticate");
+
+    assert_eq!(auth.role, UserRole::Owner);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_revokes_duplicate_auth_cookie_headers() {
+    let sandbox = unique_test_dir("logout-revokes-duplicate-auth-cookies");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    config.owner_password = Some("owner-secret".to_string());
+    state.config = Arc::new(config);
+    let admin_jar =
+        issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Admin).unwrap();
+    let owner_jar =
+        issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Owner).unwrap();
+    let admin_token = admin_jar
+        .get(AUTH_COOKIE)
+        .expect("admin auth cookie should be issued")
+        .value()
+        .to_string();
+    let owner_token = owner_jar
+        .get(AUTH_COOKIE)
+        .expect("owner auth cookie should be issued")
+        .value()
+        .to_string();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        HeaderValue::from_str(&format!(
+            "{AUTH_COOKIE}={admin_token}; {AUTH_COOKIE}={owner_token}"
+        ))
+        .unwrap(),
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/logout")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = handle_auth_http(
+        state.clone(),
+        admin_jar.clone(),
+        Method::POST,
+        "/api/auth/logout".to_string(),
+        headers.clone(),
+        request,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(auth_context_from_headers(&state.config, &admin_jar, &headers).is_none());
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -1258,6 +1354,9 @@ async fn auth_cookies_are_scoped_to_base_path() {
             .iter()
             .any(|cookie| { cookie.contains("codex_webui_auth=") && cookie.contains("Path=/;") })
     );
+    assert!(login_set_cookies.iter().any(|cookie| {
+        cookie.contains("codex_webui_auth=") && cookie.contains("Path=/absproxy;")
+    }));
 
     let request = Request::builder()
         .method(Method::POST)
@@ -1284,6 +1383,11 @@ async fn auth_cookies_are_scoped_to_base_path() {
         set_cookies
             .iter()
             .any(|cookie| cookie.contains("Path=/absproxy/4173"))
+    );
+    assert!(
+        set_cookies
+            .iter()
+            .any(|cookie| cookie.contains("Path=/absproxy;"))
     );
     assert!(
         set_cookies
@@ -1347,6 +1451,16 @@ async fn authenticated_http_mutations_require_csrf_token() {
         .unwrap();
     let login_response = handle_http(State(state.clone()), CookieJar::new(), login_request).await;
     assert_ne!(login_response.status(), StatusCode::FORBIDDEN);
+
+    let logout_jar =
+        issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Admin).unwrap();
+    let logout_request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/logout")
+        .body(Body::empty())
+        .unwrap();
+    let logout_response = handle_http(State(state.clone()), logout_jar, logout_request).await;
+    assert_eq!(logout_response.status(), StatusCode::OK);
 
     let _ = fs::remove_dir_all(sandbox);
 }

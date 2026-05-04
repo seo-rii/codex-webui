@@ -646,7 +646,16 @@ async fn session_routes_reject_invalid_session_ids_before_storage_access() {
         .body(Body::empty())
         .unwrap();
 
-    let response = handle_session_route_http(state, &jar, request, route_path, None, None).await;
+    let response = handle_session_route_http(
+        state,
+        &jar,
+        &HeaderMap::new(),
+        request,
+        route_path,
+        None,
+        None,
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let _ = fs::remove_dir_all(sandbox);

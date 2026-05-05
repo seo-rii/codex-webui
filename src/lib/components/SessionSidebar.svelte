@@ -1291,7 +1291,7 @@
     {#if accountMenuOpen}
       <div
         bind:this={accountPopoverElement}
-        class="sidebar-flyout sidebar-account-popover fixed z-50 grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] bg-white border border-gray-200 rounded-2xl shadow-2xl overflow-hidden opacity-0 pointer-events-none p-2 w-80"
+        class="sidebar-flyout sidebar-account-popover fixed z-[90] grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] bg-white border border-gray-200 rounded-2xl shadow-2xl overflow-hidden opacity-0 pointer-events-none p-2 w-80"
         style={accountPopoverStyle}
       >
         <div class="sidebar-flyout-header p-4 border-b border-gray-100 flex items-center justify-between">

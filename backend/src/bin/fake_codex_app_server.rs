@@ -153,6 +153,126 @@ fn main() {
                     }
                 }));
             }
+            Some("thread/goal/get") => {
+                let thread_id = payload
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let goal = threads
+                    .get(thread_id)
+                    .and_then(|thread| thread.get("goal"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "goal": goal
+                    }
+                }));
+            }
+            Some("thread/goal/set") => {
+                let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
+                let thread_id = params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                timestamp_counter += 1;
+                let Some(thread_object) =
+                    threads.get_mut(&thread_id).and_then(Value::as_object_mut)
+                else {
+                    print_message(&json!({
+                        "id": id,
+                        "error": {
+                            "code": -32000,
+                            "message": "thread not found"
+                        }
+                    }));
+                    continue;
+                };
+                let existing_goal = thread_object.get("goal").cloned().unwrap_or(Value::Null);
+                let objective = params
+                    .get("objective")
+                    .and_then(Value::as_str)
+                    .or_else(|| existing_goal.get("objective").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                let status = params
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .or_else(|| existing_goal.get("status").and_then(Value::as_str))
+                    .unwrap_or("active")
+                    .to_string();
+                let goal = json!({
+                    "threadId": thread_id,
+                    "objective": objective,
+                    "status": status,
+                    "tokenBudget": params
+                        .get("tokenBudget")
+                        .cloned()
+                        .or_else(|| existing_goal.get("tokenBudget").cloned())
+                        .unwrap_or(Value::Null),
+                    "tokensUsed": existing_goal
+                        .get("tokensUsed")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    "timeUsedSeconds": existing_goal
+                        .get("timeUsedSeconds")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    "createdAt": existing_goal
+                        .get("createdAt")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(timestamp_counter),
+                    "updatedAt": timestamp_counter
+                });
+                thread_object.insert("goal".to_string(), goal.clone());
+                thread_object.insert("updatedAt".to_string(), Value::from(timestamp_counter));
+                print_message(&json!({
+                    "method": "thread/goal/updated",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": Value::Null,
+                        "goal": goal
+                    }
+                }));
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "goal": goal
+                    }
+                }));
+            }
+            Some("thread/goal/clear") => {
+                let thread_id = payload
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let cleared = if let Some(thread_object) =
+                    threads.get_mut(&thread_id).and_then(Value::as_object_mut)
+                {
+                    thread_object.remove("goal").is_some()
+                } else {
+                    false
+                };
+                if cleared {
+                    print_message(&json!({
+                        "method": "thread/goal/cleared",
+                        "params": {
+                            "threadId": thread_id
+                        }
+                    }));
+                }
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "cleared": cleared
+                    }
+                }));
+            }
             Some("thread/seed") => {
                 let thread = payload
                     .get("params")

@@ -791,6 +791,134 @@ async fn runtime_notifications_emit_session_stream_events_from_rust_relay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_goal_payload_round_trips_through_app_server() {
+    let sandbox = unique_test_dir("thread-goal");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-goal-1",
+                    "name": "Goal test",
+                    "preview": "",
+                    "cwd": workspace,
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let set = set_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-1",
+        json!({
+            "objective": "ship upstream goal parity",
+            "tokenBudget": 12000
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        set.get("goal")
+            .and_then(|goal| goal.get("objective"))
+            .and_then(Value::as_str),
+        Some("ship upstream goal parity")
+    );
+    assert_eq!(
+        set.get("goal")
+            .and_then(|goal| goal.get("status"))
+            .and_then(Value::as_str),
+        Some("active")
+    );
+
+    let paused = set_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-1",
+        json!({
+            "status": "paused"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        paused
+            .get("goal")
+            .and_then(|goal| goal.get("status"))
+            .and_then(Value::as_str),
+        Some("paused")
+    );
+
+    let detail = session_detail_payload(&state, "default", "thread-goal-1", 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        detail
+            .get("goal")
+            .and_then(|goal| goal.get("objective"))
+            .and_then(Value::as_str),
+        Some("ship upstream goal parity")
+    );
+
+    let cleared = clear_session_goal_payload(&state, "default", "thread-goal-1")
+        .await
+        .unwrap();
+    assert_eq!(cleared.get("cleared").and_then(Value::as_bool), Some(true));
+    let get = get_session_goal_payload(&state, "default", "thread-goal-1")
+        .await
+        .unwrap();
+    assert!(get.get("goal").is_some_and(Value::is_null));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[test]
+fn thread_goal_notifications_are_mapped_for_session_streams() {
+    let event = map_app_server_session_notification(&AppServerNotification {
+        method: "thread/goal/updated".to_string(),
+        params: json!({
+            "threadId": "thread-goal-2",
+            "turnId": "turn-1",
+            "goal": {
+                "threadId": "thread-goal-2",
+                "objective": "finish compatibility work",
+                "status": "budget_limited",
+                "token_budget": 2000,
+                "tokens_used": 1500,
+                "time_used_seconds": 90,
+                "created_at": 10,
+                "updated_at": 20
+            }
+        }),
+    })
+    .unwrap();
+    assert_eq!(
+        event
+            .get("params")
+            .and_then(|params| params.get("goal"))
+            .and_then(|goal| goal.get("status"))
+            .and_then(Value::as_str),
+        Some("budgetLimited")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_notifications_emit_global_events_without_internal_sse() {
     let sandbox = unique_test_dir("global-stream-rust");
     let workspace = sandbox.join("workspace");

@@ -235,6 +235,74 @@ for raw_line in sys.stdin:
                 "ok": True
             }
         })
+    elif method == "thread/goal/get":
+        thread_id = params.get("threadId", "")
+        thread = threads.get(thread_id) or {}
+        write({
+            "id": request_id,
+            "result": {
+                "goal": thread.get("goal")
+            }
+        })
+    elif method == "thread/goal/set":
+        thread_id = params.get("threadId", "")
+        thread = threads.get(thread_id)
+        if not isinstance(thread, dict):
+            write({
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "thread not found"
+                }
+            })
+            continue
+        timestamp_counter += 1
+        existing_goal = thread.get("goal") or {}
+        goal = {
+            "threadId": thread_id,
+            "objective": params.get("objective") or existing_goal.get("objective", ""),
+            "status": params.get("status") or existing_goal.get("status", "active"),
+            "tokenBudget": params["tokenBudget"] if "tokenBudget" in params else existing_goal.get("tokenBudget"),
+            "tokensUsed": int(existing_goal.get("tokensUsed", 0) or 0),
+            "timeUsedSeconds": int(existing_goal.get("timeUsedSeconds", 0) or 0),
+            "createdAt": int(existing_goal.get("createdAt", timestamp_counter) or timestamp_counter),
+            "updatedAt": timestamp_counter
+        }
+        thread["goal"] = goal
+        thread["updatedAt"] = timestamp_counter
+        write({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": thread_id,
+                "turnId": None,
+                "goal": goal
+            }
+        })
+        write({
+            "id": request_id,
+            "result": {
+                "goal": goal
+            }
+        })
+    elif method == "thread/goal/clear":
+        thread_id = params.get("threadId", "")
+        thread = threads.get(thread_id)
+        cleared = False
+        if isinstance(thread, dict):
+            cleared = thread.pop("goal", None) is not None
+        if cleared:
+            write({
+                "method": "thread/goal/cleared",
+                "params": {
+                    "threadId": thread_id
+                }
+            })
+        write({
+            "id": request_id,
+            "result": {
+                "cleared": cleared
+            }
+        })
     elif method == "thread/seed":
         thread = params.get("thread") or {}
         thread_id = thread.get("id")

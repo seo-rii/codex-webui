@@ -333,6 +333,24 @@ pub(crate) async fn execute_ws_method(
                 .await
                 .map_err(anyhow::Error::from)
         }
+        "session/goal/get" => {
+            let session_id = require_session_id(&params, "sessionId")?;
+            get_session_goal_payload(state, &auth.profile_id, &session_id)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "session/goal/set" => {
+            let session_id = require_session_id(&params, "sessionId")?;
+            set_session_goal_payload(state, &auth.profile_id, &session_id, params)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "session/goal/clear" => {
+            let session_id = require_session_id(&params, "sessionId")?;
+            clear_session_goal_payload(state, &auth.profile_id, &session_id)
+                .await
+                .map_err(anyhow::Error::from)
+        }
         "session/draft/get" => {
             let session_id = require_session_id(&params, "sessionId")?;
             get_session_draft_payload(state, &auth.profile_id, &session_id)

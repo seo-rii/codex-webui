@@ -272,6 +272,26 @@ pub(crate) fn map_app_server_session_notification(
                 normalize_token_usage_payload(mapped.get("tokenUsage")),
             );
         }
+        "thread/goal/updated" => {
+            let thread_id = mapped
+                .get("threadId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            mapped.insert(
+                "goal".to_string(),
+                mapped
+                    .get("goal")
+                    .map(|goal| normalize_thread_goal_payload(goal, &thread_id))
+                    .unwrap_or(Value::Null),
+            );
+            mapped
+                .entry("turnId".to_string())
+                .or_insert_with(|| Value::Null);
+        }
+        "thread/goal/cleared" => {
+            mapped.insert("goal".to_string(), Value::Null);
+        }
         "item/commandExecution/outputDelta" => {
             let delta = mapped
                 .get("delta")

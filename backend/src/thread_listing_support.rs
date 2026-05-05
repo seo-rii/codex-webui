@@ -214,7 +214,8 @@ async fn list_app_server_thread_batch(
             json!({
                 "limit": normalized_limit,
                 "archived": archived,
-                "cursor": cursor
+                "cursor": cursor,
+                "useStateDbOnly": true
             }),
         )
         .await

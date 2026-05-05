@@ -252,6 +252,7 @@ pub(crate) async fn session_detail_payload(
         )))
     })
     .await?;
+    let goal = session_goal_or_null_payload(state, profile_id, session_id).await;
     clear_completed_session_highlight_on_open(state, profile_id, session_id).await;
 
     let payload = json!({
@@ -270,6 +271,7 @@ pub(crate) async fn session_detail_payload(
         },
         "preferences": preferences,
         "selectedSkills": selected_skills,
+        "goal": goal,
         "attachments": list_session_attachments_payload(state, profile_id, session_id).await?,
         "queue": get_session_queue_payload(state, profile_id, session_id).await?,
         "pendingRequests": session_pending_requests_payload(state, profile_id, session_id).await,
@@ -463,6 +465,7 @@ pub(crate) fn cacheable_session_detail_response(
                 "thread": thread,
                 "preferences": payload.get("preferences").cloned().unwrap_or(Value::Null),
                 "selectedSkills": payload.get("selectedSkills").cloned().unwrap_or_else(|| json!([])),
+                "goal": payload.get("goal").cloned().unwrap_or(Value::Null),
                 "attachments": payload.get("attachments").cloned().unwrap_or_else(|| json!([])),
                 "queue": payload.get("queue").cloned().unwrap_or(Value::Null),
                 "pendingRequests": payload.get("pendingRequests").cloned().unwrap_or_else(|| json!([])),

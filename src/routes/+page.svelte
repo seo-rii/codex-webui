@@ -1305,6 +1305,8 @@
   let releaseConnectionStateListener: (() => void) | null = null;
   let releaseThemeListener: (() => void) | null = null;
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  let preferenceSaveVersion = 0;
+  const pendingPreferencePatchesBySessionId = new Map<string, Partial<SessionPreferences>>();
   let hydrationRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let selectedSessionDetailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -4409,6 +4411,15 @@
           };
         }
 
+        if (payload.kind === "notification" && payload.method === "codex-webui/preferencesUpdated") {
+          const pendingPatch = pendingPreferencePatchesBySessionId.get(sessionId);
+          const incomingPreferences = payload.params.preferences as Partial<SessionPreferences> | undefined;
+          if (pendingPatch && (!incomingPreferences || !pendingPreferencePatchMatches(incomingPreferences, pendingPatch))) {
+            return;
+          }
+          pendingPreferencePatchesBySessionId.delete(sessionId);
+        }
+
         conversation = applyLocalComposerPreferencesToConversation(
           normalizeConversationExecutionState(applyStreamEvent(conversation, payload))
         );
@@ -5312,6 +5323,26 @@
     return preferences?.modelContextWindow === HUNDRED_M_CONTEXT_WINDOW;
   }
 
+  function isPlanModeEnabled(preferences: SessionPreferences | null | undefined) {
+    return (preferences?.mode ?? "default") === "plan";
+  }
+
+  function pendingPreferencePatchMatches(preferences: Partial<SessionPreferences>, patch: Partial<SessionPreferences>) {
+    for (const [key, value] of Object.entries(patch) as Array<[keyof SessionPreferences, SessionPreferences[keyof SessionPreferences]]>) {
+      if (preferences[key] !== value) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function setPlanModePreference(enabled: boolean, showNotice = true) {
+    setPreference("mode", enabled ? "plan" : "default");
+    if (showNotice) {
+      noticeText = enabled ? m.slash_plan_enabled() : m.slash_plan_disabled();
+    }
+  }
+
   function setPreferencesPatch(patch: Partial<SessionPreferences>) {
     if (readOnlyRole) {
       errorText = m.error_forbidden_role();
@@ -5334,15 +5365,21 @@
       }
     }
 
+    const nextPreferences = {
+      ...conversation.preferences,
+      ...patch
+    };
     conversation = {
       ...conversation,
-      preferences: {
-        ...conversation.preferences,
-        ...patch
-      }
+      preferences: nextPreferences
     };
+    const selectedBinding = getSelectedSessionBinding();
+    if (selectedBinding) {
+      pendingPreferencePatchesBySessionId.set(selectedBinding.sessionId, patch);
+    }
+    preferenceSaveVersion += 1;
     markConversationCacheDirty();
-    if (getSelectedSessionBinding() || typeof patch.sendOnEnter !== "boolean" || Object.keys(patch).length > 1) {
+    if (selectedBinding || typeof patch.sendOnEnter !== "boolean" || Object.keys(patch).length > 1) {
       schedulePreferenceSave();
     }
   }
@@ -5448,6 +5485,7 @@
       return;
     }
     const sessionId = selectedBinding.sessionId;
+    const saveVersion = preferenceSaveVersion;
     if (saveTimer) {
       clearTimeout(saveTimer);
     }
@@ -5459,6 +5497,9 @@
           return;
         }
         const saved = await api.savePreferences(sessionId, currentBinding.state.preferences);
+        if (saveVersion !== preferenceSaveVersion) {
+          return;
+        }
         const nextConfig = applyLocalComposerPreferencesToConfig(await api.getConfig());
         if (conversation?.thread.id === sessionId) {
           conversation = {
@@ -5467,6 +5508,7 @@
           };
           markConversationCacheDirty();
         }
+        pendingPreferencePatchesBySessionId.delete(sessionId);
         config = nextConfig;
         syncConfiguredTheme(config);
         await refreshSessions(shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null);
@@ -5904,14 +5946,14 @@
       }
       const normalized = args.toLowerCase();
       if (normalized === "plan" || normalized === "on") {
-        setPreference("mode", "plan");
+        setPlanModePreference(true, false);
         draft = "";
         scheduleComposerTextareaResize();
         noticeText = m.slash_plan_enabled();
         return true;
       }
       if (normalized === "default" || normalized === "off") {
-        setPreference("mode", "default");
+        setPlanModePreference(false, false);
         draft = "";
         scheduleComposerTextareaResize();
         noticeText = m.slash_plan_disabled();
@@ -9548,7 +9590,7 @@
       });
     }
 
-    if ((conversation.preferences.mode ?? "default") === "plan") {
+    if (isPlanModeEnabled(conversation.preferences)) {
       indicators.push({
         key: "plan",
         icon: "checklist",
@@ -10699,6 +10741,11 @@
                             <Cpu size={13} class="shrink-0 text-gray-400" />
                           {/if}
                           <span class="truncate">{composerSettingsSummary.model}</span>
+                          {#if isPlanModeEnabled(conversation.preferences)}
+                            <span class="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-700" title={m.plan_mode_enabled()}>
+                              <ListTodo size={11} />
+                            </span>
+                          {/if}
                           {#if composerSettingsSummary.speed === "flex"}
                             <span class="hidden rounded-full bg-sky-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest text-sky-700 sm:inline-flex">
                               {ui.speedFlex}
@@ -10938,32 +10985,29 @@
                             </button>
                           </div>
                         </div>
-                        <div class="rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
-                          <div class="flex items-center justify-between gap-3">
-                            <div class="space-y-0.5">
-                              <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.planMode}</p>
-                              <p class="text-[11px] text-gray-500">{(conversation.preferences.mode ?? "default") === "plan" ? m.plan_mode_enabled() : ui.planMode}</p>
-                            </div>
-                            <button
-                              class={`ui-animated-button ui-animated-button--soft inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
-                                (conversation.preferences.mode ?? "default") === "plan"
-                                  ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
-                                  : "border-gray-200 bg-white text-gray-500 hover:border-gray-300 hover:text-gray-700"
-                              }`}
-                              disabled={readOnlyRole}
-                              onclick={() => {
-                                if (!conversation) {
-                                  return;
-                                }
-                                setPreference("mode", (conversation.preferences.mode ?? "default") === "plan" ? "default" : "plan");
-                              }}
-                              type="button"
-                            >
-                              <ListTodo size={13} class="shrink-0" />
+                        <label
+                          class:checkbox-card--disabled={readOnlyRole}
+                          class="checkbox-card checkbox-card--compact w-full"
+                          title={isPlanModeEnabled(conversation.preferences) ? m.plan_mode_enabled() : m.slash_plan_disabled()}
+                        >
+                          <input
+                            checked={isPlanModeEnabled(conversation.preferences)}
+                            class="checkbox-input"
+                            disabled={readOnlyRole}
+                            onchange={(event) => setPlanModePreference((event.currentTarget as HTMLInputElement).checked)}
+                            type="checkbox"
+                          />
+                          <span class="checkbox-control"></span>
+                          <span class="checkbox-copy min-w-0">
+                            <span class="checkbox-title inline-flex items-center gap-1.5">
+                              <ListTodo size={12} class={isPlanModeEnabled(conversation.preferences) ? "text-amber-700" : "text-gray-400"} />
                               <span>{ui.planMode}</span>
-                            </button>
-                          </div>
-                        </div>
+                            </span>
+                            <span class="checkbox-description">
+                              {isPlanModeEnabled(conversation.preferences) ? m.plan_mode_enabled() : ui.autoDefault}
+                            </span>
+                          </span>
+                        </label>
                         <div class="composer-settings-card flex flex-col gap-2.5 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
                           <div class="flex min-w-0 items-start gap-2">
                             <span class={`composer-settings-card__icon inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border ${

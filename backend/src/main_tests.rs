@@ -198,6 +198,13 @@ for raw_line in sys.stdin:
             "method": "fake/ready",
             "params": {}
         })
+    elif method == "experimentalFeature/enablement/set":
+        write({
+            "id": request_id,
+            "result": {
+                "enablement": params.get("enablement") or {}
+            }
+        })
     elif method == "thread/start":
         thread_counter += 1
         timestamp_counter += 1

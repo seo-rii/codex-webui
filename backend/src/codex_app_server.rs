@@ -298,7 +298,8 @@ impl AppServerClient {
                     "method": "initialized",
                     "params": {}
                 }))
-                .await
+                .await?;
+                self.enable_required_runtime_features().await
             }
             .await
             {
@@ -328,6 +329,28 @@ impl AppServerClient {
     async fn request_started(&self, method: String, params: Value) -> Result<Value> {
         self.request_started_with_timeout(method, params, self.inner.config.request_timeout)
             .await
+    }
+
+    async fn enable_required_runtime_features(&self) -> Result<()> {
+        if let Err(error) = self
+            .request_started_with_timeout(
+                "experimentalFeature/enablement/set".to_string(),
+                json!({
+                    "enablement": {
+                        "goals": true
+                    }
+                }),
+                self.inner.config.startup_timeout,
+            )
+            .await
+        {
+            warn!(
+                profile_id = %self.inner.profile.id,
+                error = %error,
+                "failed to enable required Codex runtime features; goal mode may be unavailable"
+            );
+        }
+        Ok(())
     }
 
     async fn request_started_with_timeout(

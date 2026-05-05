@@ -77,6 +77,19 @@ fn main() {
                     }
                 }));
             }
+            Some("experimentalFeature/enablement/set") => {
+                let enablement = payload
+                    .get("params")
+                    .and_then(|params| params.get("enablement"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "enablement": enablement
+                    }
+                }));
+            }
             Some("echo") => {
                 print_message(&json!({
                     "id": id,

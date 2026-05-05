@@ -791,6 +791,33 @@ async fn runtime_notifications_emit_session_stream_events_from_rust_relay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_server_start_enables_goals_by_default() {
+    let sandbox = unique_test_dir("app-server-goals-default");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let count = app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "debug/requestCount",
+            json!({
+                "target": "experimentalFeature/enablement/set"
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(count.get("count").and_then(Value::as_u64), Some(1));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_goal_payload_round_trips_through_app_server() {
     let sandbox = unique_test_dir("thread-goal");
     let workspace = sandbox.join("workspace");

@@ -244,7 +244,7 @@ fn parse_app_server_handoff_enabled(value: Option<String>) -> bool {
                 "1" | "true" | "yes" | "on"
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(cfg!(unix))
 }
 
 #[cfg(test)]
@@ -252,8 +252,8 @@ mod tests {
     use super::parse_app_server_handoff_enabled;
 
     #[test]
-    fn app_server_handoff_is_opt_in() {
-        assert!(!parse_app_server_handoff_enabled(None));
+    fn app_server_handoff_defaults_to_platform_support() {
+        assert_eq!(parse_app_server_handoff_enabled(None), cfg!(unix));
         assert!(!parse_app_server_handoff_enabled(Some("false".to_string())));
         assert!(!parse_app_server_handoff_enabled(Some("0".to_string())));
         assert!(parse_app_server_handoff_enabled(Some("true".to_string())));

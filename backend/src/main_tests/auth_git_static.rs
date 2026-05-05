@@ -999,6 +999,7 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
     config.instance_token = Some("probe-token".to_string());
     config.password = Some("admin-secret".to_string());
     config.restart_command = Some("true".to_string());
+    config.app_server_handoff_enabled = true;
     state.config = Arc::new(config);
     fs::create_dir_all(&state.config.data_dir).unwrap();
 
@@ -1221,6 +1222,68 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
     assert!(
         state.restart_plan.lock().await.is_none(),
         "replacement gateway should be spawned before shutdown begins instead of waiting for graceful connections to drain"
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_handoff_refuses_to_drop_active_app_server_when_disabled() {
+    let sandbox = unique_test_dir("restart-handoff-disabled");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home.clone());
+    let mut config = (*state.config).clone();
+    config.instance_token = Some("probe-token".to_string());
+    config.password = Some("admin-secret".to_string());
+    config.restart_command = Some("true".to_string());
+    config.app_server_handoff_enabled = false;
+    state.config = Arc::new(config);
+    state
+        .app_servers
+        .get_or_create(AppServerProfile {
+            id: "default".to_string(),
+            codex_home,
+        })
+        .await;
+
+    let prepare_request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/admin/restart-handoff/prepare")
+        .header("x-codex-webui-instance-token", "probe-token")
+        .body(Body::empty())
+        .unwrap();
+    let prepare_response =
+        handle_http(State(state.clone()), CookieJar::new(), prepare_request).await;
+    assert_eq!(prepare_response.status(), StatusCode::CONFLICT);
+    assert!(
+        !state
+            .preserve_app_servers_on_shutdown
+            .load(Ordering::SeqCst)
+    );
+
+    let owner_jar =
+        issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Owner).unwrap();
+    let owner_jar = issue_csrf_cookie(&state.config, owner_jar, false).unwrap();
+    let csrf_token = owner_jar
+        .get(CSRF_COOKIE)
+        .expect("csrf cookie should be issued")
+        .value()
+        .to_string();
+    let restart_request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/admin/restart")
+        .header(CSRF_HEADER, csrf_token)
+        .body(Body::empty())
+        .unwrap();
+    let restart_response = handle_http(State(state.clone()), owner_jar, restart_request).await;
+    assert_eq!(restart_response.status(), StatusCode::CONFLICT);
+    assert!(
+        !state
+            .preserve_app_servers_on_shutdown
+            .load(Ordering::SeqCst)
     );
 
     let _ = fs::remove_dir_all(sandbox);

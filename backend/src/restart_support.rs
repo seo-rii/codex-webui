@@ -99,9 +99,19 @@ pub(crate) async fn prepare_gateway_restart_payload(state: &AppState) -> ApiResu
     let plan = build_gateway_restart_plan(&state.config)
         .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
     let mode = plan.mode;
+    let handoff_status = state.app_servers.handoff_status().await;
+    let handoff_prepared = state.config.app_server_handoff_enabled
+        && cfg!(unix)
+        && handoff_status.stdio_process_count == 0;
+    if !handoff_prepared && handoff_status.client_count > 0 {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "Codex app-server handoff is not available for every active client; restart would stop active Codex work.",
+        ));
+    }
     state
         .preserve_app_servers_on_shutdown
-        .store(true, Ordering::SeqCst);
+        .store(handoff_prepared, Ordering::SeqCst);
 
     spawn_gateway_restart(&state.config, plan)
         .await
@@ -115,8 +125,12 @@ pub(crate) async fn prepare_gateway_restart_payload(state: &AppState) -> ApiResu
 
     Ok(json!({
         "ok": true,
-        "handoffPrepared": true,
+        "activeAppServerProcesses": handoff_status.active_process_count,
+        "appServerClients": handoff_status.client_count,
+        "handoffPrepared": handoff_prepared,
+        "handoffProxyProcesses": handoff_status.handoff_proxy_process_count,
         "restartScheduled": true,
+        "stdioAppServerProcesses": handoff_status.stdio_process_count,
         "mode": mode
     }))
 }

@@ -214,7 +214,7 @@ The Rust gateway exposes:
 
 The CLI starts the gateway with a per-instance token and stores it in `~/.codex/codex-webui/server.json`. `codex-webui status`, `stop`, and `restart` verify that token against `/healthz` before managing the recorded PID, which avoids acting on a reused PID that belongs to another process.
 
-For restart handoff, the gateway runs Codex app-server as a long-lived local control-socket process and talks to it through `codex app-server proxy`. Before `codex-webui restart` sends SIGTERM, it calls an instance-token-protected handoff endpoint so the gateway closes only its proxy connections. The replacement gateway may be a different backend binary; it attaches to the same Codex app-server socket and resumes receiving session state. A normal `codex-webui stop` does not set that flag, so graceful shutdown closes the proxy and terminates the managed Codex app-server.
+For restart handoff, the gateway runs Codex app-server as a long-lived local control-socket process and talks to it through `codex app-server proxy`. Unix handoff is enabled by default. Before `codex-webui restart` sends SIGTERM, it calls an instance-token-protected handoff endpoint so the gateway closes only its proxy connections. The replacement gateway may be a different backend binary; it attaches to the same Codex app-server socket and resumes receiving session state. A normal `codex-webui stop` does not set that flag, so graceful shutdown closes the proxy and terminates the managed Codex app-server. If handoff is disabled while active app-server clients exist, restart preparation fails to avoid killing active turns.
 
 ## Global Operational State
 

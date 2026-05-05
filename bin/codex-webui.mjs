@@ -503,7 +503,7 @@ async function verifyServerInstance(config, meta) {
 async function prepareRestartHandoff(config, meta) {
   const token = String(meta?.instanceToken ?? "").trim();
   if (!token) {
-    return false;
+    return { prepared: false, error: "Missing instance token." };
   }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 1500);
@@ -516,9 +516,21 @@ async function prepareRestartHandoff(config, meta) {
       },
       signal: controller.signal
     });
-    return response.ok;
-  } catch {
-    return false;
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+    if (!response.ok) {
+      return { prepared: false, error: payload?.error ?? payload?.message ?? `HTTP ${response.status}` };
+    }
+    return {
+      prepared: payload?.handoffPrepared !== false || payload?.activeAppServerProcesses === 0,
+      error: null
+    };
+  } catch (error) {
+    return { prepared: false, error: error instanceof Error ? error.message : String(error) };
   } finally {
     clearTimeout(timeout);
   }
@@ -1137,13 +1149,16 @@ async function restartServer(config) {
   if (status.pid && status.running && !status.verified) {
     throw new Error(`Refusing to restart: PID ${status.pid} could not be verified as this codex-webui instance.`);
   }
-  const handoffPrepared = status.verified ? await prepareRestartHandoff(config, status.meta) : false;
+  const handoff = status.verified ? await prepareRestartHandoff(config, status.meta) : { prepared: false, error: "No verified running gateway." };
+  if (status.verified && !handoff.prepared) {
+    throw new Error(`Refusing to restart without Codex app-server handoff: ${handoff.error ?? "handoff was not prepared"}`);
+  }
   const stopResult = await stopServer(config);
   if (stopResult.unsafe) {
     throw new Error(`Refusing to restart: PID ${stopResult.pid} could not be verified as this codex-webui instance.`);
   }
   const started = await startServer(config);
-  return { ...started, handoffPrepared };
+  return { ...started, handoffPrepared: handoff.prepared };
 }
 
 function printTunnelUsage() {

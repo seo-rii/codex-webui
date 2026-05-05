@@ -284,12 +284,26 @@ codex_webui_pending_server_requests {pending_server_request_count}\n",
                         "Instance token or owner role is required.",
                     );
                 }
+                let handoff_status = state.app_servers.handoff_status().await;
+                let handoff_prepared = state.config.app_server_handoff_enabled
+                    && cfg!(unix)
+                    && handoff_status.stdio_process_count == 0;
+                if !handoff_prepared && handoff_status.client_count > 0 {
+                    return json_error(
+                        StatusCode::CONFLICT,
+                        "Codex app-server handoff is not available for every active client; restart would stop active Codex work.",
+                    );
+                }
                 state
                     .preserve_app_servers_on_shutdown
-                    .store(true, Ordering::SeqCst);
+                    .store(handoff_prepared, Ordering::SeqCst);
                 let mut response = Json(json!({
                     "ok": true,
-                    "appServerClients": state.app_servers.client_count().await
+                    "activeAppServerProcesses": handoff_status.active_process_count,
+                    "appServerClients": handoff_status.client_count,
+                    "handoffPrepared": handoff_prepared,
+                    "handoffProxyProcesses": handoff_status.handoff_proxy_process_count,
+                    "stdioAppServerProcesses": handoff_status.stdio_process_count
                 }))
                 .into_response();
                 if let Some(origin_value) = cors_origin {

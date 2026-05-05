@@ -672,8 +672,12 @@ export type CodexRuntimeActionPayload = {
 
 export type GatewayRestartPayload = {
   ok: true;
+  activeAppServerProcesses: number;
+  appServerClients: number;
   handoffPrepared: boolean;
+  handoffProxyProcesses: number;
   restartScheduled: boolean;
+  stdioAppServerProcesses: number;
   mode: "command" | "current-binary" | string;
 };
 

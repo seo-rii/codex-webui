@@ -48,6 +48,14 @@ pub struct AppServerClientConfig {
     pub handoff_dir: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AppServerHandoffStatus {
+    pub client_count: usize,
+    pub active_process_count: usize,
+    pub stdio_process_count: usize,
+    pub handoff_proxy_process_count: usize,
+}
+
 impl Default for AppServerClientConfig {
     fn default() -> Self {
         Self {
@@ -622,6 +630,32 @@ impl AppServerManager {
 
     pub async fn client_count(&self) -> usize {
         self.clients.lock().await.len()
+    }
+
+    pub async fn handoff_status(&self) -> AppServerHandoffStatus {
+        let clients = {
+            let clients = self.clients.lock().await;
+            clients.values().cloned().collect::<Vec<_>>()
+        };
+        let mut status = AppServerHandoffStatus {
+            client_count: clients.len(),
+            ..AppServerHandoffStatus::default()
+        };
+
+        for client in clients {
+            let process = client.inner.process.lock().await;
+            let Some(process) = process.as_ref() else {
+                continue;
+            };
+            status.active_process_count += 1;
+            if process.handoff_proxy {
+                status.handoff_proxy_process_count += 1;
+            } else {
+                status.stdio_process_count += 1;
+            }
+        }
+
+        status
     }
 
     pub async fn close_all(&self) -> Result<()> {

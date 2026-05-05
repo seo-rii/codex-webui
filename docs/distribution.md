@@ -141,7 +141,7 @@ The CLI prints the workspace root URL, and the login experience is handled inlin
 
 The CLI writes config, PID, server metadata, tunnel metadata, and tunnel log state through temp files followed by rename. On stop or restart, it refuses to signal the recorded PID unless the running gateway confirms the stored instance token through `/healthz`; stale files are removed only when the PID is no longer alive.
 
-Restart uses a best-effort handoff path on platforms where Codex supports Unix control sockets. The CLI asks the verified gateway to preserve managed Codex app-server processes, sends SIGTERM, waits for the gateway port to exit, and then starts the currently resolved backend binary. This lets package updates replace the web gateway while active Codex work remains attached to the existing app-server. `CODEX_WEBUI_APP_SERVER_HANDOFF=false` disables this behavior.
+Restart uses a handoff path on platforms where Codex supports Unix control sockets. Unix handoff is enabled by default. The CLI asks the verified gateway to preserve managed Codex app-server processes, sends SIGTERM, waits for the gateway port to exit, and then starts the currently resolved backend binary. This lets package updates replace the web gateway while active Codex work remains attached to the existing app-server. `CODEX_WEBUI_APP_SERVER_HANDOFF=false` disables this behavior; if active app-server clients exist, restart is refused instead of falling back to a restart that would interrupt in-flight turns.
 
 When system shutdown support is enabled, the actual armed and scheduled state is still runtime data rather than static CLI config:
 

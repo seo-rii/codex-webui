@@ -164,7 +164,7 @@ codex-webui tunnel logs
 codex-webui --hcaptcha-site-key <site-key> --hcaptcha-secret-key <secret>
 ```
 
-`codex-webui restart` prepares a Codex app-server handoff before it stops the gateway. Active Codex work is kept behind a local Unix control socket where supported, then the newly started gateway attaches through a fresh proxy process. Normal `codex-webui stop` still tears down the managed Codex app-server.
+`codex-webui restart` prepares a Codex app-server handoff before it stops the gateway. On Unix this handoff is enabled by default: active Codex work is kept behind a local control socket, then the newly started gateway attaches through a fresh proxy process. Normal `codex-webui stop` still tears down the managed Codex app-server. If `CODEX_WEBUI_APP_SERVER_HANDOFF=false` disables handoff while app-server clients are active, restart is refused instead of silently killing in-flight turns.
 
 `tunnel` supports provider selection, background or foreground execution, status inspection, and log inspection. It prefers `cloudflared` when available and falls back to `ngrok`. Starting a public tunnel prints a safety checklist and requires explicit confirmation; use `--yes` only after reviewing the exposure.
 

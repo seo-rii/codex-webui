@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { Paperclip } from "lucide-svelte";
+  import { CornerDownLeft, Paperclip } from "lucide-svelte";
 
   import { api } from "$lib/api";
   import { localeSignal } from "$lib/i18n";
@@ -26,6 +26,8 @@
   let loading = $state(true);
   let attachingContext = $state(false);
   let ctrlModifierArmed = $state(false);
+  let mobileInput = $state("");
+  let mobileInputElement = $state<HTMLInputElement | null>(null);
   let terminalInputSender: ((data: string) => void) | null = null;
   let focusTerminalViewport: (() => void) | null = null;
   const mobileTerminalKeyRows = [
@@ -54,7 +56,8 @@
       loading: m.status_loading(),
       hostShellWarning: m.terminal_host_shell_warning(),
       attachContext: m.attach_terminal_context(),
-      attachRequiresThread: m.terminal_context_requires_thread()
+      attachRequiresThread: m.terminal_context_requires_thread(),
+      send: m.send()
     };
   });
 
@@ -110,21 +113,100 @@
     return value;
   }
 
-  function sendTerminalInput(value: string) {
-    const nextValue = ctrlModifierArmed ? applyCtrlModifier(value) : value;
+  function sendTerminalInput(value: string, useCtrlModifier = true) {
+    const nextValue = useCtrlModifier && ctrlModifierArmed ? applyCtrlModifier(value) : value;
     ctrlModifierArmed = false;
     terminalInputSender?.(nextValue);
+  }
+
+  function removeLastTextCluster(value: string) {
+    const clusters = Array.from(value);
+    clusters.pop();
+    return clusters.join("");
+  }
+
+  function flushMobileInputBuffer() {
+    if (!mobileInput) {
+      return false;
+    }
+    sendTerminalInput(mobileInput, false);
+    mobileInput = "";
+    return true;
+  }
+
+  function submitMobileInput() {
+    flushMobileInputBuffer();
+    sendTerminalInput("\r", false);
+    mobileInputElement?.focus();
+  }
+
+  function focusBestTerminalInput() {
+    if (mobileInputElement && window.matchMedia("(max-width: 720px)").matches) {
+      mobileInputElement.focus();
+      return;
+    }
+    focusTerminalViewport?.();
   }
 
   function handleMobileTerminalKey(value: string) {
     if (value === "__ctrl__") {
       ctrlModifierArmed = !ctrlModifierArmed;
-      focusTerminalViewport?.();
+      focusBestTerminalInput();
       return;
     }
 
-    sendTerminalInput(value);
-    focusTerminalViewport?.();
+    if (value === "\u007f" && mobileInput) {
+      mobileInput = removeLastTextCluster(mobileInput);
+      focusBestTerminalInput();
+      return;
+    }
+
+    if (value === "\r") {
+      submitMobileInput();
+      return;
+    }
+
+    if (value === "\t" || value.startsWith("\u001b[")) {
+      flushMobileInputBuffer();
+    }
+
+    sendTerminalInput(value, false);
+    focusBestTerminalInput();
+  }
+
+  function handleMobileInputKeydown(event: KeyboardEvent) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      submitMobileInput();
+      return;
+    }
+
+    if (event.key === "Tab") {
+      event.preventDefault();
+      flushMobileInputBuffer();
+      sendTerminalInput("\t", false);
+      return;
+    }
+
+    if (ctrlModifierArmed && event.key.length === 1) {
+      event.preventDefault();
+      sendTerminalInput(event.key, true);
+    }
+  }
+
+  function handleMobileInputBeforeInput(event: InputEvent) {
+    if (event.inputType === "insertLineBreak") {
+      event.preventDefault();
+      submitMobileInput();
+      return;
+    }
+
+    if (!ctrlModifierArmed || !event.data) {
+      return;
+    }
+
+    event.preventDefault();
+    sendTerminalInput(Array.from(event.data)[0] ?? event.data, true);
   }
 
   function getTerminalTheme() {
@@ -152,6 +234,8 @@
     let inputObserver: MutationObserver | null = null;
     let pendingOutput = "";
     let flushFrame: number | null = null;
+    let mobileInputModeQuery: MediaQueryList | null = null;
+    let releaseMobileInputMode: (() => void) | null = null;
     let xterm:
       | (import("@xterm/xterm").Terminal & {
           dispose: () => void;
@@ -201,8 +285,11 @@
         }
 
         const fitAddon = new FitAddon();
+        mobileInputModeQuery = window.matchMedia("(max-width: 720px)");
+        const mobileControlsPreferred = mobileInputModeQuery.matches;
         xterm = new Terminal({
           cursorBlink: true,
+          disableStdin: mobileControlsPreferred,
           fontFamily: '"IBM Plex Mono", "SFMono-Regular", monospace',
           fontSize: 13,
           lineHeight: 1.35,
@@ -212,10 +299,29 @@
         xterm.open(container);
         syncTerminalInputAttributes();
         fitAddon.fit();
-        xterm.focus();
+        if (!mobileControlsPreferred) {
+          xterm.focus();
+        }
         focusTerminalViewport = () => {
           syncTerminalInputAttributes();
+          if (mobileInputElement && window.matchMedia("(max-width: 720px)").matches) {
+            mobileInputElement.focus();
+            return;
+          }
           xterm?.focus();
+        };
+        const syncMobileInputMode = () => {
+          if (!xterm || !mobileInputModeQuery) {
+            return;
+          }
+          xterm.options.disableStdin = mobileInputModeQuery.matches;
+          if (mobileInputModeQuery.matches) {
+            mobileInputElement?.focus();
+          }
+        };
+        mobileInputModeQuery.addEventListener("change", syncMobileInputMode);
+        releaseMobileInputMode = () => {
+          mobileInputModeQuery?.removeEventListener("change", syncMobileInputMode);
         };
         terminalInputSender = (data: string) => {
           void api.sendTerminalInput(terminalId, data).catch((error) => {
@@ -298,10 +404,12 @@
       }
       resizeObserver?.disconnect();
       inputObserver?.disconnect();
+      releaseMobileInputMode?.();
       releaseTerminal?.();
       terminalInputSender = null;
       focusTerminalViewport = null;
       ctrlModifierArmed = false;
+      mobileInput = "";
       xterm?.dispose();
       releaseThemeChange();
     };
@@ -353,6 +461,28 @@
   </div>
 
   {#if !loading}
+    <div class="terminal-shell__mobile-input-bar">
+      <input
+        bind:this={mobileInputElement}
+        bind:value={mobileInput}
+        aria-label={ui.terminal}
+        autocapitalize="none"
+        autocomplete="off"
+        autocorrect="off"
+        class="terminal-shell__mobile-input"
+        enterkeyhint="enter"
+        inputmode="text"
+        onbeforeinput={handleMobileInputBeforeInput}
+        onkeydown={handleMobileInputKeydown}
+        placeholder="$"
+        spellcheck="false"
+        type="text"
+      />
+      <button class="terminal-shell__mobile-submit" disabled={!mobileInput} onclick={submitMobileInput} type="button">
+        <CornerDownLeft size={15} />
+        <span>{ui.send}</span>
+      </button>
+    </div>
     <div class="terminal-shell__mobile-keys" aria-label="Terminal mobile shortcuts">
       {#each mobileTerminalKeyRows as row, rowIndex (`row-${rowIndex}`)}
         <div class="terminal-shell__mobile-key-row">
@@ -475,6 +605,7 @@
     height: 100%;
   }
 
+  .terminal-shell__mobile-input-bar,
   .terminal-shell__mobile-keys {
     display: none;
   }
@@ -507,13 +638,73 @@
 
     .terminal-shell__mobile-keys {
       display: grid;
-      gap: 0.55rem;
+      gap: 0.45rem;
       padding-bottom: max(0.2rem, env(safe-area-inset-bottom));
+    }
+
+    .terminal-shell__mobile-input-bar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 0.5rem;
+      align-items: center;
+    }
+
+    .terminal-shell__mobile-input {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 0.95rem;
+      outline: none;
+      background: color-mix(in srgb, var(--panel-soft) 90%, transparent);
+      color: var(--ink-strong);
+      padding: 0.7rem 0.85rem;
+      font: 700 16px/1.15 var(--font-ui);
+      transition:
+        border-color 140ms ease,
+        box-shadow 140ms ease,
+        background-color 140ms ease;
+    }
+
+    .terminal-shell__mobile-input::placeholder {
+      color: color-mix(in srgb, var(--muted) 62%, transparent);
+    }
+
+    .terminal-shell__mobile-input:focus {
+      border-color: color-mix(in srgb, var(--accent, #d85e2a) 54%, var(--line));
+      background: color-mix(in srgb, var(--panel-strong) 90%, transparent);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #d85e2a) 14%, transparent);
+    }
+
+    .terminal-shell__mobile-submit {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.35rem;
+      border: 1px solid color-mix(in srgb, var(--accent, #d85e2a) 30%, var(--line));
+      border-radius: 0.95rem;
+      background: color-mix(in srgb, var(--accent, #d85e2a) 12%, var(--panel-soft));
+      color: var(--ink-strong);
+      padding: 0.72rem 0.85rem;
+      font: 800 0.78rem/1 var(--font-ui);
+      touch-action: manipulation;
+      transition:
+        background-color 140ms ease,
+        border-color 140ms ease,
+        opacity 140ms ease,
+        transform 140ms ease;
+    }
+
+    .terminal-shell__mobile-submit:not(:disabled):active {
+      transform: scale(0.98);
+    }
+
+    .terminal-shell__mobile-submit:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
     }
 
     .terminal-shell__mobile-key-row {
       display: grid;
-      gap: 0.55rem;
+      gap: 0.45rem;
       grid-template-columns: repeat(4, minmax(0, 1fr));
     }
 
@@ -523,7 +714,7 @@
       border-radius: 0.9rem;
       background: color-mix(in srgb, var(--panel-soft) 86%, transparent);
       color: var(--ink);
-      padding: 0.75rem 0.35rem;
+      padding: 0.65rem 0.35rem;
       font: 700 0.82rem/1 var(--font-ui);
       touch-action: manipulation;
       transition:

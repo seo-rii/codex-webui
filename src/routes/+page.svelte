@@ -45,6 +45,7 @@
   import { extractAttachmentPaths, stripAttachmentPreamble } from "$lib/attachments";
   import { api } from "$lib/api";
   import { applyStreamEvent, createConversationState, mergeConversationState, type ConversationState } from "$lib/chat-state";
+  import { CODEX_SLASH_COMMANDS, findCodexSlashCommand, type CodexSlashCommandEntry } from "$lib/codex-commands";
   import AuthLoginOverlay from "$lib/components/AuthLoginOverlay.svelte";
   import FolderBrowserDialog from "$lib/components/FolderBrowserDialog.svelte";
   import LazyMonacoDiffEditor from "$lib/components/LazyMonacoDiffEditor.svelte";
@@ -184,6 +185,7 @@
     title: string;
     description: string;
     value: string;
+    support?: CodexSlashCommandEntry["support"];
   };
   type ThemedConfigPayload = AppConfigPayload & { theme?: ThemeSettings };
   type BeforeInstallPromptEvent = Event & {
@@ -942,6 +944,7 @@
         ...nextPreferences
       },
       selectedSkills: [],
+      goal: null,
       attachments: [],
       queue: {
         sessionId: "",
@@ -1716,6 +1719,29 @@
       return left.name.localeCompare(right.name);
     });
   });
+  function slashCommandDescription(entry: CodexSlashCommandEntry) {
+    switch (entry.command) {
+      case "queue":
+        return m.slash_queue_description();
+      case "steer":
+        return m.slash_steer_description();
+      case "preset":
+        return m.slash_preset_description();
+      case "model":
+        return m.slash_model_description();
+      case "personality":
+        return ui.slashPersonalityDescription;
+      case "plan":
+        return m.slash_plan_description();
+      case "goal":
+        return m.slash_goal_description();
+      case "fast":
+        return m.slash_fast_description();
+      default:
+        return entry.description;
+    }
+  }
+
   const slashSuggestions = $derived.by(() => {
     const value = draft.trimStart();
     if (!value.startsWith("/")) {
@@ -1752,50 +1778,14 @@
         }));
     }
 
-    const builtinSuggestions: SlashSuggestion[] = [
-      {
-        key: "queue",
-        command: "queue",
-        title: "/queue",
-        description: m.slash_queue_description(),
-        value: "/queue "
-      },
-      {
-        key: "steer",
-        command: "steer",
-        title: "/steer",
-        description: m.slash_steer_description(),
-        value: "/steer "
-      },
-      {
-        key: "preset",
-        command: "preset",
-        title: "/preset",
-        description: m.slash_preset_description(),
-        value: "/preset "
-      },
-      {
-        key: "model",
-        command: "model",
-        title: "/model",
-        description: m.slash_model_description(),
-        value: "/model "
-      },
-      {
-        key: "personality",
-        command: "personality",
-        title: "/personality",
-        description: ui.slashPersonalityDescription,
-        value: "/personality "
-      },
-      {
-        key: "plan",
-        command: "plan",
-        title: "/plan",
-        description: m.slash_plan_description(),
-        value: "/plan "
-      }
-    ];
+    const builtinSuggestions: SlashSuggestion[] = CODEX_SLASH_COMMANDS.filter((entry) => entry.visibleInComposer).map((entry) => ({
+      key: entry.command,
+      command: entry.command,
+      title: `/${entry.command}`,
+      description: slashCommandDescription(entry),
+      value: `/${entry.command}${entry.inlineArgs ? " " : ""}`,
+      support: entry.support
+    }));
 
     return builtinSuggestions.filter((entry) => !lower || entry.command.includes(lower) || entry.title.includes(lower)).slice(0, 6);
   });
@@ -4618,6 +4608,7 @@
       },
       preferences: patch.preferences,
       selectedSkills: patch.selectedSkills,
+      goal: patch.goal,
       attachments: patch.attachments,
       queue: patch.queue,
       pendingRequests: patch.pendingRequests,
@@ -5656,6 +5647,90 @@
     );
   }
 
+  function applyGoalPayloadToConversation(sessionId: string, goal: SessionDetailPayload["goal"]) {
+    if (!conversation || conversation.thread.id !== sessionId) {
+      return;
+    }
+    conversation = {
+      ...conversation,
+      goal
+    };
+    markConversationCacheDirty();
+  }
+
+  function formatGoalSummary(goal: SessionDetailPayload["goal"]) {
+    if (!goal) {
+      return m.slash_goal_none();
+    }
+    return m.slash_goal_summary({
+      objective: goal.objective,
+      status: goal.status,
+      tokensUsed: String(goal.tokensUsed ?? 0),
+      tokenBudget: goal.tokenBudget === null ? "∞" : String(goal.tokenBudget)
+    });
+  }
+
+  async function handleGoalSlashCommand(args: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+
+    const normalized = args.trim().toLowerCase();
+    if (!args.trim()) {
+      const selectedBinding = getSelectedSessionBinding();
+      if (!selectedBinding) {
+        noticeText = m.slash_goal_none();
+        draft = "";
+        scheduleComposerTextareaResize();
+        return;
+      }
+      const response = await api.getSessionGoal(selectedBinding.sessionId);
+      applyGoalPayloadToConversation(selectedBinding.sessionId, response.goal);
+      noticeText = formatGoalSummary(response.goal);
+      draft = "";
+      scheduleComposerTextareaResize();
+      return;
+    }
+
+    if (normalized === "clear" || normalized === "delete" || normalized === "remove") {
+      const selectedBinding = ensureSelectedSessionBinding();
+      if (!selectedBinding) {
+        return;
+      }
+      const response = await api.clearSessionGoal(selectedBinding.sessionId);
+      applyGoalPayloadToConversation(selectedBinding.sessionId, response.goal);
+      noticeText = m.slash_goal_cleared();
+      draft = "";
+      scheduleComposerTextareaResize();
+      return;
+    }
+
+    const materialized = await ensureSessionForComposer();
+    if (!materialized) {
+      return;
+    }
+
+    const response =
+      normalized === "pause" || normalized === "paused"
+        ? await api.setSessionGoal(materialized.sessionId, { status: "paused" })
+        : normalized === "resume" || normalized === "active"
+          ? await api.setSessionGoal(materialized.sessionId, { status: "active" })
+          : normalized === "complete" || normalized === "completed"
+            ? await api.setSessionGoal(materialized.sessionId, { status: "complete" })
+            : await api.setSessionGoal(materialized.sessionId, { objective: args.trim(), status: "active" });
+    applyGoalPayloadToConversation(materialized.sessionId, response.goal);
+    if (normalized === "pause" || normalized === "paused") {
+      noticeText = m.slash_goal_paused();
+    } else if (normalized === "resume" || normalized === "active") {
+      noticeText = m.slash_goal_resumed();
+    } else {
+      noticeText = response.goal ? formatGoalSummary(response.goal) : m.slash_goal_updated();
+    }
+    draft = "";
+    scheduleComposerTextareaResize();
+  }
+
   async function handleSlashCommand(rawValue: string) {
     const trimmed = rawValue.trim();
     if (!trimmed.startsWith("/")) {
@@ -5669,6 +5744,77 @@
 
     const command = match[1]?.toLowerCase() ?? "";
     const args = match[2]?.trim() ?? "";
+
+    if (command === "goal") {
+      try {
+        await handleGoalSlashCommand(args);
+      } catch (error) {
+        errorText = describeError(error);
+      }
+      return true;
+    }
+
+    if (command === "fast") {
+      if (readOnlyRole) {
+        errorText = m.error_forbidden_role();
+        return true;
+      }
+      const normalized = args.toLowerCase();
+      if (!normalized) {
+        const nextSpeed = conversation?.preferences.speed === "fast" ? "auto" : "fast";
+        setSpeedPreference(nextSpeed);
+        draft = "";
+        scheduleComposerTextareaResize();
+        noticeText = nextSpeed === "fast" ? m.slash_fast_enabled() : m.slash_fast_disabled();
+        return true;
+      }
+      if (["on", "fast", "true", "1"].includes(normalized)) {
+        setSpeedPreference("fast");
+        draft = "";
+        scheduleComposerTextareaResize();
+        noticeText = m.slash_fast_enabled();
+        return true;
+      }
+      if (["off", "auto", "false", "0"].includes(normalized)) {
+        setSpeedPreference("auto");
+        draft = "";
+        scheduleComposerTextareaResize();
+        noticeText = m.slash_fast_disabled();
+        return true;
+      }
+      if (normalized === "flex") {
+        setSpeedPreference("flex");
+        draft = "";
+        scheduleComposerTextareaResize();
+        noticeText = m.speed_flex();
+        return true;
+      }
+      errorText = m.slash_fast_invalid();
+      return true;
+    }
+
+    if (command === "rename" || command === "title") {
+      if (readOnlyRole) {
+        errorText = m.error_forbidden_role();
+        return true;
+      }
+      if (!args) {
+        errorText = m.slash_argument_required({ command: `/${command}` });
+        return true;
+      }
+      titleDraft = args;
+      await saveTitle();
+      draft = "";
+      scheduleComposerTextareaResize();
+      return true;
+    }
+
+    if (command === "new" || command === "clear") {
+      await createSession();
+      draft = "";
+      scheduleComposerTextareaResize();
+      return true;
+    }
 
     if (command === "queue") {
       if (!args) {
@@ -5772,6 +5918,15 @@
         return true;
       }
       errorText = m.slash_plan_invalid();
+      return true;
+    }
+
+    const knownCommand = findCodexSlashCommand(command);
+    if (knownCommand) {
+      errorText = m.slash_command_not_supported({
+        command: `/${knownCommand.command}`,
+        support: knownCommand.support
+      });
       return true;
     }
 
@@ -9882,6 +10037,43 @@
                   </div>
                 </div>
               {:else if conversation}
+                {#if conversation.goal}
+                  <div class="goal-chip sticky top-3 z-[44] mb-6 flex min-w-0 items-center justify-between gap-2 rounded-2xl border border-amber-200/80 bg-white/95 px-3 py-2 shadow-sm backdrop-blur">
+                    <div class="min-w-0 flex items-center gap-2">
+                      <span class="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-xl border border-amber-100 bg-amber-50 text-amber-700">
+                        <ListTodo size={14} />
+                      </span>
+                      <div class="min-w-0">
+                        <p class="truncate text-[11px] font-bold text-gray-800">{conversation.goal.objective}</p>
+                        <p class="mt-0.5 text-[10px] text-gray-500">
+                          {conversation.goal.status} · {formatTokenCount(conversation.goal.tokensUsed)}
+                          {#if conversation.goal.tokenBudget !== null}
+                            / {formatTokenCount(conversation.goal.tokenBudget)}
+                          {/if}
+                        </p>
+                      </div>
+                    </div>
+                    <div class="flex shrink-0 items-center gap-1">
+                      <button
+                        class="ui-animated-button ui-animated-button--soft rounded-lg border border-gray-200 bg-white px-2 py-1 text-[10px] font-bold text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+                        disabled={readOnlyRole}
+                        onclick={() => void handleGoalSlashCommand(conversation?.goal?.status === "paused" ? "resume" : "pause")}
+                        type="button"
+                      >
+                        {conversation.goal.status === "paused" ? "Resume" : "Pause"}
+                      </button>
+                      <button
+                        class="ui-animated-button ui-animated-button--soft rounded-lg border border-red-100 bg-red-50 px-2 py-1 text-[10px] font-bold text-red-600 hover:bg-red-100 disabled:opacity-50"
+                        disabled={readOnlyRole}
+                        onclick={() => void handleGoalSlashCommand("clear")}
+                        type="button"
+                      >
+                        {m.clear_all()}
+                      </button>
+                    </div>
+                  </div>
+                {/if}
+
                 {#if sessionHydrationRemainingTurns > 0 || loadingOlderTurns || olderTurnsAutoLoadPaused}
                   <div class="py-6 border-b border-gray-100 mb-12 flex flex-col items-center gap-4 text-center">
                     <div class="space-y-1">
@@ -10281,6 +10473,11 @@
                           {#if activeLiveTurnSubagents.length > 0}
                             <span class="rounded-full bg-sky-50 px-1.5 py-0.5 text-[9px] font-bold text-sky-700">
                               {activeLiveTurnSubagents.length} {ui.tasks}
+                            </span>
+                          {/if}
+                          {#if conversation?.goal}
+                            <span class="rounded-full bg-amber-50 px-1.5 py-0.5 text-[9px] font-bold text-amber-700">
+                              {conversation.goal.status}
                             </span>
                           {/if}
                         </div>

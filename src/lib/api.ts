@@ -46,6 +46,7 @@ import type {
   TerminalContextPayload,
   TerminalListPayload,
   TerminalSnapshotPayload,
+  ThreadGoal,
   SessionTurnSearchPayload,
   SessionTurnPayload,
   SessionTurnsPagePayload,
@@ -458,6 +459,28 @@ export const api = {
 
   getSessionItemDetail(sessionId: string, turnId: string, itemId: string) {
     return ws.request<SessionItemDetailPayload>("session/itemDetail/get", { sessionId, turnId, itemId });
+  },
+
+  getSessionGoal(sessionId: string) {
+    return ws.request<{ goal: ThreadGoal | null }>("session/goal/get", { sessionId });
+  },
+
+  setSessionGoal(
+    sessionId: string,
+    payload: {
+      objective?: string | null;
+      status?: ThreadGoal["status"] | null;
+      tokenBudget?: number | null;
+    }
+  ) {
+    return ws.request<{ goal: ThreadGoal | null }>("session/goal/set", {
+      sessionId,
+      ...payload
+    });
+  },
+
+  clearSessionGoal(sessionId: string) {
+    return ws.request<{ goal: null; cleared: boolean }>("session/goal/clear", { sessionId });
   },
 
   savePreferences(sessionId: string, preferences: Partial<SessionPreferences>) {

@@ -224,6 +224,19 @@ export type ThreadTokenUsage = {
   modelContextWindow: number | null;
 };
 
+export type ThreadGoalStatus = "active" | "paused" | "budgetLimited" | "complete";
+
+export type ThreadGoal = {
+  threadId: string;
+  objective: string;
+  status: ThreadGoalStatus;
+  tokenBudget: number | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type PendingServerRequest = {
   id: string;
   method: string;
@@ -426,6 +439,7 @@ export type SessionDetailPayload = {
   thread: CodexThread;
   preferences: SessionPreferences;
   selectedSkills: SelectedSkill[];
+  goal: ThreadGoal | null;
   attachments: AttachmentRecord[];
   queue: SessionQueuePayload;
   pendingRequests: PendingServerRequest[];
@@ -469,6 +483,7 @@ export type SessionDetailPatchPayload = {
     thread: Omit<CodexThread, "turns"> & { turns: [] };
     preferences: SessionPreferences;
     selectedSkills: SelectedSkill[];
+    goal: ThreadGoal | null;
     attachments: AttachmentRecord[];
     queue: SessionQueuePayload;
     pendingRequests: PendingServerRequest[];

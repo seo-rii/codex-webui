@@ -452,6 +452,7 @@ export function mergeConversationState(current: ConversationState, detail: Sessi
     },
     queue: mergeQueue(current.queue, incoming.queue),
     pendingRequests: mergePendingRequests(current.pendingRequests, incoming.pendingRequests),
+    goal: incoming.goal ?? current.goal ?? null,
     tokenUsage: incoming.tokenUsage ?? current.tokenUsage ?? null,
     hydration: mergeHydration(current.hydration, incoming.hydration, mergedTurns.length),
     livePlans: {
@@ -530,6 +531,16 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
 
   if (method === "thread/tokenUsage/updated") {
     next.tokenUsage = (params.tokenUsage as SessionDetailPayload["tokenUsage"]) ?? null;
+    return next;
+  }
+
+  if (method === "thread/goal/updated") {
+    next.goal = (params.goal as SessionDetailPayload["goal"]) ?? null;
+    return next;
+  }
+
+  if (method === "thread/goal/cleared") {
+    next.goal = null;
     return next;
   }
 

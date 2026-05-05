@@ -124,6 +124,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
         active_turns: Arc::new(Mutex::new(HashMap::new())),
         pending_turn_starts: Arc::new(Mutex::new(HashSet::new())),
         pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
+        account_login_flows: Arc::new(Mutex::new(HashMap::new())),
         shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
         preserve_app_servers_on_shutdown: Arc::new(AtomicBool::new(false)),
         shutdown_notify: Arc::new(Notify::new()),

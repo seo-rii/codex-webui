@@ -64,6 +64,14 @@ function apiPath(pathname: string) {
   return `${base}/api${normalized}`;
 }
 
+function browserBaseUrl() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  const url = new URL(base ? `${base}/` : "/", window.location.origin);
+  return url.toString().replace(/\/$/, "");
+}
+
 function readCookie(name: string) {
   if (typeof document === "undefined") {
     return null;
@@ -503,7 +511,11 @@ export const api = {
   },
 
   startAccountLogin(type: "chatgpt" | "chatgptDeviceCode" | "apiKey", apiKey?: string | null) {
-    return ws.request<CodexAccountLoginResponse>("account/login/start", { type, apiKey: apiKey ?? null });
+    return ws.request<CodexAccountLoginResponse>("account/login/start", {
+      type,
+      apiKey: apiKey ?? null,
+      browserBaseUrl: type === "chatgpt" ? browserBaseUrl() : null
+    });
   },
 
   cancelAccountLogin(loginId: string) {

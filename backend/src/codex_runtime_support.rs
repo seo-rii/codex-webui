@@ -1,5 +1,9 @@
 use super::*;
 
+const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_OAUTH_DEFAULT_ISSUER: &str = "https://auth.openai.com";
+const ACCOUNT_LOGIN_FLOW_TTL: Duration = Duration::from_secs(15 * 60);
+
 pub(crate) async fn codex_runtime_status(state: &AppState, check_latest: bool) -> Result<Value> {
     let configured_bin = state.config.codex_bin.clone();
     let resolved_bin_path = resolve_binary_path(&configured_bin).await;
@@ -206,6 +210,18 @@ pub(crate) async fn start_account_login(
         _ => anyhow::bail!("Invalid account login type."),
     }
 
+    if login_type == "chatgpt" {
+        if let Some(browser_base_url) = params
+            .get("browserBaseUrl")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return start_browser_account_login(state, &resolved_profile_id, browser_base_url)
+                .await;
+        }
+    }
+
     let client = app_server_client(state, profile_id).await?;
     state.quota_cache.lock().await.remove(&resolved_profile_id);
     client
@@ -218,12 +234,23 @@ pub(crate) async fn cancel_account_login(
     profile_id: &str,
     params: &Value,
 ) -> Result<Value> {
+    let login_id = require_string(params, "loginId")?;
+    if state
+        .account_login_flows
+        .lock()
+        .await
+        .remove(&login_id)
+        .is_some()
+    {
+        return Ok(json!({ "status": "canceled" }));
+    }
+
     let client = app_server_client(state, profile_id).await?;
     client
         .request(
             "account/login/cancel",
             json!({
-                "loginId": require_string(params, "loginId")?
+                "loginId": login_id
             }),
         )
         .await
@@ -236,6 +263,370 @@ pub(crate) async fn logout_account(state: &AppState, profile_id: &str) -> Result
     let client = app_server_client(state, profile_id).await?;
     state.quota_cache.lock().await.remove(&resolved_profile_id);
     client.request("account/logout", json!({})).await
+}
+
+pub(crate) async fn complete_account_oauth_callback(
+    state: &AppState,
+    query: Option<&str>,
+) -> Response {
+    let Some(return_url) = complete_account_oauth_callback_inner(state, query).await else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid or expired account login flow.",
+        )
+            .into_response();
+    };
+
+    Redirect::temporary(&return_url).into_response()
+}
+
+async fn complete_account_oauth_callback_inner(
+    state: &AppState,
+    query: Option<&str>,
+) -> Option<String> {
+    let state_token = query_param_value(query, "state")?;
+    let (login_id, flow) = take_account_login_flow(state, &state_token).await?;
+    let return_url = flow.return_url.clone();
+
+    if let Some(error) = query_param_value(query, "error") {
+        emit_account_login_completed(state, &flow.profile_id, &login_id, false, Some(error)).await;
+        return Some(append_account_login_result(&return_url, "error"));
+    }
+
+    let code = match query_param_value(query, "code") {
+        Some(code) if !code.trim().is_empty() => code,
+        _ => {
+            emit_account_login_completed(
+                state,
+                &flow.profile_id,
+                &login_id,
+                false,
+                Some("Missing authorization code.".to_string()),
+            )
+            .await;
+            return Some(append_account_login_result(&return_url, "error"));
+        }
+    };
+
+    match exchange_account_oauth_code(state, &flow, &code).await {
+        Ok(tokens) => match persist_managed_chatgpt_auth(state, &flow.profile_id, tokens).await {
+            Ok(()) => {
+                emit_account_login_completed(state, &flow.profile_id, &login_id, true, None).await;
+                emit_profile_global_notification(
+                    state,
+                    &flow.profile_id,
+                    json!({
+                        "kind": "notification",
+                        "method": "codex-webui/accountUpdated",
+                        "params": {}
+                    }),
+                )
+                .await;
+                Some(append_account_login_result(&return_url, "success"))
+            }
+            Err(error) => {
+                emit_account_login_completed(
+                    state,
+                    &flow.profile_id,
+                    &login_id,
+                    false,
+                    Some(format!("Failed to save account credentials: {error}")),
+                )
+                .await;
+                Some(append_account_login_result(&return_url, "error"))
+            }
+        },
+        Err(error) => {
+            emit_account_login_completed(
+                state,
+                &flow.profile_id,
+                &login_id,
+                false,
+                Some(format!("OAuth token exchange failed: {error}")),
+            )
+            .await;
+            Some(append_account_login_result(&return_url, "error"))
+        }
+    }
+}
+
+async fn start_browser_account_login(
+    state: &AppState,
+    profile_id: &str,
+    browser_base_url: &str,
+) -> Result<Value> {
+    let return_url = normalize_browser_account_base_url(&state.config, browser_base_url)?;
+    let redirect_uri = format!("{return_url}/api/account/oauth/callback");
+    let (code_verifier, code_challenge) = generate_pkce_pair();
+    let state_token = generate_oauth_state();
+    let login_id = Uuid::new_v4().to_string();
+    let auth_url = build_account_authorize_url(&redirect_uri, &code_challenge, &state_token);
+
+    prune_account_login_flows(state).await;
+    state.account_login_flows.lock().await.insert(
+        login_id.clone(),
+        PendingAccountLoginFlow {
+            profile_id: profile_id.to_string(),
+            state: state_token,
+            code_verifier,
+            redirect_uri,
+            return_url,
+            created_at: Instant::now(),
+        },
+    );
+
+    state.quota_cache.lock().await.remove(profile_id);
+    Ok(json!({
+        "type": "chatgpt",
+        "loginId": login_id,
+        "authUrl": auth_url
+    }))
+}
+
+fn normalize_browser_account_base_url(config: &Config, raw: &str) -> Result<String> {
+    let url = reqwest::Url::parse(raw.trim()).context("Invalid browser base URL.")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("Browser base URL must use http or https.");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("Browser base URL must not include credentials.");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("Browser base URL must not include query or fragment.");
+    }
+
+    let expected_path = if state_base_path(config).is_empty() {
+        ""
+    } else {
+        state_base_path(config).trim_end_matches('/')
+    };
+    let actual_path = url.path().trim_end_matches('/');
+    if expected_path.is_empty() {
+        if !actual_path.is_empty() {
+            anyhow::bail!("Browser base URL path must match the configured base path.");
+        }
+    } else if actual_path != expected_path {
+        anyhow::bail!("Browser base URL path must match the configured base path.");
+    }
+
+    let origin = url.origin().ascii_serialization();
+    if expected_path.is_empty() {
+        Ok(origin)
+    } else {
+        Ok(format!("{origin}{expected_path}"))
+    }
+}
+
+fn state_base_path(config: &Config) -> &str {
+    config.base_path.as_str()
+}
+
+fn generate_oauth_state() -> String {
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn generate_pkce_pair() -> (String, String) {
+    let mut bytes = [0u8; 64];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+    let verifier = URL_SAFE_NO_PAD.encode(bytes);
+    let challenge = URL_SAFE_NO_PAD.encode(<Sha256 as sha2::Digest>::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+fn account_login_issuer() -> String {
+    env::var("CODEX_APP_SERVER_LOGIN_ISSUER")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| CODEX_OAUTH_DEFAULT_ISSUER.to_string())
+}
+
+fn build_account_authorize_url(redirect_uri: &str, code_challenge: &str, state: &str) -> String {
+    let query = [
+        ("response_type", "code"),
+        ("client_id", CODEX_OAUTH_CLIENT_ID),
+        ("redirect_uri", redirect_uri),
+        (
+            "scope",
+            "openid profile email offline_access api.connectors.read api.connectors.invoke",
+        ),
+        ("code_challenge", code_challenge),
+        ("code_challenge_method", "S256"),
+        ("id_token_add_organizations", "true"),
+        ("codex_cli_simplified_flow", "true"),
+        ("state", state),
+        ("originator", "codex_cli_rs"),
+    ]
+    .into_iter()
+    .map(|(key, value)| format!("{key}={}", urlencoding::encode(value)))
+    .collect::<Vec<_>>()
+    .join("&");
+    format!("{}/oauth/authorize?{query}", account_login_issuer())
+}
+
+async fn prune_account_login_flows(state: &AppState) {
+    let now = Instant::now();
+    state
+        .account_login_flows
+        .lock()
+        .await
+        .retain(|_, flow| now.duration_since(flow.created_at) <= ACCOUNT_LOGIN_FLOW_TTL);
+}
+
+async fn take_account_login_flow(
+    state: &AppState,
+    state_token: &str,
+) -> Option<(String, PendingAccountLoginFlow)> {
+    prune_account_login_flows(state).await;
+    let mut flows = state.account_login_flows.lock().await;
+    let login_id = flows
+        .iter()
+        .find_map(|(login_id, flow)| (flow.state == state_token).then(|| login_id.clone()))?;
+    flows.remove_entry(&login_id)
+}
+
+#[derive(Debug)]
+struct ExchangedAccountTokens {
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+}
+
+#[derive(Deserialize)]
+struct AccountTokenResponse {
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+}
+
+async fn exchange_account_oauth_code(
+    state: &AppState,
+    flow: &PendingAccountLoginFlow,
+    code: &str,
+) -> Result<ExchangedAccountTokens> {
+    let response = state
+        .http
+        .post(format!("{}/oauth/token", account_login_issuer()))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(format!(
+            "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
+            urlencoding::encode(code),
+            urlencoding::encode(&flow.redirect_uri),
+            urlencoding::encode(CODEX_OAUTH_CLIENT_ID),
+            urlencoding::encode(&flow.code_verifier)
+        ))
+        .send()
+        .await
+        .context("failed to send OAuth token exchange request")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("token endpoint returned {status}: {body}");
+    }
+    let tokens = response
+        .json::<AccountTokenResponse>()
+        .await
+        .context("failed to decode OAuth token response")?;
+    Ok(ExchangedAccountTokens {
+        id_token: tokens.id_token,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+    })
+}
+
+async fn persist_managed_chatgpt_auth(
+    state: &AppState,
+    profile_id: &str,
+    tokens: ExchangedAccountTokens,
+) -> Result<()> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let profile = resolve_runtime_profile(&state.config, profile_id);
+    let id_claims = jwt_payload_value(&tokens.id_token)?;
+    let access_claims = jwt_payload_value(&tokens.access_token).unwrap_or_else(|_| json!({}));
+    let account_id = jwt_claim_string(
+        &id_claims,
+        &["https://api.openai.com/auth", "chatgpt_account_id"],
+    )
+    .or_else(|| jwt_claim_string(&access_claims, &["chatgpt_account_id"]))
+    .ok_or_else(|| anyhow!("OAuth response did not include a ChatGPT account id."))?;
+
+    let auth = json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": Value::Null,
+        "tokens": {
+            "id_token": tokens.id_token,
+            "access_token": tokens.access_token,
+            "refresh_token": tokens.refresh_token,
+            "account_id": account_id
+        }
+    });
+    let bytes = serde_json::to_vec_pretty(&auth)?;
+    write_file_atomically(&profile.codex_home.join("auth.json"), bytes).await?;
+    state.quota_cache.lock().await.remove(&resolved_profile_id);
+    state
+        .app_servers
+        .close_profile(&resolved_profile_id)
+        .await?;
+    Ok(())
+}
+
+fn jwt_payload_value(jwt: &str) -> Result<Value> {
+    let mut parts = jwt.split('.');
+    let (_header, payload, _signature) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(header), Some(payload), Some(signature))
+            if !header.is_empty() && !payload.is_empty() && !signature.is_empty() =>
+        {
+            (header, payload, signature)
+        }
+        _ => anyhow::bail!("Invalid JWT format."),
+    };
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload)
+        .context("failed to decode JWT payload")?;
+    serde_json::from_slice(&bytes).context("failed to parse JWT payload")
+}
+
+fn jwt_claim_string(value: &Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str().map(str::to_string)
+}
+
+async fn emit_account_login_completed(
+    state: &AppState,
+    profile_id: &str,
+    login_id: &str,
+    success: bool,
+    error: Option<String>,
+) {
+    emit_profile_global_notification(
+        state,
+        profile_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/accountLoginCompleted",
+            "params": {
+                "loginId": login_id,
+                "success": success,
+                "error": error
+            }
+        }),
+    )
+    .await;
+}
+
+fn append_account_login_result(return_url: &str, result: &str) -> String {
+    let separator = if return_url.contains('?') { '&' } else { '?' };
+    format!(
+        "{return_url}{separator}accountLogin={}",
+        urlencoding::encode(result)
+    )
 }
 
 async fn fetch_codex_quota(state: &AppState, profile_id: &str) -> Result<Value> {

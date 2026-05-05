@@ -337,6 +337,13 @@ codex_webui_pending_server_requests {pending_server_request_count}\n",
                 .into_response();
             }
 
+            if route_path == "/api/account/oauth/callback" {
+                if method != Method::GET {
+                    return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+                }
+                return complete_account_oauth_callback(&state, uri.query()).await;
+            }
+
             if route_path == "/api/account" || route_path.starts_with("/api/account/") {
                 let Some(auth) = auth_context_from_headers(&state.config, &jar, &headers) else {
                     let mut response =

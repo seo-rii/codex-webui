@@ -43,10 +43,21 @@ pub(crate) struct AppState {
     pub(crate) pending_turn_starts: Arc<Mutex<HashSet<String>>>,
     pub(crate) pending_server_requests:
         Arc<Mutex<HashMap<String, HashMap<String, PendingServerRequestEntry>>>>,
+    pub(crate) account_login_flows: Arc<Mutex<HashMap<String, PendingAccountLoginFlow>>>,
     pub(crate) shutdown_timers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(crate) preserve_app_servers_on_shutdown: Arc<AtomicBool>,
     pub(crate) shutdown_notify: Arc<Notify>,
     pub(crate) restart_plan: Arc<Mutex<Option<RestartPlan>>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingAccountLoginFlow {
+    pub(crate) profile_id: String,
+    pub(crate) state: String,
+    pub(crate) code_verifier: String,
+    pub(crate) redirect_uri: String,
+    pub(crate) return_url: String,
+    pub(crate) created_at: Instant,
 }
 
 #[derive(Clone, Debug)]

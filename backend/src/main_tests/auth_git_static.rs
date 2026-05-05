@@ -35,6 +35,56 @@ fn maps_account_login_completed_notifications() {
     );
 }
 
+#[tokio::test]
+async fn account_login_uses_browser_base_url_for_oauth_callback() {
+    let sandbox = unique_test_dir("account-login-browser-callback");
+    let codex_home = sandbox.join("codex-home");
+    let mut state = test_state(sandbox.clone(), vec![sandbox.clone()], codex_home);
+    let mut config = (*state.config).clone();
+    config.base_path = "/absproxy/4173".to_string();
+    state.config = Arc::new(config);
+
+    let response = start_account_login(
+        &state,
+        "default",
+        &json!({
+            "type": "chatgpt",
+            "browserBaseUrl": "https://dev.seorii.io/absproxy/4173/"
+        }),
+    )
+    .await
+    .expect("browser login should start");
+
+    assert_eq!(
+        response.get("type").and_then(Value::as_str),
+        Some("chatgpt")
+    );
+    let auth_url = response
+        .get("authUrl")
+        .and_then(Value::as_str)
+        .expect("auth url should be returned");
+    assert!(!auth_url.contains("localhost"));
+    let parsed = reqwest::Url::parse(auth_url).expect("auth url should parse");
+    assert_eq!(
+        query_param_value(parsed.query(), "redirect_uri").as_deref(),
+        Some("https://dev.seorii.io/absproxy/4173/api/account/oauth/callback")
+    );
+
+    let login_id = response
+        .get("loginId")
+        .and_then(Value::as_str)
+        .expect("login id should be returned");
+    let flows = state.account_login_flows.lock().await;
+    let flow = flows
+        .get(login_id)
+        .expect("pending login flow should be stored");
+    assert_eq!(
+        flow.redirect_uri,
+        "https://dev.seorii.io/absproxy/4173/api/account/oauth/callback"
+    );
+    assert_eq!(flow.return_url, "https://dev.seorii.io/absproxy/4173");
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminate_process_hard_kills_term_ignoring_process_group() {

@@ -86,7 +86,7 @@ pub(crate) struct SessionSummaryUiSnapshot {
 }
 
 const ACTIVE_SESSION_STATUS_RECONCILE_AFTER_MS: u64 = 5_000;
-const ACTIVE_SESSION_STATUS_RECONCILE_LIMIT: usize = 32;
+const ACTIVE_SESSION_STATUS_RECONCILE_LIMIT: usize = 4;
 
 pub(crate) fn session_filter_from_value(filter: Option<&Value>) -> SessionFilterCriteria {
     let mut tags = filter
@@ -508,7 +508,7 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                 continue;
             }
             if reconcile_candidate_ids.insert(session_id.to_string()) {
-                reconcile_candidates.push((runtime_key.clone(), session_id.to_string()));
+                reconcile_candidates.push((runtime_key.clone(), session_id.to_string(), true));
             }
             if reconcile_candidates.len() >= ACTIVE_SESSION_STATUS_RECONCILE_LIMIT {
                 break;
@@ -535,7 +535,7 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                 continue;
             }
             if reconcile_candidate_ids.insert(session_id.to_string()) {
-                reconcile_candidates.push((runtime_key.clone(), session_id.to_string()));
+                reconcile_candidates.push((runtime_key.clone(), session_id.to_string(), true));
             }
         }
     }
@@ -559,25 +559,13 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                 reconcile_candidates.push((
                     runtime_session_key(&resolved_profile_id, session_id),
                     session_id.clone(),
+                    false,
                 ));
             }
         }
     }
-    for (runtime_key, session_id) in reconcile_candidates {
-        let Ok(thread) = read_thread_payload(state, profile_id, &session_id, true).await else {
-            continue;
-        };
-        let thread_status =
-            normalized_thread_status(thread.get("status")).unwrap_or_else(|| "unknown".to_string());
-        let active_turn_id = thread
-            .get("turns")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .and_then(active_turn_id_from_turns);
-        if is_live_thread_status(&thread_status) {
-            if let Some(turn_id) = active_turn_id {
-                state.active_turns.lock().await.insert(runtime_key, turn_id);
-            }
+    for (runtime_key, session_id, has_cached_activity) in reconcile_candidates {
+        if has_cached_activity {
             continue;
         }
 
@@ -596,7 +584,7 @@ pub(crate) async fn read_session_summary_ui_snapshot(
             runtime_status_by_thread_id.insert(
                 session_id.clone(),
                 json!({
-                    "status": thread_status,
+                    "status": "completed",
                     "updatedAt": now_unix_ms()
                 }),
             );

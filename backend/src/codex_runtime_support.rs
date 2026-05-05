@@ -3,6 +3,7 @@ use super::*;
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const ACCOUNT_LOGIN_FLOW_TTL: Duration = Duration::from_secs(15 * 60);
+const ACCOUNT_APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 pub(crate) async fn codex_runtime_status(state: &AppState, check_latest: bool) -> Result<Value> {
     let configured_bin = state.config.codex_bin.clone();
@@ -161,22 +162,25 @@ pub(crate) async fn codex_quota_status(
 
 pub(crate) async fn get_account_state(state: &AppState, profile_id: &str) -> Result<Value> {
     let client = app_server_client(state, profile_id).await?;
-    match client
-        .request("account/read", json!({ "refreshToken": false }))
-        .await
+    match tokio::time::timeout(
+        ACCOUNT_APP_SERVER_REQUEST_TIMEOUT,
+        client.request("account/read", json!({ "refreshToken": false })),
+    )
+    .await
     {
-        Ok(response) => Ok(json!({
+        Ok(Ok(response)) => Ok(json!({
             "account": response.get("account").cloned().unwrap_or_else(|| json!({})),
             "requiresOpenaiAuth": response
                 .get("requiresOpenaiAuth")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         })),
-        Err(error) if is_invalid_refresh_token_error_message(&error.to_string()) => Ok(json!({
+        Ok(Err(error)) if is_invalid_refresh_token_error_message(&error.to_string()) => Ok(json!({
             "account": {},
             "requiresOpenaiAuth": true,
         })),
-        Err(error) => Err(error),
+        Ok(Err(error)) => Err(error),
+        Err(_) => anyhow::bail!("Timed out while loading Codex account state."),
     }
 }
 

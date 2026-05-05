@@ -1,5 +1,7 @@
 use super::*;
 
+const CONFIG_APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
+
 fn env_choice(var: &str, allowed: &[&str]) -> Option<String> {
     env::var(var)
         .ok()
@@ -13,6 +15,29 @@ fn env_bool(var: &str) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
+}
+
+fn fallback_config_models() -> Vec<Value> {
+    vec![json!({
+        "id": "gpt-5",
+        "displayName": "GPT-5",
+        "description": "Default Codex model",
+        "defaultReasoningEffort": "medium",
+        "supportedReasoningEfforts": ["low", "medium", "high"],
+        "additionalSpeedTiers": ["fast", "flex"],
+        "inputModalities": ["text", "image"],
+        "supportsPersonality": true,
+        "isDefault": true
+    })]
+}
+
+fn fallback_config_collaboration_modes() -> Vec<Value> {
+    vec![json!({
+        "name": "Default",
+        "mode": "default",
+        "model": Value::Null,
+        "reasoning_effort": Value::Null
+    })]
 }
 
 pub(crate) async fn session_preferences_defaults_payload(
@@ -113,10 +138,18 @@ pub(crate) async fn config_models_payload(
     let client = app_server_client(state, profile_id)
         .await
         .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
-    let response = client
-        .request("model/list", json!({ "includeHidden": false }))
-        .await
-        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    let response = tokio::time::timeout(
+        CONFIG_APP_SERVER_REQUEST_TIMEOUT,
+        client.request("model/list", json!({ "includeHidden": false })),
+    )
+    .await
+    .map_err(|_| {
+        api_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "Timed out while loading Codex models.",
+        )
+    })?
+    .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
     Ok(response
         .get("data")
         .and_then(Value::as_array)
@@ -193,10 +226,18 @@ pub(crate) async fn config_collaboration_modes_payload(
     let client = app_server_client(state, profile_id)
         .await
         .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
-    let response = client
-        .request("collaborationMode/list", json!({}))
-        .await
-        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    let response = tokio::time::timeout(
+        CONFIG_APP_SERVER_REQUEST_TIMEOUT,
+        client.request("collaborationMode/list", json!({})),
+    )
+    .await
+    .map_err(|_| {
+        api_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "Timed out while loading Codex collaboration modes.",
+        )
+    })?
+    .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
     Ok(response
         .get("data")
         .and_then(Value::as_array)
@@ -320,9 +361,16 @@ pub(crate) async fn get_config_payload(state: &AppState, profile_id: &str) -> Ap
     let autostart = autostart_result?;
     let theme_override = theme_override_result?;
     let theme = theme_override.unwrap_or_else(|| json!({}));
-    let models = models_result?;
-    let collaboration_modes = collaboration_modes_result?;
-    let account_state = account_state_result?;
+    let models = models_result.unwrap_or_else(|_| fallback_config_models());
+    let collaboration_modes =
+        collaboration_modes_result.unwrap_or_else(|_| fallback_config_collaboration_modes());
+    let account_state = account_state_result.unwrap_or_else(|error| {
+        json!({
+            "account": {},
+            "requiresOpenaiAuth": false,
+            "error": error.to_string()
+        })
+    });
     let (shutdown_available, _) = shutdown_capability;
     let paused_queues = paused_queues_result?;
     let (

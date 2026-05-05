@@ -129,17 +129,28 @@ pub(crate) async fn list_resume_pending_queues_payload(
             .cloned()
             .unwrap_or(Value::Null);
 
-        if let Ok(thread) = read_thread_payload(state, profile_id, &session_id, false).await {
-            if let Some(thread) = thread.as_object() {
-                name = display_thread_name(
-                    thread.get("name").and_then(Value::as_str),
-                    thread.get("preview").and_then(Value::as_str),
-                )
-                .map(Value::from)
-                .unwrap_or(Value::Null);
-                if !thread.get("cwd").is_none_or(Value::is_null) {
-                    cwd = thread.get("cwd").cloned().unwrap_or(Value::Null);
-                }
+        let state_thread =
+            read_state_thread_metadata_by_session_id(state, profile_id, &session_id, None)
+                .await
+                .ok()
+                .flatten();
+        let thread = if state_thread.is_some() {
+            state_thread
+        } else {
+            read_rollout_thread_metadata_by_session_id(state, profile_id, &session_id)
+                .await
+                .ok()
+                .flatten()
+        };
+        if let Some(thread) = thread.as_ref().and_then(Value::as_object) {
+            name = display_thread_name(
+                thread.get("name").and_then(Value::as_str),
+                thread.get("preview").and_then(Value::as_str),
+            )
+            .map(Value::from)
+            .unwrap_or(Value::Null);
+            if !thread.get("cwd").is_none_or(Value::is_null) {
+                cwd = thread.get("cwd").cloned().unwrap_or(Value::Null);
             }
         }
 

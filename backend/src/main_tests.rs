@@ -166,6 +166,7 @@ thread_counter = 0
 timestamp_counter = 0
 turn_counter = 0
 request_counts = {}
+method_delays = {}
 
 for raw_line in sys.stdin:
     line = raw_line.strip()
@@ -181,6 +182,23 @@ for raw_line in sys.stdin:
     def write(message):
         sys.stdout.write(json.dumps(message) + "\n")
         sys.stdout.flush()
+
+    if method == "debug/setDelay":
+        target = str(params.get("method") or "")
+        delay_ms = max(0, int(params.get("delayMs", 0) or 0))
+        if target:
+            method_delays[target] = delay_ms
+        write({
+            "id": request_id,
+            "result": {
+                "ok": True
+            }
+        })
+        continue
+
+    delay_ms = int(method_delays.get(method, 0) or 0)
+    if delay_ms > 0:
+        time.sleep(delay_ms / 1000)
 
     if method == "initialize":
         write({

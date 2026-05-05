@@ -1038,6 +1038,99 @@ async fn ui_state_cache_is_bounded_across_profiles() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_payload_uses_fallbacks_when_codex_metadata_is_slow() {
+    let sandbox = unique_test_dir("config-metadata-timeout");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let client = app_server_client(&state, "default").await.unwrap();
+    for method in ["model/list", "collaborationMode/list", "account/read"] {
+        client
+            .request(
+                "debug/setDelay",
+                json!({
+                    "method": method,
+                    "delayMs": 3_000
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-paused-slow",
+                    "name": "Paused slow queue",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "idle",
+                    "readDelayMs": 3_000,
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["queuesByThreadId"]["thread-paused-slow"] = json!({
+            "resumePending": true,
+            "updatedAt": now_unix_ms(),
+            "items": [
+                {
+                    "id": "queue-item-1",
+                    "prompt": "continue after restart"
+                }
+            ]
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let started_at = Instant::now();
+    let payload = get_config_payload(&state, "default")
+        .await
+        .expect("config payload should fall back when Codex metadata is slow");
+
+    assert!(
+        started_at.elapsed() < Duration::from_secs(2),
+        "config payload should not wait for slow Codex metadata"
+    );
+    assert_eq!(
+        payload
+            .get("models")
+            .and_then(Value::as_array)
+            .and_then(|models| models.first())
+            .and_then(|model| model.get("id"))
+            .and_then(Value::as_str),
+        Some("gpt-5")
+    );
+    assert_eq!(
+        payload
+            .get("collaborationModes")
+            .and_then(Value::as_array)
+            .and_then(|modes| modes.first())
+            .and_then(|mode| mode.get("mode"))
+            .and_then(Value::as_str),
+        Some("default")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test]
 async fn arming_shutdown_while_idle_waits_for_future_activity() {
     let sandbox = unique_test_dir("shutdown-idle-arming");

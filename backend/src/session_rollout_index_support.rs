@@ -4,6 +4,8 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
 const SESSION_ROLLOUT_INDEX_CACHE_TTL: Duration = Duration::from_secs(3);
 const SESSION_ROLLOUT_PREVIEW_SCAN_LIMIT: usize = 160;
 const SESSION_ROLLOUT_TITLE_SCAN_LIMIT: usize = 1024;
+const SESSION_ROLLOUT_SCAN_MAX_CANDIDATES: usize = 50_000;
+const SESSION_ROLLOUT_SCAN_MAX_DIRECTORIES: usize = 10_000;
 
 fn session_index_path(codex_home: &Path) -> PathBuf {
     codex_home.join("session_index.jsonl")
@@ -499,15 +501,29 @@ fn collect_rollout_candidates(codex_home: &Path, archived: bool) -> Vec<Value> {
     };
     let mut candidates = Vec::new();
     let mut pending = vec![root];
+    let mut scanned_directories = 0usize;
 
     while let Some(directory) = pending.pop() {
+        scanned_directories = scanned_directories.saturating_add(1);
+        if scanned_directories > SESSION_ROLLOUT_SCAN_MAX_DIRECTORIES {
+            break;
+        }
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 pending.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
                 continue;
             }
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
@@ -532,6 +548,12 @@ fn collect_rollout_candidates(codex_home: &Path, archived: bool) -> Vec<Value> {
                 "indexedName": indexed_entry.get("indexedName").cloned().unwrap_or(Value::Null),
                 "indexedUpdatedAt": indexed_entry.get("indexedUpdatedAt").cloned().unwrap_or(Value::Null)
             }));
+            if candidates.len() >= SESSION_ROLLOUT_SCAN_MAX_CANDIDATES {
+                break;
+            }
+        }
+        if candidates.len() >= SESSION_ROLLOUT_SCAN_MAX_CANDIDATES {
+            break;
         }
     }
 
@@ -539,6 +561,39 @@ fn collect_rollout_candidates(codex_home: &Path, archived: bool) -> Vec<Value> {
         candidate_effective_updated_at(right).cmp(&candidate_effective_updated_at(left))
     });
     candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_rollout_candidates_skips_symlink_directories() {
+        let sandbox =
+            std::env::temp_dir().join(format!("codex-webui-rollout-symlink-{}", Uuid::new_v4()));
+        let sessions_dir = sandbox.join("sessions").join("2026").join("05").join("06");
+        fs::create_dir_all(&sessions_dir).expect("test should create sessions directory");
+        fs::write(
+            sessions_dir.join("rollout-2026-05-06T00-00-00-019df000-0000-7000-8000-000000000001.jsonl"),
+            br#"{"type":"session_meta","payload":{"id":"019df000-0000-7000-8000-000000000001","cwd":"/tmp"}}"#,
+        )
+        .expect("test should write rollout");
+        std::os::unix::fs::symlink(&sandbox, sandbox.join("sessions").join("loop"))
+            .expect("test should create symlink loop");
+
+        let candidates = collect_rollout_candidates(&sandbox, false);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates
+                .first()
+                .and_then(|candidate| candidate.get("id"))
+                .and_then(Value::as_str),
+            Some("019df000-0000-7000-8000-000000000001")
+        );
+        let _ = fs::remove_dir_all(sandbox);
+    }
 }
 
 pub(crate) async fn list_rollout_candidates_payload(

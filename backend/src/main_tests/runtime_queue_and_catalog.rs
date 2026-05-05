@@ -642,6 +642,97 @@ async fn session_list_prefers_newer_thread_status_over_older_runtime_completion_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_list_does_not_block_on_stale_runtime_status_reconciliation() {
+    let sandbox = unique_test_dir("session-list-stale-reconcile-timeout");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-slow-stale",
+                    "name": "Slow stale status",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 10,
+                    "status": "running",
+                    "readDelayMs": 2_000,
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        runtime_status_by_thread_id.insert(
+            "thread-slow-stale".to_string(),
+            json!({
+                "status": "running",
+                "updatedAt": now_unix_ms().saturating_sub(60_000)
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let started_at = Instant::now();
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        started_at.elapsed() < Duration::from_secs(1),
+        "session list should not wait for slow stale status reconciliation"
+    );
+    let first = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .and_then(|sessions| sessions.first())
+        .cloned()
+        .expect("expected seeded session");
+    assert_eq!(
+        first.get("id").and_then(Value::as_str),
+        Some("thread-slow-stale")
+    );
+    assert_eq!(
+        first.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_notifications_emit_session_stream_events_from_rust_relay() {
     let sandbox = unique_test_dir("session-stream-rust");
     let workspace = sandbox.join("workspace");

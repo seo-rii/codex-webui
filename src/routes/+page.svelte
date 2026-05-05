@@ -8582,7 +8582,7 @@
       if (item.type === "agentMessage") {
         finalAgentItem = item;
       }
-      if (item.type === "fileChange" || item.type === "imageGeneration") {
+      if (item.type === "plan" || item.type === "fileChange" || item.type === "imageGeneration") {
         summaryItems.push(item);
       }
     }
@@ -8592,6 +8592,7 @@
         if (
           item.type !== "userMessage" &&
           !isInternalTranscriptItem(item) &&
+          item.type !== "plan" &&
           item.type !== "fileChange" &&
           item.type !== "imageGeneration" &&
           item.id !== finalAgentItem.id
@@ -12317,7 +12318,15 @@
       </div>
     </div>
   {:else if item.type === "plan"}
-    <div class="turn-card-shell border border-amber-100 rounded-2xl bg-amber-50/20 overflow-hidden shadow-sm"><div class="turn-card-header turn-card-header--amber px-4 py-2.5 border-b border-amber-100 flex items-center gap-3" data-sticky-level={stickyLevel}><ListTodo size={14} class="text-amber-700" /><span class="text-[10px] font-bold text-amber-700 uppercase tracking-widest">{ui.plannedStrategy}</span></div><pre class="p-5 text-xs font-mono text-gray-700 leading-relaxed whitespace-pre-wrap">{String(item.text ?? "")}</pre></div>
+    <div class="turn-card-shell overflow-hidden rounded-2xl border border-amber-100 bg-amber-50/25 shadow-sm">
+      <div class="turn-card-header turn-card-header--amber flex items-center gap-3 border-b border-amber-100 px-4 py-2.5" data-sticky-level={stickyLevel}>
+        <ListTodo size={14} class="text-amber-700" />
+        <span class="text-[10px] font-bold uppercase tracking-widest text-amber-700">{ui.plannedStrategy}</span>
+      </div>
+      <div class="bg-white/80 px-4 py-3 text-gray-700">
+        <MarkdownMessage compact expandLabel={ui.showFullMessage} maxInitialChars={compactMarkdownInitialChars} on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={String(item.text ?? "")} />
+      </div>
+    </div>
   {:else if item.type === "contextCompaction"}
     {@const contextCompressionRunning = isContextCompactionRunning(turnId, item)}
     <div class="turn-card-shell overflow-hidden rounded-2xl border border-amber-200 bg-gradient-to-br from-amber-50/80 via-white to-white shadow-sm">

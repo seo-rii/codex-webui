@@ -248,13 +248,32 @@ pub(crate) fn map_app_server_session_notification(
             );
         }
         "thread/name/updated" => {
+            let thread_id = mapped
+                .get("threadId")
+                .or_else(|| mapped.get("thread_id"))
+                .and_then(value_text)
+                .or_else(|| {
+                    mapped
+                        .get("thread")
+                        .and_then(|thread| thread.get("id"))
+                        .and_then(value_text)
+                });
+            let thread_name = ["threadName", "thread_name", "name", "title"]
+                .iter()
+                .find_map(|key| mapped.get(*key).and_then(value_text))
+                .or_else(|| {
+                    mapped.get("thread").and_then(|thread| {
+                        ["threadName", "thread_name", "name", "title"]
+                            .iter()
+                            .find_map(|key| thread.get(*key).and_then(value_text))
+                    })
+                });
+            if let Some(thread_id) = thread_id {
+                mapped.insert("threadId".to_string(), Value::String(thread_id));
+            }
             mapped.insert(
                 "threadName".to_string(),
-                mapped
-                    .get("threadName")
-                    .and_then(value_text)
-                    .map(Value::String)
-                    .unwrap_or(Value::Null),
+                thread_name.map(Value::String).unwrap_or(Value::Null),
             );
         }
         "thread/status/changed" => {

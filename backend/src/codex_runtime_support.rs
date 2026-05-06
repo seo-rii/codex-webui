@@ -3,7 +3,7 @@ use super::*;
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const ACCOUNT_LOGIN_FLOW_TTL: Duration = Duration::from_secs(15 * 60);
-const ACCOUNT_APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
+const ACCOUNT_APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub(crate) async fn codex_runtime_status(state: &AppState, check_latest: bool) -> Result<Value> {
     let configured_bin = state.config.codex_bin.clone();
@@ -180,7 +180,12 @@ pub(crate) async fn get_account_state(state: &AppState, profile_id: &str) -> Res
             "requiresOpenaiAuth": true,
         })),
         Ok(Err(error)) => Err(error),
-        Err(_) => anyhow::bail!("Timed out while loading Codex account state."),
+        Err(_) => Ok(json!({
+            "account": {},
+            "requiresOpenaiAuth": false,
+            "degraded": true,
+            "error": "Timed out while loading Codex account state."
+        })),
     }
 }
 

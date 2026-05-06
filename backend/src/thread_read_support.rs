@@ -392,6 +392,19 @@ pub(crate) async fn read_thread_metadata_payload(
     }
 }
 
+pub(crate) async fn read_local_thread_metadata_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Option<Value>> {
+    if let Some(thread) =
+        read_state_thread_metadata_by_session_id(state, profile_id, session_id, None).await?
+    {
+        return Ok(Some(thread));
+    }
+    read_rollout_thread_metadata_by_session_id(state, profile_id, session_id).await
+}
+
 pub(crate) fn resolve_rollout_path(
     state: &AppState,
     profile_id: &str,

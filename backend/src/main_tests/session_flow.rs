@@ -1650,6 +1650,210 @@ async fn session_detail_and_turn_search_payloads_use_rust_thread_reads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_detail_uses_local_rollout_tail_when_thread_read_is_slow() {
+    let sandbox = unique_test_dir("session-detail-local-tail");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000111";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    fs::write(
+        rollout_dir.join(format!("rollout-2026-04-24T01-00-00-{session_id}.jsonl")),
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:00:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:00:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-local"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:00:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "open the slow local session"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:00:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "loaded from rollout tail",
+                    "phase": "final_answer"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:00:04.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-local",
+                    "completed_at": 1_776_969_604_000_i64,
+                    "duration_ms": 3_000
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Slow app-server session",
+                    "preview": "slow",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1_776_969_600_000_i64,
+                    "updatedAt": 1_776_969_604_000_i64,
+                    "status": "running",
+                    "readDelayMs": 5_000,
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    client
+        .request(
+            "debug/setDelay",
+            json!({
+                "method": "thread/goal/get",
+                "delayMs": 5_000
+            }),
+        )
+        .await
+        .unwrap();
+
+    let detail = tokio::time::timeout(
+        Duration::from_secs(2),
+        session_detail_payload(&state, "default", session_id, 20),
+    )
+    .await
+    .expect("session detail should not wait for slow app-server thread/read or goal reads")
+    .unwrap();
+
+    let turns = detail
+        .get("thread")
+        .and_then(|value| value.get("turns"))
+        .and_then(Value::as_array)
+        .unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(
+        turns[0]
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str),
+        Some("open the slow local session")
+    );
+    assert_eq!(
+        turns[0]
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.get(1))
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str),
+        Some("loaded from rollout tail")
+    );
+    assert!(detail.get("goal").is_some_and(Value::is_null));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_summary_uses_local_rollout_metadata_when_thread_read_is_slow() {
+    let sandbox = unique_test_dir("session-summary-local-metadata");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000222";
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-10-00",
+        session_id,
+        &workspace,
+        "open the local summary session",
+        &[],
+        Some(",\"name\":\"Local rollout summary\""),
+    );
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Slow app-server summary",
+                    "preview": "slow summary",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1_776_970_200_000_i64,
+                    "updatedAt": 1_776_970_201_000_i64,
+                    "status": "running",
+                    "readDelayMs": 5_000,
+                    "isSubagent": false,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let summary = tokio::time::timeout(
+        Duration::from_secs(1),
+        build_session_summary_payload(&state, "default", session_id, None, None),
+    )
+    .await
+    .expect("session summary should not wait for slow app-server thread/read")
+    .unwrap();
+
+    assert_eq!(
+        summary.get("name").and_then(Value::as_str),
+        Some("Local rollout summary")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_detail_payload_clears_completed_highlight_on_open() {
     let sandbox = unique_test_dir("session-detail-highlight-clear");
     let workspace = sandbox.join("workspace");
@@ -1916,18 +2120,6 @@ async fn send_turn_payload_uses_app_server_and_updates_session_state() {
         Some("imagegen")
     );
 
-    app_server_client(&state, "default")
-        .await
-        .unwrap()
-        .request(
-            "thread/name/set",
-            json!({
-                "threadId": "thread-1",
-                "name": "Investigate duplicate websocket sends"
-            }),
-        )
-        .await
-        .unwrap();
     handle_profile_runtime_notification(
         &state,
         "default",
@@ -1947,6 +2139,28 @@ async fn send_turn_payload_uses_app_server_and_updates_session_state() {
     assert_eq!(
         ai_summary.get("name").and_then(Value::as_str),
         Some("Investigate duplicate websocket sends")
+    );
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "thread/name/updated".to_string(),
+            params: json!({
+                "thread_id": "thread-1",
+                "thread_name": "AI title from snake case event"
+            }),
+        },
+    )
+    .await;
+
+    let snake_case_summary =
+        build_session_summary_payload(&state, "default", "thread-1", None, None)
+            .await
+            .unwrap();
+    assert_eq!(
+        snake_case_summary.get("name").and_then(Value::as_str),
+        Some("AI title from snake case event")
     );
 
     let stored_preferences = with_ui_state_read(&state, "default", |ui_state| {

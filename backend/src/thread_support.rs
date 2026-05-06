@@ -58,23 +58,29 @@ pub(crate) async fn update_session_organization_payload(
         tags.sort();
         tags.dedup();
 
-        let meta = json!({
-            "pinned": pinned,
-            "tags": tags
-        });
-        if !pinned
-            && meta
-                .get("tags")
-                .and_then(Value::as_array)
-                .is_some_and(|items| items.is_empty())
-        {
+        let mut meta_object = current.as_object().cloned().unwrap_or_default();
+        meta_object.insert("pinned".to_string(), json!(pinned));
+        meta_object.insert("tags".to_string(), json!(tags));
+        let has_title = meta_object
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        let has_tags = meta_object
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty());
+        if !pinned && !has_tags && !has_title {
             session_meta_by_thread_id.remove(session_id);
         } else {
+            let meta = Value::Object(meta_object);
             session_meta_by_thread_id.insert(session_id.to_string(), meta.clone());
         }
 
         Ok(json!({
-            "meta": meta,
+            "meta": session_meta_by_thread_id
+                .get(session_id)
+                .cloned()
+                .unwrap_or_else(|| json!({ "pinned": false, "tags": [] })),
             "knownTags": known_tags_from_ui_state(ui_state)
         }))
     })
@@ -93,6 +99,70 @@ pub(crate) async fn update_session_organization_payload(
     emit_session_summary_updated(state, profile_id, session_id, None, None).await;
 
     Ok(payload)
+}
+
+pub(crate) async fn save_session_title_metadata(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    name: Option<&str>,
+) -> ApiResult<()> {
+    let next_name = name
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "New thread")
+        .map(str::to_string);
+
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(session_meta_by_thread_id) = ui_state
+            .get_mut("sessionMetaByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session metadata state is missing",
+            ));
+        };
+
+        let current = session_meta_by_thread_id
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| json!({ "pinned": false, "tags": [] }));
+        let mut meta_object = current.as_object().cloned().unwrap_or_default();
+        if let Some(next_name) = &next_name {
+            meta_object.insert("name".to_string(), Value::String(next_name.clone()));
+            meta_object.insert("nameUpdatedAt".to_string(), json!(now_unix_ms()));
+        } else {
+            meta_object.remove("name");
+            meta_object.remove("nameUpdatedAt");
+        }
+
+        let pinned = meta_object
+            .get("pinned")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let has_tags = meta_object
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty());
+        let has_title = meta_object
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+
+        if !pinned && !has_tags && !has_title {
+            session_meta_by_thread_id.remove(session_id);
+        } else {
+            meta_object
+                .entry("pinned".to_string())
+                .or_insert_with(|| json!(false));
+            meta_object
+                .entry("tags".to_string())
+                .or_insert_with(|| json!([]));
+            session_meta_by_thread_id.insert(session_id.to_string(), Value::Object(meta_object));
+        }
+        Ok(())
+    })
+    .await
 }
 
 pub(crate) async fn save_session_preferences_payload(
@@ -233,6 +303,7 @@ pub(crate) async fn rename_session_payload(
             )
         })?;
 
+    save_session_title_metadata(state, profile_id, session_id, Some(trimmed_name)).await?;
     emit_session_notification(
         state,
         profile_id,

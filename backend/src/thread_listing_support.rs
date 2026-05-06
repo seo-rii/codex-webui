@@ -90,6 +90,25 @@ pub(crate) fn build_session_summary_from_thread_payload(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let thread_name = thread.get("name").and_then(Value::as_str);
+    let inferred_preview_title = infer_session_display_title(&preview);
+    let meta_name = meta
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "New thread");
+    let display_name = if let Some(meta_name) = meta_name {
+        let thread_name_trimmed = thread_name.map(str::trim).unwrap_or_default();
+        if !is_placeholder_thread_name(thread_name)
+            && inferred_preview_title.as_deref() != Some(thread_name_trimmed)
+        {
+            display_thread_name(thread_name, Some(preview.as_str()))
+        } else {
+            Some(meta_name.to_string())
+        }
+    } else {
+        display_thread_name(thread_name, Some(preview.as_str()))
+    };
     let thread_status = normalized_thread_status(thread.get("status"));
     let thread_updated_at = thread
         .get("updatedAt")
@@ -134,10 +153,7 @@ pub(crate) fn build_session_summary_from_thread_payload(
 
     Ok(json!({
         "id": session_id,
-        "name": display_thread_name(
-            thread.get("name").and_then(Value::as_str),
-            Some(preview.as_str())
-        ),
+        "name": display_name,
         "preview": preview,
         "queueCount": snapshot.queue_counts_by_thread_id.get(session_id).copied().unwrap_or(0),
         "highlight": highlight,
@@ -842,7 +858,10 @@ pub(crate) async fn build_session_summary_payload(
     preferences_override: Option<Value>,
     status_override: Option<&str>,
 ) -> ApiResult<Value> {
-    let thread = read_thread_metadata_payload(state, profile_id, session_id).await?;
+    let thread = match read_local_thread_metadata_payload(state, profile_id, session_id).await? {
+        Some(thread) => thread,
+        None => read_thread_metadata_payload(state, profile_id, session_id).await?,
+    };
     let snapshot = read_session_summary_ui_snapshot(state, profile_id).await?;
     let summary = build_session_summary_from_thread_payload(
         &thread,

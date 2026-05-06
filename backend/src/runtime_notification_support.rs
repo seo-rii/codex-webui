@@ -358,6 +358,7 @@ pub(crate) async fn emit_runtime_profile_config_updated(state: &AppState, profil
 fn notification_thread_id(method: &str, params: &Value) -> Option<String> {
     params
         .get("threadId")
+        .or_else(|| params.get("thread_id"))
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| {
@@ -371,6 +372,19 @@ fn notification_thread_id(method: &str, params: &Value) -> Option<String> {
                         .map(str::to_string)
                 })
                 .flatten()
+        })
+}
+
+fn notification_thread_name(params: &Value) -> Option<String> {
+    ["threadName", "thread_name", "name", "title"]
+        .iter()
+        .find_map(|key| params.get(*key).and_then(value_text))
+        .or_else(|| {
+            params.get("thread").and_then(|thread| {
+                ["threadName", "thread_name", "name", "title"]
+                    .iter()
+                    .find_map(|key| thread.get(*key).and_then(value_text))
+            })
         })
 }
 
@@ -510,6 +524,17 @@ pub(crate) async fn handle_profile_runtime_notification(
                     )
                     .await;
                 }
+            }
+        }
+        "thread/name/updated" => {
+            let thread_name = notification_thread_name(&notification.params);
+            if let Err(error) =
+                save_session_title_metadata(state, profile_id, &session_id, thread_name.as_deref())
+                    .await
+            {
+                warn!(
+                    "failed to persist updated thread name for {profile_id}/{session_id}: {error}"
+                );
             }
         }
         "thread/status/changed" => {

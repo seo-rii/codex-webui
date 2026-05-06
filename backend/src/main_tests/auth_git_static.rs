@@ -1776,6 +1776,32 @@ fn maps_session_item_notifications_use_item_id_when_payload_omits_item_id() {
     );
 }
 
+#[test]
+fn maps_thread_name_updates_from_snake_case_payloads() {
+    let mapped = map_app_server_session_notification(&AppServerNotification {
+        method: "thread/name/updated".to_string(),
+        params: json!({
+            "thread_id": "thread-1",
+            "thread_name": "Generated session title"
+        }),
+    })
+    .expect("notification should map");
+
+    assert_eq!(
+        mapped,
+        json!({
+            "kind": "notification",
+            "method": "thread/name/updated",
+            "params": {
+                "threadId": "thread-1",
+                "thread_id": "thread-1",
+                "thread_name": "Generated session title",
+                "threadName": "Generated session title"
+            }
+        })
+    );
+}
+
 #[tokio::test]
 async fn lists_only_directories_within_allowed_root() {
     let sandbox = unique_test_dir("directories");

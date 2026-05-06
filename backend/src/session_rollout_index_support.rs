@@ -437,7 +437,13 @@ fn read_rollout_thread_metadata_from_path(
         } else if parsed.get("method").and_then(Value::as_str) == Some("thread/name/updated") {
             if let Some(thread_name) = parsed
                 .get("params")
-                .and_then(|value| value.get("threadName"))
+                .and_then(|value| {
+                    value
+                        .get("threadName")
+                        .or_else(|| value.get("thread_name"))
+                        .or_else(|| value.get("name"))
+                        .or_else(|| value.get("title"))
+                })
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())

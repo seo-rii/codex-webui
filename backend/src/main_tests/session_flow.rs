@@ -1791,6 +1791,128 @@ async fn session_detail_uses_local_rollout_tail_when_thread_read_is_slow() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncated_local_session_detail_exposes_idle_history_state() {
+    let sandbox = unique_test_dir("session-detail-truncated-idle");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000112";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join(format!("rollout-2026-04-24T01-05-00-{session_id}.jsonl"));
+    let mut file = fs::File::create(&rollout_path).unwrap();
+    use std::io::Write as _;
+    writeln!(
+        file,
+        "{}",
+        json!({
+            "timestamp": "2026-04-24T01:05:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "timestamp": "2026-04-24T01:05:00.000Z",
+                "cwd": workspace.display().to_string()
+            }
+        })
+    )
+    .unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({
+            "timestamp": "2026-04-24T01:05:00.500Z",
+            "type": "filler",
+            "payload": {
+                "text": "x".repeat((8 * 1024 * 1024) + 1024)
+            }
+        })
+    )
+    .unwrap();
+    for (timestamp, payload) in [
+        (
+            "2026-04-24T01:05:01.000Z",
+            json!({
+                "type": "task_started",
+                "turn_id": "turn-truncated"
+            }),
+        ),
+        (
+            "2026-04-24T01:05:02.000Z",
+            json!({
+                "type": "user_message",
+                "message": "open a very large local session"
+            }),
+        ),
+        (
+            "2026-04-24T01:05:03.000Z",
+            json!({
+                "type": "agent_message",
+                "message": "loaded from the truncated tail",
+                "phase": "final_answer"
+            }),
+        ),
+        (
+            "2026-04-24T01:05:04.000Z",
+            json!({
+                "type": "task_complete",
+                "turn_id": "turn-truncated",
+                "completed_at": 1_776_969_904_000_i64,
+                "duration_ms": 3_000
+            }),
+        ),
+    ] {
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": payload
+            })
+        )
+        .unwrap();
+    }
+    drop(file);
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail
+            .get("hydration")
+            .and_then(|value| value.get("state"))
+            .and_then(Value::as_str),
+        Some("idle")
+    );
+    assert_eq!(
+        detail
+            .get("hydration")
+            .and_then(|value| value.get("remainingTurns"))
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|value| value.get("turns"))
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_summary_uses_local_rollout_metadata_when_thread_read_is_slow() {
     let sandbox = unique_test_dir("session-summary-local-metadata");
     let workspace = sandbox.join("workspace");

@@ -805,11 +805,7 @@ pub(crate) async fn session_detail_payload(
                 visible_turns,
                 total_turns,
                 start,
-                if turn_window.truncated {
-                    "loading"
-                } else {
-                    "complete"
-                },
+                if start > 0 { "idle" } else { "complete" },
                 Value::Null,
                 json!({
                     "available": false,

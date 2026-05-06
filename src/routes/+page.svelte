@@ -1791,9 +1791,6 @@
 
     return builtinSuggestions.filter((entry) => !lower || entry.command.includes(lower) || entry.title.includes(lower)).slice(0, 6);
   });
-  const sessionHydrationState = $derived(conversation?.hydration.state ?? "idle");
-  const sessionHydrationLoadedTurns = $derived(conversation?.hydration.loadedTurns ?? 0);
-  const sessionHydrationTotalTurns = $derived(conversation?.hydration.totalTurns ?? null);
   const sessionHydrationRemainingTurns = $derived(conversation?.hydration.remainingTurns ?? 0);
   const sessionHydrationPercent = $derived.by(() => {
     if (!conversation?.hydration || !conversation.hydration.totalTurns || conversation.hydration.totalTurns <= 0) {
@@ -1820,9 +1817,6 @@
     if (loadingDetail && !conversation) {
       return "sessionDetail";
     }
-    if (sessionHydrationState === "loading") {
-      return "sessionHydration";
-    }
     return "idle";
   });
   const topLoadLabel = $derived.by(() => {
@@ -1844,13 +1838,6 @@
     }
     if (loadingDetail && !conversation) {
       return ui.loadingSessionBasics;
-    }
-    if (sessionHydrationState === "loading") {
-      return sessionHydrationTotalTurns
-        ? `${ui.loadingConversationProgressive} (${sessionHydrationLoadedTurns}/${sessionHydrationTotalTurns})`
-        : sessionHydrationLoadedTurns > 0
-          ? `${ui.loadingConversationProgressive} (${sessionHydrationLoadedTurns})`
-          : ui.loadingConversationProgressive;
     }
     return "";
   });

@@ -87,6 +87,7 @@ pub(crate) struct SessionSummaryUiSnapshot {
 
 const ACTIVE_SESSION_STATUS_RECONCILE_AFTER_MS: u64 = 5_000;
 const ACTIVE_SESSION_STATUS_RECONCILE_LIMIT: usize = 4;
+const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS: u64 = 150;
 
 pub(crate) fn session_filter_from_value(filter: Option<&Value>) -> SessionFilterCriteria {
     let mut tags = filter
@@ -566,7 +567,38 @@ pub(crate) async fn read_session_summary_ui_snapshot(
     }
     for (runtime_key, session_id, has_cached_activity) in reconcile_candidates {
         if has_cached_activity {
-            continue;
+            let has_active_turn = tokio::time::timeout(
+                Duration::from_millis(ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS),
+                async {
+                    if let Some(has_active_turn) =
+                        local_session_has_active_turn_payload(state, profile_id, &session_id)
+                            .await?
+                    {
+                        return Ok::<bool, ApiError>(has_active_turn);
+                    }
+
+                    let thread = read_thread_payload(state, profile_id, &session_id, true).await?;
+                    let turns = thread
+                        .get("turns")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    Ok::<bool, ApiError>(active_turn_id_from_turns(&turns).is_some())
+                },
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
+
+            match has_active_turn {
+                Some(true) => {
+                    continue;
+                }
+                Some(false) => {}
+                None => {
+                    continue;
+                }
+            }
         }
 
         state.active_turns.lock().await.remove(&runtime_key);

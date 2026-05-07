@@ -1310,6 +1310,7 @@
   let hydrationRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let selectedSessionDetailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let selectedSessionCompletionRefreshTimers: ReturnType<typeof setTimeout>[] = [];
   let sessionListCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionDetailCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionListRequestVersion = 0;
@@ -1363,7 +1364,7 @@
   }
 
   function getConversationLiveTurn(currentConversation: ConversationState | null = conversation) {
-    if (!currentConversation || !isLiveConversationStatus(currentConversation.thread.status)) {
+    if (!currentConversation) {
       return null;
     }
 
@@ -1394,13 +1395,19 @@
   function normalizeConversationExecutionState(currentConversation: ConversationState) {
     const liveTurn = getConversationLiveTurn(currentConversation);
     if (liveTurn) {
-      if (currentConversation.activeTurnId === liveTurn.id) {
+      if (currentConversation.activeTurnId === liveTurn.id && isLiveConversationStatus(currentConversation.thread.status)) {
         return currentConversation;
       }
 
       return {
         ...currentConversation,
-        activeTurnId: liveTurn.id
+        activeTurnId: liveTurn.id,
+        thread: isLiveConversationStatus(currentConversation.thread.status)
+          ? currentConversation.thread
+          : {
+              ...currentConversation.thread,
+              status: "running"
+            }
       };
     }
 
@@ -1816,6 +1823,9 @@
     }
     if (loadingDetail && !conversation) {
       return "sessionDetail";
+    }
+    if (conversation && sessionHydrationRemainingTurns > 0) {
+      return "sessionHydration";
     }
     return "idle";
   });
@@ -2376,6 +2386,7 @@
       if (selectedSessionDetailRefreshTimer) {
         clearTimeout(selectedSessionDetailRefreshTimer);
       }
+      clearSelectedSessionCompletionRefreshes();
       if (saveTimer) {
         clearTimeout(saveTimer);
       }
@@ -3751,6 +3762,40 @@
     }, nextDelay);
   }
 
+  function clearSelectedSessionCompletionRefreshes() {
+    for (const timer of selectedSessionCompletionRefreshTimers) {
+      clearTimeout(timer);
+    }
+    selectedSessionCompletionRefreshTimers = [];
+  }
+
+  function scheduleSelectedSessionCompletionRefresh(sessionId: string) {
+    clearSelectedSessionCompletionRefreshes();
+    selectedSessionCompletionRefreshTimers = [180, 900, 2200].map((delay) => {
+      const timer = setTimeout(() => {
+        selectedSessionCompletionRefreshTimers = selectedSessionCompletionRefreshTimers.filter((candidate) => candidate !== timer);
+        if (
+          selectedSessionId !== sessionId ||
+          !conversation ||
+          conversation.thread.id !== sessionId ||
+          loadingDetail ||
+          isLiveConversationStatus(conversation.thread.status)
+        ) {
+          return;
+        }
+
+        void refreshSelectedSessionState(
+          sessionId,
+          Math.max(conversation.thread.turns.length, olderTurnPageSize),
+          false,
+          null,
+          false
+        ).catch(() => {});
+      }, delay);
+      return timer;
+    });
+  }
+
   function getRequestedSessionIdFromUrl() {
     if (typeof window === "undefined") {
       return null;
@@ -3791,6 +3836,7 @@
       clearTimeout(selectedSessionDetailRefreshTimer);
       selectedSessionDetailRefreshTimer = null;
     }
+    clearSelectedSessionCompletionRefreshes();
     if (sessionListCachePersistTimer) {
       clearTimeout(sessionListCachePersistTimer);
       sessionListCachePersistTimer = null;
@@ -4216,6 +4262,15 @@
   async function selectSession(sessionId: string) {
     if (selectedSessionId === sessionId && conversation) {
       syncSelectedSessionInUrl(sessionId);
+      if (!isLiveConversationStatus(conversation.thread.status)) {
+        void refreshSelectedSessionState(
+          sessionId,
+          Math.max(conversation.thread.turns.length, olderTurnPageSize),
+          false,
+          null,
+          false
+        ).catch(() => {});
+      }
       return true;
     }
 
@@ -4273,6 +4328,7 @@
       const detailCacheKey = buildSessionDetailBrowserCacheKey(sessionId);
       let knownVersion: string | null = null;
       let turnLimit = olderTurnPageSize;
+      const selectionSummary = sessions.find((session) => session.id === sessionId) ?? null;
 
       if (detailCacheKey) {
         const cachedEntry = await readSessionDetailCache(detailCacheKey);
@@ -4282,7 +4338,9 @@
         if (cachedEntry) {
           sessionDetailCacheVersion = cachedEntry.version;
           applyLoadedSessionDetail(sessionId, cachedEntry.payload);
-          knownVersion = cachedEntry.version;
+          const cachedUpdatedAt = normalizeSessionTimestamp(cachedEntry.payload.thread.updatedAt);
+          const summaryUpdatedAt = normalizeSessionTimestamp(selectionSummary?.updatedAt ?? 0);
+          knownVersion = summaryUpdatedAt > cachedUpdatedAt ? null : cachedEntry.version;
           turnLimit = Math.max(olderTurnPageSize, cachedEntry.payload.thread.turns.length);
           stickTranscriptToBottom = true;
           forceTranscriptScroll = true;
@@ -4433,6 +4491,7 @@
 
         if (payload.kind === "notification" && payload.method === "turn/completed") {
           scheduleSelectedSessionStateRefresh(sessionId, 450);
+          scheduleSelectedSessionCompletionRefresh(sessionId);
         }
 
         if (isQueueUpdatedEvent(payload)) {
@@ -4945,15 +5004,24 @@
           conversation.thread.id === summary.id
         ) {
           const nextStatus = summary.status ?? conversation.thread.status;
+          const summaryUpdatedAt = normalizeSessionTimestamp(summary.updatedAt);
+          const conversationUpdatedAt = normalizeSessionTimestamp(conversation.thread.updatedAt);
+          const summaryIsNewer = summaryUpdatedAt > conversationUpdatedAt;
           conversation = {
             ...conversation,
             activeTurnId: isLiveConversationStatus(nextStatus) ? conversation.activeTurnId : null,
             thread: {
               ...conversation.thread,
+              name: summary.name ?? conversation.thread.name,
+              preview: summary.preview ?? conversation.thread.preview,
+              updatedAt: summaryIsNewer ? summary.updatedAt : conversation.thread.updatedAt,
               status: nextStatus
             }
           };
           markConversationCacheDirty();
+          if (summaryIsNewer || !isLiveConversationStatus(nextStatus)) {
+            scheduleSelectedSessionCompletionRefresh(summary.id);
+          }
         }
         applySessionSummaryUpdate(summary);
       } else {

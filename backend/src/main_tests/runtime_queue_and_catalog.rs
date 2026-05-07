@@ -564,6 +564,219 @@ async fn older_turn_completion_does_not_override_newer_active_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_list_clears_stale_cached_active_turn_when_thread_completed() {
+    let sandbox = unique_test_dir("session-list-stale-active-completed");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-stale-active-completed",
+                    "name": "Stale active completed",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 20,
+                    "status": "completed",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "completed",
+                            "error": Value::Null,
+                            "startedAt": 10,
+                            "completedAt": 20,
+                            "durationMs": 10,
+                            "items": []
+                        }
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    state.active_turns.lock().await.insert(
+        runtime_session_key("default", "thread-stale-active-completed"),
+        "turn-1".to_string(),
+    );
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        runtime_status_by_thread_id.insert(
+            "thread-stale-active-completed".to_string(),
+            json!({
+                "status": "running",
+                "updatedAt": now_unix_ms().saturating_sub(10_000)
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let first = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .and_then(|sessions| sessions.first())
+        .cloned()
+        .expect("expected seeded session");
+    assert_eq!(
+        first.get("id").and_then(Value::as_str),
+        Some("thread-stale-active-completed")
+    );
+    assert_eq!(
+        first.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert!(
+        !state
+            .active_turns
+            .lock()
+            .await
+            .contains_key(&runtime_session_key(
+                "default",
+                "thread-stale-active-completed"
+            ))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_list_keeps_stale_cached_active_turn_when_thread_still_active() {
+    let sandbox = unique_test_dir("session-list-stale-active-running");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-stale-active-running",
+                    "name": "Stale active running",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 20,
+                    "status": "running",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "inProgress",
+                            "error": Value::Null,
+                            "startedAt": 10,
+                            "completedAt": Value::Null,
+                            "durationMs": Value::Null,
+                            "items": []
+                        }
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    state.active_turns.lock().await.insert(
+        runtime_session_key("default", "thread-stale-active-running"),
+        "turn-1".to_string(),
+    );
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        runtime_status_by_thread_id.insert(
+            "thread-stale-active-running".to_string(),
+            json!({
+                "status": "running",
+                "updatedAt": now_unix_ms().saturating_sub(10_000)
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let first = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .and_then(|sessions| sessions.first())
+        .cloned()
+        .expect("expected seeded session");
+    assert_eq!(
+        first.get("id").and_then(Value::as_str),
+        Some("thread-stale-active-running")
+    );
+    assert_eq!(first.get("status").and_then(Value::as_str), Some("running"));
+    assert!(
+        state
+            .active_turns
+            .lock()
+            .await
+            .contains_key(&runtime_session_key(
+                "default",
+                "thread-stale-active-running"
+            ))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_list_prefers_newer_thread_status_over_older_runtime_completion_override() {
     let sandbox = unique_test_dir("session-list-newer-thread-status");
     let workspace = sandbox.join("workspace");

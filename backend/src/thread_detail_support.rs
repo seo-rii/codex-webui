@@ -759,6 +759,22 @@ async fn read_local_session_detail_source(
     Ok(Some((thread, turns)))
 }
 
+pub(crate) async fn local_session_has_active_turn_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Option<bool>> {
+    let Some((_, turn_window)) =
+        read_local_session_detail_source(state, profile_id, session_id, 20).await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(
+        active_turn_id_from_turns(&turn_window.turns).is_some(),
+    ))
+}
+
 pub(crate) async fn session_detail_payload(
     state: &AppState,
     profile_id: &str,
@@ -912,6 +928,14 @@ pub(crate) async fn session_detail_payload(
     } else if active_turn_id.is_none() {
         state.active_turns.lock().await.remove(&runtime_key);
     }
+    let detail_thread_status = if active_turn_id.is_some() {
+        json!("running")
+    } else {
+        thread
+            .get("status")
+            .cloned()
+            .unwrap_or_else(|| json!("unknown"))
+    };
     let preferences = with_ui_state_read(state, profile_id, |ui_state| {
         Ok(ui_state
             .get("preferencesByThreadId")
@@ -945,7 +969,7 @@ pub(crate) async fn session_detail_payload(
             "preview": thread.get("preview").cloned().unwrap_or_else(|| json!("")),
             "name": thread.get("name").cloned().unwrap_or(Value::Null),
             "cwd": thread.get("cwd").cloned().unwrap_or(Value::Null),
-            "status": thread.get("status").cloned().unwrap_or_else(|| json!("unknown")),
+            "status": detail_thread_status,
             "createdAt": thread.get("createdAt").cloned().unwrap_or_else(|| json!(0)),
             "updatedAt": thread.get("updatedAt").cloned().unwrap_or_else(|| json!(0)),
             "isSubagent": thread.get("isSubagent").cloned().unwrap_or_else(|| json!(false)),

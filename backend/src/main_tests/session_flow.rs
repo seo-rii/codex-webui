@@ -1913,6 +1913,84 @@ async fn truncated_local_session_detail_exposes_idle_history_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_session_detail_reports_running_when_tail_has_active_turn() {
+    let sandbox = unique_test_dir("session-detail-local-running");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000113";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    fs::write(
+        rollout_dir.join(format!("rollout-2026-04-24T01-06-00-{session_id}.jsonl")),
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:06:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:06:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:06:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-running"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:06:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "keep this local session running"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:06:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "still working",
+                    "phase": "commentary"
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("status"))
+            .and_then(Value::as_str),
+        Some("running")
+    );
+    assert_eq!(
+        detail.get("activeTurnId").and_then(Value::as_str),
+        Some("turn-running")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_summary_uses_local_rollout_metadata_when_thread_read_is_slow() {
     let sandbox = unique_test_dir("session-summary-local-metadata");
     let workspace = sandbox.join("workspace");

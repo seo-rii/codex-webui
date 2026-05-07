@@ -167,6 +167,7 @@ timestamp_counter = 0
 turn_counter = 0
 request_counts = {}
 method_delays = {}
+goals_enabled = True
 
 for raw_line in sys.stdin:
     line = raw_line.strip()
@@ -195,6 +196,16 @@ for raw_line in sys.stdin:
             }
         })
         continue
+    if method == "debug/setGoalsEnabled":
+        goals_enabled = bool(params.get("enabled"))
+        write({
+            "id": request_id,
+            "result": {
+                "ok": True,
+                "enabled": goals_enabled
+            }
+        })
+        continue
 
     delay_ms = int(method_delays.get(method, 0) or 0)
     if delay_ms > 0:
@@ -217,6 +228,7 @@ for raw_line in sys.stdin:
             "params": {}
         })
     elif method == "experimentalFeature/enablement/set":
+        goals_enabled = bool((params.get("enablement") or {}).get("goals", goals_enabled))
         write({
             "id": request_id,
             "result": {
@@ -261,6 +273,15 @@ for raw_line in sys.stdin:
             }
         })
     elif method == "thread/goal/get":
+        if not goals_enabled:
+            write({
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "goals feature is disabled"
+                }
+            })
+            continue
         thread_id = params.get("threadId", "")
         thread = threads.get(thread_id) or {}
         write({
@@ -270,6 +291,15 @@ for raw_line in sys.stdin:
             }
         })
     elif method == "thread/goal/set":
+        if not goals_enabled:
+            write({
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "goals feature is disabled"
+                }
+            })
+            continue
         thread_id = params.get("threadId", "")
         thread = threads.get(thread_id)
         if not isinstance(thread, dict):
@@ -310,6 +340,15 @@ for raw_line in sys.stdin:
             }
         })
     elif method == "thread/goal/clear":
+        if not goals_enabled:
+            write({
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "goals feature is disabled"
+                }
+            })
+            continue
         thread_id = params.get("threadId", "")
         thread = threads.get(thread_id)
         cleared = False

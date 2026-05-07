@@ -43,6 +43,7 @@ fn main() {
     let mut timestamp_counter = 0_i64;
     let mut turn_counter = 0_u64;
     let mut threads = BTreeMap::<String, Value>::new();
+    let mut goals_enabled = true;
 
     for line in stdin.lock().lines() {
         let Ok(line) = line else {
@@ -83,10 +84,28 @@ fn main() {
                     .and_then(|params| params.get("enablement"))
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+                goals_enabled = enablement
+                    .get("goals")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(goals_enabled);
                 print_message(&json!({
                     "id": id,
                     "result": {
                         "enablement": enablement
+                    }
+                }));
+            }
+            Some("debug/setGoalsEnabled") => {
+                goals_enabled = payload
+                    .get("params")
+                    .and_then(|params| params.get("enabled"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "ok": true,
+                        "enabled": goals_enabled
                     }
                 }));
             }
@@ -167,6 +186,16 @@ fn main() {
                 }));
             }
             Some("thread/goal/get") => {
+                if !goals_enabled {
+                    print_message(&json!({
+                        "id": id,
+                        "error": {
+                            "code": -32000,
+                            "message": "goals feature is disabled"
+                        }
+                    }));
+                    continue;
+                }
                 let thread_id = payload
                     .get("params")
                     .and_then(|params| params.get("threadId"))
@@ -185,6 +214,16 @@ fn main() {
                 }));
             }
             Some("thread/goal/set") => {
+                if !goals_enabled {
+                    print_message(&json!({
+                        "id": id,
+                        "error": {
+                            "code": -32000,
+                            "message": "goals feature is disabled"
+                        }
+                    }));
+                    continue;
+                }
                 let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
                 let thread_id = params
                     .get("threadId")
@@ -258,6 +297,16 @@ fn main() {
                 }));
             }
             Some("thread/goal/clear") => {
+                if !goals_enabled {
+                    print_message(&json!({
+                        "id": id,
+                        "error": {
+                            "code": -32000,
+                            "message": "goals feature is disabled"
+                        }
+                    }));
+                    continue;
+                }
                 let thread_id = payload
                     .get("params")
                     .and_then(|params| params.get("threadId"))

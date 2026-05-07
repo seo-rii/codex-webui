@@ -61,6 +61,11 @@ fn goal_from_response(response: &Value, session_id: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn is_goal_disabled_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("goal") && message.contains("disabled")
+}
+
 async fn request_thread_goal(
     state: &AppState,
     profile_id: &str,
@@ -75,12 +80,37 @@ async fn request_thread_goal(
                 format!("Failed to connect to codex app-server: {error}"),
             )
         })?;
-    client.request(method, params).await.map_err(|error| {
-        api_error(
+    match client.request(method, params.clone()).await {
+        Ok(response) => Ok(response),
+        Err(error) if is_goal_disabled_error(&error) => {
+            client
+                .request(
+                    "experimentalFeature/enablement/set",
+                    json!({
+                        "enablement": {
+                            "goals": true
+                        }
+                    }),
+                )
+                .await
+                .map_err(|enable_error| {
+                    api_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to enable Codex goals feature: {enable_error}"),
+                    )
+                })?;
+            client.request(method, params).await.map_err(|retry_error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to proxy Codex goal request: {retry_error}"),
+                )
+            })
+        }
+        Err(error) => Err(api_error(
             StatusCode::BAD_GATEWAY,
             format!("Failed to proxy Codex goal request: {error}"),
-        )
-    })
+        )),
+    }
 }
 
 pub(crate) async fn session_goal_or_null_payload(

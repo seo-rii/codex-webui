@@ -1219,6 +1219,73 @@ async fn thread_goal_payload_round_trips_through_app_server() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_goal_request_reenables_goals_when_runtime_reports_disabled() {
+    let sandbox = unique_test_dir("thread-goal-reenable");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-goal-disabled",
+                    "name": "Goal disabled retry",
+                    "preview": "",
+                    "cwd": workspace,
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    client
+        .request("debug/setGoalsEnabled", json!({ "enabled": false }))
+        .await
+        .unwrap();
+
+    let set = set_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-disabled",
+        json!({
+            "objective": "retry goal enablement"
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        set.get("goal")
+            .and_then(|goal| goal.get("objective"))
+            .and_then(Value::as_str),
+        Some("retry goal enablement")
+    );
+    let count = client
+        .request(
+            "debug/requestCount",
+            json!({
+                "target": "experimentalFeature/enablement/set"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count.get("count").and_then(Value::as_u64), Some(2));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn thread_goal_notifications_are_mapped_for_session_streams() {
     let event = map_app_server_session_notification(&AppServerNotification {

@@ -30,6 +30,7 @@
     "build:cross": "node ./scripts/build-cross.mjs",
     "verify:api-parity": "node ./scripts/verify-api-parity.mjs",
     "verify:codex-compat": "node ./scripts/verify-codex-compat.mjs",
+    "verify:codex-protocol": "pnpm verify:codex-compat",
     "verify:static-build": "node ./scripts/verify-static-build.mjs",
     "verify:security-regressions": "node ./scripts/verify-security-regressions.mjs",
     "verify:tunnel-safety": "node ./scripts/verify-tunnel-safety.mjs",

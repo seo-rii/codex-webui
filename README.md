@@ -134,6 +134,7 @@ For migration regression checks, run:
 ```bash
 pnpm verify:static-build
 pnpm verify:api-parity
+pnpm verify:codex-protocol
 pnpm verify:security-regressions
 ```
 
@@ -346,6 +347,7 @@ pnpm check
 pnpm build
 pnpm verify:static-build
 pnpm verify:api-parity
+pnpm verify:codex-protocol
 pnpm verify:security-regressions
 cargo check --manifest-path backend/Cargo.toml
 ```

@@ -21,6 +21,30 @@ In the comparison columns:
 - `Different shape`: supported, but with a browser-specific UX rather than a direct clone
 - `Not targeted`: not a current parity goal
 
+## Upstream Compatibility Tracking
+
+`codex-webui` tracks upstream Codex app-server and slash-command drift with:
+
+```bash
+pnpm verify:codex-protocol
+```
+
+The check reads a sibling Codex checkout at `../codex` by default, or the path in
+`CODEX_REPO_PATH`. It verifies that every upstream slash command is classified in
+`src/lib/codex-commands.ts` and that each app-server request/notification is
+explicitly marked as supported, planned, blocked, or relayed. If the Codex
+checkout is missing, the check skips so packaged builds do not depend on a local
+source tree.
+
+Compatibility decisions use these buckets:
+
+| Upstream surface | codex-webui policy |
+| --- | --- |
+| Core thread/session/model/account requests | Proxy through the Rust gateway to the managed Codex app-server when the browser needs the native behavior. |
+| Browser-native workflows such as queue, Git workspace, attachments, and tabs | Implement directly in `codex-webui` because they are specific to reconnect-safe web operation. |
+| Host-level process, filesystem, plugin install, and MCP approval calls | Keep blocked unless they are wrapped in `codex-webui`'s explicit allowed-root, owner-role, audit, and UI safety model. |
+| Emerging upstream features | Classify immediately, then implement as native UI, app-server proxy, planned work, or intentionally blocked behavior before exposing them in the composer. |
+
 ## High-Level Comparison
 
 | Capability | codex-webui | Codex app comparison | Codex IDE extension comparison | Notes |

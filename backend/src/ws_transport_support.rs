@@ -190,77 +190,80 @@ async fn handle_ws_message(
 
             let params_hash = request_params_hash(&params);
             let request_key = request_cache_key(&auth.profile_id, &id, auth.role);
+            let use_request_replay = ws_method_uses_request_replay(&method);
 
-            match cached_response(state, &request_key, &method, &params_hash).await {
-                CachedResponseLookup::Hit(cached) => {
-                    let _ = out_tx.send(cached).await;
-                    return Ok(());
+            if use_request_replay {
+                match cached_response(state, &request_key, &method, &params_hash).await {
+                    CachedResponseLookup::Hit(cached) => {
+                        let _ = out_tx.send(cached).await;
+                        return Ok(());
+                    }
+                    CachedResponseLookup::Conflict => {
+                        let _ = out_tx
+                            .send(ServerEnvelope::Response {
+                                id,
+                                ok: false,
+                                result: None,
+                                error: Some(
+                                    "WebSocket request id was already used with a different method or parameters."
+                                        .to_string(),
+                                ),
+                            })
+                            .await;
+                        return Ok(());
+                    }
+                    CachedResponseLookup::Miss => {}
                 }
-                CachedResponseLookup::Conflict => {
-                    let _ = out_tx
-                        .send(ServerEnvelope::Response {
-                            id,
-                            ok: false,
-                            result: None,
-                            error: Some(
-                                "WebSocket request id was already used with a different method or parameters."
-                                    .to_string(),
-                            ),
-                        })
-                        .await;
-                    return Ok(());
-                }
-                CachedResponseLookup::Miss => {}
-            }
 
-            match register_inflight_request(state, &request_key, &method, &params_hash, out_tx)
-                .await
-            {
-                InflightRequestRegistration::Started => {}
-                InflightRequestRegistration::Joined => return Ok(()),
-                InflightRequestRegistration::Conflict => {
-                    let _ = out_tx
-                        .send(ServerEnvelope::Response {
-                            id,
-                            ok: false,
-                            result: None,
-                            error: Some(
-                                "WebSocket request id is already in flight with a different method or parameters."
-                                    .to_string(),
-                            ),
-                        })
-                        .await;
-                    return Ok(());
-                }
-                InflightRequestRegistration::Full => {
-                    let _ = out_tx
-                        .send(ServerEnvelope::Response {
-                            id,
-                            ok: false,
-                            result: None,
-                            error: Some("Too many in-flight websocket requests.".to_string()),
-                        })
-                        .await;
-                    return Ok(());
+                match register_inflight_request(state, &request_key, &method, &params_hash, out_tx)
+                    .await
+                {
+                    InflightRequestRegistration::Started => {}
+                    InflightRequestRegistration::Joined => return Ok(()),
+                    InflightRequestRegistration::Conflict => {
+                        let _ = out_tx
+                            .send(ServerEnvelope::Response {
+                                id,
+                                ok: false,
+                                result: None,
+                                error: Some(
+                                    "WebSocket request id is already in flight with a different method or parameters."
+                                        .to_string(),
+                                ),
+                            })
+                            .await;
+                        return Ok(());
+                    }
+                    InflightRequestRegistration::Full => {
+                        let _ = out_tx
+                            .send(ServerEnvelope::Response {
+                                id,
+                                ok: false,
+                                result: None,
+                                error: Some("Too many in-flight websocket requests.".to_string()),
+                            })
+                            .await;
+                        return Ok(());
+                    }
                 }
             }
 
             let Some(_profile_permit) =
                 try_acquire_profile_ws_request_slot(state, &auth.profile_id).await
             else {
-                resolve_inflight_request(
-                    state,
-                    &request_key,
-                    ServerEnvelope::Response {
-                        id,
-                        ok: false,
-                        result: None,
-                        error: Some(
-                            "Too many concurrent websocket requests for this profile.".to_string(),
-                        ),
-                    },
-                )
-                .await;
+                let message = ServerEnvelope::Response {
+                    id,
+                    ok: false,
+                    result: None,
+                    error: Some(
+                        "Too many concurrent websocket requests for this profile.".to_string(),
+                    ),
+                };
+                if use_request_replay {
+                    resolve_inflight_request(state, &request_key, message).await;
+                } else {
+                    let _ = out_tx.send(message).await;
+                }
                 return Ok(());
             };
 
@@ -374,8 +377,12 @@ async fn handle_ws_message(
                 });
             }
 
-            cache_response(state, &request_key, &method, &params_hash, message.clone()).await;
-            resolve_inflight_request(state, &request_key, message).await;
+            if use_request_replay {
+                cache_response(state, &request_key, &method, &params_hash, message.clone()).await;
+                resolve_inflight_request(state, &request_key, message).await;
+            } else {
+                let _ = out_tx.send(message).await;
+            }
         }
     }
 

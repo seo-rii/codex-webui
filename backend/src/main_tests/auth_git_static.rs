@@ -1330,6 +1330,30 @@ fn viewer_websocket_permissions_are_session_observation_only() {
     }
 }
 
+#[test]
+fn connection_local_websocket_methods_bypass_request_replay() {
+    for method in [
+        "session/subscribe",
+        "session/unsubscribe",
+        "terminal/subscribe",
+        "terminal/unsubscribe",
+        "events/subscribe",
+        "events/unsubscribe",
+    ] {
+        assert!(
+            !ws_method_uses_request_replay(method),
+            "{method} must install connection-local side effects on every request"
+        );
+    }
+
+    for method in ["session/get", "sessions/list", "turn/send", "git/status"] {
+        assert!(
+            ws_method_uses_request_replay(method),
+            "{method} should keep normal websocket idempotency replay"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn viewer_http_routes_match_websocket_authorization_policy() {
     let sandbox = unique_test_dir("viewer-http-policy");
@@ -2485,6 +2509,44 @@ async fn destructive_git_mutations_reject_active_codex_work() {
         "Refusing to mutate this repository while a Codex turn is active."
     );
 
+    let error = save_git_file_payload(&state, repo.to_str().unwrap(), "busy.txt", "busy\n")
+        .await
+        .expect_err("file save should reject active Codex work");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+
+    let error = stage_git_changes_payload(&state, repo.to_str().unwrap(), Some("busy.txt"))
+        .await
+        .expect_err("stage should reject active Codex work");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+
+    let error = unstage_git_changes_payload(&state, repo.to_str().unwrap(), Some("busy.txt"))
+        .await
+        .expect_err("unstage should reject active Codex work");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+
+    let error = commit_git_changes_payload(&state, repo.to_str().unwrap(), "busy commit")
+        .await
+        .expect_err("commit should reject active Codex work");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+
+    let worktree = workspace.join("busy-worktree");
+    let error = create_git_worktree_payload(
+        &state,
+        repo.to_str().unwrap(),
+        worktree.to_str().unwrap(),
+        Some("busy-worktree"),
+        true,
+        false,
+    )
+    .await
+    .expect_err("worktree create should reject active Codex work");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+
+    let error = checkout_github_pull_request_payload(&state, repo.to_str().unwrap(), 1)
+        .await
+        .expect_err("GitHub PR checkout should reject active Codex work before gh runs");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+
     let _ = fs::remove_dir_all(sandbox);
 }
 
@@ -2518,6 +2580,43 @@ async fn git_file_save_rejects_symlinked_parent_escape() {
         "Refusing to write through a symlinked parent directory."
     );
     assert!(!outside.join("secret.txt").exists());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_worktree_create_rejects_symlinked_parent_escape() {
+    let sandbox = unique_test_dir("git-worktree-symlink-parent");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let repo = workspace.join("repo");
+    let outside = sandbox.join("outside");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    init_test_git_repo(&repo);
+    std::os::unix::fs::symlink(&outside, workspace.join("link-out")).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let target = workspace.join("link-out").join("new-worktree");
+    let error = create_git_worktree_payload(
+        &state,
+        repo.to_str().unwrap(),
+        target.to_str().unwrap(),
+        Some("escape-worktree"),
+        true,
+        false,
+    )
+    .await
+    .expect_err("worktree create must not follow a symlinked parent");
+
+    assert_eq!(error.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        error.message,
+        "Refusing to create a worktree through a symlinked parent directory."
+    );
+    assert!(!outside.join("new-worktree").exists());
 
     let _ = fs::remove_dir_all(sandbox);
 }

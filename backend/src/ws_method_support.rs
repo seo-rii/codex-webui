@@ -51,6 +51,18 @@ pub(crate) fn ws_method_requires_owner(method: &str, params: &Value) -> bool {
             .unwrap_or(false))
 }
 
+pub(crate) fn ws_method_uses_request_replay(method: &str) -> bool {
+    !matches!(
+        method,
+        "session/subscribe"
+            | "session/unsubscribe"
+            | "terminal/subscribe"
+            | "terminal/unsubscribe"
+            | "events/subscribe"
+            | "events/unsubscribe"
+    )
+}
+
 pub(crate) fn authorize_ws_method(
     config: &Config,
     role: UserRole,

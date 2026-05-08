@@ -1322,6 +1322,7 @@
   let transcriptDockElement = $state<HTMLDivElement | undefined>(undefined);
   let stickTranscriptToBottom = $state(true);
   let forceTranscriptScroll = $state(false);
+  let transcriptAutoScrollSuspendedByUser = $state(false);
   let composerSettingsTriggerElement = $state<HTMLButtonElement | undefined>(undefined);
   let composerSettingsPopoverElement = $state<HTMLDivElement | undefined>(undefined);
   let composerSettingsPopoverStyle = $state("");
@@ -1349,6 +1350,7 @@
   let transcriptDockReservePx = $state(196);
   let transcriptScrollGeneration = 0;
   let transcriptUserScrollIntentUntil = 0;
+  let transcriptProgrammaticScrollUntil = 0;
   let composerHistory = $state<string[]>([]);
   let composerHistoryIndex = $state(-1);
   let composerHistoryDraft = $state("");
@@ -3203,8 +3205,60 @@
     return { added, removed };
   }
 
+  function isTranscriptAtBottom(threshold = scrollBottomThreshold) {
+    if (!transcriptElement) {
+      return true;
+    }
+    return transcriptElement.scrollHeight - transcriptElement.scrollTop - transcriptElement.clientHeight <= threshold;
+  }
+
+  function suspendTranscriptAutoScrollForUser() {
+    transcriptAutoScrollSuspendedByUser = true;
+    stickTranscriptToBottom = false;
+    forceTranscriptScroll = false;
+    if (transcriptScrollFrame !== null && typeof window !== "undefined") {
+      cancelAnimationFrame(transcriptScrollFrame);
+    }
+    transcriptScrollFrame = null;
+    transcriptScrollGeneration += 1;
+  }
+
+  function requestTranscriptBottomScroll(force = false) {
+    if (force) {
+      transcriptAutoScrollSuspendedByUser = false;
+      noteTranscriptProgrammaticScroll(700);
+    } else if (transcriptAutoScrollSuspendedByUser && !isTranscriptAtBottom()) {
+      stickTranscriptToBottom = false;
+      forceTranscriptScroll = false;
+      return;
+    }
+
+    stickTranscriptToBottom = true;
+    forceTranscriptScroll = true;
+  }
+
+  function preserveTranscriptScrollAfterDataUpdate(force = false) {
+    if (force || isTranscriptAtBottom()) {
+      requestTranscriptBottomScroll(true);
+      return;
+    }
+
+    if (transcriptAutoScrollSuspendedByUser) {
+      stickTranscriptToBottom = false;
+      forceTranscriptScroll = false;
+      return;
+    }
+
+    if (stickTranscriptToBottom || forceTranscriptScroll) {
+      requestTranscriptBottomScroll();
+    }
+  }
+
   function scheduleTranscriptScrollToBottom() {
     if (!transcriptElement) {
+      return;
+    }
+    if (transcriptAutoScrollSuspendedByUser && !forceTranscriptScroll) {
       return;
     }
 
@@ -3215,6 +3269,7 @@
 
       const previousBehavior = transcriptElement.style.scrollBehavior;
       transcriptElement.style.scrollBehavior = "auto";
+      noteTranscriptProgrammaticScroll();
       transcriptElement.scrollTo({ top, behavior: "auto" });
 
       if (previousBehavior) {
@@ -3249,7 +3304,11 @@
           transcriptScrollFrame = null;
           return;
         }
-        if (loadingOlderTurns || (!stickTranscriptToBottom && !forceTranscriptScroll)) {
+        if (
+          loadingOlderTurns ||
+          (transcriptAutoScrollSuspendedByUser && !forceTranscriptScroll) ||
+          (!stickTranscriptToBottom && !forceTranscriptScroll)
+        ) {
           transcriptScrollFrame = null;
           forceTranscriptScroll = false;
           return;
@@ -3298,6 +3357,10 @@
 
   function hasTranscriptUserScrollIntent() {
     return getTranscriptNow() <= transcriptUserScrollIntentUntil;
+  }
+
+  function noteTranscriptProgrammaticScroll(durationMs = 180) {
+    transcriptProgrammaticScrollUntil = getTranscriptNow() + durationMs;
   }
 
   function isCacheValidationResponse(
@@ -4301,8 +4364,7 @@
     draft = "";
     draftAttachments = [];
     titleDraft = "";
-    stickTranscriptToBottom = true;
-    forceTranscriptScroll = true;
+    requestTranscriptBottomScroll(true);
     olderTurnsAutoLoadEnabled = true;
     olderTurnsAutoLoadPaused = false;
     olderTurnsAutoTriggerTimestamps = [];
@@ -4342,8 +4404,7 @@
           const summaryUpdatedAt = normalizeSessionTimestamp(selectionSummary?.updatedAt ?? 0);
           knownVersion = summaryUpdatedAt > cachedUpdatedAt ? null : cachedEntry.version;
           turnLimit = Math.max(olderTurnPageSize, cachedEntry.payload.thread.turns.length);
-          stickTranscriptToBottom = true;
-          forceTranscriptScroll = true;
+          requestTranscriptBottomScroll(true);
         }
       }
 
@@ -4858,8 +4919,7 @@
       clearHydrationRefresh();
       clearStaleSessionCatchup();
       updateSessionRecoveryPrompt(sessionId, nextConversation);
-      stickTranscriptToBottom = true;
-      forceTranscriptScroll = true;
+      preserveTranscriptScrollAfterDataUpdate(loadDraft || replaceWithRecentWindow);
       return nextConversation;
     }
 
@@ -4903,8 +4963,7 @@
       if (loadDraft) {
         await loadSavedDraft(nextDetail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
       }
-      stickTranscriptToBottom = true;
-      forceTranscriptScroll = true;
+      preserveTranscriptScrollAfterDataUpdate(loadDraft || replaceWithRecentWindow);
       return nextConversation;
     }
 
@@ -4932,8 +4991,7 @@
     if (replaceWithRecentWindow && skippedEventCount > 0) {
       scheduleSelectedSessionStateRefresh(detail.thread.id, 160, true);
     }
-    stickTranscriptToBottom = true;
-    forceTranscriptScroll = true;
+    preserveTranscriptScrollAfterDataUpdate(loadDraft || replaceWithRecentWindow);
     return nextConversation;
   }
 
@@ -7745,8 +7803,7 @@
       baselineTurnId: currentConversation.thread.turns.at(-1)?.id ?? null,
       baselineTurnCount: currentConversation.thread.turns.length
     };
-    stickTranscriptToBottom = true;
-    forceTranscriptScroll = true;
+    requestTranscriptBottomScroll(true);
   }
 
   function clearOptimisticMessageState(sessionId: string, prompt: string | null = null) {
@@ -7932,8 +7989,7 @@
   function editMessageText(text: string) {
     draft = text;
     activeWorkspaceTabId = "chat";
-    stickTranscriptToBottom = true;
-    forceTranscriptScroll = true;
+    requestTranscriptBottomScroll(true);
   }
 
   async function forkCurrentThread(
@@ -8754,13 +8810,17 @@
       return;
     }
 
-    const remaining = transcriptElement.scrollHeight - transcriptElement.scrollTop - transcriptElement.clientHeight;
-    if (remaining <= scrollBottomThreshold) {
+    if (isTranscriptAtBottom()) {
+      transcriptAutoScrollSuspendedByUser = false;
       stickTranscriptToBottom = true;
+    } else if (
+      hasTranscriptUserScrollIntent() ||
+      transcriptAutoScrollSuspendedByUser ||
+      getTranscriptNow() > transcriptProgrammaticScrollUntil
+    ) {
+      suspendTranscriptAutoScrollForUser();
     } else if (forceTranscriptScroll) {
       stickTranscriptToBottom = true;
-    } else if (hasTranscriptUserScrollIntent()) {
-      stickTranscriptToBottom = false;
     } else if (stickTranscriptToBottom) {
       scheduleTranscriptScrollToBottom();
       return;
@@ -9147,8 +9207,7 @@
         return;
       }
 
-      stickTranscriptToBottom = false;
-      forceTranscriptScroll = false;
+      suspendTranscriptAutoScrollForUser();
       target.scrollIntoView({
         block: "start",
         behavior: "smooth"

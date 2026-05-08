@@ -183,7 +183,7 @@ fn static_asset_response(asset: CachedStaticAsset) -> Response {
                 offset = close_start + "</script>".len();
             }
         }
-        csp.push_str(" https://hcaptcha.com https://*.hcaptcha.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http: https:; font-src 'self' data:; connect-src 'self' https://hcaptcha.com https://*.hcaptcha.com ws: wss:; worker-src 'self' blob:; frame-src https://hcaptcha.com https://*.hcaptcha.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+        csp.push_str(" https://hcaptcha.com https://*.hcaptcha.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://hcaptcha.com https://*.hcaptcha.com; worker-src 'self' blob:; frame-src https://hcaptcha.com https://*.hcaptcha.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
         if let Ok(value) = HeaderValue::from_str(&csp) {
             headers.insert(
                 header::HeaderName::from_static("content-security-policy"),

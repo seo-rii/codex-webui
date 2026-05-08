@@ -48,6 +48,11 @@ pub(crate) async fn handle_session_attachments_api_http(
             if let Err(error) = tokio_fs::create_dir_all(&uploads_dir).await {
                 return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
             }
+            let used_storage = match profile_attachment_storage_size(&state, &auth.profile_id).await
+            {
+                Ok(size) => size,
+                Err(error) => return json_error(error.status, &error.message),
+            };
 
             loop {
                 let mut field = match multipart.next_field().await {
@@ -106,12 +111,16 @@ pub(crate) async fn handle_session_attachments_api_http(
                         let _ = tokio_fs::remove_file(&temp_path).await;
                         return json_error(error.status, &error.message);
                     }
-                    if let Err(error) =
-                        validate_attachment_storage_quota(&state, &auth.profile_id, next_total_size)
-                            .await
+                    if used_storage.saturating_add(next_total_size)
+                        > state.config.max_attachment_storage_bytes
                     {
                         let _ = tokio_fs::remove_file(&temp_path).await;
-                        return json_error(error.status, &error.message);
+                        return json_error(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            &attachment_storage_quota_error_message(
+                                state.config.max_attachment_storage_bytes,
+                            ),
+                        );
                     }
                     total_size = next_total_size;
                     if let Err(error) = temp_file.write_all(&chunk).await {
@@ -120,6 +129,10 @@ pub(crate) async fn handle_session_attachments_api_http(
                     }
                 }
                 if let Err(error) = temp_file.flush().await {
+                    let _ = tokio_fs::remove_file(&temp_path).await;
+                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                }
+                if let Err(error) = temp_file.sync_all().await {
                     let _ = tokio_fs::remove_file(&temp_path).await;
                     return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
                 }

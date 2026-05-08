@@ -630,6 +630,34 @@ async fn session_attachment_upload_rejects_oversized_streamed_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_storage_quota_ignores_streaming_temp_files() {
+    let sandbox = unique_test_dir("attachment-temp-quota");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let mut state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let mut config = (*state.config).clone();
+    config.max_attachment_storage_bytes = 8;
+    state.config = Arc::new(config);
+    let uploads_dir = session_uploads_dir(&state, "default", "thread-1");
+    fs::create_dir_all(&uploads_dir).unwrap();
+    fs::write(
+        uploads_dir.join(".partial.upload"),
+        b"temporary upload bytes",
+    )
+    .unwrap();
+
+    validate_attachment_storage_quota(&state, "default", 8)
+        .await
+        .expect("streaming temp files should not count against profile storage quota");
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_routes_reject_invalid_session_ids_before_storage_access() {
     let sandbox = unique_test_dir("session-route-invalid-id");
     let workspace = sandbox.join("workspace");

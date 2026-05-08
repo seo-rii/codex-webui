@@ -179,7 +179,10 @@ pub(crate) fn validate_total_attachment_size(config: &Config, size: u64) -> ApiR
     Ok(())
 }
 
-async fn profile_attachment_storage_size(state: &AppState, profile_id: &str) -> ApiResult<u64> {
+pub(crate) async fn profile_attachment_storage_size(
+    state: &AppState,
+    profile_id: &str,
+) -> ApiResult<u64> {
     let uploads_root = resolve_runtime_profile(&state.config, profile_id)
         .data_dir
         .join("uploads");
@@ -218,6 +221,7 @@ async fn profile_attachment_storage_size(state: &AppState, profile_id: &str) -> 
             let file_name = entry.file_name().to_string_lossy().to_string();
             if file_name.starts_with(".upload-")
                 || file_name.starts_with(".codex-webui-attachment-")
+                || file_name.ends_with(".upload")
             {
                 continue;
             }
@@ -430,6 +434,9 @@ pub(crate) async fn store_uploaded_attachment_file(
     tokio_fs::rename(source_path, &file_path)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if let Ok(parent_dir) = tokio_fs::File::open(&uploads_dir).await {
+        let _ = parent_dir.sync_all().await;
+    }
 
     let record = StoredAttachmentRecord {
         id: attachment_id,

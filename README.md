@@ -226,7 +226,7 @@ Meaning of the main fields:
 - `profiles`: named Codex runtimes, each with its own `CODEX_HOME` and profile-local data directory
 - `allowedRoots`: filesystem roots the UI is allowed to browse
 - `passwordHash`: hashed login password
-- `ownerPasswordHash`: optional stronger owner login for terminal, runtime install/update, shutdown, and other host-level operations
+- `ownerPasswordHash`: stronger owner login for terminal, runtime install/update, shutdown, and other host-level operations; required before starting a public tunnel
 - `sessionSecret`: cookie signing secret
 - `corsAllowedOrigins`: trusted origins allowed to use browser credentials against the gateway
 - `backendBinaryPath`: explicit Rust gateway path, mainly for packaged or custom deployments

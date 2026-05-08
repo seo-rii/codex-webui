@@ -177,12 +177,14 @@ Behavior:
 6. `logs` prints the most recent tunnel log lines without requiring the user to hunt down the log file manually
 
 Before opening a public tunnel, the CLI prints a safety checklist covering the
-configured owner password, hCaptcha, allowed roots, and public route. Interactive
-runs require the `Type "expose"` prompt to be answered with `expose`;
-non-interactive runs must pass `--yes` or set
-`CODEX_WEBUI_TUNNEL_ASSUME_YES=true`. This is intentional because a tunnel
-exposes Codex control, Git operations, file tools, runtime actions, and host
-terminals outside localhost.
+configured owner password, hCaptcha, allowed roots, and public route. Public
+tunnel mode requires `ownerPasswordHash` so terminal, runtime, shutdown, and
+other host-level actions cannot silently fall back to the normal admin role when
+the gateway is bound to loopback behind a tunnel. Interactive runs require the
+`Type "expose"` prompt to be answered with `expose`; non-interactive runs must
+pass `--yes` or set `CODEX_WEBUI_TUNNEL_ASSUME_YES=true`. This is intentional
+because a tunnel exposes Codex control, Git operations, file tools, runtime
+actions, and host terminals outside localhost.
 
 Provider notes:
 

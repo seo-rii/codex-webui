@@ -59,6 +59,39 @@ try {
   };
   await fs.writeFile(path.join(configDir, "codex-webui.yml"), JSON.stringify(config, null, 2));
 
+  const missingOwnerResult = spawnSync(
+    process.execPath,
+    [
+      path.join(repoRoot, "bin", "codex-webui.mjs"),
+      "tunnel",
+      "start",
+      "--provider",
+      "cloudflared",
+      "--json",
+      "--yes"
+    ],
+    {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`
+      }
+    }
+  );
+
+  assert.notEqual(missingOwnerResult.status, 0, "tunnel start must require an owner password hash");
+  assert.match(
+    missingOwnerResult.stderr,
+    /Owner password hash is required/u,
+    "failure should explain the owner credential requirement for public tunnels"
+  );
+
+  config.ownerPasswordHash = "scrypt$owner-placeholder$placeholder";
+  await fs.writeFile(path.join(configDir, "codex-webui.yml"), JSON.stringify(config, null, 2));
+
   const result = spawnSync(
     process.execPath,
     [path.join(repoRoot, "bin", "codex-webui.mjs"), "tunnel", "start", "--provider", "cloudflared", "--json"],

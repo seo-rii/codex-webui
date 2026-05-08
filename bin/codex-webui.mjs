@@ -682,9 +682,6 @@ function tunnelSafetyFindings(config) {
   if (!String(config.sessionSecret ?? "").trim() || String(config.sessionSecret ?? "").trim().length < 32) {
     findings.push("Session secret is missing or short.");
   }
-  if (!String(config.ownerPasswordHash ?? "").trim()) {
-    findings.push("Owner password is not configured, so admin sessions can still use terminal/runtime/shutdown actions.");
-  }
   if (!String(config.hcaptchaSiteKey ?? "").trim() || !String(config.hcaptchaSecretKey ?? "").trim()) {
     findings.push("hCaptcha is not configured for the public login surface.");
   }
@@ -698,7 +695,15 @@ function tunnelSafetyFindings(config) {
   return findings;
 }
 
-function printTunnelSafetyChecklist(config, launch, findings) {
+function tunnelBlockingFindings(config) {
+  const findings = [];
+  if (!String(config.ownerPasswordHash ?? "").trim()) {
+    findings.push("Owner password hash is required before starting a public tunnel.");
+  }
+  return findings;
+}
+
+function printTunnelSafetyChecklist(config, launch, findings, blockingFindings = []) {
   console.log("Tunnel safety checklist:");
   console.log(`  Provider: ${launch.provider}`);
   console.log(`  Local origin: ${launch.originUrl}`);
@@ -706,6 +711,13 @@ function printTunnelSafetyChecklist(config, launch, findings) {
   console.log(`  Allowed roots: ${(config.allowedRoots ?? []).join(", ") || "(none)"}`);
   console.log(`  Owner password: ${String(config.ownerPasswordHash ?? "").trim() ? "configured" : "not configured"}`);
   console.log(`  hCaptcha: ${String(config.hcaptchaSiteKey ?? "").trim() && String(config.hcaptchaSecretKey ?? "").trim() ? "configured" : "not configured"}`);
+  if (blockingFindings.length > 0) {
+    console.log("");
+    console.log("Blocking issues:");
+    for (const finding of blockingFindings) {
+      console.log(`  - ${finding}`);
+    }
+  }
   if (findings.length > 0) {
     console.log("");
     console.log("Warnings:");
@@ -718,11 +730,19 @@ function printTunnelSafetyChecklist(config, launch, findings) {
 }
 
 async function confirmTunnelSafety(config, options, launch) {
+  const findings = tunnelSafetyFindings(config);
+  const blockingFindings = tunnelBlockingFindings(config);
+  if (blockingFindings.length > 0) {
+    if (!options.json) {
+      printTunnelSafetyChecklist(config, launch, findings, blockingFindings);
+    }
+    throw new Error(`Refusing to start a public tunnel. ${blockingFindings.join(" ")}`);
+  }
+
   if (options.yes || process.env.CODEX_WEBUI_TUNNEL_ASSUME_YES === "true") {
     return;
   }
 
-  const findings = tunnelSafetyFindings(config);
   printTunnelSafetyChecklist(config, launch, findings);
 
   if (!process.stdin.isTTY || options.json) {

@@ -9,8 +9,39 @@ async fn resolve_git_worktree_path(state: &AppState, worktree_path: &str) -> Api
     }
 
     let candidate = resolve_input_path(&state.config.project_root, worktree_path);
-    let existing = tokio_fs::canonicalize(&candidate).await.ok();
-    let path_to_check = existing.unwrap_or_else(|| candidate.clone());
+    let mut ancestor = PathBuf::new();
+    let mut nearest_existing = None;
+    for component in candidate.components() {
+        ancestor.push(component.as_os_str());
+        if let Ok(metadata) = tokio_fs::symlink_metadata(&ancestor).await
+            && metadata.file_type().is_symlink()
+        {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "Refusing to create a worktree through a symlinked parent directory.",
+            ));
+        }
+        if tokio_fs::metadata(&ancestor).await.is_ok() {
+            nearest_existing = Some(ancestor.clone());
+        }
+    }
+    let path_to_check = match tokio_fs::canonicalize(&candidate).await {
+        Ok(existing) => existing,
+        Err(_) => {
+            let existing_parent = nearest_existing.ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "The selected worktree parent directory is invalid.",
+                )
+            })?;
+            tokio_fs::canonicalize(existing_parent).await.map_err(|_| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "The selected worktree parent directory is invalid.",
+                )
+            })?
+        }
+    };
     let allowed_roots = resolved_allowed_roots(&state.config).await;
     if !allowed_roots
         .iter()
@@ -112,7 +143,14 @@ pub(crate) async fn create_git_worktree_payload(
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
     let repo_lock = git_operation_lock(state, &repo_root).await;
     let _repo_guard = repo_lock.lock().await;
-    let resolved_worktree_path = resolve_git_worktree_path(state, worktree_path).await?;
+    reject_git_mutation_if_repo_busy(state, &repo_root).await?;
+    let mut resolved_worktree_path = resolve_git_worktree_path(state, worktree_path).await?;
+    if let Some(parent) = Path::new(&resolved_worktree_path).parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        resolved_worktree_path = resolve_git_worktree_path(state, &resolved_worktree_path).await?;
+    }
     let trimmed_branch_name = branch_name
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -170,6 +208,7 @@ pub(crate) async fn remove_git_worktree_payload(
     let repo_lock = git_operation_lock(state, &repo_root).await;
     let _repo_guard = repo_lock.lock().await;
     let resolved_worktree_path = resolve_git_worktree_path(state, worktree_path).await?;
+    reject_git_mutation_if_repo_busy(state, &repo_root).await?;
     reject_git_mutation_if_repo_busy(state, &resolved_worktree_path).await?;
     let worktrees_output = run_git_text_payload(
         state,

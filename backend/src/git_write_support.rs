@@ -96,6 +96,7 @@ pub(crate) async fn save_git_file_payload(
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
     let repo_lock = git_operation_lock(state, &repo_root).await;
     let _repo_guard = repo_lock.lock().await;
+    reject_git_mutation_if_repo_busy(state, &repo_root).await?;
     let target_path = resolve_git_repository_file_path(&repo_root, file_path).await?;
     let repo_root_path = tokio_fs::canonicalize(&repo_root)
         .await
@@ -112,6 +113,7 @@ pub(crate) async fn stage_git_changes_payload(
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
     let repo_lock = git_operation_lock(state, &repo_root).await;
     let _repo_guard = repo_lock.lock().await;
+    reject_git_mutation_if_repo_busy(state, &repo_root).await?;
     let args = if let Some(file_path) = file_path.filter(|value| !value.trim().is_empty()) {
         vec![
             "--literal-pathspecs".to_string(),
@@ -134,6 +136,7 @@ pub(crate) async fn unstage_git_changes_payload(
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
     let repo_lock = git_operation_lock(state, &repo_root).await;
     let _repo_guard = repo_lock.lock().await;
+    reject_git_mutation_if_repo_busy(state, &repo_root).await?;
     let args = if let Some(file_path) = file_path.filter(|value| !value.trim().is_empty()) {
         vec![
             "--literal-pathspecs".to_string(),
@@ -200,6 +203,7 @@ pub(crate) async fn commit_git_changes_payload(
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
     let repo_lock = git_operation_lock(state, &repo_root).await;
     let _repo_guard = repo_lock.lock().await;
+    reject_git_mutation_if_repo_busy(state, &repo_root).await?;
     let trimmed_message = message.trim();
     if trimmed_message.is_empty() {
         return Err(api_error(

@@ -397,6 +397,16 @@ pub(crate) async fn run_automation_payload(
             ));
         };
 
+        if automation_runs.iter().any(|entry| {
+            entry.get("automationId").and_then(Value::as_str) == Some(automation_id)
+                && entry.get("status").and_then(Value::as_str) == Some("running")
+        }) {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "Automation is already starting.",
+            ));
+        }
+
         let next_run = json!({
             "id": run_id,
             "automationId": automation_id,
@@ -437,9 +447,8 @@ pub(crate) async fn run_automation_payload(
             let time_suffix = now.to_string();
             let worktree_name = build_automation_worktree_name(&automation_name);
             let worktree = repo_root_path
-                .parent()
-                .unwrap_or_else(|| repo_root_path.as_path())
-                .join(".codex-webui-worktrees")
+                .join(".codex-webui")
+                .join("worktrees")
                 .join(&worktree_name)
                 .join(&time_suffix);
             let branch_name = format!("automation/{worktree_name}-{time_suffix}");

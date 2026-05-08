@@ -1806,3 +1806,80 @@ async fn saves_and_deletes_automations_with_normalization() {
 
     let _ = fs::remove_dir_all(sandbox);
 }
+
+#[tokio::test]
+async fn automation_run_rejects_duplicate_starting_run() {
+    let sandbox = unique_test_dir("automation-duplicate-run");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &ui_state_path,
+        serde_json::to_vec_pretty(&json!({
+            "global": {
+                "shutdownAfterQueueCompletes": false,
+                "scheduledShutdown": Value::Null
+            },
+            "notifications": {
+                "items": [],
+                "settings": default_notification_settings_value()
+            },
+            "sessionMetaByThreadId": {},
+            "savedSessionFilters": [],
+            "promptPresets": [],
+            "automations": [{
+                "id": "auto-1",
+                "name": "Daily task",
+                "prompt": "Check status.",
+                "enabled": false,
+                "scheduleMode": "manual",
+                "intervalMinutes": Value::Null,
+                "target": "local",
+                "repoPath": Value::Null,
+                "cwd": Value::Null,
+                "model": Value::Null,
+                "effort": Value::Null,
+                "speed": Value::Null,
+                "mode": Value::Null,
+                "createdAt": 1,
+                "updatedAt": 1,
+                "lastRunAt": Value::Null,
+                "nextRunAt": Value::Null
+            }],
+            "automationRuns": [{
+                "id": "run-1",
+                "automationId": "auto-1",
+                "automationName": "Daily task",
+                "status": "running",
+                "trigger": "manual",
+                "sessionId": Value::Null,
+                "repoPath": Value::Null,
+                "cwd": Value::Null,
+                "worktreePath": Value::Null,
+                "startedAt": 1,
+                "completedAt": Value::Null,
+                "error": Value::Null
+            }],
+            "preferencesByThreadId": {},
+            "draftsByThreadId": {},
+            "queuesByThreadId": {},
+            "highlightsByThreadId": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = run_automation_payload(&state, "default", "auto-1", "manual")
+        .await
+        .expect_err("duplicate starting automation runs should be rejected before app-server work");
+
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "Automation is already starting.");
+
+    let _ = fs::remove_dir_all(sandbox);
+}

@@ -3,7 +3,8 @@ use super::*;
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const ACCOUNT_LOGIN_FLOW_TTL: Duration = Duration::from_secs(15 * 60);
-const ACCOUNT_APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
+const ACCOUNT_APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
+const ACCOUNT_APP_SERVER_RECOVERY_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) async fn codex_runtime_status(state: &AppState, check_latest: bool) -> Result<Value> {
     let configured_bin = state.config.codex_bin.clone();
@@ -162,31 +163,76 @@ pub(crate) async fn codex_quota_status(
 
 pub(crate) async fn get_account_state(state: &AppState, profile_id: &str) -> Result<Value> {
     let client = app_server_client(state, profile_id).await?;
-    match tokio::time::timeout(
-        ACCOUNT_APP_SERVER_REQUEST_TIMEOUT,
-        client.request("account/read", json!({ "refreshToken": false })),
-    )
-    .await
+    let response = match client
+        .request_with_timeout(
+            "account/read",
+            json!({ "refreshToken": false }),
+            ACCOUNT_APP_SERVER_REQUEST_TIMEOUT,
+            true,
+        )
+        .await
     {
-        Ok(Ok(response)) => Ok(json!({
+        Ok(response) => response,
+        Err(error)
+            if app_server_timeout_recovered(&error) || app_server_request_interrupted(&error) =>
+        {
+            match client
+                .request_with_timeout(
+                    "account/read",
+                    json!({ "refreshToken": false }),
+                    if app_server_timeout_recovered(&error) {
+                        ACCOUNT_APP_SERVER_RECOVERY_RETRY_TIMEOUT
+                    } else {
+                        ACCOUNT_APP_SERVER_REQUEST_TIMEOUT
+                    },
+                    false,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(retry_error)
+                    if is_invalid_refresh_token_error_message(&retry_error.to_string()) =>
+                {
+                    return Ok(json!({
+                        "account": {},
+                        "requiresOpenaiAuth": true,
+                    }));
+                }
+                Err(retry_error) if app_server_request_timed_out(&retry_error) => {
+                    return Ok(json!({
+                        "account": {},
+                        "requiresOpenaiAuth": false,
+                        "degraded": true,
+                        "error": "Timed out while loading Codex account state."
+                    }));
+                }
+                Err(retry_error) => return Err(retry_error),
+            }
+        }
+        Err(error) if is_invalid_refresh_token_error_message(&error.to_string()) => {
+            return Ok(json!({
+                "account": {},
+                "requiresOpenaiAuth": true,
+            }));
+        }
+        Err(error) if app_server_request_timed_out(&error) => {
+            return Ok(json!({
+                "account": {},
+                "requiresOpenaiAuth": false,
+                "degraded": true,
+                "error": "Timed out while loading Codex account state."
+            }));
+        }
+        Err(error) => return Err(error),
+    };
+
+    Ok(json!({
             "account": response.get("account").cloned().unwrap_or_else(|| json!({})),
             "requiresOpenaiAuth": response
                 .get("requiresOpenaiAuth")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-        })),
-        Ok(Err(error)) if is_invalid_refresh_token_error_message(&error.to_string()) => Ok(json!({
-            "account": {},
-            "requiresOpenaiAuth": true,
-        })),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Ok(json!({
-            "account": {},
-            "requiresOpenaiAuth": false,
-            "degraded": true,
-            "error": "Timed out while loading Codex account state."
-        })),
-    }
+    }))
 }
 
 pub(crate) async fn start_account_login(

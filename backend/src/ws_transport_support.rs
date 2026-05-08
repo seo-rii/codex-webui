@@ -4,6 +4,18 @@ tokio::task_local! {
     static ACTIVE_PROFILE_ID: String;
 }
 
+const SLOW_WS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+struct SlowWebSocketLogState {
+    next_log_at: Instant,
+    suppressed_count: u64,
+    max_elapsed_ms: u128,
+    max_response_bytes: usize,
+}
+
+static SLOW_WS_LOG_STATE: std::sync::OnceLock<std::sync::Mutex<SlowWebSocketLogState>> =
+    std::sync::OnceLock::new();
+
 pub(crate) async fn handle_ws(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -282,13 +294,54 @@ async fn handle_ws_message(
                 .map(|bytes| bytes.len())
                 .unwrap_or_default();
             if elapsed > Duration::from_millis(250) || response_size > 256 * 1024 {
-                warn!(
-                    method = %method,
-                    profile_id = %auth.profile_id,
-                    elapsed_ms = elapsed.as_millis(),
-                    response_bytes = response_size,
-                    "slow websocket request"
-                );
+                let now = Instant::now();
+                let state = SLOW_WS_LOG_STATE.get_or_init(|| {
+                    std::sync::Mutex::new(SlowWebSocketLogState {
+                        next_log_at: Instant::now(),
+                        suppressed_count: 0,
+                        max_elapsed_ms: 0,
+                        max_response_bytes: 0,
+                    })
+                });
+                match state.lock() {
+                    Ok(mut slow_log_state) => {
+                        if now >= slow_log_state.next_log_at {
+                            let suppressed_count = slow_log_state.suppressed_count;
+                            let suppressed_max_elapsed_ms = slow_log_state.max_elapsed_ms;
+                            let suppressed_max_response_bytes = slow_log_state.max_response_bytes;
+                            slow_log_state.next_log_at = now + SLOW_WS_LOG_INTERVAL;
+                            slow_log_state.suppressed_count = 0;
+                            slow_log_state.max_elapsed_ms = 0;
+                            slow_log_state.max_response_bytes = 0;
+                            warn!(
+                                method = %method,
+                                profile_id = %auth.profile_id,
+                                elapsed_ms = elapsed.as_millis(),
+                                response_bytes = response_size,
+                                suppressed_count,
+                                suppressed_max_elapsed_ms,
+                                suppressed_max_response_bytes,
+                                "slow websocket request"
+                            );
+                        } else {
+                            slow_log_state.suppressed_count =
+                                slow_log_state.suppressed_count.saturating_add(1);
+                            slow_log_state.max_elapsed_ms =
+                                slow_log_state.max_elapsed_ms.max(elapsed.as_millis());
+                            slow_log_state.max_response_bytes =
+                                slow_log_state.max_response_bytes.max(response_size);
+                        }
+                    }
+                    Err(_) => {
+                        warn!(
+                            method = %method,
+                            profile_id = %auth.profile_id,
+                            elapsed_ms = elapsed.as_millis(),
+                            response_bytes = response_size,
+                            "slow websocket request"
+                        );
+                    }
+                }
             }
             if should_audit_ws_method(&method) {
                 let log_config = state.config.clone();

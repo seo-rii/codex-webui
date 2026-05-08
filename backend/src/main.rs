@@ -30,7 +30,8 @@ use axum::{
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use backend::codex_app_server::{
     AppServerClient, AppServerClientConfig, AppServerManager, AppServerNotification,
-    AppServerProfile,
+    AppServerProfile, app_server_request_interrupted, app_server_request_timed_out,
+    app_server_timeout_recovered,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
@@ -185,11 +186,25 @@ fn main() -> Result<()> {
     let config = Arc::new(Config::from_env()?);
     install_panic_logger(config.clone());
 
+    let gateway_log_dir = runtime_logs_dir(&config);
+    fs::create_dir_all(&gateway_log_dir)
+        .with_context(|| format!("failed to create {}", gateway_log_dir.display()))?;
+    let gateway_log_path = gateway_log_dir.join("codex-webui-gateway.log");
+    let gateway_log = tracing_appender::rolling::never(&gateway_log_dir, "codex-webui-gateway.log");
+    let (gateway_log_writer, _gateway_log_guard) =
+        tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .lossy(true)
+            .finish(gateway_log);
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(gateway_log_writer),
+        )
         .init();
 
     let server_threads = runtime_thread_count_from_env(
@@ -212,6 +227,7 @@ fn main() -> Result<()> {
         server_threads,
         blocking_threads,
         server_thread_stack_bytes = SERVER_THREAD_STACK_BYTES,
+        gateway_log_path = %gateway_log_path.display(),
         "starting codex-webui runtime"
     );
 

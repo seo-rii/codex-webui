@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
-    env, fs,
+    env,
+    error::Error as StdError,
+    fs,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -113,6 +115,7 @@ struct AppServerClientInner {
 
 struct ProcessState {
     stdin: Arc<Mutex<ChildStdin>>,
+    pid: Option<u32>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: JoinHandle<()>,
     handoff_proxy: bool,
@@ -148,6 +151,44 @@ enum IncomingMessage {
     },
     Notification(AppServerNotification),
     Request(AppServerRequest),
+}
+
+#[derive(Debug)]
+struct AppServerRequestTimeoutError {
+    method: String,
+    request_timeout: Duration,
+    recovered: bool,
+}
+
+impl std::fmt::Display for AppServerRequestTimeoutError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "codex app-server request timed out after {}ms: {}",
+            self.request_timeout.as_millis(),
+            self.method
+        )
+    }
+}
+
+impl StdError for AppServerRequestTimeoutError {}
+
+pub fn app_server_request_timed_out(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<AppServerRequestTimeoutError>()
+        .is_some()
+}
+
+pub fn app_server_timeout_recovered(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<AppServerRequestTimeoutError>()
+        .is_some_and(|error| error.recovered)
+}
+
+pub fn app_server_request_interrupted(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("codex app-server exited")
+        || message.contains("codex app-server request channel closed")
 }
 
 impl AppServerClient {
@@ -199,6 +240,32 @@ impl AppServerClient {
             .context("codex app-server controller task failed")?
     }
 
+    pub async fn request_with_timeout(
+        &self,
+        method: impl Into<String>,
+        params: Value,
+        request_timeout: Duration,
+        recover_handoff_on_timeout: bool,
+    ) -> Result<Value> {
+        let client = self.clone();
+        let method = method.into();
+        self.inner
+            .controller
+            .handle
+            .spawn(async move {
+                client
+                    .request_on_controller_with_timeout(
+                        method,
+                        params,
+                        request_timeout,
+                        recover_handoff_on_timeout,
+                    )
+                    .await
+            })
+            .await
+            .context("codex app-server controller task failed")?
+    }
+
     pub async fn respond(&self, id: Value, result: Value) -> Result<()> {
         let client = self.clone();
         self.inner
@@ -235,6 +302,38 @@ impl AppServerClient {
         self.request_started(method, params).await
     }
 
+    async fn request_on_controller_with_timeout(
+        &self,
+        method: String,
+        params: Value,
+        request_timeout: Duration,
+        recover_handoff_on_timeout: bool,
+    ) -> Result<Value> {
+        match timeout(request_timeout, self.ensure_started()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                let recovered = if recover_handoff_on_timeout {
+                    self.recover_handoff_after_request_timeout().await
+                } else {
+                    false
+                };
+                return Err(AppServerRequestTimeoutError {
+                    method,
+                    request_timeout,
+                    recovered,
+                }
+                .into());
+            }
+        }
+        self.request_started_with_timeout(
+            method,
+            params,
+            request_timeout,
+            recover_handoff_on_timeout,
+        )
+        .await
+    }
+
     async fn respond_on_controller(&self, id: Value, result: Value) -> Result<()> {
         self.ensure_started().await?;
         self.write_message(&json!({
@@ -259,19 +358,26 @@ impl AppServerClient {
     async fn close_on_controller(&self) -> Result<()> {
         let process = self.inner.process.lock().await.take();
         if let Some(mut process) = process {
+            terminate_managed_process_group(process.pid).await;
             if let Some(shutdown_tx) = process.shutdown_tx.take() {
                 let _ = shutdown_tx.send(());
             }
-            let _ = process.join_handle.await;
+            let mut join_handle = process.join_handle;
+            match timeout(Duration::from_secs(2), &mut join_handle).await {
+                Ok(_) => {}
+                Err(_) => {
+                    warn!(
+                        profile_id = %self.inner.profile.id,
+                        "timed out while waiting for codex app-server process supervisor to exit"
+                    );
+                    join_handle.abort();
+                }
+            }
         }
         Ok(())
     }
 
     async fn ensure_started(&self) -> Result<()> {
-        if self.inner.process.lock().await.is_some() {
-            return Ok(());
-        }
-
         let _guard = self.inner.start_lock.lock().await;
         if self.inner.process.lock().await.is_some() {
             return Ok(());
@@ -300,6 +406,7 @@ impl AppServerClient {
                         }
                     }),
                     self.inner.config.startup_timeout,
+                    false,
                 )
                 .await?;
                 self.write_message(&json!({
@@ -335,7 +442,7 @@ impl AppServerClient {
     }
 
     async fn request_started(&self, method: String, params: Value) -> Result<Value> {
-        self.request_started_with_timeout(method, params, self.inner.config.request_timeout)
+        self.request_started_with_timeout(method, params, self.inner.config.request_timeout, false)
             .await
     }
 
@@ -349,6 +456,7 @@ impl AppServerClient {
                     }
                 }),
                 self.inner.config.startup_timeout,
+                false,
             )
             .await
         {
@@ -366,6 +474,7 @@ impl AppServerClient {
         method: String,
         params: Value,
         request_timeout: Duration,
+        recover_handoff_on_timeout: bool,
     ) -> Result<Value> {
         let id = self.inner.next_request_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
@@ -387,11 +496,17 @@ impl AppServerClient {
         match timeout(request_timeout, rx).await {
             Err(_) => {
                 self.inner.pending.lock().await.remove(&id);
-                Err(anyhow!(
-                    "codex app-server request timed out after {}s: {}",
-                    request_timeout.as_secs(),
-                    method_name
-                ))
+                let recovered = if recover_handoff_on_timeout {
+                    self.recover_handoff_after_request_timeout().await
+                } else {
+                    false
+                };
+                Err(AppServerRequestTimeoutError {
+                    method: method_name,
+                    request_timeout,
+                    recovered,
+                }
+                .into())
             }
             Ok(result) => match result {
                 Ok(Ok(value)) => Ok(value),
@@ -400,6 +515,52 @@ impl AppServerClient {
                     "codex app-server request channel closed before a response arrived"
                 )),
             },
+        }
+    }
+
+    async fn recover_handoff_after_request_timeout(&self) -> bool {
+        let should_recover_handoff = {
+            let process = self.inner.process.lock().await;
+            let process_uses_handoff = process
+                .as_ref()
+                .map(|process| process.handoff_proxy)
+                .unwrap_or(false);
+            process_uses_handoff
+                || handoff_paths(&self.inner.config, &self.inner.profile).is_some()
+        };
+        if !should_recover_handoff {
+            return false;
+        }
+
+        warn!(
+            profile_id = %self.inner.profile.id,
+            "codex app-server handoff proxy timed out; restarting through stdio"
+        );
+        self.detach_unresponsive_process("codex app-server handoff proxy timed out")
+            .await;
+        self.inner
+            .handoff_disabled_after_failure
+            .store(true, Ordering::SeqCst);
+        let _ = stop_handoff_server(&self.inner.config, &self.inner.profile).await;
+        true
+    }
+
+    async fn detach_unresponsive_process(&self, reason: &str) {
+        fail_pending_requests(&self.inner, reason).await;
+        let process = self.inner.process.lock().await.take();
+        if let Some(mut process) = process {
+            if let Some(shutdown_tx) = process.shutdown_tx.take() {
+                let _ = shutdown_tx.send(());
+            }
+            let mut join_handle = process.join_handle;
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = &mut join_handle => {}
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        join_handle.abort();
+                    }
+                }
+            });
         }
     }
 
@@ -449,6 +610,11 @@ impl AppServerClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+        }
+
         for (key, value) in &self.inner.config.extra_env {
             command.env(key, value);
         }
@@ -456,6 +622,7 @@ impl AppServerClient {
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to spawn {}", self.inner.config.codex_bin))?;
+        let pid = child.id();
         let stdin =
             Arc::new(Mutex::new(child.stdin.take().ok_or_else(|| {
                 anyhow!("failed to capture codex app-server stdin")
@@ -474,6 +641,7 @@ impl AppServerClient {
 
         Ok(ProcessState {
             stdin,
+            pid,
             shutdown_tx: Some(shutdown_tx),
             join_handle,
             handoff_proxy,
@@ -752,6 +920,28 @@ async fn handoff_socket_is_live(socket_path: &Path) -> bool {
 }
 
 #[cfg(unix)]
+async fn terminate_managed_process_group(pid: Option<u32>) {
+    let Some(pid) = pid.filter(|pid| *pid > 0) else {
+        return;
+    };
+    let process_group = format!("-{pid}");
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(&process_group)
+        .status()
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(&process_group)
+        .status()
+        .await;
+}
+
+#[cfg(not(unix))]
+async fn terminate_managed_process_group(_pid: Option<u32>) {}
+
+#[cfg(unix)]
 async fn stop_handoff_server(
     config: &AppServerClientConfig,
     profile: &AppServerProfile,
@@ -775,6 +965,12 @@ async fn stop_handoff_server(
     }
 
     if meta.pid > 0 {
+        let process_group = format!("-{}", meta.pid);
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(&process_group)
+            .status()
+            .await;
         let _ = Command::new("kill")
             .arg("-TERM")
             .arg(meta.pid.to_string())
@@ -782,6 +978,11 @@ async fn stop_handoff_server(
             .await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         if handoff_socket_is_live(&paths.socket_path).await {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(&process_group)
+                .status()
+                .await;
             let _ = Command::new("kill")
                 .arg("-KILL")
                 .arg(meta.pid.to_string())
@@ -1112,7 +1313,8 @@ fn classify_incoming_message(line: &str) -> Result<Option<IncomingMessage>> {
 mod tests {
     use super::{
         AppServerClient, AppServerClientConfig, AppServerNotification, AppServerProfile,
-        AppServerRequest, IncomingMessage, classify_incoming_message, handoff_paths,
+        AppServerRequest, IncomingMessage, app_server_request_timed_out,
+        app_server_timeout_recovered, classify_incoming_message, handoff_paths,
         write_bytes_atomically,
     };
     use serde_json::json;
@@ -1264,6 +1466,109 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_first_requests_wait_for_initialization() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "codex-webui-concurrent-start-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script_path = dir.join("fake-codex.py");
+        let log_path = dir.join("starts.log");
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+log_path = os.environ.get("FAKE_CODEX_START_LOG")
+initialized = False
+def log(message):
+    if log_path:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(message + "\n")
+
+def respond(payload, result=None):
+    print(json.dumps({"id": payload.get("id"), "result": result or {}}), flush=True)
+
+if sys.argv[1:] == ["app-server", "--listen", "stdio://"]:
+    for raw_line in sys.stdin:
+        payload = json.loads(raw_line)
+        method = payload.get("method")
+        if method == "initialize":
+            log("initialize-start")
+            time.sleep(0.4)
+            respond(payload, {"serverInfo": {"name": "fake"}})
+            log("initialize-end")
+        elif method == "initialized":
+            initialized = True
+            log("initialized")
+        elif method == "experimentalFeature/enablement/set":
+            if not initialized:
+                print(json.dumps({"id": payload.get("id"), "error": {"message": "feature before initialized"}}), flush=True)
+            else:
+                respond(payload, {})
+        elif method == "echo":
+            if not initialized:
+                print(json.dumps({"id": payload.get("id"), "error": {"message": "echo before initialized"}}), flush=True)
+            else:
+                respond(payload, payload.get("params") or {})
+        else:
+            print(json.dumps({"id": payload.get("id"), "error": {"message": "unknown method"}}), flush=True)
+"#,
+        )
+        .expect("fake codex should be written");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("fake codex metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("fake codex should be executable");
+
+        let client = AppServerClient::new(
+            AppServerProfile {
+                id: "default".to_string(),
+                codex_home: dir.join("codex-home"),
+            },
+            AppServerClientConfig {
+                codex_bin: script_path.display().to_string(),
+                startup_timeout: std::time::Duration::from_secs(2),
+                request_timeout: std::time::Duration::from_secs(2),
+                extra_env: HashMap::from([(
+                    "FAKE_CODEX_START_LOG".to_string(),
+                    log_path.display().to_string(),
+                )]),
+                ..AppServerClientConfig::default()
+            },
+        );
+
+        let (first, second) = tokio::join!(
+            client.request("echo", json!({ "request": 1 })),
+            client.request("echo", json!({ "request": 2 }))
+        );
+        assert_eq!(first.expect("first request should complete"), json!({ "request": 1 }));
+        assert_eq!(
+            second.expect("second request should complete"),
+            json!({ "request": 2 })
+        );
+
+        let log = std::fs::read_to_string(&log_path).expect("start log should exist");
+        assert!(log.contains("initialize-start"));
+        assert!(log.contains("initialized"));
+
+        client.close().await.expect("client should close");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn falls_back_to_stdio_when_handoff_proxy_does_not_initialize() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1371,6 +1676,285 @@ if "proxy" in args:
             .expect("client should fall back to stdio after a broken handoff proxy");
 
         assert_eq!(response, json!({ "ok": true }));
+        let log = std::fs::read_to_string(&log_path).expect("start log should exist");
+        assert!(log.contains("handoff-server"));
+        assert!(log.contains("proxy"));
+        assert!(log.contains("stdio"));
+
+        client.close().await.expect("client should close");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_timeout_recovers_stale_handoff_proxy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "codex-webui-handoff-timeout-recovery-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script_path = dir.join("fake-codex.py");
+        let log_path = dir.join("starts.log");
+        let handoff_dir = dir.join("handoff");
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import signal
+import socket
+import sys
+import time
+
+log_path = os.environ.get("FAKE_CODEX_START_LOG")
+def log(message):
+    if log_path:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(message + "\n")
+
+def respond(payload, result=None):
+    print(json.dumps({"id": payload.get("id"), "result": result or {}}), flush=True)
+
+args = sys.argv[1:]
+if "--listen" in args:
+    listen = args[args.index("--listen") + 1]
+    if listen.startswith("unix://"):
+        path = listen[len("unix://"):]
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+        log("handoff-server")
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        while True:
+            connection, _ = server.accept()
+            log("handoff-accepted")
+            try:
+                while connection.recv(4096):
+                    pass
+            except Exception:
+                pass
+    if listen == "stdio://":
+        log("stdio")
+        for raw_line in sys.stdin:
+            payload = json.loads(raw_line)
+            method = payload.get("method")
+            if method == "initialize":
+                respond(payload, {"serverInfo": {"name": "fake"}})
+            elif method == "initialized":
+                pass
+            elif method == "experimentalFeature/enablement/set":
+                respond(payload, {})
+            elif method == "echo":
+                respond(payload, payload.get("params") or {})
+            else:
+                print(json.dumps({"id": payload.get("id"), "error": {"message": "unknown method"}}), flush=True)
+        sys.exit(0)
+
+if "proxy" in args:
+    log("proxy")
+    for raw_line in sys.stdin:
+        payload = json.loads(raw_line)
+        method = payload.get("method")
+        if method == "initialize":
+            respond(payload, {"serverInfo": {"name": "fake-proxy"}})
+        elif method == "initialized":
+            pass
+        elif method == "experimentalFeature/enablement/set":
+            respond(payload, {})
+        elif method == "echo":
+            time.sleep(60)
+"#,
+        )
+        .expect("fake codex should be written");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("fake codex metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("fake codex should be executable");
+
+        let client = AppServerClient::new(
+            AppServerProfile {
+                id: "default".to_string(),
+                codex_home: dir.join("codex-home"),
+            },
+            AppServerClientConfig {
+                codex_bin: script_path.display().to_string(),
+                handoff_dir: Some(handoff_dir),
+                startup_timeout: std::time::Duration::from_secs(1),
+                request_timeout: std::time::Duration::from_secs(2),
+                extra_env: HashMap::from([(
+                    "FAKE_CODEX_START_LOG".to_string(),
+                    log_path.display().to_string(),
+                )]),
+                ..AppServerClientConfig::default()
+            },
+        );
+
+        let timed_out = client
+            .request_with_timeout(
+                "echo",
+                json!({ "via": "proxy" }),
+                std::time::Duration::from_millis(500),
+                true,
+            )
+            .await
+            .expect_err("stale proxy request should time out");
+        assert!(app_server_request_timed_out(&timed_out));
+        assert!(app_server_timeout_recovered(&timed_out));
+
+        let response = client
+            .request("echo", json!({ "via": "stdio" }))
+            .await
+            .expect("client should restart through stdio after handoff timeout");
+        assert_eq!(response, json!({ "via": "stdio" }));
+
+        let log = std::fs::read_to_string(&log_path).expect("start log should exist");
+        assert!(log.contains("handoff-server"));
+        assert!(log.contains("proxy"));
+        assert!(log.contains("stdio"));
+
+        client.close().await.expect("client should close");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_timeout_recovers_handoff_proxy_that_hangs_during_initialization() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "codex-webui-handoff-startup-timeout-recovery-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script_path = dir.join("fake-codex.py");
+        let log_path = dir.join("starts.log");
+        let handoff_dir = dir.join("handoff");
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import signal
+import socket
+import sys
+import time
+
+log_path = os.environ.get("FAKE_CODEX_START_LOG")
+def log(message):
+    if log_path:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(message + "\n")
+
+def respond(payload, result=None):
+    print(json.dumps({"id": payload.get("id"), "result": result or {}}), flush=True)
+
+args = sys.argv[1:]
+if "--listen" in args:
+    listen = args[args.index("--listen") + 1]
+    if listen.startswith("unix://"):
+        path = listen[len("unix://"):]
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+        log("handoff-server")
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        while True:
+            connection, _ = server.accept()
+            log("handoff-accepted")
+            try:
+                while connection.recv(4096):
+                    pass
+            except Exception:
+                pass
+    if listen == "stdio://":
+        log("stdio")
+        for raw_line in sys.stdin:
+            payload = json.loads(raw_line)
+            method = payload.get("method")
+            if method == "initialize":
+                respond(payload, {"serverInfo": {"name": "fake"}})
+            elif method == "initialized":
+                pass
+            elif method == "experimentalFeature/enablement/set":
+                respond(payload, {})
+            elif method == "echo":
+                respond(payload, payload.get("params") or {})
+            else:
+                print(json.dumps({"id": payload.get("id"), "error": {"message": "unknown method"}}), flush=True)
+        sys.exit(0)
+
+if "proxy" in args:
+    log("proxy")
+    for _ in sys.stdin:
+        time.sleep(60)
+"#,
+        )
+        .expect("fake codex should be written");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("fake codex metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("fake codex should be executable");
+
+        let client = AppServerClient::new(
+            AppServerProfile {
+                id: "default".to_string(),
+                codex_home: dir.join("codex-home"),
+            },
+            AppServerClientConfig {
+                codex_bin: script_path.display().to_string(),
+                handoff_dir: Some(handoff_dir),
+                startup_timeout: std::time::Duration::from_secs(10),
+                request_timeout: std::time::Duration::from_secs(2),
+                extra_env: HashMap::from([(
+                    "FAKE_CODEX_START_LOG".to_string(),
+                    log_path.display().to_string(),
+                )]),
+                ..AppServerClientConfig::default()
+            },
+        );
+
+        let timed_out = client
+            .request_with_timeout(
+                "echo",
+                json!({ "via": "proxy-startup" }),
+                std::time::Duration::from_millis(500),
+                true,
+            )
+            .await
+            .expect_err("startup hang should time out through the request deadline");
+        assert!(app_server_request_timed_out(&timed_out));
+        assert!(app_server_timeout_recovered(&timed_out));
+
+        let response = client
+            .request("echo", json!({ "via": "stdio" }))
+            .await
+            .expect("client should restart through stdio after startup timeout");
+        assert_eq!(response, json!({ "via": "stdio" }));
+
         let log = std::fs::read_to_string(&log_path).expect("start log should exist");
         assert!(log.contains("handoff-server"));
         assert!(log.contains("proxy"));

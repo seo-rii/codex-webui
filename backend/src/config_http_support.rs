@@ -1,6 +1,7 @@
 use super::*;
 
 const CONFIG_APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
+const CONFIG_APP_SERVER_RECOVERY_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn env_choice(var: &str, allowed: &[&str]) -> Option<String> {
     env::var(var)
@@ -135,21 +136,14 @@ pub(crate) async fn config_models_payload(
     state: &AppState,
     profile_id: &str,
 ) -> ApiResult<Vec<Value>> {
-    let client = app_server_client(state, profile_id)
-        .await
-        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
-    let response = tokio::time::timeout(
-        CONFIG_APP_SERVER_REQUEST_TIMEOUT,
-        client.request("model/list", json!({ "includeHidden": false })),
+    let response = config_app_server_request(
+        state,
+        profile_id,
+        "model/list",
+        json!({ "includeHidden": false }),
+        "Timed out while loading Codex models.",
     )
-    .await
-    .map_err(|_| {
-        api_error(
-            StatusCode::GATEWAY_TIMEOUT,
-            "Timed out while loading Codex models.",
-        )
-    })?
-    .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    .await?;
     Ok(response
         .get("data")
         .and_then(Value::as_array)
@@ -223,21 +217,14 @@ pub(crate) async fn config_collaboration_modes_payload(
     state: &AppState,
     profile_id: &str,
 ) -> ApiResult<Vec<Value>> {
-    let client = app_server_client(state, profile_id)
-        .await
-        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
-    let response = tokio::time::timeout(
-        CONFIG_APP_SERVER_REQUEST_TIMEOUT,
-        client.request("collaborationMode/list", json!({})),
+    let response = config_app_server_request(
+        state,
+        profile_id,
+        "collaborationMode/list",
+        json!({}),
+        "Timed out while loading Codex collaboration modes.",
     )
-    .await
-    .map_err(|_| {
-        api_error(
-            StatusCode::GATEWAY_TIMEOUT,
-            "Timed out while loading Codex collaboration modes.",
-        )
-    })?
-    .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    .await?;
     Ok(response
         .get("data")
         .and_then(Value::as_array)
@@ -256,6 +243,55 @@ pub(crate) async fn config_collaboration_modes_payload(
             })
         })
         .collect())
+}
+
+async fn config_app_server_request(
+    state: &AppState,
+    profile_id: &str,
+    method: &str,
+    params: Value,
+    timeout_message: &str,
+) -> ApiResult<Value> {
+    let client = app_server_client(state, profile_id)
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    match client
+        .request_with_timeout(
+            method.to_string(),
+            params.clone(),
+            CONFIG_APP_SERVER_REQUEST_TIMEOUT,
+            true,
+        )
+        .await
+    {
+        Ok(response) => Ok(response),
+        Err(error)
+            if app_server_timeout_recovered(&error) || app_server_request_interrupted(&error) =>
+        {
+            client
+                .request_with_timeout(
+                    method.to_string(),
+                    params,
+                    if app_server_timeout_recovered(&error) {
+                        CONFIG_APP_SERVER_RECOVERY_RETRY_TIMEOUT
+                    } else {
+                        CONFIG_APP_SERVER_REQUEST_TIMEOUT
+                    },
+                    false,
+                )
+                .await
+                .map_err(|retry_error| config_app_server_error(retry_error, timeout_message))
+        }
+        Err(error) => Err(config_app_server_error(error, timeout_message)),
+    }
+}
+
+fn config_app_server_error(error: anyhow::Error, timeout_message: &str) -> ApiError {
+    if app_server_request_timed_out(&error) {
+        api_error(StatusCode::GATEWAY_TIMEOUT, timeout_message)
+    } else {
+        api_error(StatusCode::BAD_GATEWAY, error.to_string())
+    }
 }
 
 pub(crate) async fn get_config_payload(state: &AppState, profile_id: &str) -> ApiResult<Value> {

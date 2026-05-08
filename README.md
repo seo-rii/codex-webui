@@ -119,8 +119,13 @@ After setup, running `codex-webui` again starts the background server and prints
 - launch URL
 - PID
 - config path
-- log path
+- CLI launcher log path
 - runtime error log path
+
+The Rust gateway writes its own non-blocking runtime log to
+`<dataDir>/logs/codex-webui-gateway.log`. Slow WebSocket request warnings are
+rate-limited there so a closed code-server terminal or an undrained stdout pipe
+cannot stall request handling.
 
 `pnpm build` produces the public SPA bundle under `build/static`, builds the Rust gateway in release mode, and copies the current-platform gateway binary to `dist/backend/<target>/` for the CLI.
 

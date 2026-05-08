@@ -4,6 +4,8 @@ use crate::thread_read_support::{
     active_turn_id_from_turns, emit_session_notification, read_thread_payload,
 };
 
+const DUPLICATE_TURN_START_ACTIVE_GRACE_MS: u64 = 30_000;
+
 async fn resolve_selected_attachment_records(
     state: &AppState,
     profile_id: &str,
@@ -178,6 +180,20 @@ pub(crate) async fn send_turn_payload(
         resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
+    {
+        let mut pending_turn_starts = state.pending_turn_starts.lock().await;
+        if !pending_turn_starts.insert(runtime_key.clone()) {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                json!({
+                    "code": "TURN_ALREADY_STARTING",
+                    "message": "A response is already starting for this session."
+                })
+                .to_string(),
+            ));
+        }
+    }
+
     let result = async {
         let attachments =
             resolve_selected_attachment_records(state, profile_id, session_id, attachment_ids)
@@ -188,11 +204,59 @@ pub(crate) async fn send_turn_payload(
             return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
         }
 
-        state
-            .pending_turn_starts
-            .lock()
+        if let Some(cached_active_turn_id) =
+            state.active_turns.lock().await.get(&runtime_key).cloned()
+        {
+            let runtime_status_updated_at = with_ui_state_read(state, profile_id, |ui_state| {
+                Ok(ui_state
+                    .get("runtimeStatusByThreadId")
+                    .and_then(Value::as_object)
+                    .and_then(|entries| entries.get(session_id))
+                    .and_then(|entry| entry.get("updatedAt"))
+                    .and_then(Value::as_u64))
+            })
             .await
-            .insert(runtime_key.clone());
+            .ok()
+            .flatten();
+            if runtime_status_updated_at.is_some_and(|updated_at| {
+                now_unix_ms().saturating_sub(updated_at) < DUPLICATE_TURN_START_ACTIVE_GRACE_MS
+            }) {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "code": "TURN_ALREADY_RUNNING",
+                        "message": "A response is already running for this session.",
+                        "turnId": cached_active_turn_id
+                    })
+                    .to_string(),
+                ));
+            }
+
+            let thread = read_thread_payload(state, profile_id, session_id, true).await?;
+            let active_turn_id = thread
+                .get("turns")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .and_then(active_turn_id_from_turns);
+            if let Some(active_turn_id) = active_turn_id {
+                state
+                    .active_turns
+                    .lock()
+                    .await
+                    .insert(runtime_key.clone(), active_turn_id.clone());
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "code": "TURN_ALREADY_RUNNING",
+                        "message": "A response is already running for this session.",
+                        "turnId": active_turn_id
+                    })
+                    .to_string(),
+                ));
+            }
+            state.active_turns.lock().await.remove(&runtime_key);
+        }
+
         set_runtime_session_status(state, profile_id, session_id, "running").await;
         emit_session_summary_updated(state, profile_id, session_id, None, Some("running")).await;
         emit_session_notification(

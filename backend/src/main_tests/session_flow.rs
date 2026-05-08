@@ -2396,6 +2396,178 @@ async fn send_turn_payload_uses_app_server_and_updates_session_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_turn_payload_rejects_concurrent_turn_starts() {
+    let sandbox = unique_test_dir("turn-send-duplicate-start");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        None,
+        Some("Duplicate start guard"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "debug/setDelay",
+            json!({
+                "method": "turn/start",
+                "delayMs": 200
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preferences = json!({
+        "cwd": workspace.display().to_string(),
+        "model": "gpt-5"
+    });
+    let first = send_turn_payload(
+        &state,
+        "default",
+        &session_id,
+        "Start a turn once.",
+        None,
+        None,
+        preferences.clone(),
+    );
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        send_turn_payload(
+            &state,
+            "default",
+            &session_id,
+            "Start a turn twice.",
+            None,
+            None,
+            preferences.clone(),
+        )
+        .await
+    };
+    let (first_result, second_result) = tokio::join!(first, second);
+
+    assert_eq!(
+        first_result.unwrap().get("turnId").and_then(Value::as_str),
+        Some("turn-1")
+    );
+    let second_error = second_result.unwrap_err();
+    assert_eq!(second_error.status, StatusCode::CONFLICT);
+    assert!(second_error.message.contains("TURN_ALREADY_STARTING"));
+
+    let request_count = client
+        .request("debug/requestCount", json!({ "target": "turn/start" }))
+        .await
+        .unwrap();
+    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(1));
+
+    let thread = read_thread_payload(&state, "default", &session_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        thread.get("turns").and_then(Value::as_array).map(Vec::len),
+        Some(1)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_turn_payload_rejects_recent_active_turn_starts() {
+    let sandbox = unique_test_dir("turn-send-active-duplicate");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        None,
+        Some("Recent active guard"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let preferences = json!({
+        "cwd": workspace.display().to_string(),
+        "model": "gpt-5"
+    });
+    let first_result = send_turn_payload(
+        &state,
+        "default",
+        &session_id,
+        "Start a turn and keep it active.",
+        None,
+        None,
+        preferences.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first_result.get("turnId").and_then(Value::as_str),
+        Some("turn-1")
+    );
+
+    let second_error = send_turn_payload(
+        &state,
+        "default",
+        &session_id,
+        "This should not become a second active turn.",
+        None,
+        None,
+        preferences,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(second_error.status, StatusCode::CONFLICT);
+    assert!(second_error.message.contains("TURN_ALREADY_RUNNING"));
+
+    let request_count = app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request("debug/requestCount", json!({ "target": "turn/start" }))
+        .await
+        .unwrap();
+    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(1));
+
+    let thread = read_thread_payload(&state, "default", &session_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        thread.get("turns").and_then(Value::as_array).map(Vec::len),
+        Some(1)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steer_turn_payload_uses_active_turn_from_thread_reads() {
     let sandbox = unique_test_dir("turn-steer-rust");
     let workspace = sandbox.join("workspace");

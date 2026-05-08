@@ -274,7 +274,41 @@ function mergeTurnItems(existingItems: CodexItem[], incomingItems: CodexItem[]) 
     seenIds.add(item.id);
   }
 
-  return merged;
+  const userMessageSignatures = new Set<string>();
+  const deduped: CodexItem[] = [];
+  for (const item of merged) {
+    if (normalizeItemTypeName(item.type) !== "userMessage") {
+      deduped.push(item);
+      continue;
+    }
+
+    const fragments: string[] = [];
+    for (const key of ["text", "message", "value"]) {
+      const value = item[key];
+      if (typeof value === "string" && value.trim()) {
+        fragments.push(value);
+      }
+    }
+    const content = Array.isArray(item.content) ? (item.content as Array<Record<string, unknown>>) : [];
+    for (const entry of content) {
+      for (const key of ["text", "content", "value"]) {
+        const value = entry[key];
+        if (typeof value === "string" && value.trim()) {
+          fragments.push(value);
+        }
+      }
+    }
+    const signature = fragments.join("\n\n").replace(/\s+/gu, " ").trim();
+    if (signature && userMessageSignatures.has(signature)) {
+      continue;
+    }
+    if (signature) {
+      userMessageSignatures.add(signature);
+    }
+    deduped.push(item);
+  }
+
+  return deduped;
 }
 
 function mergeTurn(existingTurn: CodexTurn | undefined, incomingTurn: CodexTurn): CodexTurn {

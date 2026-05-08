@@ -85,11 +85,18 @@ async fn request_thread_goal(
         Err(error) if is_goal_disabled_error(&error) => {
             client
                 .request(
-                    "experimentalFeature/enablement/set",
+                    "config/batchWrite",
                     json!({
-                        "enablement": {
-                            "goals": true
-                        }
+                        "edits": [
+                            {
+                                "keyPath": "features.goals",
+                                "value": true,
+                                "mergeStrategy": "replace"
+                            }
+                        ],
+                        "filePath": null,
+                        "expectedVersion": null,
+                        "reloadUserConfig": true
                     }),
                 )
                 .await

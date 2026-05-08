@@ -167,7 +167,7 @@ timestamp_counter = 0
 turn_counter = 0
 request_counts = {}
 method_delays = {}
-goals_enabled = True
+goals_enabled = False
 
 for raw_line in sys.stdin:
     line = raw_line.strip()
@@ -228,11 +228,21 @@ for raw_line in sys.stdin:
             "params": {}
         })
     elif method == "experimentalFeature/enablement/set":
-        goals_enabled = bool((params.get("enablement") or {}).get("goals", goals_enabled))
+        write({
+            "id": request_id,
+            "error": {
+                "code": -32602,
+                "message": "unsupported feature enablement `goals`: currently supported features are apps, memories, plugins, remote_control, tool_search, tool_suggest, tool_call_mcp_elicitation"
+            }
+        })
+    elif method == "config/batchWrite":
+        for edit in params.get("edits") or []:
+            if edit.get("keyPath") == "features.goals":
+                goals_enabled = bool(edit.get("value"))
         write({
             "id": request_id,
             "result": {
-                "enablement": params.get("enablement") or {}
+                "status": "ok"
             }
         })
     elif method == "thread/start":

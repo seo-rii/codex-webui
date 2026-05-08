@@ -136,7 +136,9 @@ const plannedRequests = new Set([
   "thread/realtime/appendText",
   "thread/realtime/listVoices",
   "thread/realtime/start",
-  "thread/realtime/stop"
+  "thread/realtime/stop",
+  "thread/turns/items/list",
+  "windowsSandbox/readiness"
 ]);
 
 const blockedRequests = new Set([
@@ -174,6 +176,7 @@ const blockedRequests = new Set([
   "plugin/share/delete",
   "plugin/share/list",
   "plugin/share/save",
+  "plugin/share/updateTargets",
   "plugin/uninstall",
   "process/kill",
   "process/resizePty",

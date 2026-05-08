@@ -414,7 +414,7 @@ impl AppServerClient {
                     "params": {}
                 }))
                 .await?;
-                self.enable_required_runtime_features().await
+                self.enable_required_codex_features().await
             }
             .await
             {
@@ -446,14 +446,21 @@ impl AppServerClient {
             .await
     }
 
-    async fn enable_required_runtime_features(&self) -> Result<()> {
+    async fn enable_required_codex_features(&self) -> Result<()> {
         if let Err(error) = self
             .request_started_with_timeout(
-                "experimentalFeature/enablement/set".to_string(),
+                "config/batchWrite".to_string(),
                 json!({
-                    "enablement": {
-                        "goals": true
-                    }
+                    "edits": [
+                        {
+                            "keyPath": "features.goals",
+                            "value": true,
+                            "mergeStrategy": "replace"
+                        }
+                    ],
+                    "filePath": null,
+                    "expectedVersion": null,
+                    "reloadUserConfig": true
                 }),
                 self.inner.config.startup_timeout,
                 false,
@@ -463,7 +470,7 @@ impl AppServerClient {
             warn!(
                 profile_id = %self.inner.profile.id,
                 error = %error,
-                "failed to enable required Codex runtime features; goal mode may be unavailable"
+                "failed to enable required Codex config features; goal mode may be unavailable"
             );
         }
         Ok(())
@@ -1509,6 +1516,8 @@ if sys.argv[1:] == ["app-server", "--listen", "stdio://"]:
         elif method == "initialized":
             initialized = True
             log("initialized")
+        elif method == "config/batchWrite":
+            respond(payload, {})
         elif method == "experimentalFeature/enablement/set":
             if not initialized:
                 print(json.dumps({"id": payload.get("id"), "error": {"message": "feature before initialized"}}), flush=True)
@@ -1755,6 +1764,8 @@ if "--listen" in args:
                 respond(payload, {"serverInfo": {"name": "fake"}})
             elif method == "initialized":
                 pass
+            elif method == "config/batchWrite":
+                respond(payload, {})
             elif method == "experimentalFeature/enablement/set":
                 respond(payload, {})
             elif method == "echo":
@@ -1772,6 +1783,8 @@ if "proxy" in args:
             respond(payload, {"serverInfo": {"name": "fake-proxy"}})
         elif method == "initialized":
             pass
+        elif method == "config/batchWrite":
+            respond(payload, {})
         elif method == "experimentalFeature/enablement/set":
             respond(payload, {})
         elif method == "echo":
@@ -1899,6 +1912,8 @@ if "--listen" in args:
                 respond(payload, {"serverInfo": {"name": "fake"}})
             elif method == "initialized":
                 pass
+            elif method == "config/batchWrite":
+                respond(payload, {})
             elif method == "experimentalFeature/enablement/set":
                 respond(payload, {})
             elif method == "echo":

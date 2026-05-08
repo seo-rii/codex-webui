@@ -1110,7 +1110,7 @@ async fn app_server_start_enables_goals_by_default() {
         .request(
             "debug/requestCount",
             json!({
-                "target": "experimentalFeature/enablement/set"
+                "target": "config/batchWrite"
             }),
         )
         .await
@@ -1220,7 +1220,7 @@ async fn thread_goal_payload_round_trips_through_app_server() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn thread_goal_request_reenables_goals_when_runtime_reports_disabled() {
+async fn thread_goal_request_reloads_config_when_goals_are_disabled() {
     let sandbox = unique_test_dir("thread-goal-reenable");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -1276,7 +1276,7 @@ async fn thread_goal_request_reenables_goals_when_runtime_reports_disabled() {
         .request(
             "debug/requestCount",
             json!({
-                "target": "experimentalFeature/enablement/set"
+                "target": "config/batchWrite"
             }),
         )
         .await

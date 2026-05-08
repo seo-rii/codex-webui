@@ -46,6 +46,7 @@ export const CODEX_SLASH_COMMANDS: CodexSlashCommandEntry[] = [
   { command: "agent", description: "Switch the active agent thread.", support: "planned", source: "upstream", inlineArgs: false, visibleInComposer: true },
   { command: "side", description: "Start a side conversation in an ephemeral fork.", support: "planned", source: "upstream", inlineArgs: true, visibleInComposer: true },
   { command: "copy", description: "Copy last response as markdown.", support: "native-webui", source: "upstream", inlineArgs: false, visibleInComposer: true },
+  { command: "raw", description: "Toggle raw scrollback mode for copy-friendly terminal selection.", support: "not-applicable", source: "upstream", inlineArgs: true, visibleInComposer: true },
   { command: "diff", description: "Show git diff.", support: "native-webui", source: "upstream", inlineArgs: false, visibleInComposer: true },
   { command: "mention", description: "Mention a file.", support: "native-webui", source: "upstream", inlineArgs: false, visibleInComposer: true },
   { command: "status", description: "Show current session configuration and token usage.", support: "native-webui", source: "upstream", inlineArgs: false, visibleInComposer: true },

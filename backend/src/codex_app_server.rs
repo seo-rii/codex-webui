@@ -525,8 +525,7 @@ impl AppServerClient {
                 .as_ref()
                 .map(|process| process.handoff_proxy)
                 .unwrap_or(false);
-            process_uses_handoff
-                || handoff_paths(&self.inner.config, &self.inner.profile).is_some()
+            process_uses_handoff || handoff_paths(&self.inner.config, &self.inner.profile).is_some()
         };
         if !should_recover_handoff {
             return false;
@@ -1553,7 +1552,10 @@ if sys.argv[1:] == ["app-server", "--listen", "stdio://"]:
             client.request("echo", json!({ "request": 1 })),
             client.request("echo", json!({ "request": 2 }))
         );
-        assert_eq!(first.expect("first request should complete"), json!({ "request": 1 }));
+        assert_eq!(
+            first.expect("first request should complete"),
+            json!({ "request": 1 })
+        );
         assert_eq!(
             second.expect("second request should complete"),
             json!({ "request": 2 })

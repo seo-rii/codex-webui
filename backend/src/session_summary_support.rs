@@ -83,6 +83,8 @@ pub(crate) struct SessionSummaryUiSnapshot {
     pub(crate) runtime_status_by_thread_id: serde_json::Map<String, Value>,
     pub(crate) queue_counts_by_thread_id: HashMap<String, usize>,
     pub(crate) active_thread_ids: HashSet<String>,
+    pub(crate) loaded_thread_ids: HashSet<String>,
+    pub(crate) loaded_thread_ids_available: bool,
 }
 
 const ACTIVE_SESSION_STATUS_RECONCILE_AFTER_MS: u64 = 5_000;
@@ -147,6 +149,58 @@ pub(crate) fn session_filter_from_query(query: Option<&str>) -> SessionFilterCri
             .filter(|value| value == "attention" || value == "completed"),
         tags,
     }
+}
+
+async fn loaded_thread_ids_from_app_server(
+    state: &AppState,
+    profile_id: &str,
+) -> Option<HashSet<String>> {
+    if state.app_servers.client_count().await == 0 {
+        return Some(HashSet::new());
+    }
+
+    let client = app_server_client(state, profile_id).await.ok()?;
+    let mut cursor: Option<String> = None;
+    let mut loaded_thread_ids = HashSet::new();
+
+    for _ in 0..20 {
+        let response = tokio::time::timeout(
+            Duration::from_millis(ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS),
+            client.request(
+                "thread/loaded/list",
+                json!({
+                    "cursor": cursor.clone(),
+                    "limit": 200
+                }),
+            ),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        for thread_id in response
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            loaded_thread_ids.insert(thread_id.to_string());
+        }
+        cursor = response
+            .get("nextCursor")
+            .or_else(|| response.get("next_cursor"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    Some(loaded_thread_ids)
 }
 
 pub(crate) fn session_sort_priority(status: Option<&str>) -> i32 {
@@ -640,6 +694,12 @@ pub(crate) async fn read_session_summary_ui_snapshot(
             .filter_map(|key| key.strip_prefix(&runtime_key_prefix).map(str::to_string)),
     );
 
+    let (loaded_thread_ids_available, loaded_thread_ids) =
+        match loaded_thread_ids_from_app_server(state, profile_id).await {
+            Some(loaded_thread_ids) => (true, loaded_thread_ids),
+            None => (false, HashSet::new()),
+        };
+
     with_ui_state_read(state, profile_id, |ui_state| {
         let queue_counts_by_thread_id = ui_state
             .get("queuesByThreadId")
@@ -684,6 +744,8 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                 .unwrap_or_else(|| runtime_status_by_thread_id.clone()),
             queue_counts_by_thread_id,
             active_thread_ids,
+            loaded_thread_ids,
+            loaded_thread_ids_available,
         })
     })
     .await

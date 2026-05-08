@@ -123,7 +123,7 @@ pub(crate) fn build_session_summary_from_thread_payload(
         .and_then(Value::as_i64)
         .map(normalize_session_timestamp)
         .unwrap_or(0);
-    let status = status_override
+    let mut status = status_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
@@ -150,6 +150,13 @@ pub(crate) fn build_session_summary_from_thread_payload(
             },
         )
         .unwrap_or_else(|| "unknown".to_string());
+    if snapshot.loaded_thread_ids_available
+        && is_live_thread_status(&status)
+        && !snapshot.active_thread_ids.contains(session_id)
+        && !snapshot.loaded_thread_ids.contains(session_id)
+    {
+        status = "completed".to_string();
+    }
 
     Ok(json!({
         "id": session_id,

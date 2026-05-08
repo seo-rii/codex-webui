@@ -531,6 +531,37 @@ fn external_or_configured_owner_modes_require_owner_role_for_owner_actions() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[test]
+fn session_summary_normalizes_unloaded_live_thread_to_completed() {
+    let mut snapshot = SessionSummaryUiSnapshot {
+        loaded_thread_ids_available: true,
+        ..SessionSummaryUiSnapshot::default()
+    };
+    let thread = json!({
+        "id": "thread-live",
+        "name": "Live on disk",
+        "preview": "Live on disk",
+        "status": "active",
+        "archived": false,
+        "createdAt": 1,
+        "updatedAt": 2
+    });
+    let summary = build_session_summary_from_thread_payload(&thread, &snapshot, None, None)
+        .expect("summary should be built");
+    assert_eq!(
+        summary.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+
+    snapshot.loaded_thread_ids.insert("thread-live".to_string());
+    let loaded_summary = build_session_summary_from_thread_payload(&thread, &snapshot, None, None)
+        .expect("loaded summary should be built");
+    assert_eq!(
+        loaded_summary.get("status").and_then(Value::as_str),
+        Some("active")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_loopback_without_auth_config_defaults_to_admin() {
     let sandbox = unique_test_dir("local-authless-admin");

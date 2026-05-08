@@ -1,5 +1,8 @@
 use super::*;
 
+const GITHUB_PULL_REQUEST_FILES_PER_PAGE: u64 = 100;
+const GITHUB_PULL_REQUEST_FILES_MAX_PAGES: u64 = 30;
+
 pub(crate) fn parse_github_remote_payload(remote_name: &str, remote_url: &str) -> Option<Value> {
     let trimmed = remote_url.trim();
     if trimmed.is_empty() {
@@ -130,6 +133,59 @@ async fn run_gh_text_payload(repo_path: &str, args: Vec<String>) -> ApiResult<St
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub(crate) fn github_pull_request_files_truncated(
+    expected_changed_files: u64,
+    loaded_files: usize,
+    hit_page_cap: bool,
+) -> bool {
+    hit_page_cap || expected_changed_files > loaded_files as u64
+}
+
+async fn list_github_pull_request_files_payloads(
+    repo_root: &str,
+    owner: &str,
+    name: &str,
+    pull_request_number: u64,
+    expected_changed_files: u64,
+) -> ApiResult<(Vec<Value>, bool)> {
+    let mut files = Vec::new();
+    let mut hit_page_cap = false;
+
+    for page in 1..=GITHUB_PULL_REQUEST_FILES_MAX_PAGES {
+        let files_raw = run_gh_text_payload(
+            repo_root,
+            vec![
+                "api".to_string(),
+                format!(
+                    "repos/{owner}/{name}/pulls/{pull_request_number}/files?per_page={GITHUB_PULL_REQUEST_FILES_PER_PAGE}&page={page}"
+                ),
+            ],
+        )
+        .await?;
+        let files_page = serde_json::from_str::<Value>(&files_raw)
+            .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+        let mut page_files = files_page.as_array().cloned().unwrap_or_default();
+        let page_file_count = page_files.len() as u64;
+        files.append(&mut page_files);
+
+        if page_file_count < GITHUB_PULL_REQUEST_FILES_PER_PAGE {
+            let loaded_files = files.len();
+            return Ok((
+                files,
+                github_pull_request_files_truncated(expected_changed_files, loaded_files, false),
+            ));
+        }
+
+        hit_page_cap = page == GITHUB_PULL_REQUEST_FILES_MAX_PAGES;
+    }
+
+    let loaded_files = files.len();
+    Ok((
+        files,
+        github_pull_request_files_truncated(expected_changed_files, loaded_files, hit_page_cap),
+    ))
 }
 
 pub(crate) async fn resolve_github_repository_payload(
@@ -327,18 +383,21 @@ pub(crate) async fn get_github_pull_request_payload(
         ],
     )
     .await?;
-    let files_raw = run_gh_text_payload(
-        &repo_root,
-        vec![
-            "api".to_string(),
-            format!("repos/{owner}/{name}/pulls/{pull_request_number}/files?per_page=100"),
-        ],
-    )
-    .await?;
     let pull_request = serde_json::from_str::<Value>(&pull_request_raw)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let files = serde_json::from_str::<Value>(&files_raw)
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let expected_changed_files = pull_request
+        .get("changed_files")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let (files, files_truncated) = list_github_pull_request_files_payloads(
+        &repo_root,
+        owner,
+        name,
+        pull_request_number,
+        expected_changed_files,
+    )
+    .await?;
+    let files_loaded = files.len() as u64;
 
     let mut detail = map_github_pull_request_summary_payload(&pull_request)
         .as_object()
@@ -381,14 +440,13 @@ pub(crate) async fn get_github_pull_request_payload(
         "files".to_string(),
         Value::Array(
             files
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
                 .into_iter()
                 .map(|entry| map_github_pull_request_file_payload(&entry))
                 .collect(),
         ),
     );
+    detail.insert("filesLoaded".to_string(), Value::from(files_loaded));
+    detail.insert("filesTruncated".to_string(), Value::from(files_truncated));
 
     Ok(json!({
         "repository": repository,

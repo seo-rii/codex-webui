@@ -790,6 +790,8 @@ export type GitHubPullRequestDetailPayload = {
     mergeStateStatus: string | null;
     commits: number;
     files: GitHubPullRequestFile[];
+    filesLoaded: number;
+    filesTruncated: boolean;
   };
 };
 

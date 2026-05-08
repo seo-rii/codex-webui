@@ -196,6 +196,10 @@
       pullRequestOverview: m.pull_request_overview(),
       pullRequestFiles: m.pull_request_files(),
       pullRequestBodyEmpty: m.pull_request_body_empty(),
+      pullRequestFilesTruncated:
+        locale === "ko"
+          ? "GitHub API 페이지 제한으로 일부 파일만 표시됩니다."
+          : "Only part of this file list is shown because the GitHub API page cap was reached.",
       sourceControl: locale === "ko" ? "소스 제어" : "Source Control",
       stagedChanges: locale === "ko" ? "스테이징된 변경 사항" : "Staged Changes",
       workingChanges: locale === "ko" ? "변경 사항" : "Changes",
@@ -1367,8 +1371,11 @@
             <section class="panel">
               <div class="panel__header">
                 <h3>{ui.pullRequestFiles}</h3>
-                <span>{activePullRequest.files.length}</span>
+                <span>{activePullRequest.filesLoaded ?? activePullRequest.files.length}</span>
               </div>
+              {#if activePullRequest.filesTruncated}
+                <p class="field-note">{ui.pullRequestFilesTruncated}</p>
+              {/if}
 
               <div class="grouped-diff-list">
                 <div class="file-list">

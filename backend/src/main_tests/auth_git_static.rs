@@ -2621,6 +2621,13 @@ async fn git_worktree_create_rejects_symlinked_parent_escape() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[test]
+fn github_pull_request_file_pagination_reports_truncation() {
+    assert!(!github_pull_request_files_truncated(2, 2, false));
+    assert!(github_pull_request_files_truncated(101, 100, false));
+    assert!(github_pull_request_files_truncated(100, 100, true));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_http_handlers_use_rust_routes() {
     let sandbox = unique_test_dir("git-http");

@@ -5,6 +5,7 @@ import type { ThemeSettings } from "$lib/theme-customization";
 import type {
   AutomationDefinition,
   AutomationRun,
+  AutomationWorktreeCleanupPayload,
   AppConfigPayload,
   AuditLogPayload,
   AuthSessionPayload,
@@ -255,6 +256,13 @@ export const api = {
     return ws.request<{ ok: true; session: SessionSummary; run: AutomationRun | null }>("automations/run", {
       automationId,
       trigger
+    });
+  },
+
+  cleanupAutomationWorktrees(keepRecent = 10, dryRun = false) {
+    return ws.request<AutomationWorktreeCleanupPayload>("automations/worktrees/cleanup", {
+      keepRecent,
+      dryRun
     });
   },
 

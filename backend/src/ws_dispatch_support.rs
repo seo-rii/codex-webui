@@ -80,6 +80,20 @@ pub(crate) async fn execute_ws_method(
                 .await
                 .map_err(anyhow::Error::from)
         }
+        "automations/worktrees/cleanup" => {
+            let keep_recent = params
+                .get("keepRecent")
+                .and_then(Value::as_u64)
+                .map(|value| value.min(1000) as usize)
+                .unwrap_or(10);
+            let dry_run = params
+                .get("dryRun")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            cleanup_automation_worktrees_payload(state, &auth.profile_id, keep_recent, dry_run)
+                .await
+                .map_err(anyhow::Error::from)
+        }
         "runtime/status" => codex_runtime_status(state, false).await,
         "runtime/checkUpdate" => codex_runtime_status(state, true).await,
         "runtime/quota" => {

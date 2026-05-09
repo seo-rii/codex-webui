@@ -7675,6 +7675,25 @@
     }
   }
 
+  async function cleanupAutomationWorktrees() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    try {
+      const response = await api.cleanupAutomationWorktrees(10, false);
+      if (config) {
+        config = applyLocalComposerPreferencesToConfig(await api.getConfig());
+      }
+      noticeText = m.automation_worktrees_cleanup_finished();
+      if (response.failed > 0) {
+        await refreshNotifications();
+      }
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
   function applySlashSuggestion(suggestion: SlashSuggestion) {
     draft = suggestion.value;
     scheduleComposerTextareaResize();
@@ -11380,6 +11399,9 @@
                 }}
                 onRunAutomation={async (automationId) => {
                   await runAutomation(automationId);
+                }}
+                onCleanupAutomationWorktrees={async () => {
+                  await cleanupAutomationWorktrees();
                 }}
                 onOpenSession={async (sessionId) => {
                   activeWorkspaceTabId = "chat";

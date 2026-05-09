@@ -230,7 +230,32 @@ pub(crate) async fn handle_automations_api_http(
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
 
-    let result = if route_path == "/api/automations" {
+    let result = if request.method() == Method::POST
+        && route_path == "/api/automations/worktrees/cleanup"
+    {
+        match read_json_body(
+            request,
+            SMALL_JSON_BODY_LIMIT,
+            "automation worktree cleanup request body",
+        )
+        .await
+        {
+            Ok(payload) => {
+                let keep_recent = payload
+                    .get("keepRecent")
+                    .and_then(Value::as_u64)
+                    .map(|value| value.min(1000) as usize)
+                    .unwrap_or(10);
+                let dry_run = payload
+                    .get("dryRun")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                cleanup_automation_worktrees_payload(&state, &auth.profile_id, keep_recent, dry_run)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    } else if route_path == "/api/automations" {
         match request.method() {
             &Method::POST => {
                 match read_json_body(request, SMALL_JSON_BODY_LIMIT, "automations request body")

@@ -11,7 +11,7 @@ export type SteeringResumeMode = "ask" | "auto";
 export type UserRole = "owner" | "admin" | "viewer";
 export type AutomationScheduleMode = "manual" | "interval";
 export type AutomationExecutionTarget = "local" | "worktree";
-export type AutomationRunStatus = "running" | "started" | "completed" | "failed";
+export type AutomationRunStatus = "running" | "started" | "completed" | "failed" | "cancelled" | "skipped";
 export type SessionForkMode = "fork" | "handoff";
 export type AutostartProvider = "windows-startup" | "macos-launch-agent" | "linux-systemd-user" | "linux-xdg-autostart";
 
@@ -125,6 +125,31 @@ export type AutomationRun = {
   startedAt: number;
   completedAt: number | null;
   error: string | null;
+  worktreeRemovedAt?: number | null;
+  worktreeCleanupError?: string | null;
+};
+
+export type AutomationWorktreeCleanupPayload = {
+  ok: true;
+  dryRun: boolean;
+  keepRecent: number;
+  candidates: number;
+  removed: number;
+  failed: number;
+  skippedActive: number;
+  worktrees: Array<{
+    runId: string;
+    automationId: string;
+    repoPath: string;
+    worktreePath: string;
+  }>;
+  errors: Array<{
+    runId: string;
+    automationId: string;
+    worktreePath: string;
+    status: number;
+    message: string;
+  }>;
 };
 
 export type SessionSummaryHighlight = {

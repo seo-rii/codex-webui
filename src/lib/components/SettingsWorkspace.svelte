@@ -69,6 +69,7 @@
     onSaveAutomation = null,
     onDeleteAutomation = null,
     onRunAutomation = null,
+    onCleanupAutomationWorktrees = null,
     onOpenSession = null,
     onConfigSaved = null
   }: {
@@ -93,6 +94,7 @@
     onSaveAutomation?: ((automation: AutomationDefinition) => void | Promise<void>) | null;
     onDeleteAutomation?: ((automationId: string) => void | Promise<void>) | null;
     onRunAutomation?: ((automationId: string) => void | Promise<void>) | null;
+    onCleanupAutomationWorktrees?: (() => void | Promise<void>) | null;
     onOpenSession?: ((sessionId: string) => void | Promise<void>) | null;
     onConfigSaved?: (() => void | Promise<void>) | null;
   } = $props();
@@ -131,6 +133,7 @@
   let savingAutostart = $state(false);
   let savingPreset = $state(false);
   let savingTheme = $state(false);
+  let cleaningAutomationWorktrees = $state(false);
   let auditLoadedForAdmin = $state(false);
   let activeTab = $state<SettingsTabId>("config");
   const dirty = $derived(Boolean(configFile && editorValue !== configFile.content));
@@ -271,6 +274,7 @@
       automationManagedWorktree: m.automation_managed_worktree(),
       saveAutomation: m.save_automation(),
       runAutomation: m.run_automation(),
+      cleanupAutomationWorktrees: m.cleanup_automation_worktrees(),
       noAutomations: m.no_automations(),
       newAutomation: m.new_automation(),
       recentAutomationRuns: m.recent_automation_runs(),
@@ -901,6 +905,22 @@
       errorText = error instanceof Error ? error.message : ui.failedSave;
     } finally {
       savingPreset = false;
+    }
+  }
+
+  async function cleanupAutomationWorktrees() {
+    if (readOnly || cleaningAutomationWorktrees) {
+      return;
+    }
+
+    cleaningAutomationWorktrees = true;
+    errorText = "";
+    try {
+      await onCleanupAutomationWorktrees?.();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      cleaningAutomationWorktrees = false;
     }
   }
 </script>
@@ -1561,7 +1581,18 @@
                 <Clock3 size={16} />
                 <h3>{ui.recentAutomationRuns}</h3>
               </div>
-              <span>{automationRuns.length}</span>
+              <div class="flex items-center gap-2">
+                <button
+                  class="ghost-button"
+                  disabled={readOnly || cleaningAutomationWorktrees}
+                  onclick={() => void cleanupAutomationWorktrees()}
+                  type="button"
+                >
+                  <Trash2 size={13} />
+                  <span>{cleaningAutomationWorktrees ? ui.saving : ui.cleanupAutomationWorktrees}</span>
+                </button>
+                <span>{automationRuns.length}</span>
+              </div>
             </div>
             {#if automationRuns.length === 0}
               <p class="field-note">{ui.noAutomationRuns}</p>

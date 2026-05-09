@@ -515,6 +515,200 @@ pub(crate) async fn delete_automation_payload(
     Ok(payload)
 }
 
+pub(crate) async fn cleanup_automation_worktrees_payload(
+    state: &AppState,
+    profile_id: &str,
+    keep_recent: usize,
+    dry_run: bool,
+) -> ApiResult<Value> {
+    #[derive(Clone)]
+    struct CleanupCandidate {
+        run_id: String,
+        automation_id: String,
+        repo_path: String,
+        worktree_path: String,
+    }
+
+    let keep_recent = keep_recent.min(1000);
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let mut runs = with_ui_state_read(state, profile_id, |ui_state| {
+        let mut runs = recent_automation_runs_from_ui_state(ui_state, 1000);
+        runs.sort_by(|left, right| {
+            right
+                .get("completedAt")
+                .and_then(Value::as_i64)
+                .or_else(|| right.get("startedAt").and_then(Value::as_i64))
+                .unwrap_or_default()
+                .cmp(
+                    &left
+                        .get("completedAt")
+                        .and_then(Value::as_i64)
+                        .or_else(|| left.get("startedAt").and_then(Value::as_i64))
+                        .unwrap_or_default(),
+                )
+        });
+        Ok(runs)
+    })
+    .await?;
+    let active_runtime_keys = state
+        .active_turns
+        .lock()
+        .await
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let pending_runtime_keys = state
+        .pending_turn_starts
+        .lock()
+        .await
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut retained_by_automation = HashMap::<String, usize>::new();
+    let mut candidates = Vec::new();
+    let mut skipped_active = 0_u64;
+
+    for run in runs.drain(..) {
+        if run.get("worktreeRemovedAt").is_some() {
+            continue;
+        }
+        let status = run.get("status").and_then(Value::as_str);
+        if !matches!(status, Some("completed" | "failed" | "cancelled")) {
+            continue;
+        }
+        let Some(automation_id) = trimmed_json_string(run.get("automationId")) else {
+            continue;
+        };
+        let Some(repo_path) = trimmed_json_string(run.get("repoPath")) else {
+            continue;
+        };
+        let Some(worktree_path) = trimmed_json_string(run.get("worktreePath")) else {
+            continue;
+        };
+        let retained = retained_by_automation
+            .entry(automation_id.clone())
+            .or_insert(0);
+        if *retained < keep_recent {
+            *retained += 1;
+            continue;
+        }
+        if let Some(session_id) = trimmed_json_string(run.get("sessionId")) {
+            let runtime_key = runtime_session_key(&resolved_profile_id, &session_id);
+            if active_runtime_keys.contains(&runtime_key)
+                || pending_runtime_keys.contains(&runtime_key)
+            {
+                skipped_active = skipped_active.saturating_add(1);
+                continue;
+            }
+        }
+        let Some(run_id) = trimmed_json_string(run.get("id")) else {
+            continue;
+        };
+        candidates.push(CleanupCandidate {
+            run_id,
+            automation_id,
+            repo_path,
+            worktree_path,
+        });
+    }
+
+    let mut removed_run_ids = HashSet::<String>::new();
+    let mut failed_errors = Vec::<Value>::new();
+    if !dry_run {
+        for candidate in &candidates {
+            match remove_git_worktree_payload(
+                state,
+                &candidate.repo_path,
+                &candidate.worktree_path,
+                false,
+            )
+            .await
+            {
+                Ok(_) => {
+                    removed_run_ids.insert(candidate.run_id.clone());
+                }
+                Err(error) => {
+                    failed_errors.push(json!({
+                        "runId": candidate.run_id,
+                        "automationId": candidate.automation_id,
+                        "worktreePath": candidate.worktree_path,
+                        "status": error.status.as_u16(),
+                        "message": error.message
+                    }));
+                }
+            }
+        }
+
+        if !removed_run_ids.is_empty() || !failed_errors.is_empty() {
+            let removed_at = now_unix_ms() as i64;
+            let failed_by_run_id = failed_errors
+                .iter()
+                .filter_map(|entry| {
+                    Some((
+                        entry.get("runId")?.as_str()?.to_string(),
+                        entry.get("message")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect::<HashMap<_, _>>();
+            with_ui_state_write(state, profile_id, |ui_state| {
+                let Some(runs) = ui_state
+                    .get_mut("automationRuns")
+                    .and_then(Value::as_array_mut)
+                else {
+                    return Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "automation runs state is missing",
+                    ));
+                };
+                for run in runs {
+                    let Some(run_id) = run.get("id").and_then(Value::as_str).map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    if let Some(object) = run.as_object_mut() {
+                        if removed_run_ids.contains(&run_id) {
+                            object.insert("worktreeRemovedAt".to_string(), Value::from(removed_at));
+                            object.remove("worktreeCleanupError");
+                        } else if let Some(error) = failed_by_run_id.get(&run_id) {
+                            object.insert(
+                                "worktreeCleanupError".to_string(),
+                                Value::from(error.clone()),
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+            emit_profile_automations_updated(state, profile_id).await;
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "dryRun": dry_run,
+        "keepRecent": keep_recent,
+        "candidates": candidates.len(),
+        "removed": removed_run_ids.len(),
+        "failed": failed_errors.len(),
+        "skippedActive": skipped_active,
+        "worktrees": candidates
+            .iter()
+            .map(|candidate| {
+                json!({
+                    "runId": candidate.run_id,
+                    "automationId": candidate.automation_id,
+                    "repoPath": candidate.repo_path,
+                    "worktreePath": candidate.worktree_path
+                })
+            })
+            .collect::<Vec<_>>(),
+        "errors": failed_errors
+    }))
+}
+
 pub(crate) async fn run_automation_payload(
     state: &AppState,
     profile_id: &str,

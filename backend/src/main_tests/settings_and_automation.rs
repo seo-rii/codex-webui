@@ -2296,3 +2296,179 @@ async fn runtime_failed_status_marks_started_automation_run_failed() {
 
     let _ = fs::remove_dir_all(sandbox);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automation_worktree_cleanup_removes_only_safe_completed_worktrees() {
+    let sandbox = unique_test_dir("automation-worktree-cleanup");
+    let workspace = sandbox.join("workspace");
+    let repo = workspace.join("repo");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    init_test_git_repo(&repo);
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let clean_worktree = repo
+        .join(".codex-webui")
+        .join("worktrees")
+        .join("daily")
+        .join("clean");
+    let dirty_worktree = repo
+        .join(".codex-webui")
+        .join("worktrees")
+        .join("daily")
+        .join("dirty");
+    let active_worktree = repo
+        .join(".codex-webui")
+        .join("worktrees")
+        .join("daily")
+        .join("active");
+    create_git_worktree_payload(
+        &state,
+        repo.to_str().unwrap(),
+        clean_worktree.to_str().unwrap(),
+        Some("automation-clean"),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    create_git_worktree_payload(
+        &state,
+        repo.to_str().unwrap(),
+        dirty_worktree.to_str().unwrap(),
+        Some("automation-dirty"),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    create_git_worktree_payload(
+        &state,
+        repo.to_str().unwrap(),
+        active_worktree.to_str().unwrap(),
+        Some("automation-active"),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    fs::write(dirty_worktree.join("dirty.txt"), "uncommitted\n").unwrap();
+    state.active_turns.lock().await.insert(
+        runtime_session_key("default", "thread-active"),
+        "turn-active".to_string(),
+    );
+
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &ui_state_path,
+        serde_json::to_vec_pretty(&json!({
+            "global": {
+                "shutdownAfterQueueCompletes": false,
+                "scheduledShutdown": Value::Null
+            },
+            "notifications": {
+                "items": [],
+                "settings": default_notification_settings_value()
+            },
+            "sessionMetaByThreadId": {},
+            "savedSessionFilters": [],
+            "promptPresets": [],
+            "automations": [],
+            "automationRuns": [
+                {
+                    "id": "run-active",
+                    "automationId": "auto-1",
+                    "automationName": "Daily task",
+                    "status": "completed",
+                    "trigger": "schedule",
+                    "sessionId": "thread-active",
+                    "repoPath": repo.display().to_string(),
+                    "cwd": active_worktree.display().to_string(),
+                    "worktreePath": active_worktree.display().to_string(),
+                    "startedAt": 30,
+                    "completedAt": 40,
+                    "error": Value::Null
+                },
+                {
+                    "id": "run-dirty",
+                    "automationId": "auto-1",
+                    "automationName": "Daily task",
+                    "status": "completed",
+                    "trigger": "schedule",
+                    "sessionId": "thread-dirty",
+                    "repoPath": repo.display().to_string(),
+                    "cwd": dirty_worktree.display().to_string(),
+                    "worktreePath": dirty_worktree.display().to_string(),
+                    "startedAt": 20,
+                    "completedAt": 30,
+                    "error": Value::Null
+                },
+                {
+                    "id": "run-clean",
+                    "automationId": "auto-1",
+                    "automationName": "Daily task",
+                    "status": "completed",
+                    "trigger": "schedule",
+                    "sessionId": "thread-clean",
+                    "repoPath": repo.display().to_string(),
+                    "cwd": clean_worktree.display().to_string(),
+                    "worktreePath": clean_worktree.display().to_string(),
+                    "startedAt": 10,
+                    "completedAt": 20,
+                    "error": Value::Null
+                }
+            ],
+            "preferencesByThreadId": {},
+            "draftsByThreadId": {},
+            "queuesByThreadId": {},
+            "highlightsByThreadId": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let payload = cleanup_automation_worktrees_payload(&state, "default", 0, false)
+        .await
+        .unwrap();
+
+    assert_eq!(payload.get("candidates").and_then(Value::as_u64), Some(2));
+    assert_eq!(payload.get("removed").and_then(Value::as_u64), Some(1));
+    assert_eq!(payload.get("failed").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        payload.get("skippedActive").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert!(!clean_worktree.exists());
+    assert!(dirty_worktree.exists());
+    assert!(active_worktree.exists());
+
+    let runs = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(recent_automation_runs_from_ui_state(ui_state, 10))
+    })
+    .await
+    .unwrap();
+    let clean_run = runs
+        .iter()
+        .find(|run| run.get("id").and_then(Value::as_str) == Some("run-clean"))
+        .unwrap();
+    let dirty_run = runs
+        .iter()
+        .find(|run| run.get("id").and_then(Value::as_str) == Some("run-dirty"))
+        .unwrap();
+    assert!(
+        clean_run
+            .get("worktreeRemovedAt")
+            .and_then(Value::as_i64)
+            .is_some()
+    );
+    assert!(
+        dirty_run
+            .get("worktreeCleanupError")
+            .and_then(Value::as_str)
+            .is_some()
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}

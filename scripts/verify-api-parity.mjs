@@ -5,26 +5,27 @@ import process from "node:process";
 const projectRoot = process.cwd();
 const frontendSourceRoot = path.join(projectRoot, "src");
 const debugClientPath = path.join(projectRoot, "scripts", "ws-debug-client.mjs");
-const backendMainPath = path.join(projectRoot, "backend", "src", "main.rs");
+const backendSourceRoot = path.join(projectRoot, "backend", "src");
 const INTERPOLATION_TOKEN = "__SEGMENT__";
-const SOURCE_FILE_EXTENSIONS = new Set([".ts", ".js", ".mjs", ".svelte"]);
+const FRONTEND_SOURCE_FILE_EXTENSIONS = new Set([".ts", ".js", ".mjs", ".svelte"]);
+const BACKEND_SOURCE_FILE_EXTENSIONS = new Set([".rs"]);
 
 function extractAll(pattern, content) {
   return [...content.matchAll(pattern)].map((match) => match[1]);
 }
 
-async function collectSourceFiles(rootPath) {
+async function collectSourceFiles(rootPath, extensions) {
   const entries = await fs.readdir(rootPath, { withFileTypes: true });
   const files = [];
 
   for (const entry of entries) {
     const entryPath = path.join(rootPath, entry.name);
     if (entry.isDirectory()) {
-      files.push(...(await collectSourceFiles(entryPath)));
+      files.push(...(await collectSourceFiles(entryPath, extensions)));
       continue;
     }
 
-    if (entry.isFile() && SOURCE_FILE_EXTENSIONS.has(path.extname(entry.name))) {
+    if (entry.isFile() && extensions.has(path.extname(entry.name))) {
       files.push(entryPath);
     }
   }
@@ -59,10 +60,12 @@ function backendSupportsTemplate(content, template) {
 }
 
 async function main() {
-  const frontendFiles = await collectSourceFiles(frontendSourceRoot);
+  const frontendFiles = await collectSourceFiles(frontendSourceRoot, FRONTEND_SOURCE_FILE_EXTENSIONS);
+  const backendFiles = await collectSourceFiles(backendSourceRoot, BACKEND_SOURCE_FILE_EXTENSIONS);
   const frontendSources = await Promise.all(frontendFiles.map((filePath) => fs.readFile(filePath, "utf8")));
+  const backendSources = await Promise.all(backendFiles.map((filePath) => fs.readFile(filePath, "utf8")));
   const debugClient = await fs.readFile(debugClientPath, "utf8");
-  const backendMain = await fs.readFile(backendMainPath, "utf8");
+  const backendContent = backendSources.join("\n");
   const allFrontendContent = frontendSources.join("\n");
   const allSourceContent = `${allFrontendContent}\n${debugClient}`;
 
@@ -87,10 +90,10 @@ async function main() {
       .filter((pathname) => pathname === "/ws")
   ]);
 
-  const missingWsMethods = [...wsMethods].filter((method) => !backendMain.includes(`"${method}"`)).sort();
-  const missingHttpRoutes = [...httpRoutes].filter((route) => !backendSupportsTemplate(backendMain, route)).sort();
+  const missingWsMethods = [...wsMethods].filter((method) => !backendContent.includes(`"${method}"`)).sort();
+  const missingHttpRoutes = [...httpRoutes].filter((route) => !backendSupportsTemplate(backendContent, route)).sort();
   const missingWebSocketRoutes = [...websocketRoutes]
-    .filter((route) => !backendSupportsTemplate(backendMain, route))
+    .filter((route) => !backendSupportsTemplate(backendContent, route))
     .sort();
 
   if (missingWsMethods.length || missingHttpRoutes.length || missingWebSocketRoutes.length) {

@@ -658,6 +658,76 @@ async fn attachment_storage_quota_ignores_streaming_temp_files() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_storage_usage_cache_updates_after_save_and_delete() {
+    let sandbox = unique_test_dir("attachment-usage-cache");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let existing_dir = session_uploads_dir(&state, "default", "thread-0");
+    fs::create_dir_all(&existing_dir).unwrap();
+    fs::write(existing_dir.join("existing.txt"), b"123456").unwrap();
+
+    assert_eq!(
+        profile_attachment_storage_size(&state, "default")
+            .await
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        state
+            .attachment_storage_usage_cache
+            .lock()
+            .await
+            .get("default")
+            .map(|entry| entry.bytes),
+        Some(6)
+    );
+
+    let stored = save_uploaded_attachment_records(
+        &state,
+        "default",
+        "thread-1",
+        vec![AttachmentUploadPayload {
+            name: "note.txt".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            bytes: b"note".to_vec(),
+        }],
+    )
+    .await
+    .unwrap();
+    let after_save = state
+        .attachment_storage_usage_cache
+        .lock()
+        .await
+        .get("default")
+        .map(|entry| entry.bytes)
+        .unwrap();
+    assert!(after_save > 6);
+    assert_eq!(
+        profile_attachment_storage_size(&state, "default")
+            .await
+            .unwrap(),
+        after_save
+    );
+
+    delete_attachment_payload(&state, "default", "thread-1", &stored[0].id)
+        .await
+        .unwrap();
+    assert_eq!(
+        profile_attachment_storage_size(&state, "default")
+            .await
+            .unwrap(),
+        6
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_routes_reject_invalid_session_ids_before_storage_access() {
     let sandbox = unique_test_dir("session-route-invalid-id");
     let workspace = sandbox.join("workspace");

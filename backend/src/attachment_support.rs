@@ -143,6 +143,7 @@ pub(crate) fn attachment_storage_quota_error_message(max_storage_bytes: u64) -> 
 
 pub(crate) const MAX_ATTACHMENTS_PER_REQUEST: usize = 20;
 pub(crate) const MAX_TOTAL_ATTACHMENT_UPLOAD_MULTIPLIER: u64 = 4;
+const ATTACHMENT_STORAGE_USAGE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 pub(crate) fn attachment_count_limit_error() -> ApiError {
     api_error(
@@ -179,7 +180,7 @@ pub(crate) fn validate_total_attachment_size(config: &Config, size: u64) -> ApiR
     Ok(())
 }
 
-pub(crate) async fn profile_attachment_storage_size(
+async fn scan_profile_attachment_storage_size(
     state: &AppState,
     profile_id: &str,
 ) -> ApiResult<u64> {
@@ -235,6 +236,50 @@ pub(crate) async fn profile_attachment_storage_size(
     }
 
     Ok(total)
+}
+
+pub(crate) async fn profile_attachment_storage_size(
+    state: &AppState,
+    profile_id: &str,
+) -> ApiResult<u64> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    if let Some(cached) = state
+        .attachment_storage_usage_cache
+        .lock()
+        .await
+        .get(&resolved_profile_id)
+        .cloned()
+        && cached.scanned_at.elapsed() < ATTACHMENT_STORAGE_USAGE_CACHE_TTL
+    {
+        return Ok(cached.bytes);
+    }
+
+    let bytes = scan_profile_attachment_storage_size(state, &resolved_profile_id).await?;
+    state.attachment_storage_usage_cache.lock().await.insert(
+        resolved_profile_id,
+        CachedAttachmentStorageUsage {
+            scanned_at: Instant::now(),
+            bytes,
+        },
+    );
+    Ok(bytes)
+}
+
+async fn adjust_attachment_storage_usage_cache(state: &AppState, profile_id: &str, delta: i128) {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let mut cache = state.attachment_storage_usage_cache.lock().await;
+    if let Some(cached) = cache.get_mut(&resolved_profile_id) {
+        if delta >= 0 {
+            cached.bytes = cached.bytes.saturating_add(delta as u64);
+        } else {
+            cached.bytes = cached.bytes.saturating_sub(delta.unsigned_abs() as u64);
+        }
+        cached.scanned_at = Instant::now();
+    }
 }
 
 pub(crate) async fn validate_attachment_storage_quota(
@@ -380,6 +425,12 @@ pub(crate) async fn save_uploaded_attachment_records(
         let metadata = serde_json::to_vec_pretty(&record)
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
         write_attachment_bytes_atomically(&meta_path, &metadata).await?;
+        adjust_attachment_storage_usage_cache(
+            state,
+            profile_id,
+            (size + metadata.len() as u64) as i128,
+        )
+        .await;
         stored.push(record);
     }
 
@@ -449,6 +500,12 @@ pub(crate) async fn store_uploaded_attachment_file(
     let metadata = serde_json::to_vec_pretty(&record)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     write_attachment_bytes_atomically(&meta_path, &metadata).await?;
+    adjust_attachment_storage_usage_cache(
+        state,
+        profile_id,
+        (size + metadata.len() as u64) as i128,
+    )
+    .await;
     Ok(record)
 }
 
@@ -530,9 +587,19 @@ pub(crate) async fn delete_attachment_payload(
         attachment_id,
         &target.original_name,
     );
+    let removed_size = tokio_fs::metadata(&file_path)
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        .saturating_add(
+            tokio_fs::metadata(&meta_path)
+                .await
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+        );
     let (file_result, meta_result) = tokio::join!(
-        tokio_fs::remove_file(file_path),
-        tokio_fs::remove_file(meta_path),
+        tokio_fs::remove_file(&file_path),
+        tokio_fs::remove_file(&meta_path),
     );
     for result in [file_result, meta_result] {
         if let Err(error) = result
@@ -544,6 +611,7 @@ pub(crate) async fn delete_attachment_payload(
             ));
         }
     }
+    adjust_attachment_storage_usage_cache(state, profile_id, -(removed_size as i128)).await;
     emit_attachments_updated(state, profile_id, session_id).await?;
     Ok(json!({ "ok": true }))
 }
@@ -690,6 +758,10 @@ pub(crate) async fn cleanup_attachment_orphans_payload(
                 }
             }
         }
+    }
+
+    if !dry_run && removed_bytes > 0 {
+        adjust_attachment_storage_usage_cache(state, profile_id, -(removed_bytes as i128)).await;
     }
 
     Ok(json!({

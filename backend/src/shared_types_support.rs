@@ -32,6 +32,8 @@ pub(crate) struct AppState {
     pub(crate) inflight_requests: Arc<Mutex<HashMap<String, InflightRequest>>>,
     pub(crate) profile_request_slots: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     pub(crate) quota_cache: Arc<Mutex<HashMap<String, CachedQuota>>>,
+    pub(crate) attachment_storage_usage_cache:
+        Arc<Mutex<HashMap<String, CachedAttachmentStorageUsage>>>,
     pub(crate) relays: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
     pub(crate) terminals: Arc<Mutex<HashMap<String, Arc<TerminalSession>>>>,
     pub(crate) ui_state_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -48,6 +50,12 @@ pub(crate) struct AppState {
     pub(crate) preserve_app_servers_on_shutdown: Arc<AtomicBool>,
     pub(crate) shutdown_notify: Arc<Notify>,
     pub(crate) restart_plan: Arc<Mutex<Option<RestartPlan>>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CachedAttachmentStorageUsage {
+    pub(crate) scanned_at: Instant,
+    pub(crate) bytes: u64,
 }
 
 #[derive(Clone, Debug)]

@@ -894,6 +894,7 @@ pub(crate) async fn execute_ws_method(
                 subscriptions.clone(),
                 auth.profile_id.clone(),
                 session_id.clone(),
+                auth.role,
             )
             .await?;
             Ok(json!({ "subscribed": true, "sessionId": session_id }))
@@ -936,6 +937,7 @@ pub(crate) async fn execute_ws_method(
                 out_tx.clone(),
                 subscriptions.clone(),
                 auth.profile_id.clone(),
+                auth.role,
             )
             .await?;
             Ok(json!({ "subscribed": true, "scope": "global" }))

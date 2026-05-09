@@ -163,6 +163,7 @@ pub(crate) async fn fetch_git_repository_payload(
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
     let repo_lock = git_operation_lock(state, &repo_root).await;
     let _repo_guard = repo_lock.lock().await;
+    reject_git_mutation_if_repo_busy(state, &repo_root).await?;
     run_git_text_payload(
         state,
         &repo_root,

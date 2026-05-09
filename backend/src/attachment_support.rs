@@ -403,7 +403,6 @@ pub(crate) async fn store_uploaded_attachment_file(
     source_path: &Path,
 ) -> ApiResult<StoredAttachmentRecord> {
     validate_attachment_size(&state.config, size)?;
-    validate_attachment_storage_quota(state, profile_id, size).await?;
     let uploads_dir = resolve_runtime_profile(&state.config, profile_id)
         .data_dir
         .join("uploads")

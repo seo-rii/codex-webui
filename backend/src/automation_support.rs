@@ -52,6 +52,10 @@ fn build_automation_worktree_name(name: &str) -> String {
     }
 }
 
+fn automation_run_is_active(status: Option<&str>) -> bool {
+    matches!(status, Some("running" | "started"))
+}
+
 async fn emit_profile_automations_updated(state: &AppState, profile_id: &str) {
     let payload = with_ui_state_read(state, profile_id, |ui_state| {
         Ok(json!({
@@ -65,6 +69,52 @@ async fn emit_profile_automations_updated(state: &AppState, profile_id: &str) {
 
     if let Ok(payload) = payload {
         emit_profile_config_updated(state, profile_id, payload).await;
+    }
+}
+
+pub(crate) async fn complete_active_automation_runs_for_session(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    status: &str,
+    error: Option<&str>,
+) {
+    let completed_at = now_unix_ms() as i64;
+    let changed = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(automation_runs) = ui_state
+            .get_mut("automationRuns")
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "automation runs state is missing",
+            ));
+        };
+
+        let mut changed = false;
+        for run in automation_runs.iter_mut() {
+            if run.get("sessionId").and_then(Value::as_str) != Some(session_id)
+                || !automation_run_is_active(run.get("status").and_then(Value::as_str))
+            {
+                continue;
+            }
+            if let Some(object) = run.as_object_mut() {
+                object.insert("status".to_string(), json!(status));
+                object.insert("completedAt".to_string(), json!(completed_at));
+                object.insert(
+                    "error".to_string(),
+                    error.map(Value::from).unwrap_or(Value::Null),
+                );
+                changed = true;
+            }
+        }
+        Ok(changed)
+    })
+    .await
+    .unwrap_or(false);
+
+    if changed {
+        emit_profile_automations_updated(state, profile_id).await;
     }
 }
 
@@ -399,11 +449,11 @@ pub(crate) async fn run_automation_payload(
 
         if automation_runs.iter().any(|entry| {
             entry.get("automationId").and_then(Value::as_str) == Some(automation_id)
-                && entry.get("status").and_then(Value::as_str) == Some("running")
+                && automation_run_is_active(entry.get("status").and_then(Value::as_str))
         }) {
             return Err(api_error(
                 StatusCode::CONFLICT,
-                "Automation is already starting.",
+                "Automation is already running.",
             ));
         }
 

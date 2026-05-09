@@ -193,7 +193,10 @@ fn persisted_auth_revocation_file_is_loaded_on_first_auth_check() {
     let codex_home = sandbox.join("codex-home");
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
-    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    config.owner_password = Some("owner-secret".to_string());
+    state.config = Arc::new(config);
     let jar = issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Admin).unwrap();
     let token = jar.get(AUTH_COOKIE).unwrap().value();
     let token_parts = token.split('.').collect::<Vec<_>>();
@@ -522,8 +525,13 @@ fn external_or_configured_owner_modes_require_owner_role_for_owner_actions() {
 
     config.public_host = "127.0.0.1".to_string();
     config.system_shutdown_enabled = true;
-    assert!(role_has_owner_access(&config, UserRole::Admin));
+    assert!(!role_has_owner_access(&config, UserRole::Admin));
 
+    config.system_shutdown_enabled = false;
+    config.require_owner_role = true;
+    assert!(!role_has_owner_access(&config, UserRole::Admin));
+    assert!(role_has_owner_access(&config, UserRole::Owner));
+    config.require_owner_role = false;
     config.owner_password = Some("owner-secret".to_string());
     assert!(!role_has_owner_access(&config, UserRole::Admin));
     assert!(role_has_owner_access(&config, UserRole::Owner));
@@ -2559,6 +2567,11 @@ async fn destructive_git_mutations_reject_active_codex_work() {
     let error = commit_git_changes_payload(&state, repo.to_str().unwrap(), "busy commit")
         .await
         .expect_err("commit should reject active Codex work");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+
+    let error = fetch_git_repository_payload(&state, repo.to_str().unwrap())
+        .await
+        .expect_err("fetch should reject active Codex work");
     assert_eq!(error.status, StatusCode::CONFLICT);
 
     let worktree = workspace.join("busy-worktree");

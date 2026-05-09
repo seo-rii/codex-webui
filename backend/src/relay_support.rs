@@ -6,6 +6,7 @@ pub(crate) async fn subscribe_session(
     subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     profile_id: String,
     session_id: String,
+    role: UserRole,
 ) -> Result<()> {
     let relay = ensure_stream_relay(&state, &profile_id, &session_id).await?;
     let mut receiver = relay.subscribe();
@@ -17,6 +18,9 @@ pub(crate) async fn subscribe_session(
         loop {
             match receiver.recv().await {
                 Ok(event) => {
+                    let Some(event) = filter_session_event_for_role(role, event) else {
+                        continue;
+                    };
                     if stream_out_tx
                         .try_send(ServerEnvelope::Event {
                             session_id: session_key.clone(),
@@ -44,6 +48,11 @@ pub(crate) async fn subscribe_session(
     }
 
     if let Ok(queue) = get_session_queue_payload(&state, &profile_id, &session_id).await {
+        let queue = if role_has_admin_access(role) {
+            queue
+        } else {
+            redacted_queue_payload(&queue)
+        };
         let _ = out_tx
             .send(ServerEnvelope::Event {
                 session_id: session_id.clone(),
@@ -108,6 +117,7 @@ pub(crate) async fn subscribe_global(
     out_tx: mpsc::Sender<ServerEnvelope>,
     subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     profile_id: String,
+    role: UserRole,
 ) -> Result<()> {
     let relay = ensure_global_relay(&state, &profile_id).await?;
     let mut receiver = relay.subscribe();
@@ -115,6 +125,9 @@ pub(crate) async fn subscribe_global(
         loop {
             match receiver.recv().await {
                 Ok(event) => {
+                    let Some(event) = filter_global_event_for_role(role, event) else {
+                        continue;
+                    };
                     if out_tx
                         .try_send(ServerEnvelope::GlobalEvent { event })
                         .is_err()
@@ -136,6 +149,86 @@ pub(crate) async fn subscribe_global(
         existing.abort();
     }
     Ok(())
+}
+
+fn redacted_queue_payload(queue: &Value) -> Value {
+    let item_count = queue
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    json!({
+        "sessionId": queue.get("sessionId").cloned().unwrap_or(Value::Null),
+        "itemCount": item_count,
+        "resumeRequired": queue
+            .get("resumeRequired")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "updatedAt": queue.get("updatedAt").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn filter_session_event_for_role(role: UserRole, event: Value) -> Option<Value> {
+    if role_has_admin_access(role) {
+        return Some(event);
+    }
+
+    if event.get("method").and_then(Value::as_str) != Some("codex-webui/queueUpdated") {
+        return Some(event);
+    }
+
+    let queue = event
+        .get("params")
+        .and_then(|params| params.get("queue"))
+        .map(redacted_queue_payload)
+        .unwrap_or_else(|| redacted_queue_payload(&Value::Null));
+    Some(json!({
+        "kind": event
+            .get("kind")
+            .cloned()
+            .unwrap_or_else(|| json!("notification")),
+        "method": "codex-webui/queueUpdated",
+        "params": {
+            "queue": queue
+        }
+    }))
+}
+
+fn redacted_notification_added_event(event: Value) -> Value {
+    let params = event.get("params").cloned().unwrap_or_else(|| json!({}));
+    let notification = params.get("notification").cloned().unwrap_or(Value::Null);
+    json!({
+        "kind": event
+            .get("kind")
+            .cloned()
+            .unwrap_or_else(|| json!("notification")),
+        "method": "codex-webui/notificationAdded",
+        "params": {
+            "notification": {
+                "id": notification.get("id").cloned().unwrap_or(Value::Null),
+                "type": notification.get("type").cloned().unwrap_or(Value::Null),
+                "createdAt": notification.get("createdAt").cloned().unwrap_or(Value::Null),
+                "readAt": notification.get("readAt").cloned().unwrap_or(Value::Null),
+                "sessionId": notification.get("sessionId").cloned().unwrap_or(Value::Null)
+            },
+            "unreadCount": params.get("unreadCount").cloned().unwrap_or_else(|| json!(0))
+        }
+    })
+}
+
+fn filter_global_event_for_role(role: UserRole, event: Value) -> Option<Value> {
+    if role_has_admin_access(role) {
+        return Some(event);
+    }
+
+    match event.get("method").and_then(Value::as_str) {
+        Some("codex-webui/sessionListsInvalidated")
+        | Some("codex-webui/sessionSummaryUpdated")
+        | Some("codex-webui/sessionAttention")
+        | Some("codex-webui/notificationStateUpdated") => Some(event),
+        Some("codex-webui/notificationAdded") => Some(redacted_notification_added_event(event)),
+        _ => None,
+    }
 }
 
 pub(crate) async fn ensure_stream_relay(

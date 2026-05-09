@@ -276,6 +276,7 @@ The Rust gateway honors a focused set of `CODEX_WEBUI_*` environment variables. 
 - `CODEX_WEBUI_HCAPTCHA_SITE_KEY`
 - `CODEX_WEBUI_HCAPTCHA_SECRET_KEY`
 - `CODEX_WEBUI_CORS_ALLOWED_ORIGINS`
+- `CODEX_WEBUI_REQUIRE_OWNER`
 - `CODEX_WEBUI_REQUIRE_ORIGIN_HEADER`
 - `CODEX_WEBUI_WEBHOOK_ALLOWED_HOSTS`
 - `CODEX_WEBUI_TRUST_PROXY_HEADERS`
@@ -318,7 +319,7 @@ See [.env.example](./.env.example) for a concise example set.
 - Use the viewer password for observation-only access instead of sharing the admin password when multiple humans need browser visibility.
 - Git actions are intentionally gated on explicit repository selection.
 - Pull, branch switch, and worktree removal are blocked while a live or pending Codex turn is using that repository.
-- If `ownerPasswordHash` is configured, host-level controls require owner login rather than ordinary admin login.
+- If `ownerPasswordHash` is configured or `CODEX_WEBUI_REQUIRE_OWNER=true`, host-level controls require owner login rather than ordinary admin login.
 - Terminal tabs run shell processes with the host user privileges of the gateway process; allowed roots only constrain the initial working directory and UI file tools, not arbitrary shell commands.
 - System shutdown support is disabled by default and must be explicitly enabled.
 - The shutdown control is global to the running server, so all connected clients see the same armed and scheduled state.

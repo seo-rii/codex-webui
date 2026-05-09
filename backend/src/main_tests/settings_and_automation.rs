@@ -743,6 +743,7 @@ async fn session_subscription_drops_slow_outbound_client() {
         subscriptions.clone(),
         "default".to_string(),
         "thread-1".to_string(),
+        UserRole::Admin,
     )
     .await
     .expect("subscription should start");
@@ -782,6 +783,155 @@ async fn session_subscription_drops_slow_outbound_client() {
             .contains_key(&session_relay_key("default", "thread-1")),
         "subscription registry cleanup is handled by websocket disconnect paths"
     );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn viewer_session_subscription_redacts_queue_payloads() {
+    let sandbox = unique_test_dir("viewer-session-queue-redaction");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    with_ui_state_write(&state, "default", |ui_state| {
+        let queues = ui_state
+            .get_mut("queuesByThreadId")
+            .and_then(Value::as_object_mut)
+            .expect("queue state should exist");
+        queues.insert(
+            "thread-queue".to_string(),
+            json!({
+                "items": [
+                    {
+                        "id": "queue-1",
+                        "prompt": "secret queued prompt",
+                        "skills": [{ "name": "secret-skill" }],
+                        "createdAt": 1
+                    }
+                ],
+                "resumePending": true,
+                "updatedAt": 2
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .expect("queue fixture should save");
+
+    let (out_tx, mut out_rx) = mpsc::channel(8);
+    let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    subscribe_session(
+        state.clone(),
+        out_tx,
+        subscriptions,
+        "default".to_string(),
+        "thread-queue".to_string(),
+        UserRole::Viewer,
+    )
+    .await
+    .expect("viewer subscription should start");
+
+    let envelope = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+        .await
+        .expect("redacted queue event should arrive")
+        .expect("redacted queue event should be readable");
+    let ServerEnvelope::Event { event, .. } = envelope else {
+        panic!("expected session event");
+    };
+    let queue = event
+        .get("params")
+        .and_then(|params| params.get("queue"))
+        .expect("queue payload should exist");
+    assert_eq!(queue.get("itemCount").and_then(Value::as_u64), Some(1));
+    assert!(queue.get("items").is_none());
+    assert!(queue.to_string().contains("secret queued prompt") == false);
+    assert!(queue.to_string().contains("secret-skill") == false);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn viewer_global_subscription_filters_sensitive_events() {
+    let sandbox = unique_test_dir("viewer-global-redaction");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let (out_tx, mut out_rx) = mpsc::channel(8);
+    let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    subscribe_global(
+        state.clone(),
+        out_tx,
+        subscriptions,
+        "default".to_string(),
+        UserRole::Viewer,
+    )
+    .await
+    .expect("viewer global subscription should start");
+
+    emit_profile_config_updated(
+        &state,
+        "default",
+        json!({
+            "promptPresets": [{ "name": "secret preset", "prompt": "do secret work" }]
+        }),
+    )
+    .await;
+    emit_profile_global_notification(
+        &state,
+        "default",
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/accountUpdated",
+            "params": { "email": "secret@example.com" }
+        }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        out_rx.try_recv().is_err(),
+        "viewer should not receive config/account events"
+    );
+
+    emit_profile_global_notification(
+        &state,
+        "default",
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/notificationAdded",
+            "params": {
+                "notification": {
+                    "id": "notice-1",
+                    "type": "sessionCompleted",
+                    "createdAt": 3,
+                    "readAt": Value::Null,
+                    "sessionId": "thread-1",
+                    "payload": { "secret": "hidden" }
+                },
+                "unreadCount": 1
+            }
+        }),
+    )
+    .await;
+
+    let envelope = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+        .await
+        .expect("redacted notification should arrive")
+        .expect("redacted notification should be readable");
+    let ServerEnvelope::GlobalEvent { event } = envelope else {
+        panic!("expected global event");
+    };
+    assert_eq!(
+        event.get("method").and_then(Value::as_str),
+        Some("codex-webui/notificationAdded")
+    );
+    assert!(!event.to_string().contains("hidden"));
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -1808,7 +1958,7 @@ async fn saves_and_deletes_automations_with_normalization() {
 }
 
 #[tokio::test]
-async fn automation_run_rejects_duplicate_starting_run() {
+async fn automation_run_rejects_duplicate_active_run() {
     let sandbox = unique_test_dir("automation-duplicate-run");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -1855,9 +2005,9 @@ async fn automation_run_rejects_duplicate_starting_run() {
                 "id": "run-1",
                 "automationId": "auto-1",
                 "automationName": "Daily task",
-                "status": "running",
+                "status": "started",
                 "trigger": "manual",
-                "sessionId": Value::Null,
+                "sessionId": "thread-auto",
                 "repoPath": Value::Null,
                 "cwd": Value::Null,
                 "worktreePath": Value::Null,
@@ -1876,10 +2026,84 @@ async fn automation_run_rejects_duplicate_starting_run() {
 
     let error = run_automation_payload(&state, "default", "auto-1", "manual")
         .await
-        .expect_err("duplicate starting automation runs should be rejected before app-server work");
+        .expect_err("duplicate active automation runs should be rejected before app-server work");
 
     assert_eq!(error.status, StatusCode::CONFLICT);
-    assert_eq!(error.message, "Automation is already starting.");
+    assert_eq!(error.message, "Automation is already running.");
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn runtime_completion_marks_started_automation_run_completed() {
+    let sandbox = unique_test_dir("automation-completion");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &ui_state_path,
+        serde_json::to_vec_pretty(&json!({
+            "global": {
+                "shutdownAfterQueueCompletes": false,
+                "scheduledShutdown": Value::Null
+            },
+            "notifications": {
+                "items": [],
+                "settings": default_notification_settings_value()
+            },
+            "sessionMetaByThreadId": {},
+            "savedSessionFilters": [],
+            "promptPresets": [],
+            "automations": [],
+            "automationRuns": [{
+                "id": "run-1",
+                "automationId": "auto-1",
+                "automationName": "Daily task",
+                "status": "started",
+                "trigger": "manual",
+                "sessionId": "thread-auto",
+                "repoPath": Value::Null,
+                "cwd": Value::Null,
+                "worktreePath": Value::Null,
+                "startedAt": 1,
+                "completedAt": Value::Null,
+                "error": Value::Null
+            }],
+            "preferencesByThreadId": {},
+            "draftsByThreadId": {},
+            "queuesByThreadId": {},
+            "highlightsByThreadId": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "turn/completed".to_string(),
+            params: json!({
+                "threadId": "thread-auto",
+                "turnId": "turn-auto"
+            }),
+        },
+    )
+    .await;
+
+    let runs = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(recent_automation_runs_from_ui_state(ui_state, 10))
+    })
+    .await
+    .unwrap();
+    let run = runs.first().expect("run should remain available");
+    assert_eq!(run.get("status").and_then(Value::as_str), Some("completed"));
+    assert!(run.get("completedAt").and_then(Value::as_i64).is_some());
 
     let _ = fs::remove_dir_all(sandbox);
 }

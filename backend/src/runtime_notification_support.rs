@@ -485,6 +485,14 @@ pub(crate) async fn handle_profile_runtime_notification(
             if still_active {
                 set_session_highlight(state, profile_id, &session_id, None).await;
             } else {
+                complete_active_automation_runs_for_session(
+                    state,
+                    profile_id,
+                    &session_id,
+                    "completed",
+                    None,
+                )
+                .await;
                 spawn_queue_drain(state, profile_id, &session_id);
                 maybe_schedule_global_shutdown(state, profile_id, turn_id.as_deref()).await;
                 emit_profile_global_notification(
@@ -552,6 +560,14 @@ pub(crate) async fn handle_profile_runtime_notification(
                     state.pending_turn_starts.lock().await.remove(&runtime_key);
                     state.active_turns.lock().await.remove(&runtime_key);
                     set_runtime_session_status(state, profile_id, &session_id, &status).await;
+                    complete_active_automation_runs_for_session(
+                        state,
+                        profile_id,
+                        &session_id,
+                        "completed",
+                        None,
+                    )
+                    .await;
                     spawn_queue_drain(state, profile_id, &session_id);
                     maybe_schedule_global_shutdown(state, profile_id, None).await;
                 }

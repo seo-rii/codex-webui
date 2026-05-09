@@ -91,6 +91,7 @@ pub(crate) struct Config {
     pub(crate) cookie_same_site: SameSiteMode,
     pub(crate) cookie_secure_mode: CookieSecureMode,
     pub(crate) cors_allowed_origins: Vec<String>,
+    pub(crate) require_owner_role: bool,
     pub(crate) require_origin_header: bool,
     pub(crate) trust_proxy_headers: bool,
     pub(crate) trusted_proxy_cidrs: Vec<TrustedProxyNet>,
@@ -205,6 +206,12 @@ impl Config {
             cors_allowed_origins: parse_cors_origins(
                 env::var("CODEX_WEBUI_CORS_ALLOWED_ORIGINS").ok(),
             )?,
+            require_owner_role: env::var("CODEX_WEBUI_REQUIRE_OWNER").is_ok_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            }),
             require_origin_header: env::var("CODEX_WEBUI_REQUIRE_ORIGIN_HEADER").is_ok_and(
                 |value| {
                     matches!(

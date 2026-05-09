@@ -2035,6 +2035,117 @@ async fn automation_run_rejects_duplicate_active_run() {
 }
 
 #[tokio::test]
+async fn scheduled_automation_overlap_records_skipped_run_and_reschedules() {
+    let sandbox = unique_test_dir("automation-schedule-overlap");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+    let before = now_unix_ms() as i64;
+    fs::write(
+        &ui_state_path,
+        serde_json::to_vec_pretty(&json!({
+            "global": {
+                "shutdownAfterQueueCompletes": false,
+                "scheduledShutdown": Value::Null
+            },
+            "notifications": {
+                "items": [],
+                "settings": default_notification_settings_value()
+            },
+            "sessionMetaByThreadId": {},
+            "savedSessionFilters": [],
+            "promptPresets": [],
+            "automations": [{
+                "id": "auto-1",
+                "name": "Daily task",
+                "prompt": "Check status.",
+                "enabled": true,
+                "scheduleMode": "interval",
+                "intervalMinutes": 5,
+                "target": "local",
+                "repoPath": Value::Null,
+                "cwd": Value::Null,
+                "model": Value::Null,
+                "effort": Value::Null,
+                "speed": Value::Null,
+                "mode": Value::Null,
+                "createdAt": 1,
+                "updatedAt": 1,
+                "lastRunAt": Value::Null,
+                "nextRunAt": before - 1
+            }],
+            "automationRuns": [{
+                "id": "run-1",
+                "automationId": "auto-1",
+                "automationName": "Daily task",
+                "status": "started",
+                "trigger": "schedule",
+                "sessionId": "thread-auto",
+                "repoPath": Value::Null,
+                "cwd": Value::Null,
+                "worktreePath": Value::Null,
+                "startedAt": 1,
+                "completedAt": Value::Null,
+                "error": Value::Null
+            }],
+            "preferencesByThreadId": {},
+            "draftsByThreadId": {},
+            "queuesByThreadId": {},
+            "highlightsByThreadId": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let payload = run_automation_payload(&state, "default", "auto-1", "schedule")
+        .await
+        .expect("scheduled overlap should skip and reschedule");
+    assert_eq!(payload.get("skipped").and_then(Value::as_bool), Some(true));
+
+    let (automations, runs) = with_ui_state_read(&state, "default", |ui_state| {
+        Ok((
+            sorted_automations_from_ui_state(ui_state),
+            recent_automation_runs_from_ui_state(ui_state, 10),
+        ))
+    })
+    .await
+    .unwrap();
+    let automation = automations.first().expect("automation should remain");
+    assert!(
+        automation
+            .get("nextRunAt")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value > before),
+        "scheduled overlap should move nextRunAt into the future"
+    );
+    let skipped = runs.first().expect("skipped run should be recorded");
+    assert_eq!(
+        skipped.get("status").and_then(Value::as_str),
+        Some("skipped")
+    );
+    assert_eq!(
+        skipped.get("trigger").and_then(Value::as_str),
+        Some("schedule")
+    );
+    assert_eq!(
+        skipped.get("error").and_then(Value::as_str),
+        Some("Automation is already running.")
+    );
+    assert_eq!(
+        state.automation_timers.lock().await.len(),
+        1,
+        "scheduled overlap should re-arm the next timer"
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn runtime_completion_marks_started_automation_run_completed() {
     let sandbox = unique_test_dir("automation-completion");
     let workspace = sandbox.join("workspace");
@@ -2104,6 +2215,84 @@ async fn runtime_completion_marks_started_automation_run_completed() {
     let run = runs.first().expect("run should remain available");
     assert_eq!(run.get("status").and_then(Value::as_str), Some("completed"));
     assert!(run.get("completedAt").and_then(Value::as_i64).is_some());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn runtime_failed_status_marks_started_automation_run_failed() {
+    let sandbox = unique_test_dir("automation-failed-status");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &ui_state_path,
+        serde_json::to_vec_pretty(&json!({
+            "global": {
+                "shutdownAfterQueueCompletes": false,
+                "scheduledShutdown": Value::Null
+            },
+            "notifications": {
+                "items": [],
+                "settings": default_notification_settings_value()
+            },
+            "sessionMetaByThreadId": {},
+            "savedSessionFilters": [],
+            "promptPresets": [],
+            "automations": [],
+            "automationRuns": [{
+                "id": "run-1",
+                "automationId": "auto-1",
+                "automationName": "Daily task",
+                "status": "started",
+                "trigger": "manual",
+                "sessionId": "thread-auto",
+                "repoPath": Value::Null,
+                "cwd": Value::Null,
+                "worktreePath": Value::Null,
+                "startedAt": 1,
+                "completedAt": Value::Null,
+                "error": Value::Null
+            }],
+            "preferencesByThreadId": {},
+            "draftsByThreadId": {},
+            "queuesByThreadId": {},
+            "highlightsByThreadId": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "thread/status/changed".to_string(),
+            params: json!({
+                "threadId": "thread-auto",
+                "status": "failed"
+            }),
+        },
+    )
+    .await;
+
+    let runs = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(recent_automation_runs_from_ui_state(ui_state, 10))
+    })
+    .await
+    .unwrap();
+    let run = runs.first().expect("run should remain available");
+    assert_eq!(run.get("status").and_then(Value::as_str), Some("failed"));
+    assert!(
+        run.get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("failed"))
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }

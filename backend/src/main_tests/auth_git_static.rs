@@ -1470,6 +1470,99 @@ async fn viewer_http_routes_match_websocket_authorization_policy() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn viewer_notification_list_payloads_are_redacted() {
+    let sandbox = unique_test_dir("viewer-notification-redaction");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &ui_state_path,
+        serde_json::to_vec_pretty(&json!({
+            "global": {
+                "shutdownAfterQueueCompletes": false,
+                "scheduledShutdown": Value::Null
+            },
+            "notifications": {
+                "items": [{
+                    "id": "notice-1",
+                    "type": "sessionCompleted",
+                    "createdAt": 20,
+                    "readAt": Value::Null,
+                    "sessionId": "thread-1",
+                    "sessionName": "Secret session name",
+                    "payload": { "secret": "hidden notification payload" }
+                }],
+                "webhookFailures": [{
+                    "id": "failure-1",
+                    "error": "hidden webhook failure"
+                }],
+                "settings": default_notification_settings_value()
+            },
+            "sessionMetaByThreadId": {},
+            "savedSessionFilters": [],
+            "promptPresets": [],
+            "automations": [],
+            "automationRuns": [],
+            "preferencesByThreadId": {},
+            "draftsByThreadId": {},
+            "queuesByThreadId": {},
+            "highlightsByThreadId": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    let auth = AuthContext {
+        profile_id: "default".to_string(),
+        role: UserRole::Viewer,
+    };
+    let ws_payload = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "notifications/list",
+        json!({ "limit": 20 }),
+    )
+    .await
+    .expect("viewer notification list should load");
+    assert!(
+        !ws_payload
+            .to_string()
+            .contains("hidden notification payload")
+    );
+    assert!(!ws_payload.to_string().contains("Secret session name"));
+    assert!(ws_payload.get("webhookFailures").is_none());
+
+    let jar = issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Viewer).unwrap();
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/notifications?limit=20")
+        .body(Body::empty())
+        .unwrap();
+    let response = handle_http(State(state.clone()), jar, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let http_payload: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        !http_payload
+            .to_string()
+            .contains("hidden notification payload")
+    );
+    assert!(!http_payload.to_string().contains("hidden webhook failure"));
+    assert!(!http_payload.to_string().contains("Secret session name"));
+    assert!(http_payload.get("webhookFailures").is_none());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn auth_token_signing_requires_explicit_session_secret() {
     let sandbox = unique_test_dir("auth-token-secret");

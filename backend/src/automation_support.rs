@@ -56,6 +56,20 @@ fn automation_run_is_active(status: Option<&str>) -> bool {
     matches!(status, Some("running" | "started"))
 }
 
+pub(crate) fn automation_status_for_thread_status(status: &str) -> (String, Option<String>) {
+    match status {
+        "failed" | "error" => (
+            "failed".to_string(),
+            Some(format!("Thread ended with status: {status}.")),
+        ),
+        "cancelled" | "canceled" | "aborted" => (
+            "cancelled".to_string(),
+            Some(format!("Thread ended with status: {status}.")),
+        ),
+        _ => ("completed".to_string(), None),
+    }
+}
+
 async fn emit_profile_automations_updated(state: &AppState, profile_id: &str) {
     let payload = with_ui_state_read(state, profile_id, |ui_state| {
         Ok(json!({
@@ -186,6 +200,105 @@ fn schedule_automation_timer(
             .insert(timer_key, handle);
     }
     .boxed()
+}
+
+async fn skip_overlapping_scheduled_automation(
+    state: &AppState,
+    profile_id: &str,
+    automation_id: &str,
+    conflict_message: &str,
+) -> ApiResult<Value> {
+    let now = now_unix_ms() as i64;
+    let run_id = Uuid::new_v4().to_string();
+    let (updated_automation, run) = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(automations) = ui_state
+            .get_mut("automations")
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "automations state is missing",
+            ));
+        };
+        let Some(automation_entry) = automations
+            .iter_mut()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(automation_id))
+        else {
+            return Err(api_error(StatusCode::NOT_FOUND, "Automation not found."));
+        };
+
+        let automation_name = trimmed_json_string(automation_entry.get("name"))
+            .unwrap_or_else(|| "Automation".into());
+        let enabled = automation_entry
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let interval_minutes = automation_entry
+            .get("intervalMinutes")
+            .and_then(Value::as_i64)
+            .unwrap_or(1)
+            .max(1);
+        let next_run_at = if enabled
+            && automation_schedule_mode(automation_entry.get("scheduleMode")) == "interval"
+        {
+            Some(now + interval_minutes * 60_000)
+        } else {
+            None
+        };
+        if let Some(object) = automation_entry.as_object_mut() {
+            object.insert("updatedAt".to_string(), Value::from(now));
+            object.insert(
+                "nextRunAt".to_string(),
+                next_run_at.map(Value::from).unwrap_or(Value::Null),
+            );
+        }
+        let repo_path = automation_entry
+            .get("repoPath")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let cwd = automation_entry.get("cwd").cloned().unwrap_or(Value::Null);
+        let updated_automation = automation_entry.clone();
+
+        let Some(automation_runs) = ui_state
+            .get_mut("automationRuns")
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "automation runs state is missing",
+            ));
+        };
+        let run = json!({
+            "id": run_id,
+            "automationId": automation_id,
+            "automationName": automation_name,
+            "status": "skipped",
+            "trigger": "schedule",
+            "sessionId": Value::Null,
+            "repoPath": repo_path,
+            "cwd": cwd,
+            "worktreePath": Value::Null,
+            "startedAt": now,
+            "completedAt": now,
+            "error": conflict_message
+        });
+        automation_runs.insert(0, run.clone());
+        if automation_runs.len() > 200 {
+            automation_runs.truncate(200);
+        }
+        Ok((updated_automation, run))
+    })
+    .await?;
+
+    emit_profile_automations_updated(state, profile_id).await;
+    schedule_automation_timer(state.clone(), profile_id.to_string(), updated_automation).await;
+
+    Ok(json!({
+        "ok": true,
+        "skipped": true,
+        "reason": "activeRun",
+        "run": run
+    }))
 }
 
 pub(crate) async fn restore_automation_schedules(state: AppState) {
@@ -436,7 +549,7 @@ pub(crate) async fn run_automation_payload(
         "manual"
     };
 
-    with_ui_state_write(state, profile_id, |ui_state| {
+    let start_record_result = with_ui_state_write(state, profile_id, |ui_state| {
         let Some(automation_runs) = ui_state
             .get_mut("automationRuns")
             .and_then(Value::as_array_mut)
@@ -482,7 +595,22 @@ pub(crate) async fn run_automation_payload(
         *automation_runs = next_runs;
         Ok(())
     })
-    .await?;
+    .await;
+    if let Err(error) = start_record_result {
+        if normalized_trigger == "schedule"
+            && error.status == StatusCode::CONFLICT
+            && error.message == "Automation is already running."
+        {
+            return skip_overlapping_scheduled_automation(
+                state,
+                profile_id,
+                automation_id,
+                &error.message,
+            )
+            .await;
+        }
+        return Err(error);
+    }
     emit_profile_automations_updated(state, profile_id).await;
 
     let result: ApiResult<Value> = async {

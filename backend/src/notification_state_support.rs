@@ -39,6 +39,32 @@ fn notifications_payload_from_items(mut items: Vec<Value>, limit: usize) -> Valu
     })
 }
 
+fn redacted_notification_item(item: Value) -> Value {
+    json!({
+        "id": item.get("id").cloned().unwrap_or(Value::Null),
+        "type": item.get("type").cloned().unwrap_or(Value::Null),
+        "createdAt": item.get("createdAt").cloned().unwrap_or(Value::Null),
+        "readAt": item.get("readAt").cloned().unwrap_or(Value::Null),
+        "sessionId": item.get("sessionId").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn redact_notifications_payload_for_viewer(mut payload: Value) -> Value {
+    if let Some(items) = payload
+        .get_mut("notifications")
+        .and_then(Value::as_array_mut)
+    {
+        *items = std::mem::take(items)
+            .into_iter()
+            .map(redacted_notification_item)
+            .collect();
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("webhookFailures");
+    }
+    payload
+}
+
 pub(crate) async fn get_notifications_payload(
     state: &AppState,
     profile_id: &str,
@@ -56,6 +82,20 @@ pub(crate) async fn get_notifications_payload(
         Ok(payload)
     })
     .await
+}
+
+pub(crate) async fn get_notifications_payload_for_role(
+    state: &AppState,
+    profile_id: &str,
+    limit: usize,
+    role: UserRole,
+) -> ApiResult<Value> {
+    let payload = get_notifications_payload(state, profile_id, limit).await?;
+    if role_has_admin_access(role) {
+        Ok(payload)
+    } else {
+        Ok(redact_notifications_payload_for_viewer(payload))
+    }
 }
 
 pub(crate) async fn record_notification_webhook_failure(

@@ -560,12 +560,14 @@ pub(crate) async fn handle_profile_runtime_notification(
                     state.pending_turn_starts.lock().await.remove(&runtime_key);
                     state.active_turns.lock().await.remove(&runtime_key);
                     set_runtime_session_status(state, profile_id, &session_id, &status).await;
+                    let (automation_status, automation_error) =
+                        automation_status_for_thread_status(&status);
                     complete_active_automation_runs_for_session(
                         state,
                         profile_id,
                         &session_id,
-                        "completed",
-                        None,
+                        &automation_status,
+                        automation_error.as_deref(),
                     )
                     .await;
                     spawn_queue_drain(state, profile_id, &session_id);

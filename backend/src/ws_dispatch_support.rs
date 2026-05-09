@@ -23,7 +23,7 @@ pub(crate) async fn execute_ws_method(
                 .and_then(Value::as_u64)
                 .map(|value| value.clamp(1, 200) as usize)
                 .unwrap_or(DEFAULT_NOTIFICATION_LIMIT);
-            get_notifications_payload(state, &auth.profile_id, limit)
+            get_notifications_payload_for_role(state, &auth.profile_id, limit, auth.role)
                 .await
                 .map_err(anyhow::Error::from)
         }

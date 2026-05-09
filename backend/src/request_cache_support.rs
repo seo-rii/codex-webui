@@ -137,6 +137,6 @@ pub(crate) async fn resolve_inflight_request(
     };
 
     for waiter in waiters {
-        let _ = waiter.send(message.clone()).await;
+        let _ = queue_ws_envelope(&waiter, message.clone(), "inflight-response");
     }
 }

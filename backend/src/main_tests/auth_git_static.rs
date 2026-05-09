@@ -780,6 +780,44 @@ async fn websocket_inflight_requests_limit_join_waiters() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_inflight_resolution_drops_saturated_waiters_without_blocking() {
+    let sandbox = unique_test_dir("ws-inflight-saturated-waiter");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let request_key = request_cache_key("default", "client-id", UserRole::Admin);
+    let params_hash = request_params_hash(&json!({ "value": 1 }));
+    let (tx, _rx) = mpsc::channel(1);
+    tx.try_send(ServerEnvelope::Pong { nonce: None })
+        .expect("test channel should fill");
+
+    assert!(matches!(
+        register_inflight_request(&state, &request_key, "session/get", &params_hash, &tx).await,
+        InflightRequestRegistration::Started
+    ));
+
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        resolve_inflight_request(
+            &state,
+            &request_key,
+            ServerEnvelope::Response {
+                id: "client-id".to_string(),
+                ok: true,
+                result: Some(json!({ "ok": true })),
+                error: None,
+            },
+        ),
+    )
+    .await
+    .expect("saturated websocket waiter should not block inflight resolution");
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_response_cache_prunes_oldest_entries_at_cap() {
     let sandbox = unique_test_dir("ws-cache-cap");
     let workspace = sandbox.join("workspace");

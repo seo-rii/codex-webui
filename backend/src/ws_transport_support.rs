@@ -5,6 +5,7 @@ tokio::task_local! {
 }
 
 const SLOW_WS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const WS_SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct SlowWebSocketLogState {
     next_log_at: Instant,
@@ -62,17 +63,29 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
                 }
             };
 
-            if sender.send(Message::Text(text.into())).await.is_err() {
-                break;
+            match tokio::time::timeout(
+                WS_SOCKET_SEND_TIMEOUT,
+                sender.send(Message::Text(text.into())),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    warn!("closing websocket connection after stalled socket send");
+                    break;
+                }
             }
         }
     });
 
-    let _ = out_tx
-        .send(ServerEnvelope::Ready {
+    let _ = queue_ws_envelope(
+        &out_tx,
+        ServerEnvelope::Ready {
             connection_id: connection_id.clone(),
-        })
-        .await;
+        },
+        "ready",
+    );
 
     while let Some(Ok(message)) = receiver.next().await {
         match message {
@@ -80,14 +93,16 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
                 let payload = match serde_json::from_str::<ClientEnvelope>(&text) {
                     Ok(payload) => payload,
                     Err(error) => {
-                        let _ = out_tx
-                            .send(ServerEnvelope::Response {
+                        let _ = queue_ws_envelope(
+                            &out_tx,
+                            ServerEnvelope::Response {
                                 id: Uuid::new_v4().to_string(),
                                 ok: false,
                                 result: None,
                                 error: Some(format!("Invalid websocket payload: {error}")),
-                            })
-                            .await;
+                            },
+                            "invalid-payload",
+                        );
                         continue;
                     }
                 };
@@ -97,16 +112,18 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
                         match Arc::clone(&request_slots).try_acquire_owned() {
                             Ok(permit) => Some(permit),
                             Err(_) => {
-                                let _ = out_tx
-                                    .send(ServerEnvelope::Response {
+                                let _ = queue_ws_envelope(
+                                    &out_tx,
+                                    ServerEnvelope::Response {
                                         id: id.clone(),
                                         ok: false,
                                         result: None,
                                         error: Some(
                                             "Too many concurrent websocket requests.".to_string(),
                                         ),
-                                    })
-                                    .await;
+                                    },
+                                    "connection-concurrency-limit",
+                                );
                                 continue;
                             }
                         }
@@ -132,11 +149,13 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
                 });
             }
             Message::Ping(payload) => {
-                let _ = out_tx
-                    .send(ServerEnvelope::Pong {
+                let _ = queue_ws_envelope(
+                    &out_tx,
+                    ServerEnvelope::Pong {
                         nonce: Some(URL_SAFE_NO_PAD.encode(payload)),
-                    })
-                    .await;
+                    },
+                    "socket-ping",
+                );
             }
             Message::Close(_) => break,
             _ => {}
@@ -148,6 +167,24 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
         handle.abort();
     }
     writer.abort();
+}
+
+pub(crate) fn queue_ws_envelope(
+    out_tx: &mpsc::Sender<ServerEnvelope>,
+    message: ServerEnvelope,
+    context: &str,
+) -> bool {
+    match out_tx.try_send(message) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!(
+                context = context,
+                "dropping websocket message for saturated outbound queue"
+            );
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
 }
 
 pub(crate) async fn try_acquire_profile_ws_request_slot(
@@ -173,18 +210,20 @@ async fn handle_ws_message(
 ) -> Result<()> {
     match payload {
         ClientEnvelope::Ping { nonce } => {
-            let _ = out_tx.send(ServerEnvelope::Pong { nonce }).await;
+            let _ = queue_ws_envelope(out_tx, ServerEnvelope::Pong { nonce }, "client-ping");
         }
         ClientEnvelope::Request { id, method, params } => {
             if let Err(error) = authorize_ws_method(&state.config, auth.role, &method, &params) {
-                let _ = out_tx
-                    .send(ServerEnvelope::Response {
+                let _ = queue_ws_envelope(
+                    out_tx,
+                    ServerEnvelope::Response {
                         id,
                         ok: false,
                         result: None,
                         error: Some(redact_user_facing_error(&error.to_string())),
-                    })
-                    .await;
+                    },
+                    "authorization-error",
+                );
                 return Ok(());
             }
 
@@ -195,12 +234,13 @@ async fn handle_ws_message(
             if use_request_replay {
                 match cached_response(state, &request_key, &method, &params_hash).await {
                     CachedResponseLookup::Hit(cached) => {
-                        let _ = out_tx.send(cached).await;
+                        let _ = queue_ws_envelope(out_tx, cached, "cached-response");
                         return Ok(());
                     }
                     CachedResponseLookup::Conflict => {
-                        let _ = out_tx
-                            .send(ServerEnvelope::Response {
+                        let _ = queue_ws_envelope(
+                            out_tx,
+                            ServerEnvelope::Response {
                                 id,
                                 ok: false,
                                 result: None,
@@ -208,8 +248,9 @@ async fn handle_ws_message(
                                     "WebSocket request id was already used with a different method or parameters."
                                         .to_string(),
                                 ),
-                            })
-                            .await;
+                            },
+                            "request-cache-conflict",
+                        );
                         return Ok(());
                     }
                     CachedResponseLookup::Miss => {}
@@ -221,8 +262,9 @@ async fn handle_ws_message(
                     InflightRequestRegistration::Started => {}
                     InflightRequestRegistration::Joined => return Ok(()),
                     InflightRequestRegistration::Conflict => {
-                        let _ = out_tx
-                            .send(ServerEnvelope::Response {
+                        let _ = queue_ws_envelope(
+                            out_tx,
+                            ServerEnvelope::Response {
                                 id,
                                 ok: false,
                                 result: None,
@@ -230,19 +272,22 @@ async fn handle_ws_message(
                                     "WebSocket request id is already in flight with a different method or parameters."
                                         .to_string(),
                                 ),
-                            })
-                            .await;
+                            },
+                            "inflight-conflict",
+                        );
                         return Ok(());
                     }
                     InflightRequestRegistration::Full => {
-                        let _ = out_tx
-                            .send(ServerEnvelope::Response {
+                        let _ = queue_ws_envelope(
+                            out_tx,
+                            ServerEnvelope::Response {
                                 id,
                                 ok: false,
                                 result: None,
                                 error: Some("Too many in-flight websocket requests.".to_string()),
-                            })
-                            .await;
+                            },
+                            "inflight-limit",
+                        );
                         return Ok(());
                     }
                 }
@@ -262,7 +307,7 @@ async fn handle_ws_message(
                 if use_request_replay {
                     resolve_inflight_request(state, &request_key, message).await;
                 } else {
-                    let _ = out_tx.send(message).await;
+                    let _ = queue_ws_envelope(out_tx, message, "profile-concurrency-limit");
                 }
                 return Ok(());
             };
@@ -381,7 +426,7 @@ async fn handle_ws_message(
                 cache_response(state, &request_key, &method, &params_hash, message.clone()).await;
                 resolve_inflight_request(state, &request_key, message).await;
             } else {
-                let _ = out_tx.send(message).await;
+                let _ = queue_ws_envelope(out_tx, message, "response");
             }
         }
     }

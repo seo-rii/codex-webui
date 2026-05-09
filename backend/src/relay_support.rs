@@ -53,8 +53,9 @@ pub(crate) async fn subscribe_session(
         } else {
             redacted_queue_payload(&queue)
         };
-        let _ = out_tx
-            .send(ServerEnvelope::Event {
+        let _ = queue_ws_envelope(
+            &out_tx,
+            ServerEnvelope::Event {
                 session_id: session_id.clone(),
                 event: json!({
                     "kind": "notification",
@@ -63,8 +64,9 @@ pub(crate) async fn subscribe_session(
                         "queue": queue
                     }
                 }),
-            })
-            .await;
+            },
+            "session-subscribe-initial-queue",
+        );
     }
 
     Ok(())

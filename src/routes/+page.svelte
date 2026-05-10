@@ -9647,7 +9647,8 @@
       top = Math.max(margin, window.innerHeight - popoverRect.height - margin);
     }
 
-    composerSettingsPopoverStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.max(220, window.innerHeight - margin * 2)}px;opacity:1;pointer-events:auto;`;
+    const maxHeight = Math.max(120, window.innerHeight - margin * 2);
+    composerSettingsPopoverStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${maxHeight}px;opacity:1;pointer-events:auto;`;
   }
 
   async function updateSessionTurnSearchPopoverPosition() {
@@ -9985,8 +9986,8 @@
     class={[
       "h-full border-r border-gray-200 transition-all duration-300",
       isMobileLayout
-        ? "fixed inset-y-0 left-0 z-[60] max-w-[calc(100vw-1.5rem)] shadow-2xl"
-        : "flex-shrink-0 z-30"
+        ? "fixed inset-y-0 left-0 z-[100] max-w-[calc(100vw-1.5rem)] shadow-2xl"
+        : "flex-shrink-0"
     ]}
   >
     <SessionSidebar
@@ -10479,7 +10480,7 @@
           </div>
 
           <!-- Bottom Area -->
-          <div bind:this={transcriptDockElement} class="transcript-dock pointer-events-none absolute inset-x-0 bottom-0 z-30 px-6 pb-6 pt-4">
+          <div bind:this={transcriptDockElement} class="transcript-dock pointer-events-none absolute inset-x-0 bottom-0 z-[82] px-6 pb-6 pt-4">
             {#if showComposerSyncPill}
               <div class="pointer-events-none absolute inset-x-0 top-0 flex justify-center px-6">
                 <div class="-translate-y-[calc(100%+0.5rem)]">
@@ -10925,10 +10926,10 @@
                 {#if composerSettingsOpen && conversation}
                   <div
                     bind:this={composerSettingsPopoverElement}
-                    class="composer-popover composer-settings-popover fixed z-[72] w-[19rem] max-w-[calc(100vw-1rem)] rounded-2xl border border-gray-200 bg-white p-3.5 shadow-2xl"
+                    class="composer-popover composer-settings-popover fixed z-[104] w-[19rem] max-w-[calc(100vw-1rem)] overflow-y-auto overscroll-contain rounded-xl border border-gray-200 bg-white p-2.5 shadow-2xl sm:rounded-2xl sm:p-3.5"
                     style={composerSettingsPopoverStyle || "opacity:0;pointer-events:none;"}
                   >
-                    <div class="composer-settings-popover__header mb-2.5 flex items-center justify-between border-b border-gray-100 pb-2.5">
+                    <div class="composer-settings-popover__header mb-2 flex items-center justify-between border-b border-gray-100 pb-2 sm:mb-2.5 sm:pb-2.5">
                       <div>
                         <h3 class="text-xs font-bold uppercase tracking-widest text-gray-400">{ui.settings}</h3>
                         <p class="mt-1 text-[11px] font-medium text-gray-500">
@@ -10943,7 +10944,7 @@
                         <X size={16} />
                       </button>
                     </div>
-                    <div aria-label={ui.settings} class="composer-settings-tabs mb-3 grid grid-cols-3 gap-1 rounded-2xl border border-gray-200 bg-gray-50 p-1" role="tablist">
+                    <div aria-label={ui.settings} class="composer-settings-tabs mb-2 grid grid-cols-3 gap-1 rounded-xl border border-gray-200 bg-gray-50 p-1 sm:mb-3 sm:rounded-2xl" role="tablist">
                       <button
                         aria-selected={composerSettingsTab === "session"}
                         class={`composer-settings-tab ui-animated-button ui-animated-button--soft flex items-center justify-center rounded-xl px-3 py-1.5 text-[10px] font-bold transition-all sm:text-[11px] ${
@@ -11081,9 +11082,9 @@
                               <p class="text-[10px] leading-4 text-gray-400">{ui.sendShortcutDescription}</p>
                             </div>
                           </div>
-                          <div class="grid w-full grid-cols-1 gap-2 sm:grid-cols-2">
+                          <div class="grid w-full grid-cols-1 gap-1.5 sm:grid-cols-2 sm:gap-2">
                             <button
-                              class={`ui-animated-button ui-animated-button--soft flex min-h-[2.75rem] w-full items-center justify-between gap-3 rounded-xl border px-3 py-2 text-left text-[11px] font-bold transition-all ${
+                              class={`ui-animated-button ui-animated-button--soft flex min-h-[2.25rem] w-full items-center justify-between gap-2 rounded-xl border px-2.5 py-1.5 text-left text-[11px] font-bold transition-all sm:min-h-[2.75rem] sm:gap-3 sm:px-3 sm:py-2 ${
                                 !conversation.preferences.sendOnEnter
                                   ? "border-gray-900 bg-gray-900 text-white shadow-sm"
                                   : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"
@@ -11100,7 +11101,7 @@
                               }`}>{ui.send}</span>
                             </button>
                             <button
-                              class={`ui-animated-button ui-animated-button--soft flex min-h-[2.75rem] w-full items-center justify-between gap-3 rounded-xl border px-3 py-2 text-left text-[11px] font-bold transition-all ${
+                              class={`ui-animated-button ui-animated-button--soft flex min-h-[2.25rem] w-full items-center justify-between gap-2 rounded-xl border px-2.5 py-1.5 text-left text-[11px] font-bold transition-all sm:min-h-[2.75rem] sm:gap-3 sm:px-3 sm:py-2 ${
                                 conversation.preferences.sendOnEnter
                                   ? "border-amber-200 bg-amber-50 text-amber-700 shadow-sm"
                                   : "border-transparent text-gray-500 hover:border-gray-200 hover:bg-gray-50 hover:text-gray-700"

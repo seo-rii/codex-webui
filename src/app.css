@@ -272,7 +272,8 @@
   .checkbox-card--compact .checkbox-title {
     font-size: 0.8rem;
     font-weight: 600;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
+    white-space: normal;
   }
 
   :root[data-theme="dark"] .bg-white {

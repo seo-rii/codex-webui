@@ -590,7 +590,7 @@
       top = Math.max(margin, window.innerHeight - popoverRect.height - margin);
     }
 
-    accountPopoverStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.max(240, window.innerHeight - margin * 2)}px;opacity:1;pointer-events:auto;`;
+    accountPopoverStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.max(120, window.innerHeight - margin * 2)}px;opacity:1;pointer-events:auto;`;
   }
 
   async function updateNotificationPanelPosition() {
@@ -1291,7 +1291,7 @@
     {#if accountMenuOpen}
       <div
         bind:this={accountPopoverElement}
-        class="sidebar-flyout sidebar-account-popover fixed z-[90] grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] bg-white border border-gray-200 rounded-2xl shadow-2xl overflow-hidden opacity-0 pointer-events-none p-2 w-80"
+        class="sidebar-flyout sidebar-account-popover fixed z-[105] grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] bg-white border border-gray-200 rounded-2xl shadow-2xl overflow-hidden opacity-0 pointer-events-none p-2 w-80 max-w-[calc(100vw-1rem)]"
         style={accountPopoverStyle}
       >
         <div class="sidebar-flyout-header p-4 border-b border-gray-100 flex items-center justify-between">
@@ -1512,12 +1512,12 @@
           {#if systemShutdownAvailable}
             <div class="space-y-4">
               <div class="sidebar-flyout-surface rounded-2xl border border-gray-200 bg-gray-50/80 p-3 shadow-sm">
-                <div class="flex items-start gap-3">
+                <div class="flex items-start gap-2 sm:gap-3">
                   <div class="sidebar-flyout-icon mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-gray-200 bg-white text-gray-500">
                     <Power size={14} />
                   </div>
                   <div class="min-w-0 flex-1">
-                    <label class:checkbox-card--disabled={readOnly} class="checkbox-card checkbox-card--compact" for="global-shutdown-after-queue">
+                    <label class:checkbox-card--disabled={readOnly} class="checkbox-card checkbox-card--compact w-full max-w-full" for="global-shutdown-after-queue">
                       <input
                         class="checkbox-input"
                         checked={systemShutdownArmed}
@@ -1527,7 +1527,7 @@
                         type="checkbox"
                       />
                       <span aria-hidden="true" class="checkbox-control"></span>
-                      <span class="checkbox-copy">
+                      <span class="checkbox-copy min-w-0">
                         <span class="checkbox-title">{ui.shutdownAfterQueueCompletes}</span>
                         <span class="checkbox-description">{ui.shutdownWaitDescription(systemShutdownDelaySeconds)}</span>
                       </span>

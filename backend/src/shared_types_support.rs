@@ -151,6 +151,14 @@ pub(crate) struct TerminalSession {
     pub(crate) stdin: Mutex<Option<tokio::process::ChildStdin>>,
     pub(crate) relay: broadcast::Sender<Value>,
     pub(crate) pid: Option<u32>,
+    pub(crate) process_identity: Option<TerminalProcessIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalProcessIdentity {
+    pub(crate) pid: u32,
+    pub(crate) process_group_id: u32,
+    pub(crate) start_time_ticks: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]

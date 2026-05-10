@@ -41,7 +41,7 @@ pub(crate) async fn cleanup_terminal_sessions(state: AppState) {
         if (summary.status == "exited" && age_ms > TERMINAL_EXITED_TTL_MS)
             || (summary.status == "running" && age_ms > TERMINAL_IDLE_TTL_MS)
         {
-            expired.push((summary.id, terminal.pid));
+            expired.push((summary.id, terminal.pid, terminal.process_identity));
         }
     }
 
@@ -52,15 +52,17 @@ pub(crate) async fn cleanup_terminal_sessions(state: AppState) {
     let mut removed = Vec::new();
     {
         let mut current = state.terminals.lock().await;
-        for (terminal_id, pid) in &expired {
+        for (terminal_id, pid, identity) in &expired {
             if current.remove(terminal_id).is_some() {
-                removed.push(*pid);
+                removed.push((*pid, *identity));
             }
         }
     }
 
-    for pid in removed.into_iter().flatten() {
-        let _ = terminate_process(pid).await;
+    for (pid, identity) in removed {
+        if let Some(pid) = pid {
+            let _ = terminate_terminal_process(pid, identity).await;
+        }
     }
     emit_terminals_updated(&state).await;
 }
@@ -172,6 +174,12 @@ pub(crate) async fn create_terminal(
     }
 
     let mut child = spawn_terminal_process(&cwd).await?;
+    let pid = child.id();
+    let process_identity = pid.and_then(read_terminal_process_identity);
+    #[cfg(target_os = "linux")]
+    if pid.is_some() && process_identity.is_none() {
+        warn!("failed to capture terminal process identity");
+    }
     let stdout = child
         .stdout
         .take()
@@ -206,7 +214,8 @@ pub(crate) async fn create_terminal(
         buffer: Mutex::new(String::new()),
         stdin: Mutex::new(Some(stdin)),
         relay,
-        pid: child.id(),
+        pid,
+        process_identity,
     });
 
     state
@@ -287,7 +296,7 @@ pub(crate) async fn close_terminal(state: AppState, terminal_id: &str) -> Result
 
     let _ = session.write_input("exit\r").await;
     if let Some(pid) = session.pid {
-        let _ = terminate_process(pid).await;
+        let _ = terminate_terminal_process(pid, session.process_identity).await;
     }
 
     emit_terminals_updated(&state).await;

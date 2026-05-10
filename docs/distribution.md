@@ -143,7 +143,12 @@ The CLI writes config, PID, server metadata, tunnel metadata, and tunnel log sta
 
 Restart uses a handoff path on platforms where Codex supports Unix control sockets. Unix handoff is enabled by default. The CLI asks the verified gateway to preserve managed Codex app-server processes, sends SIGTERM, waits for the gateway port to exit, and then starts the currently resolved backend binary. This lets package updates replace the web gateway while active Codex work remains attached to the existing app-server. `CODEX_WEBUI_APP_SERVER_HANDOFF=false` disables this behavior; if active app-server clients exist, restart is refused instead of falling back to a restart that would interrupt in-flight turns.
 
-Startup keeps runtime profile state lightweight. The gateway restores persisted queue/shutdown metadata for every profile, but it does not start Codex app-server processes until a profile receives an active Codex request. `CODEX_WEBUI_MAX_APP_SERVERS` caps concurrent Codex app-server processes and defaults to `1`; `CODEX_WEBUI_SERVER_THREADS`, `CODEX_WEBUI_BLOCKING_THREADS`, `CODEX_WEBUI_SERVER_THREAD_STACK_BYTES`, and `CODEX_WEBUI_CONTROLLER_THREADS` can be raised for larger hosts.
+Startup keeps runtime profile state lightweight. The gateway restores persisted queue/shutdown metadata for every profile, but it does not start Codex app-server processes until a profile receives an active Codex request. `CODEX_WEBUI_MAX_APP_SERVERS` caps concurrent Codex app-server processes and defaults to `1`; `CODEX_WEBUI_SERVER_THREADS`, `CODEX_WEBUI_BLOCKING_THREADS`, `CODEX_WEBUI_SERVER_THREAD_STACK_BYTES` (default `2097152`), and `CODEX_WEBUI_CONTROLLER_THREADS` can be raised for larger hosts.
+
+Terminal sessions store the child PID plus Linux process start metadata when
+available. Cleanup and close actions re-check that identity before sending
+process-group signals, so a stale PID is not allowed to target a reused process
+group.
 
 When system shutdown support is enabled, the actual armed and scheduled state is still runtime data rather than static CLI config:
 

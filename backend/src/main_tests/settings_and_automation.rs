@@ -597,6 +597,7 @@ async fn terminal_cleanup_removes_stale_sessions() {
             stdin: Mutex::new(None),
             relay,
             pid: None,
+            process_identity: None,
         }),
     );
 
@@ -635,6 +636,7 @@ async fn terminal_cleanup_loop_removes_stale_sessions_without_api_polling() {
             stdin: Mutex::new(None),
             relay,
             pid: None,
+            process_identity: None,
         }),
     );
 
@@ -679,6 +681,7 @@ async fn terminal_create_rejects_session_limit_before_spawning() {
                 stdin: Mutex::new(None),
                 relay,
                 pid: None,
+                process_identity: None,
             }),
         );
     }
@@ -2271,6 +2274,96 @@ async fn runtime_failed_status_marks_started_automation_run_failed() {
     )
     .unwrap();
 
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "thread/status/changed".to_string(),
+            params: json!({
+                "threadId": "thread-auto",
+                "status": "failed"
+            }),
+        },
+    )
+    .await;
+
+    let runs = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(recent_automation_runs_from_ui_state(ui_state, 10))
+    })
+    .await
+    .unwrap();
+    let run = runs.first().expect("run should remain available");
+    assert_eq!(run.get("status").and_then(Value::as_str), Some("failed"));
+    assert!(
+        run.get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("failed"))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn runtime_failed_status_overrides_turn_completed_automation_run() {
+    let sandbox = unique_test_dir("automation-failed-after-turn-completed");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let ui_state_path = profile_ui_state_path(&state.config, "default");
+    fs::create_dir_all(ui_state_path.parent().unwrap()).unwrap();
+    fs::write(
+        &ui_state_path,
+        serde_json::to_vec_pretty(&json!({
+            "global": {
+                "shutdownAfterQueueCompletes": false,
+                "scheduledShutdown": Value::Null
+            },
+            "notifications": {
+                "items": [],
+                "settings": default_notification_settings_value()
+            },
+            "sessionMetaByThreadId": {},
+            "savedSessionFilters": [],
+            "promptPresets": [],
+            "automations": [],
+            "automationRuns": [{
+                "id": "run-1",
+                "automationId": "auto-1",
+                "automationName": "Daily task",
+                "status": "started",
+                "trigger": "manual",
+                "sessionId": "thread-auto",
+                "repoPath": Value::Null,
+                "cwd": Value::Null,
+                "worktreePath": Value::Null,
+                "startedAt": 1,
+                "completedAt": Value::Null,
+                "error": Value::Null
+            }],
+            "preferencesByThreadId": {},
+            "draftsByThreadId": {},
+            "queuesByThreadId": {},
+            "highlightsByThreadId": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "turn/completed".to_string(),
+            params: json!({
+                "threadId": "thread-auto",
+                "turnId": "turn-auto"
+            }),
+        },
+    )
+    .await;
     handle_profile_runtime_notification(
         &state,
         "default",

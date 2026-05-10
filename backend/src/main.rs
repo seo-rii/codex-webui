@@ -54,7 +54,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
-const DEFAULT_SERVER_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_SERVER_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 mod app_util_support;
 mod arena_support;

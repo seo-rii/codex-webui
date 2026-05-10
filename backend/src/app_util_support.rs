@@ -350,7 +350,72 @@ pub(crate) fn trim_terminal_buffer(buffer: &mut String) {
     buffer.replace_range(..trim_index, "");
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn parse_terminal_process_identity(
+    pid: u32,
+    proc_stat: &str,
+) -> Option<TerminalProcessIdentity> {
+    let fields = proc_stat
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let process_group_id = fields.get(2)?.parse::<u32>().ok()?;
+    let start_time_ticks = fields.get(19)?.parse::<u64>().ok()?;
+    Some(TerminalProcessIdentity {
+        pid,
+        process_group_id,
+        start_time_ticks,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn read_terminal_process_identity(pid: u32) -> Option<TerminalProcessIdentity> {
+    let proc_stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_terminal_process_identity(pid, &proc_stat)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_terminal_process_identity(_pid: u32) -> Option<TerminalProcessIdentity> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn terminal_process_identity_matches(
+    pid: u32,
+    expected: TerminalProcessIdentity,
+) -> bool {
+    read_terminal_process_identity(pid).is_some_and(|current| current == expected)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn terminal_process_identity_matches(
+    _pid: u32,
+    _expected: TerminalProcessIdentity,
+) -> bool {
+    true
+}
+
+pub(crate) async fn terminate_terminal_process(
+    pid: u32,
+    identity: Option<TerminalProcessIdentity>,
+) -> Result<()> {
+    if cfg!(target_os = "linux") && identity.is_none() {
+        warn!("refusing to terminate terminal pid {pid}: process identity unavailable");
+        return Ok(());
+    }
+    terminate_process_guarded(pid, identity).await
+}
+
+#[cfg(test)]
 pub(crate) async fn terminate_process(pid: u32) -> Result<()> {
+    terminate_process_guarded(pid, None).await
+}
+
+async fn terminate_process_guarded(
+    pid: u32,
+    identity: Option<TerminalProcessIdentity>,
+) -> Result<()> {
     if cfg!(windows) {
         let output = run_command_with_timeout(
             "taskkill",
@@ -369,12 +434,25 @@ pub(crate) async fn terminate_process(pid: u32) -> Result<()> {
         return Ok(());
     }
 
-    let _ = run_command_with_timeout(
-        "kill",
-        vec!["-TERM".to_string(), "--".to_string(), format!("-{pid}")],
-        Duration::from_secs(4),
-    )
-    .await?;
+    if let Some(expected) = identity {
+        if !terminal_process_identity_matches(pid, expected) {
+            warn!("refusing to terminate terminal pid {pid}: process identity changed");
+            return Ok(());
+        }
+    }
+
+    let can_signal_group = identity
+        .map(|expected| expected.process_group_id == pid)
+        .unwrap_or(true);
+
+    if can_signal_group {
+        let _ = run_command_with_timeout(
+            "kill",
+            vec!["-TERM".to_string(), "--".to_string(), format!("-{pid}")],
+            Duration::from_secs(4),
+        )
+        .await?;
+    }
     let _ = run_command_with_timeout(
         "kill",
         vec!["-TERM".to_string(), pid.to_string()],
@@ -383,6 +461,33 @@ pub(crate) async fn terminate_process(pid: u32) -> Result<()> {
     .await;
 
     tokio::time::sleep(Duration::from_millis(800)).await;
+    if let Some(expected) = identity {
+        if !terminal_process_identity_matches(pid, expected) {
+            return Ok(());
+        }
+    }
+    if !can_signal_group {
+        let probe = run_command_with_timeout(
+            "kill",
+            vec!["-0".to_string(), pid.to_string()],
+            Duration::from_secs(2),
+        )
+        .await?;
+        if !probe.status.success() {
+            return Ok(());
+        }
+        let output = run_command_with_timeout(
+            "kill",
+            vec!["-KILL".to_string(), pid.to_string()],
+            Duration::from_secs(4),
+        )
+        .await?;
+        if !output.status.success() {
+            anyhow::bail!("failed to stop terminal process.");
+        }
+        return Ok(());
+    }
+
     let group_probe = run_command_with_timeout(
         "kill",
         vec!["-0".to_string(), "--".to_string(), format!("-{pid}")],
@@ -400,6 +505,11 @@ pub(crate) async fn terminate_process(pid: u32) -> Result<()> {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
+    if let Some(expected) = identity {
+        if !terminal_process_identity_matches(pid, expected) {
+            return Ok(());
+        }
+    }
     let group_probe = run_command_with_timeout(
         "kill",
         vec!["-0".to_string(), "--".to_string(), format!("-{pid}")],

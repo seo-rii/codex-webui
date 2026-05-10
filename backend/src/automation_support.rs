@@ -107,9 +107,13 @@ pub(crate) async fn complete_active_automation_runs_for_session(
 
         let mut changed = false;
         for run in automation_runs.iter_mut() {
-            if run.get("sessionId").and_then(Value::as_str) != Some(session_id)
-                || !automation_run_is_active(run.get("status").and_then(Value::as_str))
-            {
+            if run.get("sessionId").and_then(Value::as_str) != Some(session_id) {
+                continue;
+            }
+            let current_status = run.get("status").and_then(Value::as_str);
+            let can_override_completed_failure =
+                current_status == Some("completed") && matches!(status, "failed" | "cancelled");
+            if !automation_run_is_active(current_status) && !can_override_completed_failure {
                 continue;
             }
             if let Some(object) = run.as_object_mut() {

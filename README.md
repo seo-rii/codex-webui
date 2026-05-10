@@ -260,8 +260,10 @@ Resource limits:
 - `CODEX_WEBUI_MAX_APP_SERVERS`: maximum active Codex app-server processes across profiles. Default: `1`.
 - `CODEX_WEBUI_SERVER_THREADS`: gateway Tokio worker threads. Default: up to `2` based on available parallelism.
 - `CODEX_WEBUI_BLOCKING_THREADS`: gateway blocking pool threads. Default: `max(server_threads * 4, 8)`.
-- `CODEX_WEBUI_SERVER_THREAD_STACK_BYTES`: gateway worker stack size. Default: `8388608`.
+- `CODEX_WEBUI_SERVER_THREAD_STACK_BYTES`: gateway worker stack size. Default: `2097152`.
 - `CODEX_WEBUI_CONTROLLER_THREADS`: Codex app-server controller worker threads. Default: up to `2`.
+- For constrained code-server containers, start with `CODEX_WEBUI_SERVER_THREADS=1`,
+  `CODEX_WEBUI_BLOCKING_THREADS=4`, and `CODEX_WEBUI_SERVER_THREAD_STACK_BYTES=2097152`.
 - Terminals also stay alive while the Rust gateway remains up.
 - "Shutdown after queue completes" is a server-global operational toggle, not a per-session preference.
 - When that toggle is armed, the gateway waits until every session queue is empty and no live Codex turn is still running before scheduling shutdown.

@@ -109,6 +109,33 @@ async fn terminate_process_hard_kills_term_ignoring_process_group() {
     assert!(!status.success());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn terminal_process_identity_parses_proc_stat_and_matches_current_process() {
+    let parsed = parse_terminal_process_identity(
+        123,
+        "123 (script worker) S 1 123 123 0 -1 4194304 1 2 3 4 5 6 7 8 20 0 1 0 987654321 0",
+    )
+    .expect("proc stat identity should parse");
+    assert_eq!(parsed.pid, 123);
+    assert_eq!(parsed.process_group_id, 123);
+    assert_eq!(parsed.start_time_ticks, 987654321);
+
+    let current_pid = std::process::id();
+    let current = read_terminal_process_identity(current_pid)
+        .expect("current linux process identity should be readable");
+    assert_eq!(current.pid, current_pid);
+    let wrong_start_time = TerminalProcessIdentity {
+        start_time_ticks: current.start_time_ticks.saturating_add(1),
+        ..current
+    };
+    assert!(terminal_process_identity_matches(current_pid, current));
+    assert!(!terminal_process_identity_matches(
+        current_pid,
+        wrong_start_time
+    ));
+}
+
 #[test]
 fn user_facing_error_redaction_hides_paths_and_tokens() {
     let home = env::var("HOME").unwrap_or_else(|_| "/home/example".to_string());

@@ -509,5 +509,9 @@
   "realtime_stopped": "실시간 세션을 중지했습니다.",
   "realtime_voices": "실시간 음성: {voices}",
   "realtime_no_voices": "사용 가능한 실시간 음성이 없습니다.",
-  "computer_use_connection_failed": "Computer use 연결에 실패했습니다."
+  "computer_use_connection_failed": "Computer use 연결에 실패했습니다.",
+  "computer": "컴퓨터",
+  "computer_snapshot_stream": "스냅샷 스트림",
+  "computer_no_frames": "아직 computer-use 프레임을 받지 못했습니다.",
+  "computer_frame_updated": "최신 프레임"
 }

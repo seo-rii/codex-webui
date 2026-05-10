@@ -196,6 +196,177 @@ fn prepare_session_stream_item_payload(item: &Value, turn_id: &str) -> Value {
     prepare_session_deferred_item_payload(item, turn_id, 0)
 }
 
+const COMPUTER_FRAME_IMAGE_URL_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+fn value_string_from_keys(
+    record: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| record.get(*key).and_then(value_text))
+}
+
+fn infer_computer_frame_mime_type(image_url: &str) -> Option<String> {
+    let trimmed = image_url.trim();
+    if let Some(rest) = trimmed.strip_prefix("data:") {
+        return rest
+            .split_once(';')
+            .map(|(mime_type, _)| mime_type.trim().to_string())
+            .filter(|mime_type| mime_type.starts_with("image/"));
+    }
+    let without_query = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+    match without_query
+        .rsplit('.')
+        .next()
+        .map(str::to_ascii_lowercase)
+    {
+        Some(ext) if ext == "avif" => Some("image/avif".to_string()),
+        Some(ext) if ext == "webp" => Some("image/webp".to_string()),
+        Some(ext) if ext == "jpg" || ext == "jpeg" => Some("image/jpeg".to_string()),
+        Some(ext) if ext == "png" => Some("image/png".to_string()),
+        Some(ext) if ext == "gif" => Some("image/gif".to_string()),
+        _ => None,
+    }
+}
+
+fn extract_computer_frame_image_url(value: &Value, depth: usize) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    match value {
+        Value::Array(entries) => entries
+            .iter()
+            .find_map(|entry| extract_computer_frame_image_url(entry, depth + 1)),
+        Value::Object(record) => {
+            let item_type = value_string_from_keys(record, &["type", "kind"])
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let image_url = value_string_from_keys(
+                record,
+                &["imageUrl", "image_url", "dataUrl", "data_url", "url"],
+            );
+            if item_type.contains("image") {
+                if let Some(image_url) = image_url {
+                    let trimmed = image_url.trim();
+                    if !trimmed.is_empty() && trimmed.len() <= COMPUTER_FRAME_IMAGE_URL_MAX_BYTES {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+            for key in [
+                "contentItems",
+                "content_items",
+                "content",
+                "result",
+                "output",
+                "response",
+                "items",
+            ] {
+                if let Some(found) = record
+                    .get(key)
+                    .and_then(|entry| extract_computer_frame_image_url(entry, depth + 1))
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn computer_frame_tool_label(item: &Value) -> Option<String> {
+    let record = item.as_object()?;
+    let invocation = record.get("invocation").and_then(Value::as_object);
+    let namespace =
+        value_string_from_keys(record, &["namespace", "serverName", "server"]).or_else(|| {
+            invocation.and_then(|value| {
+                value_string_from_keys(value, &["namespace", "serverName", "server"])
+            })
+        });
+    let tool = value_string_from_keys(record, &["tool", "toolName", "name", "displayName"])
+        .or_else(|| {
+            invocation.and_then(|value| {
+                value_string_from_keys(value, &["tool", "toolName", "name", "displayName"])
+            })
+        });
+    match (namespace, tool) {
+        (Some(namespace), Some(tool)) => Some(format!("{namespace} · {tool}")),
+        (Some(namespace), None) => Some(namespace),
+        (None, Some(tool)) => Some(tool),
+        (None, None) => None,
+    }
+}
+
+fn looks_like_computer_tool(item: &Value) -> bool {
+    let Some(record) = item.as_object() else {
+        return false;
+    };
+    if record
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "dynamicToolCall")
+        && record
+            .get("namespace")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("computer"))
+    {
+        return true;
+    }
+    let label = computer_frame_tool_label(item)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    ["computer", "screenshot", "browser", "desktop", "remote"]
+        .iter()
+        .any(|needle| label.contains(needle))
+}
+
+pub(crate) fn map_app_server_computer_frame_notification(
+    notification: &AppServerNotification,
+) -> Option<Value> {
+    if !matches!(
+        notification.method.as_str(),
+        "item/started" | "item/completed" | "rawResponseItem/added" | "rawResponseItem/completed"
+    ) {
+        return None;
+    }
+    let params = notification.params.as_object()?;
+    let item = params
+        .get("item")
+        .or_else(|| params.get("rawResponseItem"))
+        .or_else(|| params.get("responseItem"))?;
+    if !looks_like_computer_tool(item) {
+        return None;
+    }
+    let image_url = extract_computer_frame_image_url(item, 0)?;
+    let thread_id = value_string_from_keys(
+        params,
+        &["threadId", "thread_id", "sessionId", "session_id"],
+    )
+    .unwrap_or_default();
+    let turn_id = value_string_from_keys(params, &["turnId", "turn_id"]);
+    let item_id = value_string_from_keys(params, &["itemId", "item_id"])
+        .or_else(|| item.get("id").and_then(value_text));
+    let mime_type = infer_computer_frame_mime_type(&image_url);
+    let tool = computer_frame_tool_label(item);
+    Some(json!({
+        "kind": "notification",
+        "method": "codex-webui/computerFrame",
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "itemId": item_id,
+            "imageUrl": image_url,
+            "mimeType": mime_type,
+            "tool": tool,
+            "transport": "websocket",
+            "frameMode": "snapshot",
+            "fpsHint": 1,
+            "updatedAt": now_unix_ms()
+        }
+    }))
+}
+
 pub(crate) fn map_app_server_session_notification(
     notification: &AppServerNotification,
 ) -> Option<Value> {

@@ -705,6 +705,9 @@ pub(crate) async fn handle_profile_runtime_notification(
         }
         emit_session_notification(state, profile_id, &session_id, event).await;
     }
+    if let Some(frame_event) = map_app_server_computer_frame_notification(notification) {
+        emit_session_notification(state, profile_id, &session_id, frame_event).await;
+    }
 
     if matches!(
         notification.method.as_str(),

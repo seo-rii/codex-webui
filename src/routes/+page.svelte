@@ -38,7 +38,8 @@
     ArrowRightLeft,
     Shield,
     GripVertical,
-    Keyboard
+    Keyboard,
+    Monitor
   } from "lucide-svelte";
   import { onMount, tick } from "svelte";
   import { fly, slide } from "svelte/transition";
@@ -85,6 +86,7 @@
     AttachmentRecord,
     CodexAccountLoginFlow,
     CodexItem,
+    ComputerFramePayload,
     CodexQuotaStatus,
     CodexRuntimeStatus,
     CodexTurn,
@@ -121,7 +123,7 @@
     WsConnectionState
   } from "$lib/types";
 
-  type WorkspaceTabId = "chat" | "tasks" | "git" | "settings" | `git-diff:${string}` | `code-diff:${string}` | `file:${string}` | `terminal:${string}`;
+  type WorkspaceTabId = "chat" | "tasks" | "git" | "settings" | "computer" | `git-diff:${string}` | `code-diff:${string}` | `file:${string}` | `terminal:${string}`;
   type ComposerSettingsTabId = "session" | "security" | "skills";
   type GitDiffTab = {
     id: `git-diff:${string}`;
@@ -202,6 +204,7 @@
   let quota = $state<CodexQuotaStatus | null>(null);
   let runtime = $state<CodexRuntimeStatus | null>(null);
   let remoteControlStatus = $state<{ status: string; environmentId: string | null; updatedAt: number } | null>(null);
+  let computerFramesBySessionId = $state<Record<string, ComputerFramePayload>>({});
   let dismissedRemoteControlErrorAt = $state(0);
   let sessions = $state<SessionSummary[]>([]);
   let notifications = $state<AppNotification[]>([]);
@@ -290,6 +293,7 @@
   let tasksTabOpen = $state(false);
   let gitTabOpen = $state(false);
   let settingsTabOpen = $state(false);
+  let computerTabOpen = $state(false);
   let settingsInitialTab = $state<"config" | "startup" | "audit" | "theme" | "notifications" | "presets" | "automations" | "apps" | "plugins" | "skills" | null>(null);
   let gitDiffTabs = $state<GitDiffTab[]>([]);
   let codeDiffTabs = $state<CodeDiffTab[]>([]);
@@ -479,6 +483,10 @@
       installedSkills: m.installed_skills(),
       noSkills: m.no_local_skills(),
       newTerminal: m.new_terminal(),
+      computer: m.computer(),
+      computerSnapshotStream: m.computer_snapshot_stream(),
+      computerNoFrames: m.computer_no_frames(),
+      computerFrameUpdated: m.computer_frame_updated(),
       threadTitle: m.thread_title(),
       restoreThread: m.restore_thread(),
       archiveThread: m.archive_thread(),
@@ -2014,9 +2022,62 @@
 
     return tasks;
   });
+  const selectedComputerFrame = $derived.by(() => {
+    if (!selectedSessionId) {
+      return null;
+    }
+    const streamedFrame = computerFramesBySessionId[selectedSessionId];
+    if (streamedFrame) {
+      return streamedFrame;
+    }
+    if (!conversation || conversation.thread.id !== selectedSessionId) {
+      return null;
+    }
+    for (let turnIndex = conversation.thread.turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+      const turn = conversation.thread.turns[turnIndex];
+      for (let itemIndex = turn.items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+        const item = turn.items[itemIndex];
+        if (item.type !== "dynamicToolCall" && item.type !== "mcpToolCall") {
+          continue;
+        }
+        const toolText = [
+          item.namespace,
+          item.serverName,
+          item.tool,
+          item.toolName,
+          item.name,
+          item.title,
+          item.detailPreview
+        ]
+          .filter((value) => typeof value === "string")
+          .join(" ")
+          .toLowerCase();
+        if (!["computer", "screenshot", "browser", "desktop", "remote"].some((needle) => toolText.includes(needle))) {
+          continue;
+        }
+        const imageUrl = getDynamicToolImageUrls(item).at(-1);
+        if (!imageUrl) {
+          continue;
+        }
+        return {
+          threadId: selectedSessionId,
+          turnId: turn.id,
+          itemId: item.id,
+          imageUrl,
+          mimeType: imageUrl.startsWith("data:image/") ? (imageUrl.slice(5).split(";")[0] ?? null) : null,
+          tool: String(item.tool ?? item.toolName ?? item.title ?? ui.computerFrameUpdated),
+          transport: "websocket",
+          frameMode: "snapshot",
+          fpsHint: 1,
+          updatedAt: turn.completedAt ?? conversation.thread.updatedAt ?? Date.now()
+        } satisfies ComputerFramePayload;
+      }
+    }
+    return null;
+  });
   const workspaceTabs = $derived.by(() => {
     const _locale = $localeSignal;
-    const tabs: Array<{ id: WorkspaceTabId; label: string; kind: "chat" | "tasks" | "git" | "settings" | "git-diff" | "code-diff" | "file" | "terminal" }> = [
+    const tabs: Array<{ id: WorkspaceTabId; label: string; kind: "chat" | "tasks" | "git" | "settings" | "computer" | "git-diff" | "code-diff" | "file" | "terminal" }> = [
       { id: "chat", label: ui.chat, kind: "chat" }
     ];
     if (tasksTabOpen) {
@@ -2038,6 +2099,13 @@
         id: "settings",
         label: ui.settings,
         kind: "settings"
+      });
+    }
+    if (computerTabOpen) {
+      tabs.push({
+        id: "computer",
+        label: ui.computer,
+        kind: "computer"
       });
     }
     for (const tab of gitDiffTabs) {
@@ -4557,6 +4625,10 @@
           pendingPreferencePatchesBySessionId.delete(sessionId);
         }
 
+        if (applyComputerFrameEvent(payload, sessionId)) {
+          return;
+        }
+
         conversation = applyLocalComposerPreferencesToConversation(
           normalizeConversationExecutionState(applyStreamEvent(conversation, payload))
         );
@@ -4653,6 +4725,33 @@
     hydrationRefreshTimer = null;
   }
 
+  function applyComputerFrameEvent(event: StreamEvent, fallbackSessionId: string) {
+    if (event.kind !== "notification" || event.method !== "codex-webui/computerFrame") {
+      return false;
+    }
+    const imageUrl = typeof event.params.imageUrl === "string" ? event.params.imageUrl : "";
+    const threadId = String(event.params.threadId ?? fallbackSessionId);
+    if (!imageUrl || !threadId) {
+      return true;
+    }
+    computerFramesBySessionId = {
+      ...computerFramesBySessionId,
+      [threadId]: {
+        threadId,
+        turnId: typeof event.params.turnId === "string" ? event.params.turnId : null,
+        itemId: typeof event.params.itemId === "string" ? event.params.itemId : null,
+        imageUrl,
+        mimeType: typeof event.params.mimeType === "string" ? event.params.mimeType : null,
+        tool: typeof event.params.tool === "string" ? event.params.tool : null,
+        transport: typeof event.params.transport === "string" ? event.params.transport : "websocket",
+        frameMode: typeof event.params.frameMode === "string" ? event.params.frameMode : "snapshot",
+        fpsHint: typeof event.params.fpsHint === "number" ? event.params.fpsHint : null,
+        updatedAt: typeof event.params.updatedAt === "number" ? event.params.updatedAt : Date.now()
+      }
+    };
+    return true;
+  }
+
   function flushPendingSessionEvents(sessionId: string, nextConversation: ConversationState) {
     const queued = pendingSessionEvents[sessionId] ?? [];
     if (queued.length === 0) {
@@ -4663,7 +4762,10 @@
     delete remaining[sessionId];
     pendingSessionEvents = remaining;
 
-    return queued.reduce((current, event) => applyStreamEvent(current, event), nextConversation);
+    return queued.reduce(
+      (current, event) => (applyComputerFrameEvent(event, sessionId) ? current : applyStreamEvent(current, event)),
+      nextConversation
+    );
   }
 
   function isQueueUpdatedEvent(event: StreamEvent) {
@@ -7378,6 +7480,19 @@
   function closeSettingsTab() {
     settingsTabOpen = false;
     if (activeWorkspaceTabId === "settings") {
+      activeWorkspaceTabId = "chat";
+    }
+  }
+
+  function openComputerTab() {
+    computerTabOpen = true;
+    activeWorkspaceTabId = "computer";
+    workspaceMenuOpen = false;
+  }
+
+  function closeComputerTab() {
+    computerTabOpen = false;
+    if (activeWorkspaceTabId === "computer") {
       activeWorkspaceTabId = "chat";
     }
   }
@@ -10275,6 +10390,7 @@
       onCreateTerminalTab={() => void createTerminalTab()}
       onEditTags={() => void editSelectedSessionTags()}
       onForkHandoff={() => void forkCurrentThread("handoff")}
+      onOpenComputerTab={openComputerTab}
       onOpenGitTab={openGitTab}
       onOpenMobileSidebar={openMobileSidebar}
       onOpenSettingsTab={openSettingsTab}
@@ -10309,6 +10425,10 @@
           }
           if (kind === "settings") {
             closeSettingsTab();
+            return;
+          }
+          if (kind === "computer") {
+            closeComputerTab();
             return;
           }
           if (kind === "git-diff") {
@@ -11602,6 +11722,49 @@
               <div class="workspace-loading-card">
                 <RefreshCw size={16} class="animate-spin text-gray-300" />
                 <span>{getWorkspaceLoadingLabel()}</span>
+              </div>
+            {/if}
+          </div>
+        </div>
+      {:else if activeWorkspaceTabId === "computer"}
+        <div class="flex h-full min-h-0 flex-col gap-4 overflow-hidden p-4 sm:p-6" style="background: var(--bg); color: var(--ink);">
+          <div class="flex shrink-0 items-center justify-between gap-3 rounded-2xl border px-4 py-3" style="border-color: var(--line); background: var(--panel-strong);">
+            <div class="min-w-0">
+              <p class="text-[10px] font-bold uppercase tracking-[0.2em]" style="color: var(--muted);">{ui.computerSnapshotStream}</p>
+              <h2 class="mt-1 truncate text-lg font-bold" style="color: var(--ink-strong);">{ui.computer}</h2>
+            </div>
+            {#if selectedComputerFrame}
+              <div class="flex shrink-0 flex-col items-end gap-1 text-right">
+                <span class="rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.16em]" style="border-color: var(--line); background: var(--panel-soft); color: var(--muted);">
+                  {selectedComputerFrame.mimeType ?? "image"} · {selectedComputerFrame.transport}
+                </span>
+                <span class="text-[10px] font-semibold" style="color: var(--muted);">
+                  {new Date(selectedComputerFrame.updatedAt).toLocaleTimeString()}
+                </span>
+              </div>
+            {/if}
+          </div>
+
+          <div class="flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-3xl border p-3 shadow-sm" style="border-color: var(--line); background: color-mix(in srgb, var(--panel-strong) 92%, #020617 8%);">
+            {#if selectedComputerFrame}
+              <figure class="flex h-full w-full flex-col overflow-hidden rounded-2xl border" style="border-color: var(--line); background: #020617;">
+                <div class="min-h-0 flex-1 overflow-hidden">
+                  <img
+                    alt={ui.computer}
+                    class="h-full w-full object-contain"
+                    decoding="async"
+                    src={selectedComputerFrame.imageUrl}
+                  />
+                </div>
+                <figcaption class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t px-3 py-2 text-[11px] font-semibold" style="border-color: rgba(148, 163, 184, 0.22); color: #cbd5e1;">
+                  <span class="truncate">{selectedComputerFrame.tool ?? ui.computerFrameUpdated}</span>
+                  <span class="shrink-0">{selectedComputerFrame.frameMode} · {selectedComputerFrame.fpsHint ?? 1} fps</span>
+                </figcaption>
+              </figure>
+            {:else}
+              <div class="max-w-md rounded-2xl border px-5 py-8 text-center shadow-sm" style="border-color: var(--line); background: var(--panel-strong); color: var(--muted);">
+                <Monitor class="mx-auto mb-3" size={30} />
+                <p class="text-sm font-semibold">{ui.computerNoFrames}</p>
               </div>
             {/if}
           </div>

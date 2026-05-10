@@ -7,6 +7,7 @@
     History,
     Menu,
     MessageSquare,
+    Monitor,
     Pencil,
     Pin,
     Plus,
@@ -30,6 +31,7 @@
     tasks: string;
     gitWorkspace: string;
     settingsSkills: string;
+    computer: string;
     newTerminal: string;
   };
 
@@ -60,6 +62,7 @@
     onCreateSession,
     onOpenTasksTab,
     onOpenGitTab,
+    onOpenComputerTab,
     onOpenSettingsTab,
     onCreateTerminalTab
   }: {
@@ -93,6 +96,7 @@
     onCreateSession: () => void | Promise<void>;
     onOpenTasksTab: () => void;
     onOpenGitTab: () => void;
+    onOpenComputerTab: () => void;
     onOpenSettingsTab: () => void;
     onCreateTerminalTab: () => void | Promise<void>;
   } = $props();
@@ -278,6 +282,10 @@
           <button class="workspace-open-menu__item ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors" onclick={() => { workspaceMenuOpen = false; onOpenGitTab(); }} type="button">
             <GitBranch size={16} class="text-gray-400 group-hover:text-amber-600" />
             <span>{ui.gitWorkspace}</span>
+          </button>
+          <button class="workspace-open-menu__item ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors" onclick={() => { workspaceMenuOpen = false; onOpenComputerTab(); }} type="button">
+            <Monitor size={16} class="text-gray-400 group-hover:text-amber-600" />
+            <span>{ui.computer}</span>
           </button>
           <button class="workspace-open-menu__item ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors" onclick={() => { workspaceMenuOpen = false; onOpenSettingsTab(); }} type="button">
             <Settings size={16} class="text-gray-400 group-hover:text-amber-600" />

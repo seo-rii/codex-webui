@@ -509,5 +509,9 @@
   "realtime_stopped": "Realtime stopped.",
   "realtime_voices": "Realtime voices: {voices}",
   "realtime_no_voices": "No realtime voices returned.",
-  "computer_use_connection_failed": "Computer use connection failed."
+  "computer_use_connection_failed": "Computer use connection failed.",
+  "computer": "Computer",
+  "computer_snapshot_stream": "Snapshot stream",
+  "computer_no_frames": "No computer-use frames received yet.",
+  "computer_frame_updated": "Latest frame"
 }

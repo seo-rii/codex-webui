@@ -1628,6 +1628,50 @@ fn thread_goal_notifications_are_mapped_for_session_streams() {
     );
 }
 
+#[test]
+fn computer_frame_notifications_are_mapped_from_dynamic_tool_images() {
+    let event = map_app_server_computer_frame_notification(&AppServerNotification {
+        method: "item/completed".to_string(),
+        params: json!({
+            "threadId": "thread-computer",
+            "turnId": "turn-1",
+            "itemId": "item-computer-1",
+            "item": {
+                "id": "item-computer-1",
+                "type": "dynamicToolCall",
+                "namespace": "computer",
+                "tool": "screenshot",
+                "contentItems": [
+                    {
+                        "type": "inputImage",
+                        "imageUrl": "data:image/avif;base64,AAAA"
+                    }
+                ]
+            }
+        }),
+    })
+    .expect("computer frame event should be mapped");
+
+    assert_eq!(
+        event.get("method").and_then(Value::as_str),
+        Some("codex-webui/computerFrame")
+    );
+    assert_eq!(
+        event
+            .get("params")
+            .and_then(|params| params.get("imageUrl"))
+            .and_then(Value::as_str),
+        Some("data:image/avif;base64,AAAA")
+    );
+    assert_eq!(
+        event
+            .get("params")
+            .and_then(|params| params.get("mimeType"))
+            .and_then(Value::as_str),
+        Some("image/avif")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_notifications_emit_global_events_without_internal_sse() {
     let sandbox = unique_test_dir("global-stream-rust");

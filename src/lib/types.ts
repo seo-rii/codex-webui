@@ -607,6 +607,19 @@ export type StreamEvent =
       params: Record<string, unknown>;
     };
 
+export type ComputerFramePayload = {
+  threadId: string;
+  turnId: string | null;
+  itemId: string | null;
+  imageUrl: string;
+  mimeType: string | null;
+  tool: string | null;
+  transport: "websocket" | string;
+  frameMode: "snapshot" | string;
+  fpsHint: number | null;
+  updatedAt: number;
+};
+
 export type GlobalStreamEvent = {
   kind: "notification";
   method: string;

@@ -18,6 +18,10 @@ Implemented today:
   `contentItems`, including text and image content.
 - Dynamic tool-call transcript items render returned text and image payloads
   instead of falling back to raw JSON.
+- Computer-use image content from dynamic tool calls is detected by the gateway
+  and forwarded as `codex-webui/computerFrame` session events. The browser shows
+  the latest frame in the Computer workspace tab without reloading the full
+  transcript.
 - `remoteControl/status/changed` and `app/list/updated` app-server events are
   forwarded into the browser event model.
 - `/apps`, `/plugins`, and `/realtime` slash commands are classified and wired
@@ -47,10 +51,10 @@ frames.
 Suggested shape:
 
 - app-server or gateway emits a best-effort screen snapshot event only while the
-  computer-use panel is open
-- payload is JPEG or PNG bytes, either binary WebSocket frames or base64 in a
-  JSON envelope when compatibility matters more than overhead
-- server throttles to a small rate such as 1-3 FPS by default
+  computer-use panel or session subscription is active
+- payload should prefer low-quality AVIF/WebP/JPEG snapshots when the source can
+  encode them cheaply; existing data URLs are forwarded as-is for compatibility
+- server throttles to a small rate such as 0.2-1 FPS by default
 - every frame supersedes the previous frame; the client drops stale frames if it
   is still decoding or rendering
 - frame size is capped, downscaled, and quality-limited before sending
@@ -68,6 +72,12 @@ model:
 
 This should not be treated as real video. It is a remote-inspection channel with
 occasional frames.
+
+Using AV1 as a stateful video stream is deferred. At the low frame rates useful
+for computer-use inspection, per-frame AVIF snapshots are simpler to reconnect,
+cache, and audit. A true AV1 stream only becomes attractive once inter-frame
+compression is needed and the project is ready to own encoder state, keyframe
+recovery, and browser decoder compatibility.
 
 ### Optional Later Path: WebTransport Datagrams
 
@@ -136,4 +146,3 @@ Before accepting input:
 - route every input command through the same role and audit model as other
   host-facing actions
 - reject stale input sequence ids after a stream reset
-

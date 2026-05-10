@@ -8,13 +8,13 @@ fn unique_test_dir(label: &str) -> PathBuf {
 
 #[test]
 fn default_gateway_runtime_stack_is_low_memory_friendly() {
-    assert_eq!(DEFAULT_SERVER_THREAD_STACK_BYTES, 2 * 1024 * 1024);
+    assert_eq!(DEFAULT_SERVER_THREAD_STACK_BYTES, 16 * 1024 * 1024);
     assert_eq!(
         runtime_thread_stack_bytes_from_env(
             "CODEX_WEBUI_TEST_MISSING_THREAD_STACK_BYTES",
             DEFAULT_SERVER_THREAD_STACK_BYTES,
         ),
-        2 * 1024 * 1024
+        16 * 1024 * 1024
     );
 }
 

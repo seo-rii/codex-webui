@@ -54,7 +54,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
-const DEFAULT_SERVER_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_SERVER_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 mod app_util_support;
 mod arena_support;
@@ -219,7 +219,7 @@ fn main() -> Result<()> {
     );
     let blocking_threads = runtime_thread_count_from_env(
         "CODEX_WEBUI_BLOCKING_THREADS",
-        server_threads.saturating_mul(4).max(8),
+        server_threads.saturating_mul(2).max(4),
         4,
         64,
     );
@@ -266,9 +266,9 @@ fn runtime_thread_stack_bytes_from_env(name: &str, fallback: usize) -> usize {
     env::var(name)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value >= 2 * 1024 * 1024)
+        .filter(|value| *value >= DEFAULT_SERVER_THREAD_STACK_BYTES)
         .unwrap_or(fallback)
-        .clamp(2 * 1024 * 1024, 32 * 1024 * 1024)
+        .clamp(DEFAULT_SERVER_THREAD_STACK_BYTES, 64 * 1024 * 1024)
 }
 
 async fn run_gateway(config: Arc<Config>) -> Result<()> {

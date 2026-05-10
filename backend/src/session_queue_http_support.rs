@@ -16,7 +16,10 @@ pub(crate) async fn handle_session_queue_api_http(
 
     let result = if suffix.is_empty() {
         match request.method() {
-            &Method::GET => get_session_queue_payload(&state, &auth.profile_id, session_id).await,
+            &Method::GET => {
+                get_session_queue_payload_for_role(&state, &auth.profile_id, session_id, auth.role)
+                    .await
+            }
             &Method::POST => {
                 match read_json_body(request, LARGE_JSON_BODY_LIMIT, "queue request body").await {
                     Ok(payload) => {

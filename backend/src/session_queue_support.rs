@@ -46,6 +46,37 @@ pub(crate) async fn get_session_queue_payload(
     .await
 }
 
+pub(crate) fn redacted_queue_payload(queue: &Value) -> Value {
+    let item_count = queue
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    json!({
+        "sessionId": queue.get("sessionId").cloned().unwrap_or(Value::Null),
+        "itemCount": item_count,
+        "resumeRequired": queue
+            .get("resumeRequired")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "updatedAt": queue.get("updatedAt").cloned().unwrap_or(Value::Null)
+    })
+}
+
+pub(crate) async fn get_session_queue_payload_for_role(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    role: UserRole,
+) -> ApiResult<Value> {
+    let queue = get_session_queue_payload(state, profile_id, session_id).await?;
+    if role_has_admin_access(role) {
+        Ok(queue)
+    } else {
+        Ok(redacted_queue_payload(&queue))
+    }
+}
+
 pub(crate) async fn emit_queue_updated(
     state: &AppState,
     profile_id: &str,

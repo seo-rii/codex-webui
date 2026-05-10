@@ -1590,6 +1590,100 @@ async fn viewer_notification_list_payloads_are_redacted() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn viewer_session_queue_and_draft_http_payloads_are_redacted() {
+    let sandbox = unique_test_dir("viewer-session-http-redaction");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["queuesByThreadId"]["thread-1"] = json!({
+            "items": [{
+                "id": "queue-1",
+                "prompt": "secret queued prompt",
+                "skills": [{
+                    "id": "secret-skill",
+                    "name": "Secret Skill"
+                }],
+                "attachmentIds": ["secret-attachment"]
+            }],
+            "resumePending": true,
+            "updatedAt": 42
+        });
+        ui_state["draftsByThreadId"]["thread-1"] = json!({
+            "draft": "secret unsent draft",
+            "intent": "queue",
+            "updatedAt": 43
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let viewer_jar =
+        issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Viewer).unwrap();
+    for uri in [
+        "/api/sessions/thread-1/queue",
+        "/api/sessions/thread-1/draft",
+    ] {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let response = handle_http(State(state.clone()), viewer_jar.clone(), request).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        let payload_text = payload.to_string();
+        assert!(
+            !payload_text.contains("secret queued prompt"),
+            "{uri} leaked queued prompt: {payload_text}"
+        );
+        assert!(
+            !payload_text.contains("secret unsent draft"),
+            "{uri} leaked draft: {payload_text}"
+        );
+        assert!(
+            !payload_text.contains("secret-skill"),
+            "{uri} leaked selected skill: {payload_text}"
+        );
+        assert!(
+            !payload_text.contains("secret-attachment"),
+            "{uri} leaked attachment id: {payload_text}"
+        );
+    }
+
+    let admin_jar =
+        issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Admin).unwrap();
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/sessions/thread-1/queue")
+        .body(Body::empty())
+        .unwrap();
+    let response = handle_http(State(state.clone()), admin_jar.clone(), request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert!(payload.to_string().contains("secret queued prompt"));
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/sessions/thread-1/draft")
+        .body(Body::empty())
+        .unwrap();
+    let response = handle_http(State(state.clone()), admin_jar, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert!(payload.to_string().contains("secret unsent draft"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn auth_token_signing_requires_explicit_session_secret() {
     let sandbox = unique_test_dir("auth-token-secret");

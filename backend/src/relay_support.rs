@@ -153,23 +153,6 @@ pub(crate) async fn subscribe_global(
     Ok(())
 }
 
-fn redacted_queue_payload(queue: &Value) -> Value {
-    let item_count = queue
-        .get("items")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
-    json!({
-        "sessionId": queue.get("sessionId").cloned().unwrap_or(Value::Null),
-        "itemCount": item_count,
-        "resumeRequired": queue
-            .get("resumeRequired")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        "updatedAt": queue.get("updatedAt").cloned().unwrap_or(Value::Null)
-    })
-}
-
 fn filter_session_event_for_role(role: UserRole, event: Value) -> Option<Value> {
     if role_has_admin_access(role) {
         return Some(event);

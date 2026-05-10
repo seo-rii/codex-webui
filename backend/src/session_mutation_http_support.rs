@@ -133,7 +133,10 @@ pub(crate) async fn handle_session_draft_api_http(
     session_id: &str,
 ) -> Response {
     let result = match request.method() {
-        &Method::GET => get_session_draft_payload(&state, &auth.profile_id, session_id).await,
+        &Method::GET => {
+            get_session_draft_payload_for_role(&state, &auth.profile_id, session_id, auth.role)
+                .await
+        }
         &Method::PATCH => {
             if !role_has_admin_access(auth.role) {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");

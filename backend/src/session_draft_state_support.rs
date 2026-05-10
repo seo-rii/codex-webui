@@ -29,6 +29,33 @@ pub(crate) async fn get_session_draft_payload(
     .await
 }
 
+pub(crate) fn redacted_draft_payload(draft: &Value) -> Value {
+    let draft_text = draft
+        .get("draft")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({
+        "sessionId": draft.get("sessionId").cloned().unwrap_or(Value::Null),
+        "hasDraft": !draft_text.trim().is_empty(),
+        "intent": draft.get("intent").cloned().unwrap_or(Value::Null),
+        "updatedAt": draft.get("updatedAt").cloned().unwrap_or(Value::Null)
+    })
+}
+
+pub(crate) async fn get_session_draft_payload_for_role(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    role: UserRole,
+) -> ApiResult<Value> {
+    let draft = get_session_draft_payload(state, profile_id, session_id).await?;
+    if role_has_admin_access(role) {
+        Ok(draft)
+    } else {
+        Ok(redacted_draft_payload(&draft))
+    }
+}
+
 pub(crate) async fn save_session_draft_payload(
     state: &AppState,
     profile_id: &str,

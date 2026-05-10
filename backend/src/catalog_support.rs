@@ -220,6 +220,118 @@ pub(crate) fn build_catalog_payload_for_codex_home(codex_home: &Path) -> Value {
     })
 }
 
+pub(crate) fn merge_app_server_plugin_catalog_payload(
+    payload: &mut Value,
+    app_server_payload: &Value,
+) {
+    let Some(plugins) = payload.get_mut("plugins").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    let mut seen = plugins
+        .iter()
+        .filter_map(|plugin| {
+            plugin
+                .get("mentionPath")
+                .or_else(|| plugin.get("path"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<HashSet<_>>();
+
+    let Some(marketplaces) = app_server_payload
+        .get("marketplaces")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+
+    for marketplace in marketplaces {
+        let marketplace_name = marketplace
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if marketplace_name.is_empty() {
+            continue;
+        }
+        let marketplace_path = marketplace.get("path").cloned().unwrap_or(Value::Null);
+        let Some(summaries) = marketplace.get("plugins").and_then(Value::as_array) else {
+            continue;
+        };
+
+        for summary in summaries {
+            let plugin_name = summary
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| summary.get("id").and_then(Value::as_str))
+                .unwrap_or_default()
+                .trim();
+            if plugin_name.is_empty() {
+                continue;
+            }
+            let mention_path = format!("plugin://{plugin_name}@{marketplace_name}");
+            if !seen.insert(mention_path.clone()) {
+                continue;
+            }
+
+            let interface = summary.get("interface").unwrap_or(&Value::Null);
+            let display_name = interface
+                .get("displayName")
+                .and_then(Value::as_str)
+                .or_else(|| interface.get("display_name").and_then(Value::as_str))
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(plugin_name);
+            let description = interface
+                .get("shortDescription")
+                .or_else(|| interface.get("short_description"))
+                .or_else(|| interface.get("longDescription"))
+                .or_else(|| interface.get("long_description"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let developer_name = interface
+                .get("developerName")
+                .or_else(|| interface.get("developer_name"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let category = interface.get("category").cloned().unwrap_or(Value::Null);
+            let capabilities = interface
+                .get("capabilities")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+
+            plugins.push(json!({
+                "name": plugin_name,
+                "displayName": display_name,
+                "description": description,
+                "version": Value::Null,
+                "developerName": developer_name,
+                "category": category,
+                "path": mention_path,
+                "mentionPath": mention_path,
+                "marketplaceName": marketplace_name,
+                "marketplacePath": marketplace_path.clone(),
+                "pluginId": summary.get("id").cloned().unwrap_or(Value::Null),
+                "installed": summary.get("installed").and_then(Value::as_bool).unwrap_or(false),
+                "enabled": summary.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+                "installPolicy": summary.get("installPolicy").cloned().unwrap_or(Value::Null),
+                "authPolicy": summary.get("authPolicy").cloned().unwrap_or(Value::Null),
+                "availability": summary.get("availability").cloned().unwrap_or(Value::Null),
+                "capabilities": capabilities,
+                "skills": []
+            }));
+        }
+    }
+}
+
+pub(crate) async fn invalidate_catalog_cache_for_profile(state: &AppState, profile_id: &str) {
+    let codex_home = resolve_runtime_profile(&state.config, profile_id)
+        .codex_home
+        .display()
+        .to_string();
+    state.catalog_cache.lock().await.remove(&codex_home);
+}
+
 pub(crate) async fn get_catalog_payload(state: &AppState, profile_id: &str) -> ApiResult<Value> {
     let codex_home = resolve_runtime_profile(&state.config, profile_id)
         .codex_home
@@ -237,10 +349,30 @@ pub(crate) async fn get_catalog_payload(state: &AppState, profile_id: &str) -> A
     let codex_home_path = resolve_runtime_profile(&state.config, profile_id)
         .codex_home
         .clone();
-    let payload =
+    let mut payload =
         tokio::task::spawn_blocking(move || build_catalog_payload_for_codex_home(&codex_home_path))
             .await
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if let Ok(client) = app_server_client(state, profile_id).await {
+        let cwds = resolved_allowed_roots(&state.config)
+            .await
+            .into_iter()
+            .map(|path| Value::String(path.display().to_string()))
+            .collect::<Vec<_>>();
+        if let Ok(plugin_payload) = client
+            .request_with_timeout(
+                "plugin/list",
+                json!({
+                    "cwds": cwds
+                }),
+                Duration::from_secs(3),
+                false,
+            )
+            .await
+        {
+            merge_app_server_plugin_catalog_payload(&mut payload, &plugin_payload);
+        }
+    }
 
     {
         let mut cache = state.catalog_cache.lock().await;

@@ -538,6 +538,9 @@ pub(crate) async fn handle_profile_runtime_notification(
 ) {
     let Some(session_id) = notification_thread_id(&notification.method, &notification.params)
     else {
+        if let Some(event) = map_app_server_global_notification(notification) {
+            emit_profile_global_notification(state, profile_id, event).await;
+        }
         return;
     };
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)

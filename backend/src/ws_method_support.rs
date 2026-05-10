@@ -28,6 +28,12 @@ pub(crate) fn ws_method_requires_owner(method: &str, params: &Value) -> bool {
     matches!(
         method,
         "config/update"
+            | "codex/features/set"
+            | "codex/marketplaces/add"
+            | "codex/marketplaces/remove"
+            | "codex/marketplaces/upgrade"
+            | "codex/plugins/install"
+            | "codex/plugins/uninstall"
             | "runtime/install"
             | "runtime/update"
             | "terminal/list"
@@ -60,6 +66,10 @@ pub(crate) fn ws_method_uses_request_replay(method: &str) -> bool {
             | "terminal/unsubscribe"
             | "events/subscribe"
             | "events/unsubscribe"
+            | "codex/realtime/start"
+            | "codex/realtime/appendAudio"
+            | "codex/realtime/appendText"
+            | "codex/realtime/stop"
     )
 }
 
@@ -87,6 +97,14 @@ pub(crate) fn should_audit_ws_method(method: &str) -> bool {
             | "runtime/status"
             | "runtime/checkUpdate"
             | "runtime/quota"
+            | "codex/features/list"
+            | "codex/plugins/list"
+            | "codex/plugins/read"
+            | "codex/plugins/skill/read"
+            | "codex/skills/list"
+            | "codex/hooks/list"
+            | "codex/apps/list"
+            | "codex/realtime/listVoices"
             | "catalog/get"
             | "directories/browse"
             | "editor/file/get"

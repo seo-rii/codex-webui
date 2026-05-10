@@ -243,6 +243,27 @@ for raw_line in sys.stdin:
             "method": "fake/ready",
             "params": {}
         })
+    elif method == "experimentalFeature/list":
+        write({
+            "id": request_id,
+            "result": {
+                "features": [
+                    {
+                        "key": "plugins",
+                        "enabled": True,
+                        "defaultEnabled": True,
+                        "stage": "stable"
+                    },
+                    {
+                        "key": "tool_suggest",
+                        "enabled": True,
+                        "defaultEnabled": True,
+                        "stage": "beta"
+                    }
+                ],
+                "nextCursor": None
+            }
+        })
     elif method == "experimentalFeature/enablement/set":
         write({
             "id": request_id,
@@ -250,6 +271,155 @@ for raw_line in sys.stdin:
                 "code": -32602,
                 "message": "unsupported feature enablement `goals`: currently supported features are apps, memories, plugins, remote_control, tool_search, tool_suggest, tool_call_mcp_elicitation"
             }
+        })
+    elif method == "plugin/list":
+        write({
+            "id": request_id,
+            "result": {
+                "marketplaces": [
+                    {
+                        "name": "openai-bundled",
+                        "path": None,
+                        "interface": {
+                            "displayName": "OpenAI bundled"
+                        },
+                        "plugins": [
+                            {
+                                "id": "computer-use@openai-bundled",
+                                "name": "computer-use",
+                                "shareContext": None,
+                                "source": {
+                                    "type": "remote"
+                                },
+                                "installed": False,
+                                "enabled": True,
+                                "installPolicy": "AVAILABLE",
+                                "authPolicy": "ON_USE",
+                                "availability": "AVAILABLE",
+                                "interface": {
+                                    "displayName": "Computer Use",
+                                    "shortDescription": "Control a browser or desktop through Codex tools.",
+                                    "developerName": "OpenAI",
+                                    "category": "automation",
+                                    "capabilities": ["mcp", "computer"],
+                                    "defaultPrompt": ["Use the computer-use tools when a task needs UI interaction."]
+                                },
+                                "keywords": ["computer", "browser", "desktop"]
+                            }
+                        ]
+                    }
+                ],
+                "marketplaceLoadErrors": [],
+                "featuredPluginIds": ["computer-use@openai-bundled"]
+            }
+        })
+    elif method == "plugin/read":
+        plugin_name = params.get("pluginName") or params.get("plugin_name") or "computer-use"
+        marketplace_name = params.get("remoteMarketplaceName") or "openai-bundled"
+        write({
+            "id": request_id,
+            "result": {
+                "plugin": {
+                    "marketplaceName": marketplace_name,
+                    "marketplacePath": params.get("marketplacePath"),
+                    "summary": {
+                        "id": f"{plugin_name}@{marketplace_name}",
+                        "name": plugin_name,
+                        "shareContext": None,
+                        "source": {
+                            "type": "remote"
+                        },
+                        "installed": False,
+                        "enabled": True,
+                        "installPolicy": "AVAILABLE",
+                        "authPolicy": "ON_USE",
+                        "availability": "AVAILABLE",
+                        "interface": {
+                            "displayName": "Computer Use",
+                            "shortDescription": "Control a browser or desktop through Codex tools.",
+                            "developerName": "OpenAI",
+                            "category": "automation",
+                            "capabilities": ["mcp", "computer"]
+                        },
+                        "keywords": ["computer"]
+                    },
+                    "description": "Bundled computer-use plugin.",
+                    "skills": [],
+                    "hooks": [],
+                    "apps": [],
+                    "mcpServers": ["computer-use"]
+                }
+            }
+        })
+    elif method == "plugin/install":
+        write({
+            "id": request_id,
+            "result": {
+                "authPolicy": "ON_USE",
+                "appsNeedingAuth": []
+            }
+        })
+    elif method == "plugin/uninstall":
+        write({
+            "id": request_id,
+            "result": {}
+        })
+    elif method == "app/list":
+        write({
+            "id": request_id,
+            "result": {
+                "data": [
+                    {
+                        "id": "computer-use",
+                        "name": "Computer Use",
+                        "description": "Control a browser or desktop through Codex tools.",
+                        "logoUrl": None,
+                        "logoUrlDark": None,
+                        "distributionChannel": "plugin",
+                        "branding": None,
+                        "appMetadata": None,
+                        "labels": None,
+                        "installUrl": None,
+                        "isAccessible": True,
+                        "isEnabled": True,
+                        "pluginDisplayNames": ["Computer Use"]
+                    }
+                ],
+                "nextCursor": None
+            }
+        })
+    elif method == "thread/realtime/listVoices":
+        write({
+            "id": request_id,
+            "result": {
+                "voices": ["alloy", "verse"]
+            }
+        })
+    elif method == "thread/realtime/start":
+        thread_id = params.get("threadId", "")
+        write({
+            "method": "thread/realtime/started",
+            "params": {
+                "threadId": thread_id,
+                "realtimeSessionId": "rt-test"
+            }
+        })
+        if isinstance(params.get("transport"), dict) and params["transport"].get("type") == "webrtc":
+            write({
+                "method": "thread/realtime/sdp",
+                "params": {
+                    "threadId": thread_id,
+                    "sdp": "v=0\\r\\n"
+                }
+            })
+        write({
+            "id": request_id,
+            "result": {}
+        })
+    elif method in ("thread/realtime/appendText", "thread/realtime/appendAudio", "thread/realtime/stop"):
+        write({
+            "id": request_id,
+            "result": {}
         })
     elif method == "config/batchWrite":
         for edit in params.get("edits") or []:

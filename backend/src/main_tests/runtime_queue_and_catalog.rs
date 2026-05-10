@@ -110,6 +110,78 @@ async fn resolve_server_request_payload_returns_not_found_without_pending_reques
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dynamic_tool_call_requests_can_be_resolved_with_content_items() {
+    let sandbox = unique_test_dir("dynamic-tool-call-request");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    handle_profile_server_request(
+        &state,
+        "default",
+        &backend::codex_app_server::AppServerRequest {
+            id: json!("dynamic-1"),
+            method: "item/tool/call".to_string(),
+            params: json!({
+                "threadId": "thread-dynamic",
+                "turnId": "turn-1",
+                "callId": "call-1",
+                "namespace": "computer",
+                "tool": "screenshot",
+                "arguments": {}
+            }),
+        },
+    )
+    .await;
+
+    let pending = state
+        .pending_server_requests
+        .lock()
+        .await
+        .get(&runtime_session_key("default", "thread-dynamic"))
+        .and_then(|entries| entries.get("dynamic-1"))
+        .cloned()
+        .expect("dynamic tool request should be stored");
+    assert_eq!(pending.method, "item/tool/call");
+    assert_eq!(
+        pending.params.get("namespace").and_then(Value::as_str),
+        Some("computer")
+    );
+
+    let payload = resolve_server_request_payload(
+        &state,
+        "default",
+        "thread-dynamic",
+        "dynamic-1",
+        json!({
+            "contentItems": [
+                {
+                    "type": "inputText",
+                    "text": "manual tool output"
+                }
+            ],
+            "success": true
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+    assert!(
+        state
+            .pending_server_requests
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-dynamic"))
+            .is_none()
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_status_includes_webui_build_metadata() {
     let sandbox = unique_test_dir("runtime-build-metadata");
     let workspace = sandbox.join("workspace");
@@ -141,6 +213,192 @@ async fn runtime_status_includes_webui_build_metadata() {
             .get("webuiBuildDirty")
             .and_then(Value::as_bool)
             .is_some()
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_merges_app_server_computer_use_plugin() {
+    let sandbox = unique_test_dir("catalog-computer-use-plugin");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let payload = get_catalog_payload(&state, "default").await.unwrap();
+    let plugins = payload
+        .get("plugins")
+        .and_then(Value::as_array)
+        .expect("catalog should include plugins array");
+    let computer_use = plugins
+        .iter()
+        .find(|plugin| {
+            plugin.get("mentionPath").and_then(Value::as_str)
+                == Some("plugin://computer-use@openai-bundled")
+        })
+        .expect("computer-use plugin should be merged from app-server");
+
+    assert_eq!(
+        computer_use.get("displayName").and_then(Value::as_str),
+        Some("Computer Use")
+    );
+    assert_eq!(
+        computer_use.get("marketplaceName").and_then(Value::as_str),
+        Some("openai-bundled")
+    );
+    assert_eq!(
+        computer_use.get("installed").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(
+        computer_use
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .is_some_and(|capabilities| capabilities
+                .iter()
+                .any(|value| value.as_str() == Some("computer")))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[test]
+fn turn_input_payload_encodes_codex_plugin_mentions() {
+    let selected_plugins = vec![json!({
+        "name": "Computer Use",
+        "path": "plugin://computer-use@openai-bundled"
+    })];
+
+    let (input, additional_roots) =
+        build_turn_input_payload("open a browser", &[], &selected_plugins);
+
+    assert!(additional_roots.is_empty());
+    assert_eq!(input.len(), 2);
+    assert_eq!(
+        input[0].get("text").and_then(Value::as_str),
+        Some("@computer-use\n\nopen a browser")
+    );
+    assert_eq!(
+        input[1].get("type").and_then(Value::as_str),
+        Some("mention")
+    );
+    assert_eq!(
+        input[1].get("path").and_then(Value::as_str),
+        Some("plugin://computer-use@openai-bundled")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_protocol_proxy_methods_forward_to_app_server() {
+    let sandbox = unique_test_dir("codex-protocol-proxy");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    let auth = AuthContext {
+        role: UserRole::Owner,
+        profile_id: "default".to_string(),
+    };
+
+    let features = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "codex/features/list",
+        json!({}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        features
+            .get("features")
+            .and_then(Value::as_array)
+            .is_some_and(|features| features
+                .iter()
+                .any(|feature| { feature.get("key").and_then(Value::as_str) == Some("plugins") }))
+    );
+
+    let install = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "codex/plugins/install",
+        json!({
+            "marketplacePath": Value::Null,
+            "remoteMarketplaceName": "openai-bundled",
+            "pluginName": "computer-use"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        install.get("authPolicy").and_then(Value::as_str),
+        Some("ON_USE")
+    );
+
+    let voices = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "codex/realtime/listVoices",
+        json!({}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        voices
+            .get("voices")
+            .and_then(Value::as_array)
+            .is_some_and(|voices| voices.iter().any(|voice| voice.as_str() == Some("alloy")))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_apps_list_proxy_forwards_to_app_server() {
+    let sandbox = unique_test_dir("codex-apps-list-proxy");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    let auth = AuthContext {
+        role: UserRole::Owner,
+        profile_id: "default".to_string(),
+    };
+
+    let apps = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "codex/apps/list",
+        json!({}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        apps.get("data")
+            .and_then(Value::as_array)
+            .is_some_and(|apps| apps
+                .iter()
+                .any(|app| app.get("id").and_then(Value::as_str) == Some("computer-use")))
     );
 
     let _ = fs::remove_dir_all(sandbox);

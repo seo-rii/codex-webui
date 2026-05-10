@@ -31,7 +31,7 @@ async fn resolve_selected_attachment_records(
         .collect())
 }
 
-fn build_turn_input_payload(
+pub(crate) fn build_turn_input_payload(
     prompt: &str,
     attachments: &[StoredAttachmentRecord],
     selected_skills: &[Value],
@@ -59,20 +59,76 @@ fn build_turn_input_payload(
         }
     }
 
-    let skill_markers = selected_skills
-        .iter()
-        .filter_map(|skill| skill.get("name").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .filter(|value| !prompt.contains(&format!("${value}")))
-        .map(|value| format!("${value}"))
-        .collect::<Vec<_>>();
-    let text_body = if skill_markers.is_empty() {
+    let mut reference_markers = Vec::new();
+    let mut reference_items = Vec::new();
+    for selected in selected_skills {
+        let name = selected
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let path = selected
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if name.is_empty() || path.is_empty() {
+            continue;
+        }
+
+        if path.starts_with("plugin://") || path.starts_with("app://") {
+            let marker = if let Some(plugin_id) = path
+                .strip_prefix("plugin://")
+                .and_then(|value| value.split('@').next())
+                .filter(|value| !value.is_empty())
+            {
+                format!("@{plugin_id}")
+            } else {
+                let app_slug_source = name
+                    .chars()
+                    .map(|ch| {
+                        if ch.is_ascii_alphanumeric() {
+                            ch.to_ascii_lowercase()
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect::<String>();
+                let app_slug = app_slug_source
+                    .split('-')
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("-");
+                format!("${}", if app_slug.is_empty() { name } else { &app_slug })
+            };
+            if !prompt.contains(&marker) {
+                reference_markers.push(marker);
+            }
+            reference_items.push(json!({
+                "type": "mention",
+                "name": name,
+                "path": path
+            }));
+            continue;
+        }
+
+        let marker = format!("${name}");
+        if !prompt.contains(&marker) {
+            reference_markers.push(marker);
+        }
+        reference_items.push(json!({
+            "type": "skill",
+            "name": name,
+            "path": path
+        }));
+    }
+
+    let text_body = if reference_markers.is_empty() {
         prompt.to_string()
     } else if prompt.trim().is_empty() {
-        skill_markers.join("\n")
+        reference_markers.join("\n")
     } else {
-        format!("{}\n\n{prompt}", skill_markers.join("\n"))
+        format!("{}\n\n{prompt}", reference_markers.join("\n"))
     };
 
     let mut input = vec![json!({
@@ -87,13 +143,7 @@ fn build_turn_input_payload(
         },
         "text_elements": []
     })];
-    input.extend(selected_skills.iter().cloned().map(|skill| {
-        json!({
-            "type": "skill",
-            "name": skill.get("name").and_then(Value::as_str).unwrap_or_default(),
-            "path": skill.get("path").and_then(Value::as_str).unwrap_or_default()
-        })
-    }));
+    input.extend(reference_items);
     for image_path in image_attachment_paths {
         input.push(json!({
             "type": "localImage",

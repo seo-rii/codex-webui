@@ -365,6 +365,16 @@ pub(crate) fn map_app_server_global_notification(
             "method": "codex-webui/accountRateLimitsUpdated",
             "params": notification.params
         })),
+        "remoteControl/status/changed" => Some(json!({
+            "kind": "notification",
+            "method": "codex-webui/remoteControlStatusChanged",
+            "params": notification.params
+        })),
+        "app/list/updated" => Some(json!({
+            "kind": "notification",
+            "method": "codex-webui/appListUpdated",
+            "params": notification.params
+        })),
         _ => None,
     }
 }

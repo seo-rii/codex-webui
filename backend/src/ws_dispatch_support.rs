@@ -107,6 +107,121 @@ pub(crate) async fn execute_ws_method(
             )
             .await
         }
+        "codex/features/list" => {
+            proxy_app_server_payload(state, &auth.profile_id, "experimentalFeature/list", params)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "codex/features/set" => proxy_app_server_payload(
+            state,
+            &auth.profile_id,
+            "experimentalFeature/enablement/set",
+            params,
+        )
+        .await
+        .map_err(anyhow::Error::from),
+        "codex/plugins/list" => {
+            proxy_app_server_payload(state, &auth.profile_id, "plugin/list", params)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "codex/plugins/read" => {
+            proxy_app_server_payload(state, &auth.profile_id, "plugin/read", params)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "codex/plugins/skill/read" => {
+            proxy_app_server_payload(state, &auth.profile_id, "plugin/skill/read", params)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "codex/plugins/install" => {
+            let payload =
+                proxy_app_server_payload(state, &auth.profile_id, "plugin/install", params)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+            invalidate_catalog_cache_for_profile(state, &auth.profile_id).await;
+            Ok(payload)
+        }
+        "codex/plugins/uninstall" => {
+            let payload =
+                proxy_app_server_payload(state, &auth.profile_id, "plugin/uninstall", params)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+            invalidate_catalog_cache_for_profile(state, &auth.profile_id).await;
+            Ok(payload)
+        }
+        "codex/marketplaces/add" => {
+            let payload =
+                proxy_app_server_payload(state, &auth.profile_id, "marketplace/add", params)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+            invalidate_catalog_cache_for_profile(state, &auth.profile_id).await;
+            Ok(payload)
+        }
+        "codex/marketplaces/remove" => {
+            let payload =
+                proxy_app_server_payload(state, &auth.profile_id, "marketplace/remove", params)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+            invalidate_catalog_cache_for_profile(state, &auth.profile_id).await;
+            Ok(payload)
+        }
+        "codex/marketplaces/upgrade" => {
+            let payload =
+                proxy_app_server_payload(state, &auth.profile_id, "marketplace/upgrade", params)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+            invalidate_catalog_cache_for_profile(state, &auth.profile_id).await;
+            Ok(payload)
+        }
+        "codex/skills/list" => {
+            proxy_app_server_payload(state, &auth.profile_id, "skills/list", params)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "codex/hooks/list" => {
+            proxy_app_server_payload(state, &auth.profile_id, "hooks/list", params)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "codex/apps/list" => proxy_app_server_payload(state, &auth.profile_id, "app/list", params)
+            .await
+            .map_err(anyhow::Error::from),
+        "codex/realtime/start" => {
+            proxy_app_server_payload(state, &auth.profile_id, "thread/realtime/start", params)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "codex/realtime/appendAudio" => proxy_app_server_payload(
+            state,
+            &auth.profile_id,
+            "thread/realtime/appendAudio",
+            params,
+        )
+        .await
+        .map_err(anyhow::Error::from),
+        "codex/realtime/appendText" => proxy_app_server_payload(
+            state,
+            &auth.profile_id,
+            "thread/realtime/appendText",
+            params,
+        )
+        .await
+        .map_err(anyhow::Error::from),
+        "codex/realtime/stop" => {
+            proxy_app_server_payload(state, &auth.profile_id, "thread/realtime/stop", params)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "codex/realtime/listVoices" => proxy_app_server_payload(
+            state,
+            &auth.profile_id,
+            "thread/realtime/listVoices",
+            params,
+        )
+        .await
+        .map_err(anyhow::Error::from),
         "catalog/get" => get_catalog_payload(state, &auth.profile_id)
             .await
             .map_err(anyhow::Error::from),

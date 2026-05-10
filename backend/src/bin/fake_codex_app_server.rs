@@ -78,6 +78,28 @@ fn main() {
                     }
                 }));
             }
+            Some("experimentalFeature/list") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "features": [
+                            {
+                                "key": "plugins",
+                                "enabled": true,
+                                "defaultEnabled": true,
+                                "stage": "stable"
+                            },
+                            {
+                                "key": "tool_suggest",
+                                "enabled": true,
+                                "defaultEnabled": true,
+                                "stage": "beta"
+                            }
+                        ],
+                        "nextCursor": null
+                    }
+                }));
+            }
             Some("experimentalFeature/enablement/set") => {
                 let enablement = payload
                     .get("params")
@@ -93,6 +115,183 @@ fn main() {
                             enablement
                         )
                     }
+                }));
+            }
+            Some("plugin/list") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "marketplaces": [
+                            {
+                                "name": "openai-bundled",
+                                "path": null,
+                                "interface": {
+                                    "displayName": "OpenAI bundled"
+                                },
+                                "plugins": [
+                                    {
+                                        "id": "computer-use@openai-bundled",
+                                        "name": "computer-use",
+                                        "shareContext": null,
+                                        "source": {
+                                            "type": "remote"
+                                        },
+                                        "installed": false,
+                                        "enabled": true,
+                                        "installPolicy": "AVAILABLE",
+                                        "authPolicy": "ON_USE",
+                                        "availability": "AVAILABLE",
+                                        "interface": {
+                                            "displayName": "Computer Use",
+                                            "shortDescription": "Control a browser or desktop through Codex tools.",
+                                            "developerName": "OpenAI",
+                                            "category": "automation",
+                                            "capabilities": ["mcp", "computer"]
+                                        },
+                                        "keywords": ["computer", "browser", "desktop"]
+                                    }
+                                ]
+                            }
+                        ],
+                        "marketplaceLoadErrors": [],
+                        "featuredPluginIds": ["computer-use@openai-bundled"]
+                    }
+                }));
+            }
+            Some("plugin/read") => {
+                let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
+                let plugin_name = params
+                    .get("pluginName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("computer-use");
+                let marketplace_name = params
+                    .get("remoteMarketplaceName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("openai-bundled");
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "plugin": {
+                            "marketplaceName": marketplace_name,
+                            "marketplacePath": params.get("marketplacePath").cloned().unwrap_or(Value::Null),
+                            "summary": {
+                                "id": format!("{plugin_name}@{marketplace_name}"),
+                                "name": plugin_name,
+                                "shareContext": null,
+                                "source": {
+                                    "type": "remote"
+                                },
+                                "installed": false,
+                                "enabled": true,
+                                "installPolicy": "AVAILABLE",
+                                "authPolicy": "ON_USE",
+                                "availability": "AVAILABLE",
+                                "interface": {
+                                    "displayName": "Computer Use",
+                                    "shortDescription": "Control a browser or desktop through Codex tools.",
+                                    "developerName": "OpenAI",
+                                    "category": "automation",
+                                    "capabilities": ["mcp", "computer"]
+                                },
+                                "keywords": ["computer"]
+                            },
+                            "description": "Bundled computer-use plugin.",
+                            "skills": [],
+                            "hooks": [],
+                            "apps": [],
+                            "mcpServers": ["computer-use"]
+                        }
+                    }
+                }));
+            }
+            Some("plugin/install") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "authPolicy": "ON_USE",
+                        "appsNeedingAuth": []
+                    }
+                }));
+            }
+            Some("plugin/uninstall") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {}
+                }));
+            }
+            Some("app/list") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "data": [
+                            {
+                                "id": "computer-use",
+                                "name": "Computer Use",
+                                "description": "Control a browser or desktop through Codex tools.",
+                                "logoUrl": null,
+                                "logoUrlDark": null,
+                                "distributionChannel": "plugin",
+                                "branding": null,
+                                "appMetadata": null,
+                                "labels": null,
+                                "installUrl": null,
+                                "isAccessible": true,
+                                "isEnabled": true,
+                                "pluginDisplayNames": ["Computer Use"]
+                            }
+                        ],
+                        "nextCursor": null
+                    }
+                }));
+            }
+            Some("thread/realtime/listVoices") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "voices": ["alloy", "verse"]
+                    }
+                }));
+            }
+            Some("thread/realtime/start") => {
+                let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
+                let thread_id = params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                print_message(&json!({
+                    "method": "thread/realtime/started",
+                    "params": {
+                        "threadId": thread_id,
+                        "realtimeSessionId": "rt-test"
+                    }
+                }));
+                if params
+                    .get("transport")
+                    .and_then(|transport| transport.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("webrtc")
+                {
+                    print_message(&json!({
+                        "method": "thread/realtime/sdp",
+                        "params": {
+                            "threadId": thread_id,
+                            "sdp": "v=0\r\n"
+                        }
+                    }));
+                }
+                print_message(&json!({
+                    "id": id,
+                    "result": {}
+                }));
+            }
+            Some(
+                "thread/realtime/appendText"
+                | "thread/realtime/appendAudio"
+                | "thread/realtime/stop",
+            ) => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {}
                 }));
             }
             Some("config/batchWrite") => {

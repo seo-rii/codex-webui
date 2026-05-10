@@ -136,6 +136,86 @@ pub(crate) async fn complete_active_automation_runs_for_session(
     }
 }
 
+pub(crate) async fn reconcile_stale_automation_runs_for_profile(
+    state: &AppState,
+    profile_id: &str,
+) -> usize {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let runtime_key_prefix = format!("profile::{resolved_profile_id}::session-runtime::");
+    let mut active_session_ids = HashSet::new();
+    {
+        let active_turns = state.active_turns.lock().await;
+        for key in active_turns.keys() {
+            if let Some(session_id) = key.strip_prefix(&runtime_key_prefix) {
+                active_session_ids.insert(session_id.to_string());
+            }
+        }
+    }
+    {
+        let pending_turn_starts = state.pending_turn_starts.lock().await;
+        for key in pending_turn_starts.iter() {
+            if let Some(session_id) = key.strip_prefix(&runtime_key_prefix) {
+                active_session_ids.insert(session_id.to_string());
+            }
+        }
+    }
+
+    let stale_runs = with_ui_state_read(state, profile_id, |ui_state| {
+        let runtime_status_by_thread_id = ui_state
+            .get("runtimeStatusByThreadId")
+            .and_then(Value::as_object);
+        let automation_runs = ui_state
+            .get("automationRuns")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut stale_runs = Vec::new();
+        let mut seen_sessions = HashSet::new();
+        for run in automation_runs {
+            if !automation_run_is_active(run.get("status").and_then(Value::as_str)) {
+                continue;
+            }
+            let Some(session_id) = trimmed_json_string(run.get("sessionId")) else {
+                continue;
+            };
+            if active_session_ids.contains(&session_id) || !seen_sessions.insert(session_id.clone())
+            {
+                continue;
+            }
+            let Some(status) = runtime_status_by_thread_id
+                .and_then(|entries| entries.get(&session_id))
+                .and_then(|status_value| normalized_thread_status(Some(status_value)))
+            else {
+                continue;
+            };
+            if is_live_thread_status(&status) {
+                continue;
+            }
+            let (automation_status, automation_error) =
+                automation_status_for_thread_status(&status);
+            stale_runs.push((session_id, automation_status, automation_error));
+        }
+        Ok(stale_runs)
+    })
+    .await
+    .unwrap_or_default();
+
+    let count = stale_runs.len();
+    for (session_id, status, error) in stale_runs {
+        complete_active_automation_runs_for_session(
+            state,
+            profile_id,
+            &session_id,
+            &status,
+            error.as_deref(),
+        )
+        .await;
+    }
+    count
+}
+
 async fn clear_automation_timer(state: &AppState, profile_id: &str, automation_id: &str) {
     let timer_key = automation_timer_key(profile_id, automation_id);
     if let Some(handle) = state.automation_timers.lock().await.remove(&timer_key) {
@@ -308,6 +388,7 @@ async fn skip_overlapping_scheduled_automation(
 pub(crate) async fn restore_automation_schedules(state: AppState) {
     let profile_ids = state.config.profiles.keys().cloned().collect::<Vec<_>>();
     for profile_id in profile_ids {
+        reconcile_stale_automation_runs_for_profile(&state, &profile_id).await;
         let result = with_ui_state_read(&state, &profile_id, |ui_state| {
             Ok(sorted_automations_from_ui_state(ui_state))
         })
@@ -570,6 +651,10 @@ pub(crate) async fn cleanup_automation_worktrees_payload(
         .iter()
         .cloned()
         .collect::<HashSet<_>>();
+    let known_worktree_paths = runs
+        .iter()
+        .filter_map(|run| trimmed_json_string(run.get("worktreePath")))
+        .collect::<HashSet<_>>();
     let mut retained_by_automation = HashMap::<String, usize>::new();
     let mut candidates = Vec::new();
     let mut skipped_active = 0_u64;
@@ -690,6 +775,57 @@ pub(crate) async fn cleanup_automation_worktrees_payload(
         }
     }
 
+    let mut orphan_candidates = Vec::<Value>::new();
+    for root in resolved_allowed_roots(&state.config).await {
+        let mut roots_to_scan = vec![root.clone()];
+        if let Ok(mut children) = tokio_fs::read_dir(&root).await {
+            while let Ok(Some(child)) = children.next_entry().await {
+                let child_path = child.path();
+                if child_path.is_dir() {
+                    roots_to_scan.push(child_path);
+                }
+            }
+        }
+        for repo_root in roots_to_scan {
+            let worktrees_root = repo_root.join(".codex-webui").join("worktrees");
+            let mut automation_dirs = match tokio_fs::read_dir(&worktrees_root).await {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            while let Ok(Some(automation_dir)) = automation_dirs.next_entry().await {
+                let automation_dir_path = automation_dir.path();
+                if !automation_dir_path.is_dir() {
+                    continue;
+                }
+                let automation_id = automation_dir
+                    .file_name()
+                    .to_string_lossy()
+                    .trim()
+                    .to_string();
+                let mut worktree_dirs = match tokio_fs::read_dir(&automation_dir_path).await {
+                    Ok(entries) => entries,
+                    Err(_) => continue,
+                };
+                while let Ok(Some(worktree_dir)) = worktree_dirs.next_entry().await {
+                    let worktree_path = worktree_dir.path();
+                    if !worktree_path.is_dir() {
+                        continue;
+                    }
+                    let worktree_path_text = worktree_path.display().to_string();
+                    if known_worktree_paths.contains(&worktree_path_text) {
+                        continue;
+                    }
+                    orphan_candidates.push(json!({
+                        "automationId": automation_id,
+                        "repoPath": repo_root.display().to_string(),
+                        "worktreePath": worktree_path_text
+                    }));
+                }
+            }
+        }
+    }
+    let orphan_count = orphan_candidates.len();
+
     Ok(json!({
         "ok": true,
         "dryRun": dry_run,
@@ -698,6 +834,8 @@ pub(crate) async fn cleanup_automation_worktrees_payload(
         "removed": removed_run_ids.len(),
         "failed": failed_errors.len(),
         "skippedActive": skipped_active,
+        "orphans": orphan_count,
+        "orphanCandidates": orphan_candidates,
         "worktrees": candidates
             .iter()
             .map(|candidate| {
@@ -828,6 +966,41 @@ pub(crate) async fn run_automation_payload(
                 .join(&worktree_name)
                 .join(&time_suffix);
             let branch_name = format!("automation/{worktree_name}-{time_suffix}");
+            let git_dir = repo_root_path.join(".git");
+            if git_dir.is_dir() {
+                let exclude_result: Result<()> = async {
+                    let exclude_path = git_dir.join("info").join("exclude");
+                    if let Some(parent) = exclude_path.parent() {
+                        tokio_fs::create_dir_all(parent).await?;
+                    }
+                    let existing = tokio_fs::read_to_string(&exclude_path)
+                        .await
+                        .unwrap_or_default();
+                    if !existing
+                        .lines()
+                        .any(|line| line.trim() == ".codex-webui/worktrees/")
+                    {
+                        let mut file = tokio_fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&exclude_path)
+                            .await?;
+                        if !existing.is_empty() && !existing.ends_with('\n') {
+                            file.write_all(b"\n").await?;
+                        }
+                        file.write_all(b".codex-webui/worktrees/\n").await?;
+                        file.sync_all().await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = exclude_result {
+                    warn!(
+                        "failed to add automation worktree exclude for {}: {error}",
+                        repo_root_path.display()
+                    );
+                }
+            }
 
             create_git_worktree_payload(
                 state,

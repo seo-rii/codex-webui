@@ -484,6 +484,14 @@ pub(crate) async fn clear_profile_runtime_activity_after_app_server_exit(
 
     let affected_session_ids = affected_session_ids.into_iter().collect::<Vec<_>>();
     for session_id in &affected_session_ids {
+        complete_active_automation_runs_for_session(
+            state,
+            profile_id,
+            session_id,
+            "failed",
+            Some(reason_value.as_str().unwrap_or("codex app-server exited")),
+        )
+        .await;
         emit_session_notification(
             state,
             profile_id,
@@ -897,6 +905,10 @@ pub(crate) fn register_runtime_profile_monitor(
     let monitor_state = state.clone();
     let monitor_profile_id = resolved_profile_id.clone();
     let handle = tokio::spawn(async move {
+        let mut automation_reconcile_interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(60));
+        automation_reconcile_interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 notification = notifications.recv() => match notification {
@@ -946,6 +958,18 @@ pub(crate) fn register_runtime_profile_monitor(
                         );
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = automation_reconcile_interval.tick() => {
+                    let reconciled = reconcile_stale_automation_runs_for_profile(
+                        &monitor_state,
+                        &monitor_profile_id,
+                    )
+                    .await;
+                    if reconciled > 0 {
+                        tracing::debug!(
+                            "reconciled {reconciled} stale automation run(s) for {monitor_profile_id}"
+                        );
+                    }
                 },
             }
         }

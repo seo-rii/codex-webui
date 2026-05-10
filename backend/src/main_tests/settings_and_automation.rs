@@ -2393,6 +2393,58 @@ async fn runtime_failed_status_overrides_turn_completed_automation_run() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test]
+async fn stale_automation_reconciliation_closes_terminal_started_run() {
+    let sandbox = unique_test_dir("automation-stale-reconcile");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"]["thread-auto"] = json!({
+            "status": "failed",
+            "updatedAt": 42
+        });
+        ui_state["automationRuns"] = json!([{
+            "id": "run-1",
+            "automationId": "auto-1",
+            "automationName": "Daily task",
+            "status": "started",
+            "trigger": "schedule",
+            "sessionId": "thread-auto",
+            "repoPath": Value::Null,
+            "cwd": Value::Null,
+            "worktreePath": Value::Null,
+            "startedAt": 1,
+            "completedAt": Value::Null,
+            "error": Value::Null
+        }]);
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let reconciled = reconcile_stale_automation_runs_for_profile(&state, "default").await;
+    assert_eq!(reconciled, 1);
+
+    let runs = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(recent_automation_runs_from_ui_state(ui_state, 10))
+    })
+    .await
+    .unwrap();
+    let run = runs.first().expect("run should remain available");
+    assert_eq!(run.get("status").and_then(Value::as_str), Some("failed"));
+    assert!(
+        run.get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("failed"))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automation_worktree_cleanup_removes_only_safe_completed_worktrees() {
     let sandbox = unique_test_dir("automation-worktree-cleanup");
@@ -2419,6 +2471,11 @@ async fn automation_worktree_cleanup_removes_only_safe_completed_worktrees() {
         .join("worktrees")
         .join("daily")
         .join("active");
+    let orphan_worktree = repo
+        .join(".codex-webui")
+        .join("worktrees")
+        .join("daily")
+        .join("orphan");
     create_git_worktree_payload(
         &state,
         repo.to_str().unwrap(),
@@ -2449,6 +2506,7 @@ async fn automation_worktree_cleanup_removes_only_safe_completed_worktrees() {
     )
     .await
     .unwrap();
+    fs::create_dir_all(&orphan_worktree).unwrap();
     fs::write(dirty_worktree.join("dirty.txt"), "uncommitted\n").unwrap();
     state.active_turns.lock().await.insert(
         runtime_session_key("default", "thread-active"),
@@ -2536,9 +2594,20 @@ async fn automation_worktree_cleanup_removes_only_safe_completed_worktrees() {
         payload.get("skippedActive").and_then(Value::as_u64),
         Some(1)
     );
+    assert_eq!(payload.get("orphans").and_then(Value::as_u64), Some(1));
+    assert!(
+        payload
+            .get("orphanCandidates")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| entries
+                .iter()
+                .any(|entry| entry.get("worktreePath").and_then(Value::as_str)
+                    == orphan_worktree.to_str()))
+    );
     assert!(!clean_worktree.exists());
     assert!(dirty_worktree.exists());
     assert!(active_worktree.exists());
+    assert!(orphan_worktree.exists());
 
     let runs = with_ui_state_read(&state, "default", |ui_state| {
         Ok(recent_automation_runs_from_ui_state(ui_state, 10))

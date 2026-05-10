@@ -1907,6 +1907,20 @@ async fn app_server_exit_clears_cached_running_session_state() {
                 "updatedAt": now_unix_ms()
             }),
         );
+        ui_state["automationRuns"] = json!([{
+            "id": "run-crashed",
+            "automationId": "auto-crashed",
+            "automationName": "Crashed automation",
+            "status": "started",
+            "trigger": "schedule",
+            "sessionId": session_id,
+            "repoPath": Value::Null,
+            "cwd": Value::Null,
+            "worktreePath": Value::Null,
+            "startedAt": 1,
+            "completedAt": Value::Null,
+            "error": Value::Null
+        }]);
         Ok(())
     })
     .await
@@ -1930,6 +1944,20 @@ async fn app_server_exit_clears_cached_running_session_state() {
             .and_then(|status| status.get("status"))
             .and_then(Value::as_str),
         Some("failed")
+    );
+    let runs = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(recent_automation_runs_from_ui_state(ui_state, 10))
+    })
+    .await
+    .unwrap();
+    let run = runs
+        .first()
+        .expect("automation run should remain available");
+    assert_eq!(run.get("status").and_then(Value::as_str), Some("failed"));
+    assert!(
+        run.get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("codex app-server exited"))
     );
 
     let _ = fs::remove_dir_all(sandbox);

@@ -498,5 +498,16 @@
   "app_install_unavailable": "目前的瀏覽器未提供安裝提示。",
   "app_install_ios_hint": "在 iPhone 或 iPad 上，請使用「分享」，再選擇「加入主畫面」。",
   "app_installed_notice": "已安裝應用程式。",
-  "app_install_prompt_dismissed": "已關閉安裝提示。"
+  "app_install_prompt_dismissed": "已關閉安裝提示。",
+  "apps": "Apps",
+  "app_enabled": "Enabled",
+  "app_disabled": "Disabled",
+  "app_accessible": "Accessible",
+  "app_needs_auth": "Needs auth",
+  "no_apps": "No apps returned.",
+  "realtime_started": "Realtime started.",
+  "realtime_stopped": "Realtime stopped.",
+  "realtime_voices": "Realtime voices: {voices}",
+  "realtime_no_voices": "No realtime voices returned.",
+  "computer_use_connection_failed": "Computer use connection failed."
 }

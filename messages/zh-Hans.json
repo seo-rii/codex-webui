@@ -498,5 +498,16 @@
   "app_install_unavailable": "当前浏览器未提供安装提示。",
   "app_install_ios_hint": "在 iPhone 或 iPad 上，请使用“共享”，然后选择“添加到主屏幕”。",
   "app_installed_notice": "已安装应用。",
-  "app_install_prompt_dismissed": "已关闭安装提示。"
+  "app_install_prompt_dismissed": "已关闭安装提示。",
+  "apps": "Apps",
+  "app_enabled": "Enabled",
+  "app_disabled": "Disabled",
+  "app_accessible": "Accessible",
+  "app_needs_auth": "Needs auth",
+  "no_apps": "No apps returned.",
+  "realtime_started": "Realtime started.",
+  "realtime_stopped": "Realtime stopped.",
+  "realtime_voices": "Realtime voices: {voices}",
+  "realtime_no_voices": "No realtime voices returned.",
+  "computer_use_connection_failed": "Computer use connection failed."
 }

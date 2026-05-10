@@ -498,5 +498,16 @@
   "app_install_unavailable": "Ce navigateur n’expose pas actuellement d’invite d’installation.",
   "app_install_ios_hint": "Sur iPhone ou iPad, utilisez Partager puis Ajouter à l’écran d’accueil.",
   "app_installed_notice": "Application installée.",
-  "app_install_prompt_dismissed": "Invite d’installation ignorée."
+  "app_install_prompt_dismissed": "Invite d’installation ignorée.",
+  "apps": "Apps",
+  "app_enabled": "Enabled",
+  "app_disabled": "Disabled",
+  "app_accessible": "Accessible",
+  "app_needs_auth": "Needs auth",
+  "no_apps": "No apps returned.",
+  "realtime_started": "Realtime started.",
+  "realtime_stopped": "Realtime stopped.",
+  "realtime_voices": "Realtime voices: {voices}",
+  "realtime_no_voices": "No realtime voices returned.",
+  "computer_use_connection_failed": "Computer use connection failed."
 }

@@ -870,7 +870,36 @@ export type PluginCatalogEntry = {
   developerName: string | null;
   category: string | null;
   path: string;
+  mentionPath?: string | null;
+  marketplaceName?: string | null;
+  marketplacePath?: string | null;
+  pluginId?: string | null;
+  installed?: boolean;
+  enabled?: boolean;
+  installPolicy?: string | null;
+  authPolicy?: string | null;
+  availability?: string | null;
+  capabilities?: string[];
   skills: string[];
+};
+
+export type CodexAppInfo = {
+  id: string;
+  name: string;
+  description: string | null;
+  logoUrl: string | null;
+  logoUrlDark: string | null;
+  distributionChannel: string | null;
+  installUrl: string | null;
+  isAccessible: boolean;
+  isEnabled: boolean;
+  pluginDisplayNames: string[];
+  [key: string]: unknown;
+};
+
+export type CodexAppsListPayload = {
+  data: CodexAppInfo[];
+  nextCursor: string | null;
 };
 
 export type SkillCatalogEntry = {
@@ -878,7 +907,7 @@ export type SkillCatalogEntry = {
   name: string;
   description: string;
   path: string;
-  source: "local" | "system" | "plugin";
+  source: "local" | "system" | "plugin" | "codex-plugin";
   pluginName: string | null;
 };
 

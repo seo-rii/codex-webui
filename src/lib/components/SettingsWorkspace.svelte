@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { BellRing, Clock3, History, Info, Palette, Pencil, Play, Plug, Power, RefreshCw, RotateCcw, Save, Settings2, Sparkles, Trash2, Wand2 } from "lucide-svelte";
+  import { BellRing, Clock3, History, Info, Monitor, Palette, Pencil, Play, Plug, Power, RefreshCw, RotateCcw, Save, Settings2, Sparkles, Trash2, Wand2 } from "lucide-svelte";
   import { fade } from "svelte/transition";
 
   import { api } from "$lib/api";
@@ -26,6 +26,7 @@
     AutostartProvider,
     AppConfigPayload,
     CatalogPayload,
+    CodexAppInfo,
     CodexRuntimeStatus,
     EditableFilePayload,
     NotificationEventType,
@@ -43,6 +44,7 @@
     | "notifications"
     | "presets"
     | "automations"
+    | "apps"
     | "plugins"
     | "skills";
   const HUNDRED_M_CONTEXT_WINDOW = 100_000_000;
@@ -61,6 +63,7 @@
     resolvedTheme = "light",
     webRole = "admin",
     readOnly = false,
+    initialTab = null,
     onAutostartSaved = null,
     onSaveThemeSettings = null,
     onNotificationSettingsSaved = null,
@@ -86,6 +89,7 @@
     resolvedTheme?: ResolvedTheme;
     webRole?: UserRole | null;
     readOnly?: boolean;
+    initialTab?: SettingsTabId | null;
     onAutostartSaved?: ((enabled: boolean) => void | Promise<void>) | null;
     onSaveThemeSettings?: ((settings: ThemeSettings) => void | Promise<void>) | null;
     onNotificationSettingsSaved?: ((settings: Partial<NotificationSettings>) => void | Promise<void>) | null;
@@ -101,6 +105,7 @@
 
   let configFile = $state<EditableFilePayload | null>(null);
   let catalog = $state<CatalogPayload | null>(null);
+  let apps = $state<CodexAppInfo[]>([]);
   let editorValue = $state("");
   let errorText = $state("");
   let notificationSlackWebhookUrl = $state("");
@@ -134,8 +139,10 @@
   let savingPreset = $state(false);
   let savingTheme = $state(false);
   let cleaningAutomationWorktrees = $state(false);
+  let installingPluginPath = $state<string | null>(null);
   let auditLoadedForAdmin = $state(false);
   let activeTab = $state<SettingsTabId>("config");
+  let appliedInitialTab = $state<SettingsTabId | null>(null);
   const dirty = $derived(Boolean(configFile && editorValue !== configFile.content));
   const configModelContextWindow = $derived.by(() => parseTomlIntegerSetting(editorValue, "model_context_window"));
   const themeDirty = $derived(themeBaseFingerprint !== JSON.stringify(themeDraft));
@@ -285,6 +292,14 @@
       savePreset: m.save_preset(),
       noPromptPresets: m.no_prompt_presets(),
       installedPlugins: m.installed_plugins(),
+      apps: m.apps(),
+      appEnabled: m.app_enabled(),
+      appDisabled: m.app_disabled(),
+      appAccessible: m.app_accessible(),
+      appNeedsAuth: m.app_needs_auth(),
+      noApps: m.no_apps(),
+      install: m.install(),
+      appInstalled: m.app_installed(),
       noPlugins: m.no_installed_plugins(),
       noDescription: m.no_description(),
       installedSkills: m.installed_skills(),
@@ -365,6 +380,13 @@
         alert: automationDirty
       },
       {
+        id: "apps",
+        label: ui.apps,
+        icon: Monitor,
+        meta: apps.length > 0 ? String(apps.length) : null,
+        alert: false
+      },
+      {
         id: "plugins",
         label: ui.installedPlugins,
         icon: Plug,
@@ -403,6 +425,14 @@
     if (!settingsTabs.some((tab) => tab.id === activeTab)) {
       activeTab = settingsTabs[0]?.id ?? "config";
     }
+  });
+
+  $effect(() => {
+    if (!initialTab || initialTab === appliedInitialTab || !settingsTabs.some((tab) => tab.id === initialTab)) {
+      return;
+    }
+    activeTab = initialTab;
+    appliedInitialTab = initialTab;
   });
 
   $effect(() => {
@@ -544,14 +574,16 @@
     errorText = "";
 
     try {
-      const [nextFile, nextCatalog, nextAudit] = await Promise.all([
+      const [nextFile, nextCatalog, nextApps, nextAudit] = await Promise.all([
         api.getEditableFile(configFilePath),
         api.getCatalog(),
+        api.listCodexApps({ limit: 80 }).catch(() => ({ data: [] as CodexAppInfo[], nextCursor: null })),
         webRole !== "viewer" ? api.getAuditLog(120) : Promise.resolve({ entries: [] as AuditLogEntry[] })
       ]);
       configFile = nextFile;
       editorValue = nextFile.content;
       catalog = nextCatalog;
+      apps = nextApps.data;
       auditEntries = nextAudit.entries;
       auditLoadedForAdmin = webRole !== "viewer";
     } catch (error) {
@@ -559,6 +591,41 @@
     } finally {
       loading = false;
       reloading = false;
+    }
+  }
+
+  async function installCodexPlugin(plugin: CatalogPayload["plugins"][number]) {
+    if (readOnly || installingPluginPath) {
+      return;
+    }
+    const marketplacePath = typeof plugin.marketplacePath === "string" && plugin.marketplacePath.trim() ? plugin.marketplacePath.trim() : null;
+    const remoteMarketplaceName =
+      typeof plugin.marketplaceName === "string" && plugin.marketplaceName.trim() ? plugin.marketplaceName.trim() : null;
+    if (!marketplacePath && !remoteMarketplaceName) {
+      return;
+    }
+
+    const pluginKey = plugin.mentionPath ?? plugin.path;
+    installingPluginPath = pluginKey;
+    errorText = "";
+
+    try {
+      const params: Record<string, unknown> = {
+        pluginName: plugin.name
+      };
+      if (marketplacePath) {
+        params.marketplacePath = marketplacePath;
+        params.remoteMarketplaceName = null;
+      } else {
+        params.marketplacePath = null;
+        params.remoteMarketplaceName = remoteMarketplaceName;
+      }
+      await api.installCodexPlugin(params);
+      catalog = await api.getCatalog();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      installingPluginPath = null;
     }
   }
 
@@ -1636,6 +1703,51 @@
           </div>
         </section>
       </div>
+    {:else if activeTab === "apps"}
+      <div
+        aria-labelledby="settings-tab-apps"
+        class="settings-tab-panel"
+        id="settings-panel-apps"
+        role="tabpanel"
+        transition:fade={{ duration: 160 }}
+      >
+        <section class="panel">
+          <div class="panel__header">
+            <div class="panel-title">
+              <Monitor size={16} />
+              <h3>{ui.apps}</h3>
+            </div>
+            <span>{apps.length}</span>
+          </div>
+          <div class="catalog-list">
+            {#if apps.length === 0}
+              <p class="field-note">{ui.noApps}</p>
+            {:else}
+              {#each apps as app (app.id)}
+                <article class="catalog-card">
+                  <div class="catalog-card__header">
+                    <div class="catalog-card__title">
+                      <Monitor size={14} />
+                      <strong>{app.name}</strong>
+                    </div>
+                    <span class={`meta-pill subtle ${app.isEnabled ? "" : "opacity-60"}`}>
+                      {app.isEnabled ? ui.appEnabled : ui.appDisabled}
+                    </span>
+                  </div>
+                  <p>{app.description || ui.noDescription}</p>
+                  <small>{app.id}{app.distributionChannel ? ` · ${app.distributionChannel}` : ""}</small>
+                  <div class="tag-row">
+                    <span class="meta-pill subtle">{app.isAccessible ? ui.appAccessible : ui.appNeedsAuth}</span>
+                    {#each app.pluginDisplayNames ?? [] as pluginName (pluginName)}
+                      <span class="meta-pill subtle">{pluginName}</span>
+                    {/each}
+                  </div>
+                </article>
+              {/each}
+            {/if}
+          </div>
+        </section>
+      </div>
     {:else if activeTab === "plugins"}
       <div
         aria-labelledby="settings-tab-plugins"
@@ -1658,12 +1770,37 @@
             {:else}
               {#each catalog?.plugins ?? [] as plugin (plugin.path)}
                 <article class="catalog-card">
-                  <div class="catalog-card__title">
-                    <Plug size={14} />
-                    <strong>{plugin.displayName}</strong>
+                  <div class="catalog-card__header">
+                    <div class="catalog-card__title">
+                      <Plug size={14} />
+                      <strong>{plugin.displayName}</strong>
+                    </div>
+                    {#if plugin.mentionPath && plugin.installed === false}
+                      <button
+                        class="compact-action"
+                        disabled={readOnly || installingPluginPath !== null || plugin.installPolicy === "NOT_AVAILABLE"}
+                        onclick={() => void installCodexPlugin(plugin)}
+                        type="button"
+                      >
+                        {ui.install}
+                      </button>
+                    {/if}
                   </div>
                   <p>{plugin.description || ui.noDescription}</p>
                   <small>{plugin.name}{plugin.version ? ` · ${plugin.version}` : ""}{plugin.developerName ? ` · ${plugin.developerName}` : ""}</small>
+                  {#if plugin.marketplaceName || plugin.installed !== undefined || plugin.capabilities?.length}
+                    <div class="tag-row">
+                      {#if plugin.marketplaceName}
+                        <span class="meta-pill subtle">{plugin.marketplaceName}</span>
+                      {/if}
+                      {#if plugin.installed !== undefined}
+                        <span class="meta-pill subtle">{plugin.installed ? ui.appInstalled : ui.install}</span>
+                      {/if}
+                      {#each plugin.capabilities ?? [] as capability (capability)}
+                        <span class="meta-pill subtle">{capability}</span>
+                      {/each}
+                    </div>
+                  {/if}
                   {#if plugin.skills.length > 0}
                     <div class="tag-row">
                       {#each plugin.skills as skillName (skillName)}
@@ -2195,11 +2332,50 @@
     background: rgba(255, 251, 235, 0.9);
   }
 
+  .catalog-card__header {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.65rem;
+  }
+
   .catalog-card__title {
     display: flex;
+    min-width: 0;
     gap: 0.55rem;
     align-items: center;
     color: var(--ink-strong);
+  }
+
+  .catalog-card__title strong {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .compact-action {
+    flex: 0 0 auto;
+    border: 1px solid rgba(245, 158, 11, 0.28);
+    border-radius: 999px;
+    background: var(--panel-soft);
+    color: var(--accent);
+    padding: 0.32rem 0.6rem;
+    font-size: 0.72rem;
+    font-weight: 800;
+    transition: transform 140ms ease, border-color 140ms ease, background-color 140ms ease;
+  }
+
+  .compact-action:hover:not(:disabled) {
+    transform: translateY(-1px);
+    border-color: rgba(245, 158, 11, 0.42);
+    background: var(--accent-soft);
+  }
+
+  .compact-action:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
   }
 
   .catalog-card p,

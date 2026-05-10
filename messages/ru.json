@@ -498,5 +498,16 @@
   "app_install_unavailable": "Этот браузер сейчас не показывает приглашение к установке.",
   "app_install_ios_hint": "На iPhone или iPad используйте «Поделиться», затем «На экран Домой».",
   "app_installed_notice": "Приложение установлено.",
-  "app_install_prompt_dismissed": "Окно установки закрыто."
+  "app_install_prompt_dismissed": "Окно установки закрыто.",
+  "apps": "Apps",
+  "app_enabled": "Enabled",
+  "app_disabled": "Disabled",
+  "app_accessible": "Accessible",
+  "app_needs_auth": "Needs auth",
+  "no_apps": "No apps returned.",
+  "realtime_started": "Realtime started.",
+  "realtime_stopped": "Realtime stopped.",
+  "realtime_voices": "Realtime voices: {voices}",
+  "realtime_no_voices": "No realtime voices returned.",
+  "computer_use_connection_failed": "Computer use connection failed."
 }

@@ -498,5 +498,16 @@
   "app_install_unavailable": "This browser does not currently expose an install prompt.",
   "app_install_ios_hint": "On iPhone or iPad, use Share and then Add to Home Screen.",
   "app_installed_notice": "Installed the app.",
-  "app_install_prompt_dismissed": "Dismissed the install prompt."
+  "app_install_prompt_dismissed": "Dismissed the install prompt.",
+  "apps": "Apps",
+  "app_enabled": "Enabled",
+  "app_disabled": "Disabled",
+  "app_accessible": "Accessible",
+  "app_needs_auth": "Needs auth",
+  "no_apps": "No apps returned.",
+  "realtime_started": "Realtime started.",
+  "realtime_stopped": "Realtime stopped.",
+  "realtime_voices": "Realtime voices: {voices}",
+  "realtime_no_voices": "No realtime voices returned.",
+  "computer_use_connection_failed": "Computer use connection failed."
 }

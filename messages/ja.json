@@ -498,5 +498,16 @@
   "app_install_unavailable": "このブラウザではインストールプロンプトを利用できません。",
   "app_install_ios_hint": "iPhone または iPad では、共有から「ホーム画面に追加」を使ってください。",
   "app_installed_notice": "アプリをインストールしました。",
-  "app_install_prompt_dismissed": "インストールプロンプトを閉じました。"
+  "app_install_prompt_dismissed": "インストールプロンプトを閉じました。",
+  "apps": "Apps",
+  "app_enabled": "Enabled",
+  "app_disabled": "Disabled",
+  "app_accessible": "Accessible",
+  "app_needs_auth": "Needs auth",
+  "no_apps": "No apps returned.",
+  "realtime_started": "Realtime started.",
+  "realtime_stopped": "Realtime stopped.",
+  "realtime_voices": "Realtime voices: {voices}",
+  "realtime_no_voices": "No realtime voices returned.",
+  "computer_use_connection_failed": "Computer use connection failed."
 }

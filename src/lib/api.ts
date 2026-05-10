@@ -12,6 +12,7 @@ import type {
   AttachmentRecord,
   CatalogPayload,
   CodexAccountLoginResponse,
+  CodexAppsListPayload,
   CodexQuotaStatus,
   CodexRuntimeActionPayload,
   CodexRuntimeStatus,
@@ -276,6 +277,66 @@ export const api = {
 
   getCatalog() {
     return ws.request<CatalogPayload>("catalog/get");
+  },
+
+  listCodexFeatures(params: Record<string, unknown> = {}) {
+    return ws.request<Record<string, unknown>>("codex/features/list", params);
+  },
+
+  setCodexFeatureEnablement(enablement: Record<string, boolean>) {
+    return ws.request<Record<string, unknown>>("codex/features/set", { enablement });
+  },
+
+  listCodexPlugins(params: Record<string, unknown> = {}) {
+    return ws.request<Record<string, unknown>>("codex/plugins/list", params);
+  },
+
+  readCodexPlugin(params: Record<string, unknown>) {
+    return ws.request<Record<string, unknown>>("codex/plugins/read", params);
+  },
+
+  listCodexApps(params: Record<string, unknown> = {}) {
+    return ws.request<CodexAppsListPayload>("codex/apps/list", params);
+  },
+
+  installCodexPlugin(params: Record<string, unknown>) {
+    return ws.request<Record<string, unknown>>("codex/plugins/install", params);
+  },
+
+  uninstallCodexPlugin(pluginId: string) {
+    return ws.request<Record<string, unknown>>("codex/plugins/uninstall", { pluginId });
+  },
+
+  listRealtimeVoices() {
+    return ws.request<{ voices: unknown }>("codex/realtime/listVoices", {});
+  },
+
+  startRealtimeSession(
+    threadId: string,
+    params: {
+      outputModality?: "text" | "audio";
+      prompt?: string | null;
+      realtimeSessionId?: string | null;
+      transport?: Record<string, unknown> | null;
+      voice?: string | null;
+    } = {}
+  ) {
+    return ws.request<Record<string, unknown>>("codex/realtime/start", {
+      threadId,
+      outputModality: params.outputModality ?? "text",
+      prompt: params.prompt ?? null,
+      realtimeSessionId: params.realtimeSessionId ?? null,
+      transport: params.transport ?? null,
+      voice: params.voice ?? null
+    });
+  },
+
+  appendRealtimeText(threadId: string, text: string) {
+    return ws.request<Record<string, unknown>>("codex/realtime/appendText", { threadId, text });
+  },
+
+  stopRealtimeSession(threadId: string) {
+    return ws.request<Record<string, unknown>>("codex/realtime/stop", { threadId });
   },
 
   getEditableFile(filePath: string) {

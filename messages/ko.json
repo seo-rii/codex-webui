@@ -498,5 +498,16 @@
   "app_install_unavailable": "이 브라우저에서는 지금 설치 프롬프트를 사용할 수 없습니다.",
   "app_install_ios_hint": "iPhone 또는 iPad에서는 공유 후 홈 화면에 추가를 사용하세요.",
   "app_installed_notice": "앱을 설치했습니다.",
-  "app_install_prompt_dismissed": "설치 프롬프트를 닫았습니다."
+  "app_install_prompt_dismissed": "설치 프롬프트를 닫았습니다.",
+  "apps": "앱",
+  "app_enabled": "활성화",
+  "app_disabled": "비활성화",
+  "app_accessible": "접근 가능",
+  "app_needs_auth": "인증 필요",
+  "no_apps": "앱이 없습니다.",
+  "realtime_started": "실시간 세션을 시작했습니다.",
+  "realtime_stopped": "실시간 세션을 중지했습니다.",
+  "realtime_voices": "실시간 음성: {voices}",
+  "realtime_no_voices": "사용 가능한 실시간 음성이 없습니다.",
+  "computer_use_connection_failed": "Computer use 연결에 실패했습니다."
 }

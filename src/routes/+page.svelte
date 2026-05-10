@@ -201,6 +201,8 @@
   let catalog = $state<CatalogPayload | null>(null);
   let quota = $state<CodexQuotaStatus | null>(null);
   let runtime = $state<CodexRuntimeStatus | null>(null);
+  let remoteControlStatus = $state<{ status: string; environmentId: string | null; updatedAt: number } | null>(null);
+  let dismissedRemoteControlErrorAt = $state(0);
   let sessions = $state<SessionSummary[]>([]);
   let notifications = $state<AppNotification[]>([]);
   let sessionsCursor = $state<string | null>(null);
@@ -288,6 +290,7 @@
   let tasksTabOpen = $state(false);
   let gitTabOpen = $state(false);
   let settingsTabOpen = $state(false);
+  let settingsInitialTab = $state<"config" | "startup" | "audit" | "theme" | "notifications" | "presets" | "automations" | "apps" | "plugins" | "skills" | null>(null);
   let gitDiffTabs = $state<GitDiffTab[]>([]);
   let codeDiffTabs = $state<CodeDiffTab[]>([]);
   let fileTabs = $state<FileTab[]>([]);
@@ -1712,7 +1715,25 @@
     () => ["pragmatic", "friendly", "none"] as Array<SessionPreferences["personality"]>
   );
   const filteredComposerSkills = $derived.by(() => {
-    const skills = catalog?.skills ?? [];
+    const pluginMentions = (catalog?.plugins ?? [])
+      .filter((plugin) => plugin.mentionPath || plugin.path.startsWith("plugin://"))
+      .map((plugin) => {
+        const mentionPath = plugin.mentionPath ?? plugin.path;
+        return {
+          id: mentionPath,
+          name: plugin.displayName || plugin.name,
+          description: [
+            plugin.description,
+            plugin.capabilities?.length ? plugin.capabilities.join(", ") : ""
+          ]
+            .filter(Boolean)
+            .join(" · "),
+          path: mentionPath,
+          source: "codex-plugin" as const,
+          pluginName: plugin.marketplaceName ?? plugin.name
+        };
+      });
+    const skills = [...(catalog?.skills ?? []), ...pluginMentions];
     const needle = composerSkillQuery.trim().toLowerCase();
     const selectedPaths = new Set(composerSelectedSkills.map((skill) => skill.path));
     const filtered = needle
@@ -1918,6 +1939,13 @@
       return {
         tone: "success" as const,
         text: noticeText,
+        dismissible: true
+      };
+    }
+    if (remoteControlStatus?.status === "errored" && remoteControlStatus.updatedAt > dismissedRemoteControlErrorAt) {
+      return {
+        tone: "warning" as const,
+        text: m.computer_use_connection_failed(),
         dismissible: true
       };
     }
@@ -2187,6 +2215,9 @@
   function dismissFeedbackSnackbar() {
     errorText = "";
     noticeText = "";
+    if (remoteControlStatus?.status === "errored") {
+      dismissedRemoteControlErrorAt = remoteControlStatus.updatedAt;
+    }
   }
 
   $effect(() => {
@@ -5248,6 +5279,23 @@
       return;
     }
 
+    if (event.method === "codex-webui/remoteControlStatusChanged") {
+      remoteControlStatus = {
+        status: String(event.params.status ?? "disabled"),
+        environmentId: typeof event.params.environmentId === "string" ? String(event.params.environmentId) : null,
+        updatedAt: Date.now()
+      };
+      return;
+    }
+
+    if (event.method === "codex-webui/appListUpdated") {
+      catalog = null;
+      if (composerSettingsOpen || activeWorkspaceTabId === "settings") {
+        void ensureCatalogLoaded();
+      }
+      return;
+    }
+
     if (event.method === "codex-webui/terminalsUpdated") {
       terminals = Array.isArray(event.params.terminals) ? (event.params.terminals as TerminalSummary[]) : [];
       if (activeWorkspaceTabId.startsWith("terminal:")) {
@@ -6073,6 +6121,68 @@
         return true;
       }
       errorText = m.slash_plan_invalid();
+      return true;
+    }
+
+    if (command === "realtime") {
+      if (readOnlyRole) {
+        errorText = m.error_forbidden_role();
+        return true;
+      }
+      const selectedBinding = ensureSelectedSessionBinding();
+      if (!selectedBinding) {
+        return true;
+      }
+      const normalized = args.toLowerCase();
+      try {
+        if (["stop", "off", "end"].includes(normalized)) {
+          await api.stopRealtimeSession(selectedBinding.sessionId);
+          noticeText = m.realtime_stopped();
+        } else if (normalized === "voices") {
+          const response = await api.listRealtimeVoices();
+          const voices = Array.isArray(response.voices)
+            ? response.voices.map((voice) => String(voice)).join(", ")
+            : JSON.stringify(response.voices);
+          noticeText = voices ? m.realtime_voices({ voices }) : m.realtime_no_voices();
+        } else {
+          await api.startRealtimeSession(selectedBinding.sessionId, {
+            outputModality: "text",
+            prompt: args ? args : null
+          });
+          noticeText = m.realtime_started();
+        }
+        draft = "";
+        scheduleComposerTextareaResize();
+      } catch (error) {
+        errorText = describeError(error);
+      }
+      return true;
+    }
+
+    if (command === "apps") {
+      try {
+        const response = await api.listCodexApps({
+          limit: 20,
+          threadId: selectedSessionId ?? null
+        });
+        const names = response.data.map((app) => app.name).filter(Boolean);
+        noticeText = names.length > 0 ? `${m.apps()}: ${names.slice(0, 8).join(", ")}` : m.no_apps();
+        openSettingsTab("apps");
+        draft = "";
+        scheduleComposerTextareaResize();
+      } catch (error) {
+        errorText = describeError(error);
+      }
+      return true;
+    }
+
+    if (command === "plugins") {
+      await ensureCatalogLoaded();
+      const names = (catalog?.plugins ?? []).map((plugin) => plugin.displayName || plugin.name).filter(Boolean);
+      noticeText = names.length > 0 ? `Plugins: ${names.slice(0, 8).join(", ")}` : "No plugins returned.";
+      openSettingsTab("plugins");
+      draft = "";
+      scheduleComposerTextareaResize();
       return true;
     }
 
@@ -7251,7 +7361,8 @@
     workspaceMenuOpen = false;
   }
 
-  function openSettingsTab() {
+  function openSettingsTab(tab: typeof settingsInitialTab = "config") {
+    settingsInitialTab = tab;
     settingsTabOpen = true;
     activeWorkspaceTabId = "settings";
     workspaceMenuOpen = false;
@@ -9372,7 +9483,44 @@
         })
         .join("\n");
     }
+    if (item.type === "dynamicToolCall") {
+      const textItems = getDynamicToolContentItems(item)
+        .map((entry) => {
+          if (entry.type === "inputText" && typeof entry.text === "string") {
+            return entry.text;
+          }
+          if (entry.type === "inputImage" && typeof entry.imageUrl === "string") {
+            return entry.imageUrl;
+          }
+          return "";
+        })
+        .filter((value) => value.trim().length > 0);
+      if (textItems.length > 0) {
+        return textItems.join("\n\n");
+      }
+    }
     return JSON.stringify(item, null, 2);
+  }
+
+  function getDynamicToolContentItems(item: CodexItem): Array<Record<string, unknown>> {
+    const contentItems = Array.isArray(item.contentItems)
+      ? item.contentItems
+      : Array.isArray(item.content_items)
+        ? item.content_items
+        : [];
+    return contentItems.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object");
+  }
+
+  function getDynamicToolTextItems(item: CodexItem) {
+    return getDynamicToolContentItems(item)
+      .filter((entry) => entry.type === "inputText" && typeof entry.text === "string")
+      .map((entry) => String(entry.text));
+  }
+
+  function getDynamicToolImageUrls(item: CodexItem) {
+    return getDynamicToolContentItems(item)
+      .filter((entry) => entry.type === "inputImage" && typeof entry.imageUrl === "string")
+      .map((entry) => String(entry.imageUrl));
   }
 
   function getOutputPreviewKey(turnId: string, outputId: string) {
@@ -10469,6 +10617,46 @@
                               {/each}
                               <button class="w-full py-3 bg-amber-600 text-white rounded-xl text-sm font-bold hover:bg-amber-700 shadow-md transition-all active:scale-[0.98]" onclick={() => void submitRequestUserInput(request)}>{ui.submitResponse}</button>
                             </div>
+                          {:else if request.method === "item/tool/call"}
+                            <div class="space-y-3">
+                              <div class="rounded-xl border border-gray-200 bg-gray-50 p-3">
+                                <div class="flex flex-wrap items-center gap-2 text-xs font-bold text-gray-500">
+                                  <span>{m.tool_call()}</span>
+                                  <span class="rounded-full bg-white px-2 py-0.5 text-gray-700">
+                                    {String(request.params.namespace ?? "tool")} / {String(request.params.tool ?? "unknown")}
+                                  </span>
+                                </div>
+                                <pre class="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white p-2 text-[11px] text-gray-600">{JSON.stringify(request.params.arguments ?? {}, null, 2)}</pre>
+                              </div>
+                              <textarea
+                                class="min-h-24 w-full rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-800 focus:border-amber-500 focus:outline-none"
+                                oninput={(event) => updateRawRequestResponse(request.id, (event.currentTarget as HTMLTextAreaElement).value)}
+                                placeholder={ui.typeYourResponse}
+                                value={rawRequestResponses[request.id] ?? ""}
+                              ></textarea>
+                              <div class="flex flex-wrap gap-2">
+                                <button
+                                  class="flex-1 rounded-xl bg-amber-600 px-4 py-2 text-xs font-bold text-white shadow-sm transition-all hover:bg-amber-700"
+                                  onclick={() => void resolvePendingRequest(request, {
+                                    contentItems: [{ type: "inputText", text: rawRequestResponses[request.id] ?? "" }],
+                                    success: true
+                                  })}
+                                  type="button"
+                                >
+                                  {ui.submitResponse}
+                                </button>
+                                <button
+                                  class="flex-1 rounded-xl bg-gray-100 px-4 py-2 text-xs font-bold text-gray-600 transition-all hover:bg-gray-200"
+                                  onclick={() => void resolvePendingRequest(request, {
+                                    contentItems: [{ type: "inputText", text: rawRequestResponses[request.id] || "Tool call declined." }],
+                                    success: false
+                                  })}
+                                  type="button"
+                                >
+                                  Decline
+                                </button>
+                              </div>
+                            </div>
                           {/if}
                         </div>
                       </div>
@@ -11370,6 +11558,7 @@
                 themeSettings={(config as ThemedConfigPayload | null)?.theme ?? null}
                 themeMode={themeMode}
                 resolvedTheme={resolvedTheme}
+                initialTab={settingsInitialTab}
                 webRole={webRole}
                 readOnly={readOnlyRole}
                 onConfigSaved={async () => {
@@ -12570,6 +12759,17 @@
           {:else if getItemDetailError(turnId, item.id)}<div class="p-4 bg-red-50 text-red-600 text-xs border-t border-red-100">{getItemDetailError(turnId, item.id)}</div>
           {:else if item.type === "fileChange" && getFileChangeViews(item).length > 0}
             <div class="p-0 space-y-0">{#each getFileChangeViews(item) as change}<div class="border-b border-gray-100 last:border-0"><button class="turn-card-header turn-card-header--neutral w-full flex items-center justify-between px-4 py-1.75 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel + 1} onclick={() => toggleFileChangeEntry(turnId, item.id, change)}><div class="flex items-center gap-2"><span class="text-[10px] font-mono font-bold text-gray-600">{change.path}</span><span class="px-1.5 py-0.5 bg-gray-100 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{change.kind}</span></div><ChevronDown size={12} class="text-gray-300 {isFileChangeEntryExpanded(turnId, item.id, change) ? 'rotate-180' : ''} transition-transform" /></button>{#if isFileChangeEntryExpanded(turnId, item.id, change)}<div class="turn-card-expand bg-gray-50 p-0 border-t border-gray-100" transition:slide|local={{ duration: 180 }}>{#if change.renderable}<LazyMonacoDiffEditor fallbackText={change.diff} height={400} modified={change.modified} original={change.original} path={change.path} />{:else}<pre class="p-3 text-[10px] font-mono text-gray-600 overflow-x-auto">{change.diff}</pre>{/if}</div>{/if}</div>{/each}</div>
+          {:else if item.type === "dynamicToolCall" && (getDynamicToolTextItems(item).length > 0 || getDynamicToolImageUrls(item).length > 0)}
+            <div class="space-y-3 p-3">
+              {#each getDynamicToolTextItems(item) as text, index (`${item.id}:text:${index}`)}
+                <pre class="overflow-x-auto whitespace-pre-wrap break-words rounded-xl border border-gray-100 bg-gray-50 p-3 text-[11px] leading-relaxed text-gray-700">{text}</pre>
+              {/each}
+              {#each getDynamicToolImageUrls(item) as imageUrl, index (`${item.id}:image:${index}`)}
+                <figure class="overflow-hidden rounded-xl border border-gray-100 bg-gray-50">
+                  <img alt={`${getToolItemLabel(item)} ${index + 1}`} class="block h-auto max-h-[34rem] w-full object-contain" loading="lazy" src={imageUrl} />
+                </figure>
+              {/each}
+            </div>
           {:else if getDeferredToolBody(item)}{@render renderCappedOutput(getDeferredToolBody(item), getOutputPreviewKey(turnId, item.id))}
           {:else}<div class="p-4 text-gray-400 text-xs italic text-center">{ui.noAdditionalOutput}</div>{/if}
         </div>

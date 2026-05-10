@@ -93,6 +93,15 @@ function isLiveThreadStatus(status: string | null | undefined) {
   return status === "running" || status === "active";
 }
 
+function realtimeTurnIdForThread(threadId: string) {
+  return `realtime:${threadId}`;
+}
+
+function realtimeItemTypeForRole(role: unknown) {
+  const normalized = String(role ?? "").toLowerCase();
+  return normalized === "user" || normalized === "human" ? "userMessage" : "agentMessage";
+}
+
 function preferProgressiveString(existing: unknown, incoming: unknown) {
   if (typeof incoming !== "string") {
     return typeof existing === "string" ? existing : incoming;
@@ -689,6 +698,89 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
   if (method === "turn/diff/updated") {
     const turnId = String(params.turnId ?? "");
     next.liveDiffs[turnId] = String(params.diff ?? "");
+    return next;
+  }
+
+  if (method === "thread/realtime/started") {
+    const turnId = realtimeTurnIdForThread(next.thread.id);
+    const seeded = ensureTurn(next, turnId, {
+      status: "inProgress",
+      startedAt: Date.now(),
+      completedAt: null,
+      durationMs: null
+    });
+    next.thread.turns = seeded.turns;
+    next.activeTurnId = turnId;
+    next.thread.status = "running";
+    return next;
+  }
+
+  if (method === "thread/realtime/transcript/delta" || method === "thread/realtime/transcript/done") {
+    const turnId = realtimeTurnIdForThread(next.thread.id);
+    const role = String(params.role ?? "assistant");
+    const itemId = `${turnId}:${role}`;
+    const seeded = ensureTurn(next, turnId, {
+      status: "inProgress",
+      startedAt: Date.now(),
+      completedAt: null,
+      durationMs: null
+    });
+    const existing =
+      seeded.turn.items.find((candidate) => candidate.id === itemId) ??
+      ({
+        id: itemId,
+        type: realtimeItemTypeForRole(role),
+        text: ""
+      } satisfies CodexItem);
+    const nextText =
+      method === "thread/realtime/transcript/done"
+        ? String(params.text ?? existing.text ?? "")
+        : `${String(existing.text ?? "")}${String(params.delta ?? "")}`;
+
+    upsertItem(seeded.turn, {
+      ...existing,
+      type: realtimeItemTypeForRole(role),
+      text: nextText
+    });
+    next.thread.turns = seeded.turns;
+    next.activeTurnId = turnId;
+    next.thread.status = "running";
+    return next;
+  }
+
+  if (method === "thread/realtime/error") {
+    const turnId = realtimeTurnIdForThread(next.thread.id);
+    const seeded = ensureTurn(next, turnId, {
+      status: "inProgress",
+      startedAt: Date.now(),
+      completedAt: null,
+      durationMs: null
+    });
+    upsertItem(seeded.turn, {
+      id: `${turnId}:error`,
+      type: "agentMessage",
+      text: `Realtime error: ${String(params.message ?? params.error ?? "Unknown error")}`
+    });
+    next.thread.turns = seeded.turns;
+    next.activeTurnId = turnId;
+    next.thread.status = "running";
+    return next;
+  }
+
+  if (method === "thread/realtime/closed") {
+    const turnId = realtimeTurnIdForThread(next.thread.id);
+    const seeded = ensureTurn(next, turnId, {
+      status: "completed"
+    });
+    seeded.turn.status = "completed";
+    seeded.turn.completedAt = seeded.turn.completedAt ?? Date.now();
+    next.thread.turns = seeded.turns;
+    if (next.activeTurnId === turnId) {
+      next.activeTurnId = null;
+    }
+    if (!resolveConversationRunningTurn(next)) {
+      next.thread.status = "completed";
+    }
     return next;
   }
 

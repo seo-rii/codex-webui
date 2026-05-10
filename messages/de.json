@@ -498,5 +498,16 @@
   "app_install_unavailable": "Dieser Browser bietet derzeit keinen Installationsdialog an.",
   "app_install_ios_hint": "Auf iPhone oder iPad verwende Teilen und dann Zum Home-Bildschirm.",
   "app_installed_notice": "App installiert.",
-  "app_install_prompt_dismissed": "Installationsdialog geschlossen."
+  "app_install_prompt_dismissed": "Installationsdialog geschlossen.",
+  "apps": "Apps",
+  "app_enabled": "Enabled",
+  "app_disabled": "Disabled",
+  "app_accessible": "Accessible",
+  "app_needs_auth": "Needs auth",
+  "no_apps": "No apps returned.",
+  "realtime_started": "Realtime started.",
+  "realtime_stopped": "Realtime stopped.",
+  "realtime_voices": "Realtime voices: {voices}",
+  "realtime_no_voices": "No realtime voices returned.",
+  "computer_use_connection_failed": "Computer use connection failed."
 }

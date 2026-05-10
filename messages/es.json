@@ -498,5 +498,16 @@
   "app_install_unavailable": "Este navegador no muestra actualmente el aviso de instalación.",
   "app_install_ios_hint": "En iPhone o iPad, usa Compartir y luego Añadir a pantalla de inicio.",
   "app_installed_notice": "Aplicación instalada.",
-  "app_install_prompt_dismissed": "Se descartó el aviso de instalación."
+  "app_install_prompt_dismissed": "Se descartó el aviso de instalación.",
+  "apps": "Apps",
+  "app_enabled": "Enabled",
+  "app_disabled": "Disabled",
+  "app_accessible": "Accessible",
+  "app_needs_auth": "Needs auth",
+  "no_apps": "No apps returned.",
+  "realtime_started": "Realtime started.",
+  "realtime_stopped": "Realtime stopped.",
+  "realtime_voices": "Realtime voices: {voices}",
+  "realtime_no_voices": "No realtime voices returned.",
+  "computer_use_connection_failed": "Computer use connection failed."
 }

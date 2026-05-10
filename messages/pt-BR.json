@@ -498,5 +498,16 @@
   "app_install_unavailable": "Este navegador não mostra um prompt de instalação no momento.",
   "app_install_ios_hint": "No iPhone ou iPad, use Compartilhar e depois Adicionar à Tela de Início.",
   "app_installed_notice": "App instalada.",
-  "app_install_prompt_dismissed": "Prompt de instalação dispensado."
+  "app_install_prompt_dismissed": "Prompt de instalação dispensado.",
+  "apps": "Apps",
+  "app_enabled": "Enabled",
+  "app_disabled": "Disabled",
+  "app_accessible": "Accessible",
+  "app_needs_auth": "Needs auth",
+  "no_apps": "No apps returned.",
+  "realtime_started": "Realtime started.",
+  "realtime_stopped": "Realtime stopped.",
+  "realtime_voices": "Realtime voices: {voices}",
+  "realtime_no_voices": "No realtime voices returned.",
+  "computer_use_connection_failed": "Computer use connection failed."
 }

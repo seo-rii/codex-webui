@@ -169,9 +169,9 @@ pub(crate) async fn run_command_with_timeout(
     }
 }
 
-pub(crate) async fn terminate_child_process_group(child: &mut Child, child_pid: Option<u32>) {
+pub(crate) async fn terminate_child_process_group(child: &mut Child, _child_pid: Option<u32>) {
     #[cfg(unix)]
-    if let Some(pid) = child_pid {
+    if let Some(pid) = _child_pid {
         let group = format!("-{pid}");
         let _ = Command::new("kill")
             .args(["-TERM", "--", group.as_str()])

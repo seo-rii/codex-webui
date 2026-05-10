@@ -123,8 +123,9 @@ async fn validate_terminal_cwd(state: &AppState, requested_cwd: Option<String>) 
 }
 
 async fn spawn_terminal_process(cwd: &str) -> Result<Child> {
-    if cfg!(windows) {
-        Command::new("powershell.exe")
+    #[cfg(windows)]
+    {
+        return Command::new("powershell.exe")
             .current_dir(cwd)
             .arg("-NoLogo")
             .arg("-NoExit")
@@ -132,8 +133,11 @@ async fn spawn_terminal_process(cwd: &str) -> Result<Child> {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .context("failed to start terminal process")
-    } else {
+            .context("failed to start terminal process");
+    }
+
+    #[cfg(not(windows))]
+    {
         let mut command = Command::new("script");
         command
             .current_dir(cwd)

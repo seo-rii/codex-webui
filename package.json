@@ -27,6 +27,7 @@
     "paraglide:compile": "paraglide-js compile --project ./project.inlang --outdir ./src/lib/paraglide --strategy cookie globalVariable preferredLanguage baseLocale --is-server 'import.meta.env.SSR' --emit-ts-declarations",
     "dev": "pnpm paraglide:compile && vite dev",
     "build": "pnpm paraglide:compile && svelte-kit sync && node ./scripts/build-app.mjs",
+    "build:e2e-fake": "cargo build --manifest-path backend/Cargo.toml --bin fake_codex_app_server",
     "build:cross": "node ./scripts/build-cross.mjs",
     "verify:api-parity": "node ./scripts/verify-api-parity.mjs",
     "verify:codex-compat": "node ./scripts/verify-codex-compat.mjs",
@@ -39,7 +40,7 @@
     "gateway:build": "cargo build --manifest-path backend/Cargo.toml",
     "preview": "vite preview",
     "check": "pnpm paraglide:compile && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "test:e2e": "pnpm build && pnpm verify:static-build && pnpm verify:api-parity && playwright test",
+    "test:e2e": "pnpm build && pnpm verify:static-build && pnpm verify:api-parity && pnpm build:e2e-fake && playwright test",
     "hash-password": "node scripts/hash-password.mjs"
   },
   "dependencies": {

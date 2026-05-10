@@ -87,6 +87,7 @@
     CodexAccountLoginFlow,
     CodexItem,
     ComputerFramePayload,
+    ComputerInputEvent,
     CodexQuotaStatus,
     CodexRuntimeStatus,
     CodexTurn,
@@ -205,6 +206,9 @@
   let runtime = $state<CodexRuntimeStatus | null>(null);
   let remoteControlStatus = $state<{ status: string; environmentId: string | null; updatedAt: number } | null>(null);
   let computerFramesBySessionId = $state<Record<string, ComputerFramePayload>>({});
+  let computerInputText = $state("");
+  let computerInputBusy = $state(false);
+  let computerInputStatus = $state<string | null>(null);
   let dismissedRemoteControlErrorAt = $state(0);
   let sessions = $state<SessionSummary[]>([]);
   let notifications = $state<AppNotification[]>([]);
@@ -487,6 +491,13 @@
       computerSnapshotStream: m.computer_snapshot_stream(),
       computerNoFrames: m.computer_no_frames(),
       computerFrameUpdated: m.computer_frame_updated(),
+      computerInputHint: m.computer_input_hint(),
+      computerClickHint: m.computer_click_hint(),
+      computerInputDelivered: m.computer_input_delivered(),
+      computerInputFailed: m.computer_input_failed(),
+      sendComputerInput: m.send_computer_input(),
+      scrollUp: m.scroll_up(),
+      scrollDown: m.scroll_down(),
       threadTitle: m.thread_title(),
       restoreThread: m.restore_thread(),
       archiveThread: m.archive_thread(),
@@ -7497,6 +7508,80 @@
     }
   }
 
+  async function sendComputerInput(input: ComputerInputEvent) {
+    if (!selectedSessionId || readOnlyRole || computerInputBusy) {
+      return;
+    }
+    computerInputBusy = true;
+    computerInputStatus = null;
+    try {
+      const result = await api.sendComputerInput(selectedSessionId, input);
+      computerInputStatus = `${ui.computerInputDelivered} · ${result.routed}`;
+    } catch (error) {
+      computerInputStatus = ui.computerInputFailed;
+      errorText = describeError(error);
+    } finally {
+      computerInputBusy = false;
+    }
+  }
+
+  function handleComputerFrameClick(event: MouseEvent) {
+    if (!selectedComputerFrame || readOnlyRole || computerInputBusy) {
+      return;
+    }
+    const target = event.currentTarget as HTMLElement;
+    const rect = target.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return;
+    }
+    void sendComputerInput({
+      type: event.detail >= 2 ? "double_click" : "click",
+      x: Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1),
+      y: Math.min(Math.max((event.clientY - rect.top) / rect.height, 0), 1),
+      button: "left",
+      coordinateSpace: "normalized",
+      frameUpdatedAt: selectedComputerFrame.updatedAt
+    });
+  }
+
+  function sendComputerTextInput() {
+    const text = computerInputText.trim();
+    if (!text || !selectedComputerFrame) {
+      return;
+    }
+    computerInputText = "";
+    void sendComputerInput({
+      type: "text",
+      text,
+      frameUpdatedAt: selectedComputerFrame.updatedAt
+    });
+  }
+
+  function sendComputerKeyInput(key: string, modifiers: string[] = []) {
+    if (!selectedComputerFrame) {
+      return;
+    }
+    void sendComputerInput({
+      type: "key",
+      key,
+      modifiers,
+      frameUpdatedAt: selectedComputerFrame.updatedAt
+    });
+  }
+
+  function sendComputerScrollInput(deltaY: number) {
+    if (!selectedComputerFrame) {
+      return;
+    }
+    void sendComputerInput({
+      type: "scroll",
+      deltaX: 0,
+      deltaY,
+      coordinateSpace: "normalized",
+      frameUpdatedAt: selectedComputerFrame.updatedAt
+    });
+  }
+
   function openGitDiffTab(repoPath: string, filePath: string) {
     const tabKey = `${repoPath}::${filePath}`;
     const nextRequest: GitOpenRequest = {
@@ -11727,7 +11812,7 @@
           </div>
         </div>
       {:else if activeWorkspaceTabId === "computer"}
-        <div class="flex h-full min-h-0 flex-col gap-4 overflow-hidden p-4 sm:p-6" style="background: var(--bg); color: var(--ink);">
+        <div class="flex h-full min-h-0 flex-col gap-4 overflow-hidden p-4 sm:p-6" data-testid="computer-workspace" style="background: var(--bg); color: var(--ink);">
           <div class="flex shrink-0 items-center justify-between gap-3 rounded-2xl border px-4 py-3" style="border-color: var(--line); background: var(--panel-strong);">
             <div class="min-w-0">
               <p class="text-[10px] font-bold uppercase tracking-[0.2em]" style="color: var(--muted);">{ui.computerSnapshotStream}</p>
@@ -11748,14 +11833,21 @@
           <div class="flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-3xl border p-3 shadow-sm" style="border-color: var(--line); background: color-mix(in srgb, var(--panel-strong) 92%, #020617 8%);">
             {#if selectedComputerFrame}
               <figure class="flex h-full w-full flex-col overflow-hidden rounded-2xl border" style="border-color: var(--line); background: #020617;">
-                <div class="min-h-0 flex-1 overflow-hidden">
+                <button
+                  aria-label={ui.computerClickHint}
+                  class={`min-h-0 flex-1 overflow-hidden border-0 bg-transparent p-0 ${readOnlyRole || computerInputBusy ? "" : "cursor-crosshair"}`}
+                  data-testid="computer-frame-image"
+                  disabled={readOnlyRole || computerInputBusy}
+                  onclick={handleComputerFrameClick}
+                  type="button"
+                >
                   <img
                     alt={ui.computer}
                     class="h-full w-full object-contain"
                     decoding="async"
                     src={selectedComputerFrame.imageUrl}
                   />
-                </div>
+                </button>
                 <figcaption class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t px-3 py-2 text-[11px] font-semibold" style="border-color: rgba(148, 163, 184, 0.22); color: #cbd5e1;">
                   <span class="truncate">{selectedComputerFrame.tool ?? ui.computerFrameUpdated}</span>
                   <span class="shrink-0">{selectedComputerFrame.frameMode} · {selectedComputerFrame.fpsHint ?? 1} fps</span>
@@ -11767,6 +11859,47 @@
                 <p class="text-sm font-semibold">{ui.computerNoFrames}</p>
               </div>
             {/if}
+          </div>
+          <div class="grid shrink-0 gap-3 rounded-2xl border p-3 sm:grid-cols-[1fr_auto]" style="border-color: var(--line); background: var(--panel-strong);">
+            <div class="min-w-0">
+              <p class="mb-2 text-[10px] font-bold uppercase tracking-[0.16em]" style="color: var(--muted);">{ui.computerInputHint}</p>
+              <div class="flex min-w-0 items-center gap-2">
+                <input
+                  bind:value={computerInputText}
+                  class="min-w-0 flex-1 rounded-xl border px-3 py-2 text-sm outline-none transition focus:ring-2 focus:ring-amber-500/20"
+                  data-testid="computer-input-text"
+                  disabled={readOnlyRole || computerInputBusy || !selectedComputerFrame}
+                  onkeydown={(event) => {
+                    if (event.key !== "Enter") {
+                      return;
+                    }
+                    event.preventDefault();
+                    sendComputerTextInput();
+                  }}
+                  placeholder={ui.computerClickHint}
+                  style="border-color: var(--line); background: var(--panel-soft); color: var(--ink-strong);"
+                  type="text"
+                />
+                <button
+                  class="surface-contrast-button ui-animated-button ui-animated-button--strong rounded-xl px-3 py-2 text-xs font-bold disabled:cursor-not-allowed disabled:opacity-50"
+                  data-testid="computer-input-send"
+                  disabled={readOnlyRole || computerInputBusy || !selectedComputerFrame || !computerInputText.trim()}
+                  onclick={sendComputerTextInput}
+                  type="button"
+                >
+                  {ui.sendComputerInput}
+                </button>
+              </div>
+              {#if computerInputStatus}
+                <p class="mt-2 text-[11px] font-semibold" style="color: var(--muted);">{computerInputStatus}</p>
+              {/if}
+            </div>
+            <div class="flex flex-wrap items-end gap-2">
+              <button class="ui-animated-button ui-animated-button--soft rounded-xl border px-3 py-2 text-xs font-bold disabled:opacity-50" data-testid="computer-key-enter" disabled={readOnlyRole || computerInputBusy || !selectedComputerFrame} onclick={() => sendComputerKeyInput("Enter")} style="border-color: var(--line); color: var(--ink);" type="button">Enter</button>
+              <button class="ui-animated-button ui-animated-button--soft rounded-xl border px-3 py-2 text-xs font-bold disabled:opacity-50" disabled={readOnlyRole || computerInputBusy || !selectedComputerFrame} onclick={() => sendComputerKeyInput("Escape")} style="border-color: var(--line); color: var(--ink);" type="button">Esc</button>
+              <button class="ui-animated-button ui-animated-button--soft rounded-xl border px-3 py-2 text-xs font-bold disabled:opacity-50" disabled={readOnlyRole || computerInputBusy || !selectedComputerFrame} onclick={() => sendComputerScrollInput(-640)} style="border-color: var(--line); color: var(--ink);" type="button">{ui.scrollUp}</button>
+              <button class="ui-animated-button ui-animated-button--soft rounded-xl border px-3 py-2 text-xs font-bold disabled:opacity-50" disabled={readOnlyRole || computerInputBusy || !selectedComputerFrame} onclick={() => sendComputerScrollInput(640)} style="border-color: var(--line); color: var(--ink);" type="button">{ui.scrollDown}</button>
+            </div>
           </div>
         </div>
       {:else if activeWorkspaceTabId === "git"}

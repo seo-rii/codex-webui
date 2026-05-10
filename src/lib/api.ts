@@ -13,6 +13,8 @@ import type {
   CatalogPayload,
   CodexAccountLoginResponse,
   CodexAppsListPayload,
+  ComputerInputEvent,
+  ComputerInputPayload,
   CodexQuotaStatus,
   CodexRuntimeActionPayload,
   CodexRuntimeStatus,
@@ -337,6 +339,10 @@ export const api = {
 
   stopRealtimeSession(threadId: string) {
     return ws.request<Record<string, unknown>>("codex/realtime/stop", { threadId });
+  },
+
+  sendComputerInput(sessionId: string, input: ComputerInputEvent) {
+    return ws.request<ComputerInputPayload>("computer/input", { sessionId, input });
   },
 
   getEditableFile(filePath: string) {

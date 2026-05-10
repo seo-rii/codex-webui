@@ -886,6 +886,54 @@ fn main() {
                     }
                 }));
             }
+            Some("thread/inject_items") => {
+                let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
+                let thread_id = params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(thread_object) =
+                    threads.get_mut(&thread_id).and_then(Value::as_object_mut)
+                {
+                    thread_object.insert("lastInjectedItems".to_string(), params.clone());
+                    thread_object.insert("updatedAt".to_string(), Value::from(timestamp_counter));
+                }
+                print_message(&json!({
+                    "id": id,
+                    "result": {}
+                }));
+            }
+            Some("mcpServer/tool/call") => {
+                let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
+                let thread_id = params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(thread_object) =
+                    threads.get_mut(&thread_id).and_then(Value::as_object_mut)
+                {
+                    thread_object.insert("lastMcpToolCall".to_string(), params.clone());
+                    thread_object.insert("updatedAt".to_string(), Value::from(timestamp_counter));
+                }
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "computer input accepted"
+                            }
+                        ],
+                        "structuredContent": {
+                            "ok": true,
+                            "params": params
+                        },
+                        "isError": false
+                    }
+                }));
+            }
             Some("account/read") => {
                 print_message(&json!({
                     "id": id,

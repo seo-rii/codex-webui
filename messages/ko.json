@@ -513,5 +513,12 @@
   "computer": "컴퓨터",
   "computer_snapshot_stream": "스냅샷 스트림",
   "computer_no_frames": "아직 computer-use 프레임을 받지 못했습니다.",
-  "computer_frame_updated": "최신 프레임"
+  "computer_frame_updated": "최신 프레임",
+  "computer_input_hint": "입력 fallback",
+  "computer_click_hint": "프레임을 클릭하거나 텍스트/키를 보냅니다.",
+  "computer_input_delivered": "입력을 전달했습니다",
+  "computer_input_failed": "입력 전달 실패",
+  "send_computer_input": "보내기",
+  "scroll_up": "위로 스크롤",
+  "scroll_down": "아래로 스크롤"
 }

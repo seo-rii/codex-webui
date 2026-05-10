@@ -513,5 +513,12 @@
   "computer": "Computer",
   "computer_snapshot_stream": "Snapshot stream",
   "computer_no_frames": "No computer-use frames received yet.",
-  "computer_frame_updated": "Latest frame"
+  "computer_frame_updated": "Latest frame",
+  "computer_input_hint": "Input fallback",
+  "computer_click_hint": "Click the frame, type text, or send a key.",
+  "computer_input_delivered": "Input delivered",
+  "computer_input_failed": "Input failed",
+  "send_computer_input": "Send",
+  "scroll_up": "Scroll up",
+  "scroll_down": "Scroll down"
 }

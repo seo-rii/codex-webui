@@ -34,3 +34,50 @@ jobs:
 
       - name: Run fast security regression suite
         run: pnpm verify:security-regressions
+
+  windows-e2e:
+    name: Windows E2E
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    env:
+      CODEX_WEBUI_E2E_PORT: "44173"
+      CODEX_WEBUI_E2E_BASE_PATH: "/e2e/base"
+      CODEX_WEBUI_E2E_PASSWORD: "test"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install chromium
+
+      - name: Build app
+        run: pnpm build
+
+      - name: Build fake Codex app-server
+        run: pnpm build:e2e-fake
+
+      - name: Run computer input E2E
+        run: pnpm exec playwright test e2e/computer-input.spec.ts --reporter=line

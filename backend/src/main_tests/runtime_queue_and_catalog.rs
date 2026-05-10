@@ -83,6 +83,65 @@ async fn resolve_server_request_payload_uses_pending_request_store() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn computer_input_resolves_pending_computer_tool_request() {
+    let sandbox = unique_test_dir("computer-input-pending");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    handle_profile_server_request(
+        &state,
+        "default",
+        &backend::codex_app_server::AppServerRequest {
+            id: json!("computer-call-1"),
+            method: "item/tool/call".to_string(),
+            params: json!({
+                "threadId": "thread-computer-input",
+                "turnId": "turn-1",
+                "callId": "call-1",
+                "namespace": "computer",
+                "tool": "click",
+                "arguments": {}
+            }),
+        },
+    )
+    .await;
+
+    let payload = send_computer_input_payload(
+        &state,
+        "default",
+        "thread-computer-input",
+        json!({
+            "type": "click",
+            "x": 0.5,
+            "y": 0.25,
+            "button": "left",
+            "coordinateSpace": "normalized"
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        payload.get("routed").and_then(Value::as_str),
+        Some("pendingDynamicTool")
+    );
+    assert!(
+        state
+            .pending_server_requests
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-computer-input"))
+            .is_none()
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolve_server_request_payload_returns_not_found_without_pending_request() {
     let sandbox = unique_test_dir("approval-missing");
     let workspace = sandbox.join("workspace");

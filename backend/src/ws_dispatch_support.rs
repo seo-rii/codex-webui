@@ -664,6 +664,17 @@ pub(crate) async fn execute_ws_method(
                 .await
                 .map_err(anyhow::Error::from)
         }
+        "computer/input" => {
+            let session_id = require_session_id(&params, "sessionId")?;
+            send_computer_input_payload(
+                state,
+                &auth.profile_id,
+                &session_id,
+                params.get("input").cloned().unwrap_or_else(|| json!({})),
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        }
         "approval/resolve" => {
             let session_id = require_session_id(&params, "sessionId")?;
             let request_id = require_string(&params, "requestId")?;

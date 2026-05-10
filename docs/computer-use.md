@@ -22,6 +22,10 @@ Implemented today:
   and forwarded as `codex-webui/computerFrame` session events. The browser shows
   the latest frame in the Computer workspace tab without reloading the full
   transcript.
+- The Computer workspace has a WebSocket input fallback. Click, text, key, and
+  scroll events are sent through `computer/input`; the gateway first tries a
+  pending computer dynamic-tool request, then a `computer-use` MCP tool call,
+  then active-turn steering or history injection as a last resort.
 - `remoteControl/status/changed` and `app/list/updated` app-server events are
   forwarded into the browser event model.
 - `/apps`, `/plugins`, and `/realtime` slash commands are classified and wired
@@ -146,3 +150,5 @@ Before accepting input:
 - route every input command through the same role and audit model as other
   host-facing actions
 - reject stale input sequence ids after a stream reset
+- keep input side effects on reliable WebSocket RPC in the baseline transport;
+  datagram transports are only for lossy frame delivery, not clicks or keys

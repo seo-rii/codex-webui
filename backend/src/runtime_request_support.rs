@@ -306,3 +306,195 @@ pub(crate) async fn resolve_server_request_payload(
 
     Ok(json!({ "ok": true }))
 }
+
+pub(crate) async fn send_computer_input_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    mut input: Value,
+) -> ApiResult<Value> {
+    let event_type = input
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(
+        event_type.as_str(),
+        "click" | "doubleclick" | "double_click" | "scroll" | "key" | "text"
+    ) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "INVALID_COMPUTER_INPUT"));
+    }
+
+    if let Some(record) = input.as_object_mut() {
+        record.insert("type".to_string(), Value::String(event_type.clone()));
+        record.insert(
+            "threadId".to_string(),
+            Value::String(session_id.to_string()),
+        );
+        record.insert("sequence".to_string(), json!(now_unix_ms()));
+        record.insert("transport".to_string(), json!("websocket"));
+    }
+
+    let input_text = format!(
+        "Computer input event from codex-webui: {}",
+        serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
+    );
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        session_id,
+    );
+    let pending_request_id = {
+        let pending_requests = state.pending_server_requests.lock().await;
+        pending_requests.get(&runtime_key).and_then(|entries| {
+            let mut candidates = entries
+                .iter()
+                .filter(|(_, pending)| {
+                    pending.method == "item/tool/call"
+                        && pending
+                            .params
+                            .get("namespace")
+                            .and_then(Value::as_str)
+                            .is_some_and(|namespace| namespace.eq_ignore_ascii_case("computer"))
+                })
+                .map(|(id, pending)| (id.clone(), pending.created_at_ms))
+                .collect::<Vec<_>>();
+            candidates.sort_by_key(|(_, created_at)| *created_at);
+            candidates.into_iter().next().map(|(id, _)| id)
+        })
+    };
+
+    let routed: &str;
+    let upstream: Value;
+    if let Some(request_id) = pending_request_id {
+        let result = json!({
+            "contentItems": [
+                {
+                    "type": "inputText",
+                    "text": input_text
+                }
+            ],
+            "success": true
+        });
+        upstream =
+            resolve_server_request_payload(state, profile_id, session_id, &request_id, result)
+                .await?;
+        routed = "pendingDynamicTool";
+    } else {
+        let client = app_server_client(state, profile_id)
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to connect to codex app-server: {error}"),
+                )
+            })?;
+        let tool = input
+            .get("tool")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| match event_type.as_str() {
+                "doubleclick" | "double_click" => "double_click".to_string(),
+                "scroll" => "scroll".to_string(),
+                "key" => "key".to_string(),
+                "text" => "type".to_string(),
+                _ => "click".to_string(),
+            });
+        let server = input
+            .get("server")
+            .and_then(Value::as_str)
+            .unwrap_or("computer-use")
+            .to_string();
+        let mcp_result = client
+            .request_with_timeout(
+                "mcpServer/tool/call".to_string(),
+                json!({
+                    "threadId": session_id,
+                    "server": server,
+                    "tool": tool,
+                    "arguments": input,
+                    "_meta": {
+                        "codexWebui": {
+                            "transport": "websocket",
+                            "fallback": true
+                        }
+                    }
+                }),
+                Duration::from_secs(8),
+                false,
+            )
+            .await;
+        match mcp_result {
+            Ok(result) => {
+                upstream = result;
+                routed = "mcpServerTool";
+            }
+            Err(error) => {
+                if resolve_active_turn_id_payload(state, profile_id, session_id)
+                    .await?
+                    .is_some()
+                {
+                    upstream =
+                        steer_turn_payload(state, profile_id, session_id, &input_text, None, None)
+                            .await?;
+                    routed = "turnSteer";
+                } else {
+                    upstream = client
+                        .request_with_timeout(
+                            "thread/inject_items".to_string(),
+                            json!({
+                                "threadId": session_id,
+                                "items": [
+                                    {
+                                        "type": "message",
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "input_text",
+                                                "text": input_text
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }),
+                            Duration::from_secs(8),
+                            false,
+                        )
+                        .await
+                        .map_err(|inject_error| {
+                            api_error(
+                                StatusCode::BAD_GATEWAY,
+                                format!(
+                                    "Failed to deliver computer input: MCP call failed: {error}; inject fallback failed: {inject_error}"
+                                ),
+                            )
+                        })?;
+                    routed = "threadInject";
+                }
+            }
+        }
+    }
+
+    emit_session_notification(
+        state,
+        profile_id,
+        session_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/computerInput",
+            "params": {
+                "threadId": session_id,
+                "input": input,
+                "routed": routed,
+                "updatedAt": now_unix_ms()
+            }
+        }),
+    )
+    .await;
+
+    Ok(json!({
+        "ok": true,
+        "routed": routed,
+        "upstream": upstream
+    }))
+}

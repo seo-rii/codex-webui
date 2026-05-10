@@ -620,6 +620,48 @@ export type ComputerFramePayload = {
   updatedAt: number;
 };
 
+export type ComputerInputEvent =
+  | {
+      type: "click" | "double_click";
+      x: number;
+      y: number;
+      button: "left" | "middle" | "right";
+      coordinateSpace: "normalized";
+      frameUpdatedAt: number | null;
+      server?: string;
+      tool?: string;
+    }
+  | {
+      type: "scroll";
+      deltaX: number;
+      deltaY: number;
+      coordinateSpace: "normalized";
+      frameUpdatedAt: number | null;
+      server?: string;
+      tool?: string;
+    }
+  | {
+      type: "key";
+      key: string;
+      modifiers: string[];
+      frameUpdatedAt: number | null;
+      server?: string;
+      tool?: string;
+    }
+  | {
+      type: "text";
+      text: string;
+      frameUpdatedAt: number | null;
+      server?: string;
+      tool?: string;
+    };
+
+export type ComputerInputPayload = {
+  ok: true;
+  routed: "pendingDynamicTool" | "mcpServerTool" | "turnSteer" | "threadInject" | "local" | string;
+  upstream: Record<string, unknown> | null;
+};
+
 export type GlobalStreamEvent = {
   kind: "notification";
   method: string;

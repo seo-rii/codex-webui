@@ -189,6 +189,60 @@ async fn runtime_quota_status_reuses_recent_cache_for_forced_refresh() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_quota_status_returns_cached_payload_while_refresh_in_flight() {
+    let sandbox = unique_test_dir("runtime-quota-inflight-cache");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let cached_payload = json!({
+        "available": true,
+        "source": "cached",
+        "fetchedAt": now_unix_ms(),
+        "account": {
+            "email": "cached@example.com"
+        },
+        "plan": {
+            "type": "pro"
+        },
+        "fiveHour": {
+            "remainingPercent": 90
+        },
+        "weekly": {
+            "remainingPercent": 80
+        },
+        "error": Value::Null
+    });
+    state.quota_cache.lock().await.insert(
+        "default".to_string(),
+        CachedQuota {
+            created_at: Instant::now() - QUOTA_CACHE_TTL - Duration::from_secs(1),
+            payload: cached_payload,
+        },
+    );
+    state
+        .quota_refreshes
+        .lock()
+        .await
+        .insert("default".to_string());
+
+    let payload = codex_quota_status(&state, true, "default").await.unwrap();
+    assert_eq!(
+        payload.get("source").and_then(Value::as_str),
+        Some("cached")
+    );
+    assert_eq!(
+        payload.get("refreshing").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_list_shows_running_when_active_turn_exists_but_thread_metadata_is_idle() {
     let sandbox = unique_test_dir("session-list-running-status-sync");
     let workspace = sandbox.join("workspace");

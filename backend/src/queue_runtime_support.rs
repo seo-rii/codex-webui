@@ -198,10 +198,36 @@ async fn session_turn_activity(
     let runtime_key = runtime_session_key(resolved_profile_id, session_id);
     let cached_active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
 
-    let thread = match read_thread_payload(state, profile_id, session_id, true).await {
-        Ok(payload) => payload,
+    match local_session_has_active_turn_payload(state, profile_id, session_id).await {
+        Ok(Some(true)) => return SessionTurnActivity::Active,
+        Ok(Some(false)) => {
+            state.active_turns.lock().await.remove(&runtime_key);
+            return SessionTurnActivity::Idle;
+        }
+        Ok(None) => {}
+        Err(_) => return SessionTurnActivity::Unknown,
+    }
+
+    let client = match app_server_client(state, profile_id).await {
+        Ok(client) => client,
         Err(_) => return SessionTurnActivity::Unknown,
     };
+    let response = match client
+        .request_with_timeout(
+            "thread/read",
+            json!({
+                "threadId": session_id,
+                "includeTurns": false
+            }),
+            Duration::from_millis(500),
+            false,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return SessionTurnActivity::Unknown,
+    };
+    let thread = response.get("thread").cloned().unwrap_or(Value::Null);
     let Some(thread) = thread.as_object() else {
         return SessionTurnActivity::Unknown;
     };

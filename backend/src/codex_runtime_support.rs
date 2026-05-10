@@ -121,9 +121,12 @@ pub(crate) async fn codex_quota_status(
     refresh: bool,
     profile_id: &str,
 ) -> Result<Value> {
-    {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let cached_payload = {
         let cache = state.quota_cache.lock().await;
-        if let Some(cached) = cache.get(profile_id) {
+        if let Some(cached) = cache.get(&resolved_profile_id) {
             let ttl = if refresh {
                 QUOTA_FORCE_MIN_REFRESH_INTERVAL
             } else {
@@ -132,10 +135,39 @@ pub(crate) async fn codex_quota_status(
             if cached.created_at.elapsed() < ttl {
                 return Ok(cached.payload.clone());
             }
+            Some(cached.payload.clone())
+        } else {
+            None
+        }
+    };
+
+    {
+        let mut refreshes = state.quota_refreshes.lock().await;
+        if !refreshes.insert(resolved_profile_id.clone()) {
+            return Ok(cached_payload
+                .map(|mut payload| {
+                    if let Some(object) = payload.as_object_mut() {
+                        object.insert("refreshing".to_string(), Value::Bool(true));
+                    }
+                    payload
+                })
+                .unwrap_or_else(|| {
+                    json!({
+                        "available": false,
+                        "source": Value::Null,
+                        "fetchedAt": now_unix_ms(),
+                        "account": Value::Null,
+                        "plan": Value::Null,
+                        "fiveHour": Value::Null,
+                        "weekly": Value::Null,
+                        "refreshing": true,
+                        "error": Value::Null,
+                    })
+                }));
         }
     }
 
-    let payload = match fetch_codex_quota(state, profile_id).await {
+    let payload = match fetch_codex_quota(state, &resolved_profile_id).await {
         Ok(payload) => payload,
         Err(error) => json!({
             "available": false,
@@ -148,10 +180,15 @@ pub(crate) async fn codex_quota_status(
             "error": error.to_string(),
         }),
     };
+    state
+        .quota_refreshes
+        .lock()
+        .await
+        .remove(&resolved_profile_id);
 
     let mut cache = state.quota_cache.lock().await;
     cache.insert(
-        profile_id.to_string(),
+        resolved_profile_id,
         CachedQuota {
             created_at: Instant::now(),
             payload: payload.clone(),

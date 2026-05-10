@@ -1,7 +1,7 @@
 use super::*;
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 
-const SESSION_ROLLOUT_INDEX_CACHE_TTL: Duration = Duration::from_secs(3);
+const SESSION_ROLLOUT_INDEX_CACHE_TTL: Duration = Duration::from_secs(20);
 const SESSION_ROLLOUT_PREVIEW_SCAN_LIMIT: usize = 160;
 const SESSION_ROLLOUT_TITLE_SCAN_LIMIT: usize = 1024;
 const SESSION_ROLLOUT_SCAN_MAX_CANDIDATES: usize = 50_000;

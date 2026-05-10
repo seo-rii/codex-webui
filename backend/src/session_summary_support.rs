@@ -90,6 +90,11 @@ pub(crate) struct SessionSummaryUiSnapshot {
 const ACTIVE_SESSION_STATUS_RECONCILE_AFTER_MS: u64 = 5_000;
 const ACTIVE_SESSION_STATUS_RECONCILE_LIMIT: usize = 4;
 const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS: u64 = 150;
+const LOADED_THREAD_IDS_CACHE_TTL: Duration = Duration::from_secs(5);
+
+fn loaded_thread_ids_cache_key(profile_id: &str) -> String {
+    format!("{profile_id}:loaded-thread-ids")
+}
 
 pub(crate) fn session_filter_from_value(filter: Option<&Value>) -> SessionFilterCriteria {
     let mut tags = filter
@@ -155,8 +160,26 @@ async fn loaded_thread_ids_from_app_server(
     state: &AppState,
     profile_id: &str,
 ) -> Option<HashSet<String>> {
-    if state.app_servers.client_count().await == 0 {
+    if state.app_servers.active_process_count().await == 0 {
         return Some(HashSet::new());
+    }
+
+    let cache_key = loaded_thread_ids_cache_key(profile_id);
+    {
+        let mut cache = state.session_thread_cache.lock().await;
+        if let Some(cached) = cache.get(&cache_key) {
+            if cached.created_at.elapsed() < LOADED_THREAD_IDS_CACHE_TTL {
+                return Some(
+                    cached
+                        .threads
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                );
+            }
+            cache.remove(&cache_key);
+        }
     }
 
     let client = app_server_client(state, profile_id).await.ok()?;
@@ -164,19 +187,18 @@ async fn loaded_thread_ids_from_app_server(
     let mut loaded_thread_ids = HashSet::new();
 
     for _ in 0..20 {
-        let response = tokio::time::timeout(
-            Duration::from_millis(ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS),
-            client.request(
+        let response = client
+            .request_with_timeout(
                 "thread/loaded/list",
                 json!({
                     "cursor": cursor.clone(),
                     "limit": 200
                 }),
-            ),
-        )
-        .await
-        .ok()?
-        .ok()?;
+                Duration::from_millis(ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS),
+                false,
+            )
+            .await
+            .ok()?;
         for thread_id in response
             .get("data")
             .and_then(Value::as_array)
@@ -200,6 +222,18 @@ async fn loaded_thread_ids_from_app_server(
         }
     }
 
+    state.session_thread_cache.lock().await.insert(
+        cache_key,
+        CachedSessionThreads {
+            created_at: Instant::now(),
+            threads: loaded_thread_ids
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect(),
+            next_cursor: String::new(),
+        },
+    );
     Some(loaded_thread_ids)
 }
 
@@ -534,7 +568,7 @@ pub(crate) async fn read_session_summary_ui_snapshot(
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
         .0
         .to_string();
-    let runtime_status_by_thread_id = with_ui_state_read(state, profile_id, |ui_state| {
+    let mut runtime_status_by_thread_id = with_ui_state_read(state, profile_id, |ui_state| {
         Ok(ui_state
             .get("runtimeStatusByThreadId")
             .and_then(Value::as_object)
@@ -544,6 +578,42 @@ pub(crate) async fn read_session_summary_ui_snapshot(
     .await?;
     let runtime_key_prefix = format!("profile::{resolved_profile_id}::session-runtime::");
     let now_ms = now_unix_ms();
+    let has_active_app_server_process = state.app_servers.active_process_count().await > 0;
+    if !has_active_app_server_process {
+        let has_cached_active_work = state
+            .active_turns
+            .lock()
+            .await
+            .keys()
+            .any(|key| key.starts_with(&runtime_key_prefix))
+            || state
+                .pending_turn_starts
+                .lock()
+                .await
+                .iter()
+                .any(|key| key.starts_with(&runtime_key_prefix));
+        let has_live_runtime_status = runtime_status_by_thread_id.values().any(|status_value| {
+            normalized_thread_status(Some(status_value))
+                .as_deref()
+                .is_some_and(is_live_thread_status)
+        });
+        if has_cached_active_work || has_live_runtime_status {
+            clear_profile_runtime_activity_after_app_server_exit(
+                state,
+                profile_id,
+                Some("codex app-server is not running"),
+            )
+            .await;
+            runtime_status_by_thread_id = with_ui_state_read(state, profile_id, |ui_state| {
+                Ok(ui_state
+                    .get("runtimeStatusByThreadId")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default())
+            })
+            .await?;
+        }
+    }
     let mut reconcile_candidates = Vec::new();
     let mut reconcile_candidate_ids = HashSet::new();
     {
@@ -621,28 +691,48 @@ pub(crate) async fn read_session_summary_ui_snapshot(
     }
     for (runtime_key, session_id, has_cached_activity) in reconcile_candidates {
         if has_cached_activity {
-            let has_active_turn = tokio::time::timeout(
-                Duration::from_millis(ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS),
-                async {
-                    if let Some(has_active_turn) =
-                        local_session_has_active_turn_payload(state, profile_id, &session_id)
-                            .await?
-                    {
-                        return Ok::<bool, ApiError>(has_active_turn);
-                    }
+            let has_active_turn = async {
+                if let Some(has_active_turn) =
+                    local_session_has_active_turn_payload(state, profile_id, &session_id).await?
+                {
+                    return Ok::<bool, ApiError>(has_active_turn);
+                }
 
-                    let thread = read_thread_payload(state, profile_id, &session_id, true).await?;
-                    let turns = thread
-                        .get("turns")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    Ok::<bool, ApiError>(active_turn_id_from_turns(&turns).is_some())
-                },
-            )
+                let client = app_server_client(state, profile_id)
+                    .await
+                    .map_err(|error| {
+                        api_error(
+                            StatusCode::BAD_GATEWAY,
+                            format!("Failed to connect to codex app-server: {error}"),
+                        )
+                    })?;
+                let response = client
+                    .request_with_timeout(
+                        "thread/read",
+                        json!({
+                            "threadId": session_id.clone(),
+                            "includeTurns": true
+                        }),
+                        Duration::from_millis(ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS),
+                        false,
+                    )
+                    .await
+                    .map_err(|error| {
+                        api_error(
+                            StatusCode::BAD_GATEWAY,
+                            format!("Failed to read the session: {error}"),
+                        )
+                    })?;
+                let turns = response
+                    .get("thread")
+                    .and_then(|thread| thread.get("turns"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                Ok::<bool, ApiError>(active_turn_id_from_turns(&turns).is_some())
+            }
             .await
-            .ok()
-            .and_then(Result::ok);
+            .ok();
 
             match has_active_turn {
                 Some(true) => {

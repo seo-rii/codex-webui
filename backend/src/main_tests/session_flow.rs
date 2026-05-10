@@ -365,6 +365,12 @@ async fn rollout_file_listing_promotes_old_pinned_and_running_sessions() {
         vec![workspace.clone()],
         codex_home.clone(),
     );
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request("model/list", json!({}))
+        .await
+        .unwrap();
     let pinned_id = "019e0000-0000-7000-8000-000000000011";
     let running_id = "019e0000-0000-7000-8000-000000000012";
     let newest_id = "019e0000-0000-7000-8000-000000000013";
@@ -1791,6 +1797,145 @@ async fn session_detail_uses_local_rollout_tail_when_thread_read_is_slow() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_detail_does_not_resurrect_active_rollout_after_app_server_exit() {
+    let sandbox = unique_test_dir("session-detail-stale-active-rollout");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000999";
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-10-00",
+        session_id,
+        &workspace,
+        "start and crash before completion",
+        &[&json!({
+            "timestamp": "2026-04-24T01:10:03.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_started",
+                "turn_id": "turn-stale"
+            }
+        })
+        .to_string()],
+        None,
+    );
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        runtime_status_by_thread_id.insert(
+            session_id.to_string(),
+            json!({
+                "status": "failed",
+                "updatedAt": now_unix_ms(),
+                "reason": "codex app-server exited"
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("status"))
+            .and_then(Value::as_str),
+        Some("failed")
+    );
+    assert!(detail.get("activeTurnId").is_some_and(Value::is_null));
+    assert!(
+        state
+            .active_turns
+            .lock()
+            .await
+            .get(&runtime_session_key("default", session_id))
+            .is_none()
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_server_exit_clears_cached_running_session_state() {
+    let sandbox = unique_test_dir("app-server-exit-clears-running");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let session_id = "thread-crashed";
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-crashed".to_string());
+    state.pending_turn_starts.lock().await.insert(runtime_key);
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        runtime_status_by_thread_id.insert(
+            session_id.to_string(),
+            json!({
+                "status": "running",
+                "updatedAt": now_unix_ms()
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    clear_profile_runtime_activity_after_app_server_exit(
+        &state,
+        "default",
+        Some("codex app-server exited"),
+    )
+    .await;
+    let snapshot = read_session_summary_ui_snapshot(&state, "default")
+        .await
+        .unwrap();
+
+    assert!(snapshot.active_thread_ids.is_empty());
+    assert_eq!(
+        snapshot
+            .runtime_status_by_thread_id
+            .get(session_id)
+            .and_then(|status| status.get("status"))
+            .and_then(Value::as_str),
+        Some("failed")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn truncated_local_session_detail_exposes_idle_history_state() {
     let sandbox = unique_test_dir("session-detail-truncated-idle");
     let workspace = sandbox.join("workspace");
@@ -2049,6 +2194,59 @@ async fn session_summary_uses_local_rollout_metadata_when_thread_read_is_slow() 
         summary.get("name").and_then(Value::as_str),
         Some("Local rollout summary")
     );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_summary_snapshot_reuses_loaded_thread_ids_probe() {
+    let sandbox = unique_test_dir("session-summary-loaded-cache");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-loaded-cache",
+                    "name": "Loaded cache",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "running",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    read_session_summary_ui_snapshot(&state, "default")
+        .await
+        .unwrap();
+    read_session_summary_ui_snapshot(&state, "default")
+        .await
+        .unwrap();
+
+    let count = client
+        .request(
+            "debug/requestCount",
+            json!({ "target": "thread/loaded/list" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count.get("count").and_then(Value::as_u64), Some(1));
 
     let _ = fs::remove_dir_all(sandbox);
 }

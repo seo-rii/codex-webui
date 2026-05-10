@@ -78,7 +78,8 @@ Compatibility decisions use these buckets:
 | Git worktree management | Implemented | Partial | Comparable | Explicitly exposed in the web UI because multiple browser workspaces benefit from it. |
 | Terminal tabs | Implemented | Different shape | Comparable | Terminals live in the Rust gateway and survive page reloads while the server stays up. |
 | Subagent activity view | Implemented | Comparable | Comparable | Subagent activity is rendered inline and can open related threads in tabs. |
-| Plugin and skill visibility | Implemented | Different shape | Partial | Lists locally installed plugins and skills from `CODEX_HOME`. |
+| Plugin, app, and skill visibility | Implemented | Different shape | Partial | Lists local `CODEX_HOME` skills/plugins and app-server plugin/app catalog data, including installable marketplace plugins. |
+| Computer-use plugin bridge | Partial | Partial | Partial | Proxies Codex plugin/app/realtime protocol surfaces, renders dynamic tool-call text/image output, and documents a WebSocket snapshot-stream transport before taking on WebRTC. |
 | `config.toml` editor | Implemented | Different shape | Different shape | Browser-native settings page that syncs session defaults back to Codex config. |
 | Runtime install and update checks | Implemented | Different shape | Not targeted | Added for browser-hosted deployments where the runtime might not be present yet. |
 | Quota display | Implemented | Comparable | Comparable | Exposed in the account surface with cached refresh support. |

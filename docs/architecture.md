@@ -122,6 +122,35 @@ The same principle applies to account routing:
 
 The result is a multi-backend architecture without making the browser manage backend selection, auth files, or process lifetimes.
 
+## Codex App, Plugin, And Computer-Use Surfaces
+
+The Rust gateway also proxies selected newer Codex app-server protocol surfaces
+instead of reimplementing them from scratch.
+
+Current proxied families include:
+
+- experimental feature list and enablement updates
+- plugin list/read/install/uninstall
+- marketplace add/remove/upgrade
+- skill and hook list reads
+- app list reads
+- text-oriented realtime start/append/stop/list-voices calls
+
+The browser-facing catalog merges local `CODEX_HOME` plugins and app-server
+marketplace plugins into one composer/search surface. Plugin and app changes
+invalidate the catalog cache and propagate through global WebSocket events.
+
+Computer-use is treated as an app/plugin capability, not as a special browser
+runtime. Dynamic tool-call requests are resolved with structured content items,
+and dynamic tool-call transcript items can render text and image payloads. A
+full WebRTC media stack is intentionally deferred. For screen visibility, the
+planned first transport is a bounded WebSocket snapshot stream: low frame rate,
+small images, explicit owner/admin gating, and reliable RPC for input events.
+WebTransport datagrams are a possible future acceleration path when HTTP/3
+deployment support is available.
+
+See [computer-use.md](./computer-use.md) for the transport rationale.
+
 ## Multi-Account Runtime Model
 
 Multi-account support is implemented as runtime profiles rather than by mutating one shared `~/.codex/auth.json`.

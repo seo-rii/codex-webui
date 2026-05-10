@@ -42,7 +42,8 @@ The project also optimizes for a case where native Codex surfaces can become exp
 - Attachments, Monaco-backed diff/file editing, aggregated live diff, live plan, and subagent activity views
 - Git repository discovery, status, fetch/pull, staged/unstaged Source Control sections, dense tree-or-list change browsing, commit inspection, branch checkout, and worktree management in a VS Code-inspired Git workspace
 - Terminal tabs that survive page reloads as long as the server process stays up
-- Runtime install/update checks, quota display, plugin/skill catalog visibility, and `config.toml` editing
+- Runtime install/update checks, quota display, plugin/skill/app catalog visibility, and `config.toml` editing
+- Computer-use groundwork through Codex app-server plugin/app proxies, dynamic tool-call responses, image/text tool output rendering, remote-control status events, and a documented WebSocket snapshot-stream path before any WebRTC dependency
 - Persistent notification center with unread sync, plus Slack and generic webhook delivery for completion, attention, queue-failure, and shutdown events
 - Session pinning, per-session tags, and saved sidebar filters that persist on the server and stay synchronized across clients
 - Prompt presets stored server-side, plus composer slash commands for presets, queueing, steering, model changes, and plan-mode toggles
@@ -86,6 +87,7 @@ Still evolving:
 - For a high-level feature matrix, see [docs/feature-matrix.md](./docs/feature-matrix.md).
 - For architecture details, see [docs/architecture.md](./docs/architecture.md).
 - For packaging and `npx` distribution details, see [docs/distribution.md](./docs/distribution.md).
+- For computer-use and realtime transport decisions, see [docs/computer-use.md](./docs/computer-use.md).
 
 ## Architecture
 

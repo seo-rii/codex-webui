@@ -914,8 +914,32 @@ pub(crate) async fn session_detail_payload(
         resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
-    let active_turn_id_from_payload = active_turn_id_from_turns(&turns);
-    let cached_active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
+    let raw_active_turn_id_from_payload = active_turn_id_from_turns(&turns);
+    let terminal_runtime_status = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("runtimeStatusByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|statuses| statuses.get(session_id))
+            .and_then(|status| {
+                normalized_thread_status(Some(status))
+                    .filter(|status| !is_live_thread_status(status))
+            }))
+    })
+    .await?;
+    let stale_active_turn_after_exit =
+        raw_active_turn_id_from_payload.is_some() && terminal_runtime_status.is_some();
+    let active_turn_id_from_payload = if stale_active_turn_after_exit {
+        None
+    } else {
+        raw_active_turn_id_from_payload
+    };
+    let cached_active_turn_id = if terminal_runtime_status.is_some() {
+        state.active_turns.lock().await.remove(&runtime_key);
+        state.pending_turn_starts.lock().await.remove(&runtime_key);
+        None
+    } else {
+        state.active_turns.lock().await.get(&runtime_key).cloned()
+    };
     let active_turn_id = active_turn_id_from_payload
         .clone()
         .or_else(|| cached_active_turn_id.clone());
@@ -930,6 +954,8 @@ pub(crate) async fn session_detail_payload(
     }
     let detail_thread_status = if active_turn_id.is_some() {
         json!("running")
+    } else if let Some(status) = terminal_runtime_status {
+        json!(status)
     } else {
         thread
             .get("status")

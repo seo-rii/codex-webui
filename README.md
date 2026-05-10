@@ -239,8 +239,9 @@ Meaning of the main fields:
 
 - A profile should point at a distinct directory such as `~/.codex-work` or `~/.codex-personal`.
 - Codex stores `auth.json`, `config.toml`, sessions, plugins, and skills under `CODEX_HOME`, so separating profiles at that level avoids account collisions.
-- The web UI starts a separate `codex app-server` client per profile on demand and lets each browser client choose its active profile independently.
+- The web UI keeps profile state lightweight at startup and starts `codex app-server` processes only when a profile receives an active Codex request.
 - This means two browsers can stay connected to different accounts at the same time without swapping a shared `~/.codex/auth.json` file.
+- Active Codex app-server processes are capped by `CODEX_WEBUI_MAX_APP_SERVERS` and default to `1`; raise it only when the host has enough memory for concurrent profiles.
 
 If you only want one account at a time, you can still keep a single profile and swap `auth.json` manually before restart. For simultaneous multi-account use, separate `CODEX_HOME` directories are the intended model.
 
@@ -253,6 +254,14 @@ If you only want one account at a time, you can still keep a single profile and 
 - Existing sessions keep their own persisted preferences; changing defaults mainly affects new sessions and future default state.
 - If a saved draft exists while a session is still hydrating, local input typed into the composer wins; draft restore will not clobber text or attachments the user entered during loading.
 - Queued follow-ups are stored server-side and can continue after the page closes as long as the server remains up.
+
+Resource limits:
+
+- `CODEX_WEBUI_MAX_APP_SERVERS`: maximum active Codex app-server processes across profiles. Default: `1`.
+- `CODEX_WEBUI_SERVER_THREADS`: gateway Tokio worker threads. Default: up to `2` based on available parallelism.
+- `CODEX_WEBUI_BLOCKING_THREADS`: gateway blocking pool threads. Default: `max(server_threads * 4, 8)`.
+- `CODEX_WEBUI_SERVER_THREAD_STACK_BYTES`: gateway worker stack size. Default: `8388608`.
+- `CODEX_WEBUI_CONTROLLER_THREADS`: Codex app-server controller worker threads. Default: up to `2`.
 - Terminals also stay alive while the Rust gateway remains up.
 - "Shutdown after queue completes" is a server-global operational toggle, not a per-session preference.
 - When that toggle is armed, the gateway waits until every session queue is empty and no live Codex turn is still running before scheduling shutdown.

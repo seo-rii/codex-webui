@@ -54,7 +54,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
-const SERVER_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_SERVER_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 mod app_util_support;
 mod arena_support;
@@ -211,22 +211,27 @@ fn main() -> Result<()> {
         "CODEX_WEBUI_SERVER_THREADS",
         std::thread::available_parallelism()
             .map(usize::from)
-            .unwrap_or(4)
-            .max(4),
-        2,
-        64,
+            .unwrap_or(1)
+            .min(2)
+            .max(1),
+        1,
+        16,
     );
     let blocking_threads = runtime_thread_count_from_env(
         "CODEX_WEBUI_BLOCKING_THREADS",
-        server_threads.saturating_mul(8).max(32),
-        8,
-        512,
+        server_threads.saturating_mul(4).max(8),
+        4,
+        64,
+    );
+    let server_thread_stack_bytes = runtime_thread_stack_bytes_from_env(
+        "CODEX_WEBUI_SERVER_THREAD_STACK_BYTES",
+        DEFAULT_SERVER_THREAD_STACK_BYTES,
     );
 
     info!(
         server_threads,
         blocking_threads,
-        server_thread_stack_bytes = SERVER_THREAD_STACK_BYTES,
+        server_thread_stack_bytes,
         gateway_log_path = %gateway_log_path.display(),
         "starting codex-webui runtime"
     );
@@ -235,7 +240,7 @@ fn main() -> Result<()> {
         .enable_all()
         .worker_threads(server_threads)
         .max_blocking_threads(blocking_threads)
-        .thread_stack_size(SERVER_THREAD_STACK_BYTES)
+        .thread_stack_size(server_thread_stack_bytes)
         .thread_name("codex-webui-server")
         .build()
         .context("failed to build codex-webui server runtime")?;
@@ -255,6 +260,15 @@ fn runtime_thread_count_from_env(
         .filter(|value| *value > 0)
         .unwrap_or(fallback)
         .clamp(minimum, maximum)
+}
+
+fn runtime_thread_stack_bytes_from_env(name: &str, fallback: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value >= 2 * 1024 * 1024)
+        .unwrap_or(fallback)
+        .clamp(2 * 1024 * 1024, 32 * 1024 * 1024)
 }
 
 async fn run_gateway(config: Arc<Config>) -> Result<()> {
@@ -289,6 +303,7 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             inflight_requests: Arc::new(Mutex::new(HashMap::new())),
             profile_request_slots: Arc::new(Mutex::new(HashMap::new())),
             quota_cache: Arc::new(Mutex::new(HashMap::new())),
+            quota_refreshes: Arc::new(Mutex::new(HashSet::new())),
             attachment_storage_usage_cache: Arc::new(Mutex::new(HashMap::new())),
             relays: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),
@@ -302,6 +317,7 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
             account_login_flows: Arc::new(Mutex::new(HashMap::new())),
             shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
+            runtime_profile_monitors: Arc::new(std::sync::Mutex::new(HashMap::new())),
             preserve_app_servers_on_shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             restart_plan: Arc::new(Mutex::new(None)),

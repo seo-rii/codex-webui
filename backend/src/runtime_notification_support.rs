@@ -407,6 +407,102 @@ async fn session_has_cached_runtime_activity(state: &AppState, runtime_key: &str
         || state.pending_turn_starts.lock().await.contains(runtime_key)
 }
 
+pub(crate) async fn clear_profile_runtime_activity_after_app_server_exit(
+    state: &AppState,
+    profile_id: &str,
+    reason: Option<&str>,
+) -> Vec<String> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let runtime_key_prefix = format!("profile::{resolved_profile_id}::session-runtime::");
+    let now_ms = now_unix_ms();
+    let reason_value = reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+    let mut affected_session_ids = HashSet::new();
+
+    {
+        let mut active_turns = state.active_turns.lock().await;
+        let stale_keys = active_turns
+            .keys()
+            .filter(|key| key.starts_with(&runtime_key_prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in stale_keys {
+            active_turns.remove(&key);
+            if let Some(session_id) = key.strip_prefix(&runtime_key_prefix) {
+                affected_session_ids.insert(session_id.to_string());
+            }
+        }
+    }
+    {
+        let mut pending_turn_starts = state.pending_turn_starts.lock().await;
+        let stale_keys = pending_turn_starts
+            .iter()
+            .filter(|key| key.starts_with(&runtime_key_prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in stale_keys {
+            pending_turn_starts.remove(&key);
+            if let Some(session_id) = key.strip_prefix(&runtime_key_prefix) {
+                affected_session_ids.insert(session_id.to_string());
+            }
+        }
+    }
+
+    let runtime_status_session_ids = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        let mut changed_session_ids = Vec::new();
+        for (session_id, status_value) in runtime_status_by_thread_id.iter_mut() {
+            let status = normalized_thread_status(Some(status_value));
+            if !status.as_deref().is_some_and(is_live_thread_status) {
+                continue;
+            }
+            *status_value = json!({
+                "status": "failed",
+                "updatedAt": now_ms,
+                "reason": reason_value.clone(),
+            });
+            changed_session_ids.push(session_id.clone());
+        }
+        Ok(changed_session_ids)
+    })
+    .await
+    .unwrap_or_default();
+    affected_session_ids.extend(runtime_status_session_ids);
+
+    let affected_session_ids = affected_session_ids.into_iter().collect::<Vec<_>>();
+    for session_id in &affected_session_ids {
+        emit_session_notification(
+            state,
+            profile_id,
+            session_id,
+            json!({
+                "kind": "notification",
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": session_id,
+                    "status": "failed",
+                    "reason": reason_value.clone(),
+                }
+            }),
+        )
+        .await;
+    }
+    affected_session_ids
+}
+
 pub(crate) async fn set_runtime_session_status(
     state: &AppState,
     profile_id: &str,
@@ -694,8 +790,26 @@ pub(crate) async fn restore_persisted_shutdown_state(
         return Ok(());
     }
 
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let runtime_key_prefix = format!("profile::{resolved_profile_id}::");
+    let has_cached_active_work = state
+        .active_turns
+        .lock()
+        .await
+        .keys()
+        .any(|key| key.starts_with(&runtime_key_prefix))
+        || state
+            .pending_turn_starts
+            .lock()
+            .await
+            .iter()
+            .any(|key| key.starts_with(&runtime_key_prefix));
     let has_work_now = has_outstanding_queued_work(state, profile_id).await
-        || has_active_work_across_threads(state, profile_id).await;
+        || if state.app_servers.active_process_count().await == 0 {
+            has_cached_active_work
+        } else {
+            has_active_work_across_threads(state, profile_id).await
+        };
     if shutdown_after_queue_completes && !shutdown_primed && has_work_now {
         with_ui_state_write(state, profile_id, |ui_state| {
             let Some(global) = ui_state.get_mut("global").and_then(Value::as_object_mut) else {
@@ -749,60 +863,86 @@ pub(crate) async fn restore_runtime_profile_state(state: AppState, profile_id: S
         warn!("failed to restore shutdown state for {profile_id}: {error}");
     }
     emit_runtime_profile_config_updated(&state, &profile_id).await;
+}
 
-    let mut reconnect_delay = Duration::from_secs(1);
-    loop {
-        let client = match app_server_client(&state, &profile_id).await {
-            Ok(client) => client,
-            Err(error) => {
-                warn!(
-                    retry_after_ms = reconnect_delay.as_millis(),
-                    "failed to create app-server client for {profile_id}: {error:#}"
-                );
-                tokio::time::sleep(reconnect_delay).await;
-                reconnect_delay = reconnect_delay
-                    .saturating_mul(2)
-                    .min(Duration::from_secs(60));
-                continue;
-            }
-        };
-        let _ = client
-            .request("model/list", json!({ "includeHidden": false }))
-            .await;
-        reconnect_delay = Duration::from_secs(1);
-        let mut notifications = client.subscribe_notifications();
-        let mut requests = client.subscribe_requests();
+pub(crate) fn register_runtime_profile_monitor(
+    state: &AppState,
+    profile_id: &str,
+    mut notifications: broadcast::Receiver<AppServerNotification>,
+    mut requests: broadcast::Receiver<backend::codex_app_server::AppServerRequest>,
+) {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let Ok(mut monitors) = state.runtime_profile_monitors.lock() else {
+        warn!("runtime profile monitor registry is poisoned for {resolved_profile_id}");
+        return;
+    };
+    if monitors
+        .get(&resolved_profile_id)
+        .is_some_and(|handle| !handle.is_finished())
+    {
+        return;
+    }
+    if let Some(handle) = monitors.remove(&resolved_profile_id) {
+        handle.abort();
+    }
 
+    let monitor_state = state.clone();
+    let monitor_profile_id = resolved_profile_id.clone();
+    let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 notification = notifications.recv() => match notification {
                     Ok(notification) => {
-                        handle_profile_runtime_notification(&state, &profile_id, &notification).await;
+                        if notification.method == "codex-webui/app-server/exited" {
+                            let affected_session_ids =
+                                clear_profile_runtime_activity_after_app_server_exit(
+                                &monitor_state,
+                                &monitor_profile_id,
+                                notification.params.get("reason").and_then(Value::as_str),
+                            )
+                            .await;
+                            for session_id in affected_session_ids {
+                                emit_session_summary_updated(
+                                    &monitor_state,
+                                    &monitor_profile_id,
+                                    &session_id,
+                                    None,
+                                    Some("failed"),
+                                )
+                                .await;
+                            }
+                        } else {
+                            handle_profile_runtime_notification(
+                                &monitor_state,
+                                &monitor_profile_id,
+                                &notification,
+                            )
+                            .await;
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(
-                            "runtime app-server relay lagged for {profile_id}: skipped {skipped} messages"
+                            "runtime app-server relay lagged for {monitor_profile_id}: skipped {skipped} messages"
                         );
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
                 request = requests.recv() => match request {
                     Ok(request) => {
-                        handle_profile_server_request(&state, &profile_id, &request).await;
+                        handle_profile_server_request(&monitor_state, &monitor_profile_id, &request)
+                            .await;
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(
-                            "runtime app-server request relay lagged for {profile_id}: skipped {skipped} messages"
+                            "runtime app-server request relay lagged for {monitor_profile_id}: skipped {skipped} messages"
                         );
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
-                }
+                },
             }
         }
-
-        tokio::time::sleep(reconnect_delay).await;
-        reconnect_delay = reconnect_delay
-            .saturating_mul(2)
-            .min(Duration::from_secs(60));
-    }
+    });
+    monitors.insert(resolved_profile_id, handle);
 }

@@ -32,6 +32,7 @@ pub(crate) struct AppState {
     pub(crate) inflight_requests: Arc<Mutex<HashMap<String, InflightRequest>>>,
     pub(crate) profile_request_slots: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     pub(crate) quota_cache: Arc<Mutex<HashMap<String, CachedQuota>>>,
+    pub(crate) quota_refreshes: Arc<Mutex<HashSet<String>>>,
     pub(crate) attachment_storage_usage_cache:
         Arc<Mutex<HashMap<String, CachedAttachmentStorageUsage>>>,
     pub(crate) relays: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
@@ -47,6 +48,8 @@ pub(crate) struct AppState {
         Arc<Mutex<HashMap<String, HashMap<String, PendingServerRequestEntry>>>>,
     pub(crate) account_login_flows: Arc<Mutex<HashMap<String, PendingAccountLoginFlow>>>,
     pub(crate) shutdown_timers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    pub(crate) runtime_profile_monitors:
+        Arc<std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(crate) preserve_app_servers_on_shutdown: Arc<AtomicBool>,
     pub(crate) shutdown_notify: Arc<Notify>,
     pub(crate) restart_plan: Arc<Mutex<Option<RestartPlan>>>,

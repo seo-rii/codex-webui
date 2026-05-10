@@ -1425,9 +1425,12 @@ async fn restore_runtime_profile_state_does_not_schedule_shutdown_without_new_wo
     .await
     .unwrap();
 
-    restore_persisted_shutdown_state(&state, "default")
-        .await
-        .unwrap();
+    restore_runtime_profile_state(state.clone(), "default".to_string()).await;
+    assert_eq!(
+        state.app_servers.client_count().await,
+        0,
+        "startup restore must not allocate a codex app-server client"
+    );
 
     let restored_state = with_ui_state_read(&state, "default", |ui_state| {
         Ok((

@@ -115,6 +115,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
         inflight_requests: Arc::new(Mutex::new(HashMap::new())),
         profile_request_slots: Arc::new(Mutex::new(HashMap::new())),
         quota_cache: Arc::new(Mutex::new(HashMap::new())),
+        quota_refreshes: Arc::new(Mutex::new(HashSet::new())),
         attachment_storage_usage_cache: Arc::new(Mutex::new(HashMap::new())),
         relays: Arc::new(Mutex::new(HashMap::new())),
         terminals: Arc::new(Mutex::new(HashMap::new())),
@@ -128,6 +129,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
         pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
         account_login_flows: Arc::new(Mutex::new(HashMap::new())),
         shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
+        runtime_profile_monitors: Arc::new(std::sync::Mutex::new(HashMap::new())),
         preserve_app_servers_on_shutdown: Arc::new(AtomicBool::new(false)),
         shutdown_notify: Arc::new(Notify::new()),
         restart_plan: Arc::new(Mutex::new(None)),
@@ -433,6 +435,20 @@ for raw_line in sys.stdin:
                     "thread": thread
                 }
             })
+    elif method == "thread/loaded/list":
+        limit = max(1, min(int(params.get("limit", 200) or 200), 200))
+        cursor = str(params.get("cursor") or "").strip()
+        start = int(cursor) if cursor.isdigit() else 0
+        data = list(threads.keys())
+        end = min(start + limit, len(data))
+        next_cursor = str(end) if end < len(data) else None
+        write({
+            "id": request_id,
+            "result": {
+                "data": data[start:end] if start < len(data) else [],
+                "nextCursor": next_cursor
+            }
+        })
     elif method == "thread/list":
         archived = bool(params.get("archived", False))
         limit = max(1, min(int(params.get("limit", 20) or 20), 200))

@@ -5,13 +5,20 @@ pub(crate) async fn app_server_client(
     profile_id: &str,
 ) -> Result<AppServerClient> {
     let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
-    Ok(state
+    let client = state
         .app_servers
         .get_or_create(AppServerProfile {
             id: resolved_profile_id.to_string(),
             codex_home: profile.codex_home.clone(),
         })
-        .await)
+        .await;
+    register_runtime_profile_monitor(
+        state,
+        resolved_profile_id,
+        client.subscribe_notifications(),
+        client.subscribe_requests(),
+    );
+    Ok(client)
 }
 
 pub(crate) fn resolve_runtime_profile_entry<'a>(

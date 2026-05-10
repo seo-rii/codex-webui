@@ -22,13 +22,13 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
     runtime::{Builder as TokioRuntimeBuilder, Handle as TokioRuntimeHandle},
-    sync::{Mutex, broadcast, oneshot},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast, oneshot},
     task::JoinHandle,
     time::timeout,
 };
 use tracing::{info, warn};
 
-const APP_SERVER_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+const APP_SERVER_THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppServerProfile {
@@ -45,6 +45,7 @@ pub struct AppServerClientConfig {
     pub stderr_log_path: Option<PathBuf>,
     pub extra_env: HashMap<String, String>,
     pub controller_threads: usize,
+    pub max_processes: usize,
     pub request_timeout: Duration,
     pub startup_timeout: Duration,
     pub handoff_dir: Option<PathBuf>,
@@ -68,6 +69,7 @@ impl Default for AppServerClientConfig {
             stderr_log_path: None,
             extra_env: HashMap::new(),
             controller_threads: default_controller_thread_count(),
+            max_processes: default_max_process_count(),
             request_timeout: default_request_timeout(),
             startup_timeout: default_startup_timeout(),
             handoff_dir: None,
@@ -119,6 +121,7 @@ struct ProcessState {
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: JoinHandle<()>,
     handoff_proxy: bool,
+    _process_slot: OwnedSemaphorePermit,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +144,7 @@ struct HandoffMeta {
 struct AppServerControllerRuntime {
     handle: TokioRuntimeHandle,
     shutdown_tx: StdMutex<Option<oneshot::Sender<()>>>,
+    process_slots: Arc<Semaphore>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -193,7 +197,8 @@ pub fn app_server_request_interrupted(error: &anyhow::Error) -> bool {
 
 impl AppServerClient {
     pub fn new(profile: AppServerProfile, config: AppServerClientConfig) -> Self {
-        let controller = AppServerControllerRuntime::new(config.controller_threads);
+        let controller =
+            AppServerControllerRuntime::new(config.controller_threads, config.max_processes);
         Self::with_controller(profile, config, controller)
     }
 
@@ -597,6 +602,19 @@ impl AppServerClient {
     }
 
     async fn spawn_process(&self) -> Result<ProcessState> {
+        let process_slot = match timeout(
+            self.inner.config.startup_timeout,
+            self.inner.controller.process_slots.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(slot)) => slot,
+            Ok(Err(_)) => anyhow::bail!("codex app-server process limiter is closed"),
+            Err(_) => anyhow::bail!(
+                "codex app-server process limit reached (max {}). Close an inactive session or set CODEX_WEBUI_MAX_APP_SERVERS to a larger value.",
+                self.inner.config.max_processes.max(1)
+            ),
+        };
         let mut command = Command::new(&self.inner.config.codex_bin);
         let handoff_paths = self.ensure_handoff_server_running().await?;
         let handoff_proxy = handoff_paths.is_some();
@@ -651,6 +669,7 @@ impl AppServerClient {
             shutdown_tx: Some(shutdown_tx),
             join_handle,
             handoff_proxy,
+            _process_slot: process_slot,
         })
     }
 
@@ -769,7 +788,8 @@ impl AppServerClient {
 
 impl AppServerManager {
     pub fn new(config: AppServerClientConfig) -> Self {
-        let controller = AppServerControllerRuntime::new(config.controller_threads);
+        let controller =
+            AppServerControllerRuntime::new(config.controller_threads, config.max_processes);
         Self {
             config,
             clients: Arc::new(Mutex::new(HashMap::new())),
@@ -804,6 +824,20 @@ impl AppServerManager {
 
     pub async fn client_count(&self) -> usize {
         self.clients.lock().await.len()
+    }
+
+    pub async fn active_process_count(&self) -> usize {
+        let clients = {
+            let clients = self.clients.lock().await;
+            clients.values().cloned().collect::<Vec<_>>()
+        };
+        let mut active = 0;
+        for client in clients {
+            if client.inner.process.lock().await.is_some() {
+                active += 1;
+            }
+        }
+        active
     }
 
     pub async fn handoff_status(&self) -> AppServerHandoffStatus {
@@ -1011,9 +1045,10 @@ async fn stop_handoff_server(
 }
 
 impl AppServerControllerRuntime {
-    fn new(worker_threads: usize) -> Arc<Self> {
-        let worker_threads = worker_threads.max(1).min(16);
-        let blocking_threads = worker_threads.saturating_mul(8).max(8);
+    fn new(worker_threads: usize, max_processes: usize) -> Arc<Self> {
+        let worker_threads = worker_threads.clamp(1, 4);
+        let blocking_threads = worker_threads.saturating_mul(4).max(4).min(32);
+        let max_processes = max_processes.clamp(1, 16);
         let (handle_tx, handle_rx) = std_mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -1043,6 +1078,7 @@ impl AppServerControllerRuntime {
         Arc::new(Self {
             handle,
             shutdown_tx: StdMutex::new(Some(shutdown_tx)),
+            process_slots: Arc::new(Semaphore::new(max_processes)),
         })
     }
 }
@@ -1065,10 +1101,19 @@ fn default_controller_thread_count() -> usize {
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(usize::from)
-                .unwrap_or(2)
-                .min(4)
-                .max(2)
+                .unwrap_or(1)
+                .min(2)
+                .max(1)
         })
+        .clamp(1, 4)
+}
+
+fn default_max_process_count() -> usize {
+    std::env::var("CODEX_WEBUI_MAX_APP_SERVERS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
         .clamp(1, 16)
 }
 
@@ -1113,9 +1158,15 @@ async fn supervise_process(
     let _ = stdout_task.await;
     let _ = stderr_task.await;
 
-    let reason = match exit_result {
-        Ok(status) => format!("codex app-server exited ({status})"),
-        Err(error) => format!("failed to wait for codex app-server exit: {error}"),
+    let (reason, exit_code) = match exit_result {
+        Ok(status) => (
+            format!("codex app-server exited ({status})"),
+            status.code().map(Value::from).unwrap_or(Value::Null),
+        ),
+        Err(error) => (
+            format!("failed to wait for codex app-server exit: {error}"),
+            Value::Null,
+        ),
     };
 
     warn!(
@@ -1123,6 +1174,13 @@ async fn supervise_process(
         codex_home = %inner.profile.codex_home.display(),
         "{reason}"
     );
+    let _ = inner.notifications_tx.send(AppServerNotification {
+        method: "codex-webui/app-server/exited".to_string(),
+        params: json!({
+            "reason": reason,
+            "exitCode": exit_code,
+        }),
+    });
     fail_pending_requests(&inner, &reason).await;
 
     let mut process = inner.process.lock().await;
@@ -1318,8 +1376,8 @@ fn classify_incoming_message(line: &str) -> Result<Option<IncomingMessage>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppServerClient, AppServerClientConfig, AppServerNotification, AppServerProfile,
-        AppServerRequest, IncomingMessage, app_server_request_timed_out,
+        AppServerClient, AppServerClientConfig, AppServerManager, AppServerNotification,
+        AppServerProfile, AppServerRequest, IncomingMessage, app_server_request_timed_out,
         app_server_timeout_recovered, classify_incoming_message, handoff_paths,
         write_bytes_atomically,
     };
@@ -1575,6 +1633,91 @@ if sys.argv[1:] == ["app-server", "--listen", "stdio://"]:
         assert!(log.contains("initialized"));
 
         client.close().await.expect("client should close");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manager_limits_active_app_server_processes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "codex-webui-process-limit-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script_path = dir.join("fake-codex.py");
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+if sys.argv[1:] == ["app-server", "--listen", "stdio://"]:
+    for raw_line in sys.stdin:
+        payload = json.loads(raw_line)
+        method = payload.get("method")
+        request_id = payload.get("id")
+        if method == "initialized":
+            continue
+        if method in ("initialize", "config/batchWrite"):
+            print(json.dumps({"id": request_id, "result": {"ok": True}}), flush=True)
+        elif method == "echo":
+            print(json.dumps({"id": request_id, "result": payload.get("params") or {}}), flush=True)
+        else:
+            print(json.dumps({"id": request_id, "error": {"message": "unknown method"}}), flush=True)
+"#,
+        )
+        .expect("fake codex should be written");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("fake codex metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("fake codex should be executable");
+
+        let manager = AppServerManager::new(AppServerClientConfig {
+            codex_bin: script_path.display().to_string(),
+            max_processes: 1,
+            startup_timeout: std::time::Duration::from_millis(150),
+            request_timeout: std::time::Duration::from_secs(1),
+            ..AppServerClientConfig::default()
+        });
+        let first = manager
+            .get_or_create(AppServerProfile {
+                id: "default".to_string(),
+                codex_home: dir.join("codex-home-1"),
+            })
+            .await;
+        let second = manager
+            .get_or_create(AppServerProfile {
+                id: "other".to_string(),
+                codex_home: dir.join("codex-home-2"),
+            })
+            .await;
+
+        first
+            .request("echo", json!({ "profile": "default" }))
+            .await
+            .expect("first profile should acquire the only process slot");
+        let error = second
+            .request("echo", json!({ "profile": "other" }))
+            .await
+            .expect_err("second profile should wait for the process cap");
+        assert!(error.to_string().contains("process limit reached"));
+
+        first.close().await.expect("first client should close");
+        assert_eq!(
+            second
+                .request("echo", json!({ "profile": "other" }))
+                .await
+                .expect("second profile should start after the first closes"),
+            json!({ "profile": "other" })
+        );
+        second.close().await.expect("second client should close");
         let _ = std::fs::remove_dir_all(dir);
     }
 

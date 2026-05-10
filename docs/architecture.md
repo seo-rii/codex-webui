@@ -19,6 +19,7 @@ The browser renders a single workspace page and keeps very little authoritative 
 - credentialed HTTP is used for password login/logout and multipart attachment upload
 - WebSocket RPC is used for session activity, chat, queue operations, Git, terminals, account flows, and runtime actions
 - the UI is optimistic where it helps responsiveness, but server state remains authoritative
+- session screens initially receive summaries and the most recent turn window; older turns, large command output, MCP calls, and file diffs are fetched lazily
 - saved-draft restore is intentionally subordinate to active local composer input, so hydration does not overwrite text the user typed while the session was still loading
 
 ### Rust gateway
@@ -38,6 +39,8 @@ It is responsible for:
 - runtime install/update checks
 - quota fetching
 - session, queue, attachment, Git, editor, notification, and runtime API handling
+- local session rollout indexing, summary hydration, recent-turn parsing, older-turn paging, and lazy transcript item detail loading
+- profile-aware routing to the correct Codex app-server, with lazy startup and a cap on concurrently active profile runtimes
 - enforcing base path and CORS policy
 - appending audit-log entries for privileged login and WebSocket actions
 - exposing lightweight `/healthz`, `/readyz`, and admin-only `/metrics` diagnostics
@@ -45,6 +48,8 @@ It is responsible for:
 ### Codex app-server
 
 `codex app-server` remains the source of truth for live Codex thread execution, thread metadata, and stream notifications.
+
+For cold history reads, `codex-webui` may serve browser-optimized summary and recent-turn payloads from local rollout files first, then reconcile with app-server state when live status matters. This keeps the browser responsive even when the upstream app-server would have to enumerate or serialize very large histories.
 
 ## Request And Event Flow
 
@@ -93,6 +98,30 @@ The current split is deliberate:
 - Rust is the public edge and owns browser-facing state, auth, API handling, terminal persistence, and reconnect safety
 - `codex app-server` stays responsible for live Codex execution and runtime thread notifications
 
+## Performance Model For Large Histories
+
+Long Codex sessions and large session directories are one of the main reasons the gateway does more than simple proxying.
+
+The browser-facing session path is optimized around bounded payloads:
+
+- session listing starts from filesystem candidates ordered by modification time rather than waiting for a full app-server history enumeration
+- candidate metadata is hydrated from Codex state databases or rollout headers only for the visible page
+- the local rollout parser reads bounded tail windows for session detail, so opening a long thread loads recent turns first
+- older turns are requested with an explicit cursor and limit
+- large transcript items, command output, MCP payloads, file changes, and Monaco diffs stay collapsed until expanded
+- summary pages include per-session version hashes so clients can request diffs and avoid replacing the whole list when only a few sessions changed
+
+This gives the web UI a different performance profile from a native local surface. A browser reconnect can restore the visible shell quickly, then progressively hydrate deeper history without blocking chat input, queue operations, or live WebSocket notifications.
+
+The same principle applies to account routing:
+
+- each configured account is represented by a profile with its own `CODEX_HOME`
+- Rust chooses the profile from the signed browser cookie and routes app-server RPC to that profile
+- app-server processes start only when a profile receives active Codex work or an account/runtime request
+- `CODEX_WEBUI_MAX_APP_SERVERS` caps concurrent profile runtimes so a host with many configured accounts does not launch every backend at startup
+
+The result is a multi-backend architecture without making the browser manage backend selection, auth files, or process lifetimes.
+
 ## Multi-Account Runtime Model
 
 Multi-account support is implemented as runtime profiles rather than by mutating one shared `~/.codex/auth.json`.
@@ -140,7 +169,9 @@ The sidebar is built from two sources:
 - `codex-webui`-owned per-session organization metadata such as pins and tags
 - `codex-webui`-owned prompt preset metadata used by the composer and settings workspace
 
-The local index is used because large session histories make direct thread enumeration expensive. The index work runs off the hot request path so session-list refreshes do not block the main server flow.
+The local index is used because large session histories make direct thread enumeration expensive. It does not blindly parse every full transcript for every sidebar refresh. It first scans bounded rollout candidates, then hydrates the metadata needed for the current page, search result, or selected session. Expensive parsing work runs off the hot request path so session-list refreshes do not block the main server flow.
+
+Session detail uses the same strategy. The first detail response contains only the recent turn window and hydration metadata. If the user scrolls upward, the browser asks for older turn pages. If the user expands a collapsed tool call or file change, the browser asks for that item's detail. This is why a very long session can remain usable in the web UI without sending a multi-megabyte transcript on every reconnect.
 
 Completion and input-required badges are not treated as frontend-only affordances. They are persisted in `codex-webui` state, injected into session summaries, and cleared by backend acknowledgement flows when a user opens the relevant session or resolves the pending request state.
 

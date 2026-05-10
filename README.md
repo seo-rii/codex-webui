@@ -22,12 +22,17 @@ Codex already has strong native surfaces:
 
 The goal is not to replace upstream surfaces. The goal is to make Codex usable from a browser while preserving the operational model of local Codex execution.
 
+The project also optimizes for a case where native Codex surfaces can become expensive: many historical sessions, very long rollouts, and browser clients that reconnect frequently. Instead of asking Codex to materialize every session and every turn up front, the web gateway maintains its own lightweight session index, parses only the rollout metadata and recent turn window needed for the current view, and hydrates older turns or large tool details only when the user asks for them.
+
 ## Highlights
 
 - Password-protected browser access with signed HTTP-only cookies
 - Multi-account profile switching backed by separate `CODEX_HOME` directories and profile-scoped `codex app-server` instances
+- Profile-aware backend routing, so each browser session is routed to the correct Codex account without rewriting a shared `auth.json`
+- Lazy profile activation with a configurable cap on active Codex app-server processes, avoiding one app-server per configured account at startup
 - Reconnect-safe WebSocket control plane for chat, sessions, Git, terminals, runtime actions, and account flows
 - Request-ID dedupe at the public gateway so reconnect replays do not execute queue or other mutating RPC calls twice, with role/method/parameter matching and response-size budgets
+- Custom local rollout parser and session index for large histories: sidebar pages, search summaries, recent turns, and per-item details are loaded progressively instead of pulling entire session transcripts into the browser
 - Operational probes for `/healthz`, `/readyz`, and admin-only `/metrics`
 - Dedicated runtime error logs under `<dataDir>/logs/` for Rust gateway failures and per-profile `codex app-server` stderr
 - Optional owner role for host-level capabilities such as terminals, runtime install/update, forced worktree removal, and dangerous session approval/sandbox settings
@@ -57,6 +62,7 @@ Stable enough to use:
 - browser login
 - multi-client session sync
 - progressive session loading
+- large-history session listing and recent-turn hydration
 - queue persistence
 - Git and terminal workflows
 
@@ -90,7 +96,8 @@ Still evolving:
 3. session activity, chat, Git, terminals, and runtime state use a reconnect-safe WebSocket RPC channel
 4. a Rust gateway owns auth, cookies, WebSocket fan-out, terminal persistence, runtime install/update actions, session and Git APIs, and static asset serving
 5. the Rust gateway serves the prebuilt static SPA from `build/static`, rewrites the compile-time base-path placeholder at response time, and talks directly to per-profile `codex app-server` processes for live Codex state
-6. SvelteKit server hooks and `/api` route handlers are removed from the frontend source tree; all shipped API behavior now lives in Rust
+6. the Rust gateway also owns the browser-facing session index and rollout-window parser so long histories can be paged, searched, and expanded without loading every transcript item
+7. SvelteKit server hooks and `/api` route handlers are removed from the frontend source tree; all shipped API behavior now lives in Rust
 
 More detail is in [docs/architecture.md](./docs/architecture.md).
 

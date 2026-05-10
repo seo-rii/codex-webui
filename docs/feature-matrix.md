@@ -49,10 +49,11 @@ Compatibility decisions use these buckets:
 
 | Capability | codex-webui | Codex app comparison | Codex IDE extension comparison | Notes |
 | --- | --- | --- | --- | --- |
-| Session list and chat history | Implemented | Comparable | Comparable | Progressive loading, search, archive, reconnect-safe refresh, and backend-persisted sidebar badges are browser-first additions. |
+| Session list and chat history | Implemented | Comparable | Comparable | Progressive loading, search, archive, reconnect-safe refresh, backend-persisted sidebar badges, and a local rollout metadata index are browser-first additions. |
+| Large-history performance | Implemented | Different shape | Different shape | Uses Rust-side rollout candidate scanning, visible-page metadata hydration, recent-turn windows, older-turn paging, and lazy item detail loading so many or very long sessions do not require full transcript serialization up front. |
 | Multi-turn streaming chat | Implemented | Comparable | Comparable | Streaming survives tab reloads because execution remains server-side. |
 | Model selection | Implemented | Comparable | Comparable | Exposed from the chat composer shell and persisted in session preferences. |
-| Multi-account switching | Implemented | Different shape | Different shape | Uses profile-scoped `CODEX_HOME` directories, independent browser profile cookies, and separate `codex app-server` clients rather than a single shared desktop login state. |
+| Multi-account switching | Implemented | Different shape | Different shape | Uses profile-scoped `CODEX_HOME` directories, independent browser profile cookies, profile-aware backend routing, lazy app-server startup, and a cap on active app-server processes rather than a single shared desktop login state. |
 | Reasoning effort selection | Implemented | Comparable | Comparable | Matches the app-server preference model rather than copying a specific upstream layout. |
 | Plan mode selection | Implemented | Comparable | Comparable | Uses the same session preference model that Codex consumes. |
 | Speed mode selection | Implemented | Comparable | Comparable | Supports `auto`, `fast`, and `flex` where available from model metadata. |
@@ -97,6 +98,8 @@ Upstream Codex surfaces are not primarily optimized for a self-hosted browser de
 - a Rust public gateway
 - signed cookies
 - WebSocket fan-out
+- a local rollout parser and session index optimized for visible summaries and recent turns
+- profile-aware app-server routing instead of swapping one global account file
 - long-lived server-side queue and terminal state
 
 ### Remote-operations focus

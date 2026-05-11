@@ -118,6 +118,7 @@ struct AppServerClientInner {
 struct ProcessState {
     stdin: Arc<Mutex<ChildStdin>>,
     pid: Option<u32>,
+    process_identity: Option<ManagedProcessIdentity>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: JoinHandle<()>,
     handoff_proxy: bool,
@@ -134,11 +135,20 @@ struct HandoffPaths {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct HandoffMeta {
     pid: u32,
+    #[serde(default)]
+    process_identity: Option<ManagedProcessIdentity>,
     profile_id: String,
     socket_path: String,
     codex_bin: String,
     codex_home: String,
     started_at_ms: u128,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct ManagedProcessIdentity {
+    pid: u32,
+    process_group_id: u32,
+    start_time_ticks: u64,
 }
 
 struct AppServerControllerRuntime {
@@ -363,7 +373,7 @@ impl AppServerClient {
     async fn close_on_controller(&self) -> Result<()> {
         let process = self.inner.process.lock().await.take();
         if let Some(mut process) = process {
-            terminate_managed_process_group(process.pid).await;
+            terminate_managed_process_group(process.pid, process.process_identity).await;
             if let Some(shutdown_tx) = process.shutdown_tx.take() {
                 let _ = shutdown_tx.send(());
             }
@@ -666,6 +676,7 @@ impl AppServerClient {
         Ok(ProcessState {
             stdin,
             pid,
+            process_identity: read_managed_process_identity(pid),
             shutdown_tx: Some(shutdown_tx),
             join_handle,
             handoff_proxy,
@@ -744,6 +755,7 @@ impl AppServerClient {
                 )
             })?;
             let pid = child.id().unwrap_or_default();
+            let process_identity = read_managed_process_identity(Some(pid));
             drop(child);
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -751,6 +763,7 @@ impl AppServerClient {
                 if handoff_socket_is_live(&paths.socket_path).await {
                     let meta = HandoffMeta {
                         pid,
+                        process_identity,
                         profile_id: self.inner.profile.id.clone(),
                         socket_path: paths.socket_path.display().to_string(),
                         codex_bin: self.inner.config.codex_bin.clone(),
@@ -960,26 +973,122 @@ async fn handoff_socket_is_live(socket_path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-async fn terminate_managed_process_group(pid: Option<u32>) {
+async fn terminate_managed_process_group(
+    pid: Option<u32>,
+    identity: Option<ManagedProcessIdentity>,
+) {
     let Some(pid) = pid.filter(|pid| *pid > 0) else {
         return;
     };
+    if !managed_process_can_signal_group(pid, identity) {
+        return;
+    }
     let process_group = format!("-{pid}");
     let _ = Command::new("kill")
         .arg("-TERM")
+        .arg("--")
         .arg(&process_group)
+        .status()
+        .await;
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg("--")
+        .arg(pid.to_string())
         .status()
         .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let _ = Command::new("kill")
         .arg("-KILL")
+        .arg("--")
         .arg(&process_group)
+        .status()
+        .await;
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg("--")
+        .arg(pid.to_string())
         .status()
         .await;
 }
 
 #[cfg(not(unix))]
-async fn terminate_managed_process_group(_pid: Option<u32>) {}
+async fn terminate_managed_process_group(
+    _pid: Option<u32>,
+    _identity: Option<ManagedProcessIdentity>,
+) {
+}
+
+#[cfg(unix)]
+fn managed_process_can_signal_group(pid: u32, identity: Option<ManagedProcessIdentity>) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(expected) = identity else {
+            warn!("refusing to terminate codex app-server pid {pid}: process identity unavailable");
+            return false;
+        };
+        if expected.pid != pid {
+            warn!(
+                "refusing to terminate codex app-server pid {pid}: identity pid {} does not match",
+                expected.pid
+            );
+            return false;
+        }
+        if !managed_process_identity_matches(pid, expected) {
+            warn!("refusing to terminate codex app-server pid {pid}: process identity changed");
+            return false;
+        }
+        if expected.process_group_id != pid {
+            warn!(
+                "refusing to terminate codex app-server pid {pid}: process group {} is not child-owned",
+                expected.process_group_id
+            );
+            return false;
+        }
+        true
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, identity);
+        true
+    }
+}
+
+fn read_managed_process_identity(pid: Option<u32>) -> Option<ManagedProcessIdentity> {
+    let pid = pid?;
+    read_managed_process_identity_for_pid(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn read_managed_process_identity_for_pid(pid: u32) -> Option<ManagedProcessIdentity> {
+    let proc_stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_managed_process_identity(pid, &proc_stat)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_managed_process_identity_for_pid(_pid: u32) -> Option<ManagedProcessIdentity> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_managed_process_identity(pid: u32, proc_stat: &str) -> Option<ManagedProcessIdentity> {
+    let fields = proc_stat
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let process_group_id = fields.get(2)?.parse::<u32>().ok()?;
+    let start_time_ticks = fields.get(19)?.parse::<u64>().ok()?;
+    Some(ManagedProcessIdentity {
+        pid,
+        process_group_id,
+        start_time_ticks,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn managed_process_identity_matches(pid: u32, expected: ManagedProcessIdentity) -> bool {
+    read_managed_process_identity_for_pid(pid).is_some_and(|current| current == expected)
+}
 
 #[cfg(unix)]
 async fn stop_handoff_server(
@@ -1005,29 +1114,15 @@ async fn stop_handoff_server(
     }
 
     if meta.pid > 0 {
-        let process_group = format!("-{}", meta.pid);
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(&process_group)
-            .status()
-            .await;
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(meta.pid.to_string())
-            .status()
-            .await;
+        terminate_managed_process_group(Some(meta.pid), meta.process_identity).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         if handoff_socket_is_live(&paths.socket_path).await {
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(&process_group)
-                .status()
-                .await;
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(meta.pid.to_string())
-                .status()
-                .await;
+            warn!(
+                pid = meta.pid,
+                socket = %paths.socket_path.display(),
+                "codex app-server handoff socket is still live after guarded termination"
+            );
+            return Ok(());
         }
     }
 
@@ -1384,6 +1479,37 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_process_group_signaling_requires_current_child_owned_identity() {
+        let parsed = super::parse_managed_process_identity(
+            123,
+            "123 (codex app-server) S 1 123 123 0 -1 4194304 1 2 3 4 5 6 7 8 20 0 1 0 987654321 0",
+        )
+        .expect("proc stat identity should parse");
+        assert_eq!(parsed.pid, 123);
+        assert_eq!(parsed.process_group_id, 123);
+        assert_eq!(parsed.start_time_ticks, 987654321);
+
+        let current_pid = std::process::id();
+        let current = super::read_managed_process_identity_for_pid(current_pid)
+            .expect("current process identity should be readable on linux");
+        assert!(!super::managed_process_can_signal_group(current_pid, None));
+        assert_eq!(
+            super::managed_process_can_signal_group(current_pid, Some(current)),
+            current.process_group_id == current_pid
+        );
+
+        let changed_identity = super::ManagedProcessIdentity {
+            start_time_ticks: current.start_time_ticks.saturating_add(1),
+            ..current
+        };
+        assert!(!super::managed_process_can_signal_group(
+            current_pid,
+            Some(changed_identity)
+        ));
+    }
 
     #[test]
     fn classifies_notifications() {

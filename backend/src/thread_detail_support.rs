@@ -437,6 +437,39 @@ fn build_turn_window_from_rollout_records(
                             .cloned()
                             .unwrap_or_else(|| Value::Null),
                     );
+                    if let Some(last_agent_message) = payload
+                        .get("last_agent_message")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        let has_same_agent_message = turn
+                            .get("items")
+                            .and_then(Value::as_array)
+                            .is_some_and(|items| {
+                                items.iter().any(|item| {
+                                    item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                                        && item.get("text").and_then(Value::as_str)
+                                            == Some(last_agent_message)
+                                })
+                            });
+                        if !has_same_agent_message {
+                            let turn_item_prefix = turn
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("turn")
+                                .to_string();
+                            if let Some(items) = turn.get_mut("items").and_then(Value::as_array_mut)
+                            {
+                                items.push(json!({
+                                    "id": format!("{turn_item_prefix}:agent-complete:{record_index}"),
+                                    "type": "agentMessage",
+                                    "text": last_agent_message,
+                                    "phase": "final_answer"
+                                }));
+                            }
+                        }
+                    }
                 }
             }
             ("event_msg", "user_message") => {
@@ -728,7 +761,7 @@ async fn read_local_session_detail_source(
     if let Some(rollout_path) =
         find_rollout_path_by_session_id(state, profile_id, session_id).await?
     {
-        let thread = read_rollout_thread_metadata_by_session_id(state, profile_id, session_id)
+        let thread = read_local_thread_metadata_payload(state, profile_id, session_id)
             .await?
             .unwrap_or_else(|| {
                 json!({

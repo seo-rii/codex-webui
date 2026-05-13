@@ -636,6 +636,67 @@ async fn rollout_file_listing_hydrates_visible_entries_from_state_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_detail_hydrates_visible_title_from_state_metadata() {
+    let sandbox = unique_test_dir("session-detail-state-title");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let session_id = "019e0000-0000-7000-8000-000000000032";
+
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-21-00",
+        session_id,
+        &workspace,
+        "first prompt fallback title",
+        &[],
+        None,
+    );
+    write_state_thread_fixture(
+        &codex_home,
+        session_id,
+        "AI generated state title",
+        "State preview",
+        &workspace,
+        false,
+        1_713_920_000_000,
+        1_713_920_006_000,
+        None,
+        None,
+        false,
+    );
+
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("name"))
+            .and_then(Value::as_str),
+        Some("AI generated state title")
+    );
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("preview"))
+            .and_then(Value::as_str),
+        Some("State preview")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rollout_file_search_and_archived_listing_use_file_index() {
     let sandbox = unique_test_dir("session-rollout-search");
     let workspace = sandbox.join("workspace");
@@ -1714,6 +1775,7 @@ async fn session_detail_uses_local_rollout_tail_when_thread_read_is_slow() {
                 "payload": {
                     "type": "task_complete",
                     "turn_id": "turn-local",
+                    "last_agent_message": "loaded from rollout tail",
                     "completed_at": 1_776_969_604_000_i64,
                     "duration_ms": 3_000
                 }
@@ -1781,6 +1843,13 @@ async fn session_detail_uses_local_rollout_tail_when_thread_read_is_slow() {
             .and_then(|item| item.get("text"))
             .and_then(Value::as_str),
         Some("open the slow local session")
+    );
+    assert_eq!(
+        turns[0]
+            .get("items")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(2)
     );
     assert_eq!(
         turns[0]
@@ -2080,6 +2149,97 @@ async fn truncated_local_session_detail_exposes_idle_history_state() {
             .and_then(Value::as_array)
             .map(Vec::len),
         Some(1)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_detail_uses_task_complete_last_agent_message_fallback() {
+    let sandbox = unique_test_dir("session-detail-complete-message");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000114";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    fs::write(
+        rollout_dir.join(format!("rollout-2026-04-24T01-07-00-{session_id}.jsonl")),
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:07:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:07:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:07:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-completed"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:07:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "finish in the background"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:07:04.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-completed",
+                    "last_agent_message": "final answer from task completion",
+                    "completed_at": 1_776_970_024_000_i64,
+                    "duration_ms": 3_000
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+
+    let turns = detail
+        .get("thread")
+        .and_then(|value| value.get("turns"))
+        .and_then(Value::as_array)
+        .unwrap();
+    assert_eq!(turns.len(), 1);
+    let items = turns[0].get("items").and_then(Value::as_array).unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str),
+        Some("final answer from task completion")
     );
 
     let _ = fs::remove_dir_all(sandbox);

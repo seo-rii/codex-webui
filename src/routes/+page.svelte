@@ -11027,7 +11027,7 @@
               {/if}
 
               {#if activeLiveTurnId}
-                <div class="turn-card-shell border border-amber-200 rounded-2xl bg-white shadow-sm overflow-hidden">
+                <div class="live-turn-card turn-card-shell border border-amber-200 rounded-2xl bg-white shadow-sm overflow-hidden">
                   <button class="turn-card-header turn-card-header--amber w-full flex items-center justify-between gap-2.5 px-3 py-2 hover:bg-amber-50/40 transition-colors" data-sticky-level="0" onclick={() => (liveTurnCardExpanded = !liveTurnCardExpanded)} type="button">
                     <div class="min-w-0 flex items-center gap-2.5">
                       <div class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-amber-50 text-amber-700 border border-amber-100">
@@ -11075,7 +11075,7 @@
                             <button class="rounded-lg border border-gray-200 bg-white px-2.5 py-1 text-[10px] font-bold text-gray-700 hover:bg-gray-50 transition-colors" onclick={() => openLiveDiffTab(activeLiveTurnId, activeLiveTurnDiff)} type="button">{ui.openTab}</button>
                           </div>
                           {#if activeLiveTurnDiffViews.length > 0}
-                            <div class="max-h-72 overflow-auto">
+                            <div class="live-turn-scroll max-h-72 overflow-auto">
                               {#each activeLiveTurnDiffViews as change (`${change.path}:${change.kind}`)}
                                 <div class="border-t border-gray-100 first:border-t-0">
                                   <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-3 px-2.5 py-2 text-left hover:bg-gray-50 transition-colors" data-sticky-level="2" onclick={() => toggleFileChangeEntry(activeLiveTurnId, "live-diff:active", change)} type="button">
@@ -11132,7 +11132,7 @@
                               {activeLiveTurnSubagents.length}
                             </span>
                           </div>
-                          <div class="max-h-72 overflow-auto">
+                          <div class="live-turn-scroll max-h-72 overflow-auto">
                             {#each activeLiveTurnSubagents as task (task.key)}
                               <div class="flex items-start justify-between gap-2 border-t border-sky-50 px-2.5 py-2.5 first:border-t-0">
                                 <div class="min-w-0 flex-1">
@@ -12766,6 +12766,18 @@
   .turn-card-header[data-sticky-level="3"] {
     top: 10.2rem;
     z-index: 23;
+  }
+
+  .live-turn-card .turn-card-header {
+    position: relative;
+    top: auto;
+    z-index: 1;
+  }
+
+  .live-turn-card .live-turn-scroll .turn-card-header {
+    position: sticky;
+    top: 0;
+    z-index: 3;
   }
 
   .turn-card-shell > :first-child {

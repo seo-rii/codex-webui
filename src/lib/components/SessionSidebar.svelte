@@ -1605,6 +1605,10 @@
     background: var(--scrollbar-thumb-hover);
   }
 
+  .sidebar-flyout {
+    z-index: 150;
+  }
+
   :global(:root[data-theme="dark"]) .sidebar-mode-toggle {
     background: rgba(30, 41, 59, 0.5);
     box-shadow: inset 0 0 0 1px rgba(71, 85, 105, 0.26);

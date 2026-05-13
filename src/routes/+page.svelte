@@ -5564,6 +5564,8 @@
 
   function openMobileSidebar() {
     workspaceMenuOpen = false;
+    composerSettingsOpen = false;
+    resetSessionTurnSearch();
     mobileSidebarOpen = true;
   }
 
@@ -10334,7 +10336,7 @@
     class={[
       "h-full border-r border-gray-200 transition-all duration-300",
       isMobileLayout
-        ? "fixed inset-y-0 left-0 z-[100] max-w-[calc(100vw-1.5rem)] shadow-2xl"
+        ? "fixed inset-y-0 left-0 z-[130] max-w-[calc(100vw-1.5rem)] shadow-2xl"
         : "flex-shrink-0"
     ]}
   >
@@ -12028,7 +12030,7 @@
 {#if isMobileLayout && mobileSidebarOpen}
   <button
     aria-label={ui.closeThreadList}
-    class="ui-scrim ui-scrim--soft fixed inset-0 z-50 transition-all"
+    class="ui-scrim ui-scrim--soft fixed inset-0 z-[120] transition-all"
     onclick={closeMobileSidebar}
     type="button"
   ></button>

@@ -56,6 +56,9 @@ type SessionEventHandler = (event: StreamEvent) => void;
 type TerminalEventHandler = (event: TerminalEvent) => void;
 
 const HEARTBEAT_MS = 20_000;
+const CONNECT_TIMEOUT_MS = 12_000;
+const PONG_TIMEOUT_MS = 10_000;
+const FOREGROUND_STALE_MS = HEARTBEAT_MS + PONG_TIMEOUT_MS;
 const RECONNECT_DELAYS = [250, 500, 1000, 2000, 4000];
 
 function appPath(pathname: string) {
@@ -79,10 +82,13 @@ export class WebSocketRpcClient {
   private socket: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private connectTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  private pongTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
   private connectionGeneration = 0;
   private manualClose = false;
   private hasConnectedOnce = false;
+  private lastActivityAt = 0;
   private pending = new Map<string, PendingRequest>();
   private sessionHandlers = new Map<string, Set<SessionEventHandler>>();
   private terminalHandlers = new Map<string, Set<TerminalEventHandler>>();
@@ -202,12 +208,18 @@ export class WebSocketRpcClient {
     this.reconnectAttempt = 0;
 
     if (this.socket?.readyState === WebSocket.OPEN) {
-      this.sendPing();
+      const staleOpenSocket = this.lastActivityAt > 0 && Date.now() - this.lastActivityAt > FOREGROUND_STALE_MS;
+      if (staleOpenSocket) {
+        this.forceReconnect();
+        return;
+      }
+      this.sendPing(true);
       this.flushPending();
       return;
     }
 
     if (this.socket?.readyState === WebSocket.CONNECTING) {
+      this.forceReconnect();
       return;
     }
 
@@ -226,6 +238,8 @@ export class WebSocketRpcClient {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
+    this.clearConnectTimeout();
+    this.clearPongTimeout();
 
     if (this.socket) {
       this.socket.close();
@@ -252,12 +266,16 @@ export class WebSocketRpcClient {
     this.setConnectionState(this.hasConnectedOnce ? "reconnecting" : "connecting");
     const socket = new WebSocket(this.buildWebSocketUrl());
     this.socket = socket;
+    this.startConnectTimeout(socket);
 
     socket.addEventListener("open", () => {
       if (this.socket !== socket) {
         return;
       }
 
+      this.clearConnectTimeout();
+      this.clearPongTimeout();
+      this.lastActivityAt = Date.now();
       const isReconnect = this.hasConnectedOnce;
       this.hasConnectedOnce = true;
       this.reconnectAttempt = 0;
@@ -283,6 +301,13 @@ export class WebSocketRpcClient {
       try {
         payload = JSON.parse(event.data) as ServerEnvelope;
       } catch {
+        return;
+      }
+
+      this.lastActivityAt = Date.now();
+      this.clearPongTimeout();
+
+      if (payload.kind === "pong") {
         return;
       }
 
@@ -336,6 +361,8 @@ export class WebSocketRpcClient {
       }
       this.socket = null;
       this.stopHeartbeat();
+      this.clearConnectTimeout();
+      this.clearPongTimeout();
 
       if (!this.manualClose && this.hasConnectionDemand()) {
         this.setConnectionState("reconnecting");
@@ -413,7 +440,7 @@ export class WebSocketRpcClient {
   private startHeartbeat() {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
-      this.sendPing();
+      this.sendPing(true);
     }, HEARTBEAT_MS);
   }
 
@@ -424,8 +451,9 @@ export class WebSocketRpcClient {
     }
   }
 
-  private sendPing() {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+  private sendPing(expectPong = false) {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
       return false;
     }
 
@@ -434,12 +462,73 @@ export class WebSocketRpcClient {
       nonce: makeRequestId()
     };
     try {
-      this.socket.send(JSON.stringify(payload));
+      socket.send(JSON.stringify(payload));
+      if (expectPong) {
+        this.startPongTimeout(socket);
+      }
       return true;
     } catch {
-      this.socket.close();
+      socket.close();
       return false;
     }
+  }
+
+  private startConnectTimeout(socket: WebSocket) {
+    this.clearConnectTimeout();
+    this.connectTimeoutTimer = setTimeout(() => {
+      if (this.socket !== socket || socket.readyState !== WebSocket.CONNECTING) {
+        return;
+      }
+      this.forceReconnect();
+    }, CONNECT_TIMEOUT_MS);
+  }
+
+  private clearConnectTimeout() {
+    if (this.connectTimeoutTimer) {
+      clearTimeout(this.connectTimeoutTimer);
+      this.connectTimeoutTimer = null;
+    }
+  }
+
+  private startPongTimeout(socket: WebSocket) {
+    this.clearPongTimeout();
+    this.pongTimeoutTimer = setTimeout(() => {
+      if (this.socket !== socket || socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      this.forceReconnect();
+    }, PONG_TIMEOUT_MS);
+  }
+
+  private clearPongTimeout() {
+    if (this.pongTimeoutTimer) {
+      clearTimeout(this.pongTimeoutTimer);
+      this.pongTimeoutTimer = null;
+    }
+  }
+
+  private forceReconnect() {
+    if (typeof window === "undefined" || !this.hasConnectionDemand()) {
+      return;
+    }
+
+    const socket = this.socket;
+    this.socket = null;
+    this.manualClose = false;
+    this.stopHeartbeat();
+    this.clearConnectTimeout();
+    this.clearPongTimeout();
+    this.setConnectionState(this.hasConnectedOnce ? "reconnecting" : "connecting");
+
+    if (socket && socket.readyState !== WebSocket.CLOSING && socket.readyState !== WebSocket.CLOSED) {
+      try {
+        socket.close();
+      } catch {
+        // The replacement connection below is the recovery path.
+      }
+    }
+
+    this.ensureConnected();
   }
 
   private buildWebSocketUrl() {

@@ -11,6 +11,7 @@ type CacheEnvelope<T> = {
 
 const DB_NAME = "codex-webui-browser-cache";
 const DB_VERSION = 1;
+const BROWSER_CACHE_OPERATION_TIMEOUT_MS = 1_500;
 const STORE_LIMITS: Record<CacheStoreName, { maxEntries: number; ttlMs: number }> = {
   "session-details": {
     maxEntries: 80,
@@ -56,6 +57,24 @@ function pruneMemoryStore(storeName: CacheStoreName) {
 
 function browserSupportsIndexedDb() {
   return typeof window !== "undefined" && typeof window.indexedDB !== "undefined";
+}
+
+async function withBrowserCacheTimeout<T>(operation: Promise<T>) {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error("Browser cache operation timed out."));
+        }, BROWSER_CACHE_OPERATION_TIMEOUT_MS);
+      })
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function openDatabase() {
@@ -122,15 +141,17 @@ async function readEnvelope<T>(storeName: CacheStoreName, key: string) {
   const memory = memoryStores[storeName].get(key) as CacheEnvelope<T> | undefined;
 
   try {
-    const value = await runStoreRequest<CacheEnvelope<T> | null>(storeName, "readonly", (store, resolve, reject) => {
-      const request = store.get(key);
-      request.onsuccess = () => {
-        resolve((request.result as CacheEnvelope<T> | undefined) ?? null);
-      };
-      request.onerror = () => {
-        reject(request.error ?? new Error("Browser cache read failed."));
-      };
-    });
+    const value = await withBrowserCacheTimeout(
+      runStoreRequest<CacheEnvelope<T> | null>(storeName, "readonly", (store, resolve, reject) => {
+        const request = store.get(key);
+        request.onsuccess = () => {
+          resolve((request.result as CacheEnvelope<T> | undefined) ?? null);
+        };
+        request.onerror = () => {
+          reject(request.error ?? new Error("Browser cache read failed."));
+        };
+      })
+    );
     if (value && !isExpiredEnvelope(storeName, value as CacheEnvelope<unknown>)) {
       memoryStores[storeName].set(key, value as CacheEnvelope<unknown>);
       return value;
@@ -152,15 +173,17 @@ async function deleteEnvelope(storeName: CacheStoreName, key: string) {
   }
 
   try {
-    await runStoreRequest<void>(storeName, "readwrite", (store, resolve, reject) => {
-      const request = store.delete(key);
-      request.onsuccess = () => {
-        resolve();
-      };
-      request.onerror = () => {
-        reject(request.error ?? new Error("Browser cache delete failed."));
-      };
-    });
+    await withBrowserCacheTimeout(
+      runStoreRequest<void>(storeName, "readwrite", (store, resolve, reject) => {
+        const request = store.delete(key);
+        request.onsuccess = () => {
+          resolve();
+        };
+        request.onerror = () => {
+          reject(request.error ?? new Error("Browser cache delete failed."));
+        };
+      })
+    );
   } catch {
     // Ignore cache delete failures.
   }
@@ -173,29 +196,31 @@ async function prunePersistentStore(storeName: CacheStoreName) {
   }
 
   try {
-    await runStoreRequest<void>(storeName, "readwrite", (store, resolve, reject) => {
-      const request = store.getAll();
-      request.onsuccess = () => {
-        const entries = ((request.result as CacheEnvelope<unknown>[] | undefined) ?? []).filter(Boolean);
-        const expiredKeys = entries.filter((entry) => isExpiredEnvelope(storeName, entry)).map((entry) => entry.key);
-        const maxEntries = STORE_LIMITS[storeName].maxEntries;
-        const overflowKeys =
-          entries.length > maxEntries
-            ? entries
-                .filter((entry) => !expiredKeys.includes(entry.key))
-                .sort((left, right) => left.savedAt - right.savedAt)
-                .slice(0, entries.length - maxEntries)
-                .map((entry) => entry.key)
-            : [];
-        for (const key of new Set([...expiredKeys, ...overflowKeys])) {
-          store.delete(key);
-        }
-        resolve();
-      };
-      request.onerror = () => {
-        reject(request.error ?? new Error("Browser cache prune failed."));
-      };
-    });
+    await withBrowserCacheTimeout(
+      runStoreRequest<void>(storeName, "readwrite", (store, resolve, reject) => {
+        const request = store.getAll();
+        request.onsuccess = () => {
+          const entries = ((request.result as CacheEnvelope<unknown>[] | undefined) ?? []).filter(Boolean);
+          const expiredKeys = entries.filter((entry) => isExpiredEnvelope(storeName, entry)).map((entry) => entry.key);
+          const maxEntries = STORE_LIMITS[storeName].maxEntries;
+          const overflowKeys =
+            entries.length > maxEntries
+              ? entries
+                  .filter((entry) => !expiredKeys.includes(entry.key))
+                  .sort((left, right) => left.savedAt - right.savedAt)
+                  .slice(0, entries.length - maxEntries)
+                  .map((entry) => entry.key)
+              : [];
+          for (const key of new Set([...expiredKeys, ...overflowKeys])) {
+            store.delete(key);
+          }
+          resolve();
+        };
+        request.onerror = () => {
+          reject(request.error ?? new Error("Browser cache prune failed."));
+        };
+      })
+    );
   } catch {
     // Ignore cache prune failures.
   }
@@ -206,15 +231,17 @@ async function writeEnvelope<T>(storeName: CacheStoreName, envelope: CacheEnvelo
   pruneMemoryStore(storeName);
 
   try {
-    await runStoreRequest<void>(storeName, "readwrite", (store, resolve, reject) => {
-      const request = store.put(envelope);
-      request.onsuccess = () => {
-        resolve();
-      };
-      request.onerror = () => {
-        reject(request.error ?? new Error("Browser cache write failed."));
-      };
-    });
+    await withBrowserCacheTimeout(
+      runStoreRequest<void>(storeName, "readwrite", (store, resolve, reject) => {
+        const request = store.put(envelope);
+        request.onsuccess = () => {
+          resolve();
+        };
+        request.onerror = () => {
+          reject(request.error ?? new Error("Browser cache write failed."));
+        };
+      })
+    );
   } catch {
     // Memory fallback already contains the latest value.
   }
@@ -256,20 +283,26 @@ export async function clearSessionBrowserCache() {
   }
 
   try {
-    const database = await openDatabase();
+    const database = await withBrowserCacheTimeout(openDatabase());
     await Promise.all(
       (["session-details", "session-lists"] as CacheStoreName[]).map(
         (storeName) =>
           new Promise<void>((resolve, reject) => {
-            const transaction = database.transaction(storeName, "readwrite");
-            const store = transaction.objectStore(storeName);
-            const request = store.clear();
-            request.onsuccess = () => {
-              resolve();
-            };
-            request.onerror = () => {
-              reject(request.error ?? new Error("Browser cache clear failed."));
-            };
+            void withBrowserCacheTimeout(
+              new Promise<void>((resolveOperation, rejectOperation) => {
+                const transaction = database.transaction(storeName, "readwrite");
+                const store = transaction.objectStore(storeName);
+                const request = store.clear();
+                request.onsuccess = () => {
+                  resolveOperation();
+                };
+                request.onerror = () => {
+                  rejectOperation(request.error ?? new Error("Browser cache clear failed."));
+                };
+              })
+            )
+              .then(resolve)
+              .catch(reject);
           })
       )
     );

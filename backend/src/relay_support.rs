@@ -1,5 +1,25 @@
 use super::*;
 
+const RELAY_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+
+async fn send_relay_envelope(
+    out_tx: &mpsc::Sender<ServerEnvelope>,
+    message: ServerEnvelope,
+    context: &str,
+) -> bool {
+    match tokio::time::timeout(RELAY_SEND_TIMEOUT, out_tx.send(message)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            warn!(
+                context = context,
+                "dropping websocket subscription after stalled relay send"
+            );
+            false
+        }
+    }
+}
+
 pub(crate) async fn subscribe_session(
     state: AppState,
     out_tx: mpsc::Sender<ServerEnvelope>,
@@ -21,14 +41,16 @@ pub(crate) async fn subscribe_session(
                     let Some(event) = filter_session_event_for_role(role, event) else {
                         continue;
                     };
-                    if stream_out_tx
-                        .try_send(ServerEnvelope::Event {
+                    if !send_relay_envelope(
+                        &stream_out_tx,
+                        ServerEnvelope::Event {
                             session_id: session_key.clone(),
                             event,
-                        })
-                        .is_err()
+                        },
+                        "session-subscription",
+                    )
+                    .await
                     {
-                        warn!("dropping session subscription for slow websocket client");
                         break;
                     }
                 }
@@ -86,14 +108,16 @@ pub(crate) async fn subscribe_terminal(
         loop {
             match receiver.recv().await {
                 Ok(event) => {
-                    if out_tx
-                        .try_send(ServerEnvelope::TerminalEvent {
+                    if !send_relay_envelope(
+                        &out_tx,
+                        ServerEnvelope::TerminalEvent {
                             terminal_id: terminal_key.clone(),
                             event,
-                        })
-                        .is_err()
+                        },
+                        "terminal-subscription",
+                    )
+                    .await
                     {
-                        warn!("dropping terminal subscription for slow websocket client");
                         break;
                     }
                 }
@@ -130,11 +154,13 @@ pub(crate) async fn subscribe_global(
                     let Some(event) = filter_global_event_for_role(role, event) else {
                         continue;
                     };
-                    if out_tx
-                        .try_send(ServerEnvelope::GlobalEvent { event })
-                        .is_err()
+                    if !send_relay_envelope(
+                        &out_tx,
+                        ServerEnvelope::GlobalEvent { event },
+                        "global-subscription",
+                    )
+                    .await
                     {
-                        warn!("dropping global subscription for slow websocket client");
                         break;
                     }
                 }

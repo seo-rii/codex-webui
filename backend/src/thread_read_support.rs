@@ -6,7 +6,7 @@ fn is_unmaterialized_thread_error_message(message: &str) -> bool {
         || lowered.contains("includeturns is unavailable before first user message")
 }
 
-fn thread_agent_nickname(thread: &Value) -> Option<String> {
+pub(crate) fn thread_agent_nickname(thread: &Value) -> Option<String> {
     thread
         .get("agentNickname")
         .and_then(Value::as_str)
@@ -34,7 +34,7 @@ fn thread_agent_nickname(thread: &Value) -> Option<String> {
         })
 }
 
-fn thread_agent_role(thread: &Value) -> Option<String> {
+pub(crate) fn thread_agent_role(thread: &Value) -> Option<String> {
     thread
         .get("agentRole")
         .and_then(Value::as_str)
@@ -67,6 +67,18 @@ pub(crate) fn thread_is_subagent(thread: &Value) -> bool {
         .get("isSubagent")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+        || thread
+            .get("spawnedSubagent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || thread
+            .get("spawned_subagent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || thread
+            .get("spawned_subagent")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value != 0)
         || thread
             .get("source")
             .and_then(|value| value.get("subagent"))

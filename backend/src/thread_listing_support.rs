@@ -174,14 +174,14 @@ pub(crate) fn build_session_summary_from_thread_payload(
         "createdAt": thread.get("createdAt").cloned().unwrap_or_else(|| json!(0)),
         "updatedAt": thread.get("updatedAt").cloned().unwrap_or_else(|| json!(0)),
         "status": status,
-        "isSubagent": thread.get("isSubagent").and_then(Value::as_bool).unwrap_or(false),
-        "agentNickname": thread.get("agentNickname").cloned().unwrap_or(Value::Null),
-        "agentRole": thread.get("agentRole").cloned().unwrap_or(Value::Null),
+        "isSubagent": thread_is_subagent(thread),
+        "agentNickname": thread_agent_nickname(thread).map(Value::String).unwrap_or(Value::Null),
+        "agentRole": thread_agent_role(thread).map(Value::String).unwrap_or(Value::Null),
         "preferences": preferences
     }))
 }
 
-fn project_thread_listing_payload(thread: &Value) -> Value {
+pub(crate) fn project_thread_listing_payload(thread: &Value) -> Value {
     let object = thread.as_object().cloned().unwrap_or_default();
     let mut projected = serde_json::Map::new();
     for key in [
@@ -194,8 +194,12 @@ fn project_thread_listing_payload(thread: &Value) -> Value {
         "updatedAt",
         "status",
         "isSubagent",
+        "spawnedSubagent",
+        "spawned_subagent",
         "agentNickname",
         "agentRole",
+        "agent_nickname",
+        "agent_role",
         "source",
     ] {
         if let Some(value) = object.get(key) {

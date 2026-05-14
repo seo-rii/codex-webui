@@ -353,6 +353,101 @@ async fn rollout_file_listing_and_update_avoid_app_server_thread_lists() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_server_listing_filters_projected_state_db_subagents() {
+    let sandbox = unique_test_dir("session-app-server-subagent-listing");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let visible_id = "019e0000-0000-7000-8000-000000000011";
+    let subagent_id = "019e0000-0000-7000-8000-000000000012";
+    let workspace_path = workspace.display().to_string();
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": visible_id,
+                    "name": "Visible parent session",
+                    "preview": "parent prompt",
+                    "cwd": workspace_path,
+                    "archived": false,
+                    "createdAt": 1_713_920_000_000i64,
+                    "updatedAt": 1_713_920_010_000i64,
+                    "status": "completed"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": subagent_id,
+                    "name": "Hidden worker session",
+                    "preview": "subagent prompt",
+                    "cwd": workspace_path,
+                    "archived": false,
+                    "createdAt": 1_713_920_001_000i64,
+                    "updatedAt": 1_713_920_020_000i64,
+                    "status": "completed",
+                    "spawned_subagent": 1,
+                    "agent_nickname": "Turing",
+                    "agent_role": "explorer"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let projected = project_thread_listing_payload(&json!({
+        "id": subagent_id,
+        "spawned_subagent": 1,
+        "agent_nickname": "Turing",
+        "agent_role": "explorer"
+    }));
+    assert!(thread_is_subagent(&projected));
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        payload
+            .get("sessions")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        payload
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|sessions| sessions.first())
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some(visible_id)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rollout_file_listing_promotes_old_pinned_and_running_sessions() {
     let sandbox = unique_test_dir("session-rollout-priority");
     let workspace = sandbox.join("workspace");

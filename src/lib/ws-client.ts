@@ -50,6 +50,7 @@ type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   sentGeneration: number | null;
+  timeoutTimer: ReturnType<typeof setTimeout>;
 };
 
 type SessionEventHandler = (event: StreamEvent) => void;
@@ -59,6 +60,7 @@ const HEARTBEAT_MS = 20_000;
 const CONNECT_TIMEOUT_MS = 12_000;
 const PONG_TIMEOUT_MS = 10_000;
 const FOREGROUND_STALE_MS = HEARTBEAT_MS + PONG_TIMEOUT_MS;
+const REQUEST_TIMEOUT_MS = 120_000;
 const RECONNECT_DELAYS = [250, 500, 1000, 2000, 4000];
 
 function appPath(pathname: string) {
@@ -111,11 +113,23 @@ export class WebSocketRpcClient {
     };
 
     return new Promise<T>((resolve, reject) => {
+      const timeoutTimer = setTimeout(() => {
+        const pending = this.pending.get(id);
+        if (!pending) {
+          return;
+        }
+
+        this.pending.delete(id);
+        pending.reject(new Error("WebSocket request timed out."));
+        this.sendPing(true);
+      }, REQUEST_TIMEOUT_MS);
+
       this.pending.set(id, {
         message,
         resolve: resolve as (value: unknown) => void,
         reject,
-        sentGeneration: null
+        sentGeneration: null,
+        timeoutTimer
       });
       this.ensureConnected();
       this.flushPending();
@@ -248,6 +262,7 @@ export class WebSocketRpcClient {
     this.setConnectionState("disconnected");
 
     for (const pending of this.pending.values()) {
+      clearTimeout(pending.timeoutTimer);
       pending.reject(new Error(message));
     }
     this.pending.clear();
@@ -318,6 +333,7 @@ export class WebSocketRpcClient {
         }
 
         this.pending.delete(payload.id);
+        clearTimeout(pending.timeoutTimer);
         if (payload.ok) {
           pending.resolve(payload.result);
         } else {

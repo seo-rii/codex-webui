@@ -1,5 +1,14 @@
 use super::*;
 
+fn normalize_session_folder_name(value: Option<&Value>) -> ApiResult<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Folder name is required."))
+}
+
 pub(crate) async fn update_session_organization_payload(
     state: &AppState,
     profile_id: &str,
@@ -76,12 +85,14 @@ pub(crate) async fn update_session_organization_payload(
             session_meta_by_thread_id.insert(session_id.to_string(), meta.clone());
         }
 
+        let meta = session_meta_by_thread_id
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| json!({ "pinned": false, "tags": [] }));
         Ok(json!({
-            "meta": session_meta_by_thread_id
-                .get(session_id)
-                .cloned()
-                .unwrap_or_else(|| json!({ "pinned": false, "tags": [] })),
-            "knownTags": known_tags_from_ui_state(ui_state)
+            "meta": meta,
+            "knownTags": known_tags_from_ui_state(ui_state),
+            "sessionFolders": session_folders_from_ui_state(ui_state)
         }))
     })
     .await?;
@@ -91,12 +102,181 @@ pub(crate) async fn update_session_organization_payload(
         profile_id,
         json!({
             "sessionOrganization": {
-                "knownTags": payload.get("knownTags").cloned().unwrap_or_else(|| json!([]))
+                "knownTags": payload.get("knownTags").cloned().unwrap_or_else(|| json!([])),
+                "sessionFolders": payload
+                    .get("sessionFolders")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]))
             }
         }),
     )
     .await;
     emit_session_summary_updated(state, profile_id, session_id, None, None).await;
+
+    Ok(payload)
+}
+
+pub(crate) async fn upsert_session_folder_payload(
+    state: &AppState,
+    profile_id: &str,
+    params: Value,
+) -> ApiResult<Value> {
+    let name = normalize_session_folder_name(params.get("name"))?;
+    let pinned_patch = params.get("pinned").and_then(Value::as_bool);
+    let payload = with_ui_state_write(state, profile_id, |ui_state| {
+        let now = now_unix_ms();
+        let Some(folders_by_name) = ui_state
+            .get_mut("sessionFoldersByName")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session folders state is missing",
+            ));
+        };
+        let current = folders_by_name
+            .get(&name)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let pinned = pinned_patch.unwrap_or_else(|| {
+            current
+                .get("pinned")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        });
+        let created_at = current
+            .get("createdAt")
+            .and_then(Value::as_u64)
+            .unwrap_or(now);
+        let folder = json!({
+            "name": name,
+            "pinned": pinned,
+            "createdAt": created_at,
+            "updatedAt": now
+        });
+        folders_by_name.insert(name.clone(), folder.clone());
+        Ok(json!({
+            "folder": folder,
+            "knownTags": known_tags_from_ui_state(ui_state),
+            "sessionFolders": session_folders_from_ui_state(ui_state)
+        }))
+    })
+    .await?;
+
+    emit_profile_config_updated(
+        state,
+        profile_id,
+        json!({
+            "sessionOrganization": {
+                "knownTags": payload.get("knownTags").cloned().unwrap_or_else(|| json!([])),
+                "sessionFolders": payload
+                    .get("sessionFolders")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]))
+            }
+        }),
+    )
+    .await;
+
+    Ok(payload)
+}
+
+pub(crate) async fn delete_session_folder_payload(
+    state: &AppState,
+    profile_id: &str,
+    params: Value,
+) -> ApiResult<Value> {
+    let name = normalize_session_folder_name(params.get("name"))?;
+    let remove_from_sessions = params
+        .get("removeFromSessions")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let payload = with_ui_state_write(state, profile_id, |ui_state| {
+        if let Some(folders_by_name) = ui_state
+            .get_mut("sessionFoldersByName")
+            .and_then(Value::as_object_mut)
+        {
+            folders_by_name.remove(&name);
+        }
+        if remove_from_sessions {
+            if let Some(session_meta_by_thread_id) = ui_state
+                .get_mut("sessionMetaByThreadId")
+                .and_then(Value::as_object_mut)
+            {
+                let mut empty_entries = Vec::new();
+                for (session_id, meta) in session_meta_by_thread_id.iter_mut() {
+                    if let Some(meta_object) = meta.as_object_mut() {
+                        let mut next_tags = meta_object
+                            .get("tags")
+                            .and_then(Value::as_array)
+                            .map(|tags| {
+                                tags.iter()
+                                    .filter_map(Value::as_str)
+                                    .filter(|tag| tag.trim() != name)
+                                    .map(str::to_string)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        next_tags.sort();
+                        next_tags.dedup();
+                        meta_object.insert("tags".to_string(), json!(next_tags));
+                        let pinned = meta_object
+                            .get("pinned")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let has_tags = meta_object
+                            .get("tags")
+                            .and_then(Value::as_array)
+                            .is_some_and(|tags| !tags.is_empty());
+                        let has_title = meta_object
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|title| !title.trim().is_empty());
+                        if !pinned && !has_tags && !has_title {
+                            empty_entries.push(session_id.clone());
+                        }
+                    }
+                }
+                for session_id in empty_entries {
+                    session_meta_by_thread_id.remove(&session_id);
+                }
+            }
+        }
+        Ok(json!({
+            "removed": name,
+            "knownTags": known_tags_from_ui_state(ui_state),
+            "sessionFolders": session_folders_from_ui_state(ui_state)
+        }))
+    })
+    .await?;
+
+    emit_profile_config_updated(
+        state,
+        profile_id,
+        json!({
+            "sessionOrganization": {
+                "knownTags": payload.get("knownTags").cloned().unwrap_or_else(|| json!([])),
+                "sessionFolders": payload
+                    .get("sessionFolders")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]))
+            }
+        }),
+    )
+    .await;
+    if remove_from_sessions {
+        emit_profile_global_notification(
+            state,
+            profile_id,
+            json!({
+                "kind": "notification",
+                "method": "codex-webui/sessionListsInvalidated",
+                "params": { "reason": "folderDeleted" }
+            }),
+        )
+        .await;
+    }
 
     Ok(payload)
 }

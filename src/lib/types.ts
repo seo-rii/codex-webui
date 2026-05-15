@@ -77,6 +77,14 @@ export type SavedSessionFilter = SessionSummaryFilter & {
   name: string;
 };
 
+export type SessionFolder = {
+  name: string;
+  pinned: boolean;
+  sessionCount: number;
+  createdAt: number | null;
+  updatedAt: number | null;
+};
+
 export type PromptPreset = {
   id: string;
   name: string;
@@ -399,6 +407,7 @@ export type AppConfigPayload = {
   sessionOrganization: {
     savedFilters: SavedSessionFilter[];
     knownTags: string[];
+    sessionFolders: SessionFolder[];
   };
   promptPresets: PromptPreset[];
   automations: {

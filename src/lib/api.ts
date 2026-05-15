@@ -571,10 +571,30 @@ export const api = {
   },
 
   updateSessionOrganization(sessionId: string, patch: Partial<{ pinned: boolean; tags: string[] }>) {
-    return ws.request<{ meta: { pinned: boolean; tags: string[] }; knownTags: string[] }>("session/organization/update", {
+    return ws.request<{
+      meta: { pinned: boolean; tags: string[] };
+      knownTags: string[];
+      sessionFolders: AppConfigPayload["sessionOrganization"]["sessionFolders"];
+    }>("session/organization/update", {
       sessionId,
       ...patch
     });
+  },
+
+  upsertSessionFolder(name: string, pinned: boolean | null = null) {
+    return ws.request<{
+      folder: AppConfigPayload["sessionOrganization"]["sessionFolders"][number];
+      knownTags: string[];
+      sessionFolders: AppConfigPayload["sessionOrganization"]["sessionFolders"];
+    }>("sessionFolders/upsert", { name, pinned });
+  },
+
+  deleteSessionFolder(name: string, removeFromSessions = false) {
+    return ws.request<{
+      removed: string;
+      knownTags: string[];
+      sessionFolders: AppConfigPayload["sessionOrganization"]["sessionFolders"];
+    }>("sessionFolders/delete", { name, removeFromSessions });
   },
 
   saveSessionFilter(filter: SavedSessionFilter) {

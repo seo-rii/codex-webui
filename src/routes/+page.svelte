@@ -112,6 +112,7 @@
     SessionQueuePayload,
     SessionRolloutRecoveryPayload,
     SessionSearchScope,
+    SessionFolder,
     SessionSummaryFilter,
     SessionSummary,
     SessionTurnSearchMatch,
@@ -272,6 +273,7 @@
     tags: []
   });
   let activeSavedSessionFilterId = $state<string | null>(null);
+  let activeSessionFolder = $state<string | null>(null);
   let showArchivedSessions = $state(false);
   let accountLoginFlow = $state<CodexAccountLoginFlow | null>(null);
   let composerSettingsOpen = $state(false);
@@ -1268,6 +1270,24 @@
 
     const created = await api.createSession(draftState.preferences, nextTitle, draftSelectedSkillsSnapshot);
     upsertSessionSummary(created);
+    if (activeSessionFolder) {
+      try {
+        const response = await api.updateSessionOrganization(created.id, {
+          tags: [activeSessionFolder]
+        });
+        upsertSessionSummary({
+          ...created,
+          pinned: response.meta.pinned,
+          tags: response.meta.tags
+        });
+        updateConfigSessionOrganization({
+          knownTags: response.knownTags,
+          sessionFolders: response.sessionFolders
+        });
+      } catch (error) {
+        errorText = describeError(error);
+      }
+    }
     const restored = await selectSession(created.id);
     if (!restored || !conversation || selectedSessionId !== created.id) {
       activateDraftSession(draftState.preferences, {
@@ -3051,6 +3071,19 @@
 
   function isDefaultSessionFilter(filter: SessionSummaryFilter) {
     return !filter.pinnedOnly && !filter.runningOnly && !filter.queuedOnly && filter.highlight === "all" && filter.tags.length === 0;
+  }
+
+  function updateConfigSessionOrganization(patch: Partial<AppConfigPayload["sessionOrganization"]>) {
+    if (!config) {
+      return;
+    }
+    config = {
+      ...config,
+      sessionOrganization: {
+        ...config.sessionOrganization,
+        ...patch
+      }
+    };
   }
 
   function matchesSessionSummaryFilter(session: SessionSummary, filter: SessionSummaryFilter) {
@@ -7042,15 +7075,10 @@
         pinned: response.meta.pinned,
         tags: response.meta.tags
       });
-      if (config) {
-        config = {
-          ...config,
-          sessionOrganization: {
-            ...config.sessionOrganization,
-            knownTags: response.knownTags
-          }
-        };
-      }
+      updateConfigSessionOrganization({
+        knownTags: response.knownTags,
+        sessionFolders: response.sessionFolders
+      });
       noticeText = nextPinned ? m.session_pinned_notice() : m.session_unpinned_notice();
     } catch (error) {
       errorText = describeError(error);
@@ -7082,15 +7110,10 @@
         pinned: response.meta.pinned,
         tags: response.meta.tags
       });
-      if (config) {
-        config = {
-          ...config,
-          sessionOrganization: {
-            ...config.sessionOrganization,
-            knownTags: response.knownTags
-          }
-        };
-      }
+      updateConfigSessionOrganization({
+        knownTags: response.knownTags,
+        sessionFolders: response.sessionFolders
+      });
       noticeText = m.session_tags_updated_notice();
     } catch (error) {
       errorText = describeError(error);
@@ -7835,6 +7858,11 @@
       ...sessionFilter,
       ...patch
     });
+    activeSessionFolder =
+      sessionFilter.tags.length === 1 &&
+      (config?.sessionOrganization.sessionFolders ?? []).some((folder) => folder.name === sessionFilter.tags[0])
+        ? sessionFilter.tags[0]
+        : null;
     activeSavedSessionFilterId = null;
     scheduleSessionRefresh(60);
   }
@@ -7842,7 +7870,92 @@
   function applySavedSessionFilter(filter: SavedSessionFilter | null) {
     sessionFilter = normalizeSessionFilterState(filter);
     activeSavedSessionFilterId = filter?.id ?? null;
+    activeSessionFolder = null;
     scheduleSessionRefresh(0);
+  }
+
+  function openSessionFolder(folderName: string | null) {
+    activeSessionFolder = folderName;
+    activeSavedSessionFilterId = null;
+    sessionFilter = normalizeSessionFilterState({
+      ...sessionFilter,
+      tags: folderName ? [folderName] : []
+    });
+    showArchivedSessions = false;
+    scheduleSessionRefresh(0);
+  }
+
+  async function createSessionFolder() {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    const folderName = typeof window === "undefined" ? "" : window.prompt(m.session_folder_name_prompt(), "")?.trim() ?? "";
+    if (!folderName) {
+      return;
+    }
+    try {
+      const response = await api.upsertSessionFolder(folderName, false);
+      updateConfigSessionOrganization({
+        knownTags: response.knownTags,
+        sessionFolders: response.sessionFolders
+      });
+      openSessionFolder(response.folder.name);
+      noticeText = m.session_folder_created_notice({ name: response.folder.name });
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function toggleSessionFolderPin(folder: SessionFolder) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    try {
+      const response = await api.upsertSessionFolder(folder.name, !folder.pinned);
+      updateConfigSessionOrganization({
+        knownTags: response.knownTags,
+        sessionFolders: response.sessionFolders
+      });
+      noticeText = response.folder.pinned
+        ? m.session_folder_pinned_notice({ name: response.folder.name })
+        : m.session_folder_unpinned_notice({ name: response.folder.name });
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function setSelectedSessionFolderMembership(folderName: string, inFolder: boolean) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    if (!selectedSessionId || !selectedSessionSummary) {
+      return;
+    }
+    const nextTags = inFolder
+      ? [...new Set([...selectedSessionSummary.tags, folderName])]
+      : selectedSessionSummary.tags.filter((tag) => tag !== folderName);
+    try {
+      const response = await api.updateSessionOrganization(selectedSessionId, {
+        tags: nextTags
+      });
+      applySessionSummaryUpdate({
+        ...selectedSessionSummary,
+        pinned: response.meta.pinned,
+        tags: response.meta.tags
+      });
+      updateConfigSessionOrganization({
+        knownTags: response.knownTags,
+        sessionFolders: response.sessionFolders
+      });
+      noticeText = inFolder
+        ? m.session_folder_added_notice({ name: folderName })
+        : m.session_folder_removed_notice({ name: folderName });
+    } catch (error) {
+      errorText = describeError(error);
+    }
   }
 
   async function saveCurrentSessionFilter() {
@@ -7862,15 +7975,10 @@
         ...sessionFilter
       };
       const response = await api.saveSessionFilter(savedFilter);
-      if (config) {
-        config = {
-          ...config,
-          sessionOrganization: {
-            savedFilters: response.savedFilters,
-            knownTags: response.knownTags
-          }
-        };
-      }
+      updateConfigSessionOrganization({
+        savedFilters: response.savedFilters,
+        knownTags: response.knownTags
+      });
       activeSavedSessionFilterId = savedFilter.id;
       noticeText = m.saved_filter_saved();
     } catch (error) {
@@ -7885,15 +7993,10 @@
     }
     try {
       const response = await api.deleteSessionFilter(filterId);
-      if (config) {
-        config = {
-          ...config,
-          sessionOrganization: {
-            savedFilters: response.savedFilters,
-            knownTags: response.knownTags
-          }
-        };
-      }
+      updateConfigSessionOrganization({
+        savedFilters: response.savedFilters,
+        knownTags: response.knownTags
+      });
       if (activeSavedSessionFilterId === filterId) {
         activeSavedSessionFilterId = null;
       }
@@ -10384,10 +10487,12 @@
       sessionsLoadPercent={sessionLoadPercent}
       searchQuery={sessionSearchQuery}
       searchScope={sessionSearchScope}
-      {sessionFilter}
-      savedSessionFilters={config?.sessionOrganization.savedFilters ?? []}
-      knownSessionTags={config?.sessionOrganization.knownTags ?? []}
-      {activeSavedSessionFilterId}
+	      {sessionFilter}
+	      savedSessionFilters={config?.sessionOrganization.savedFilters ?? []}
+	      knownSessionTags={config?.sessionOrganization.knownTags ?? []}
+	      sessionFolders={config?.sessionOrganization.sessionFolders ?? []}
+	      {activeSessionFolder}
+	      {activeSavedSessionFilterId}
       showArchived={showArchivedSessions}
       showCloseButton={isMobileLayout}
       onArchivedChange={updateArchivedSessions}
@@ -10440,8 +10545,21 @@
       onThemeModeChange={changeThemeMode}
       onSearchQueryChange={updateSessionSearchQuery}
       onSearchScopeChange={updateSessionSearchScope}
-      onSessionFilterChange={updateSessionFilter}
-      onApplySavedFilter={applySavedSessionFilter}
+	      onSessionFilterChange={updateSessionFilter}
+	      onSelectSessionFolder={openSessionFolder}
+	      onCreateSessionFolder={() => {
+	        void createSessionFolder();
+	      }}
+	      onToggleSessionFolderPin={(folder) => {
+	        void toggleSessionFolderPin(folder);
+	      }}
+	      onAddSelectedSessionToFolder={(folderName) => {
+	        void setSelectedSessionFolderMembership(folderName, true);
+	      }}
+	      onRemoveSelectedSessionFromFolder={(folderName) => {
+	        void setSelectedSessionFolderMembership(folderName, false);
+	      }}
+	      onApplySavedFilter={applySavedSessionFilter}
       onSaveCurrentFilter={() => {
         void saveCurrentSessionFilter();
       }}

@@ -30,6 +30,7 @@ fn default_ui_state_value() -> Value {
             "settings": default_notification_settings_value(),
             "webhookFailures": []
         },
+        "sessionFoldersByName": {},
         "sessionMetaByThreadId": {},
         "savedSessionFilters": [],
         "promptPresets": [],
@@ -124,6 +125,7 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
     }
 
     for (key, default_value) in [
+        ("sessionFoldersByName", json!({})),
         ("sessionMetaByThreadId", json!({})),
         ("savedSessionFilters", json!([])),
         ("promptPresets", json!([])),
@@ -487,6 +489,90 @@ pub(crate) fn known_tags_from_ui_state(ui_state: &Value) -> Vec<String> {
     tags.sort();
     tags.dedup();
     tags
+}
+
+pub(crate) fn session_folders_from_ui_state(ui_state: &Value) -> Vec<Value> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    if let Some(entries) = ui_state
+        .get("sessionMetaByThreadId")
+        .and_then(Value::as_object)
+    {
+        for tags in entries
+            .values()
+            .filter_map(Value::as_object)
+            .filter_map(|entry| entry.get("tags"))
+            .filter_map(Value::as_array)
+        {
+            for tag in tags.iter().filter_map(Value::as_str) {
+                let trimmed = tag.trim();
+                if !trimmed.is_empty() {
+                    *counts.entry(trimmed.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    let mut folders: HashMap<String, Value> = HashMap::new();
+    if let Some(entries) = ui_state
+        .get("sessionFoldersByName")
+        .and_then(Value::as_object)
+    {
+        for (key, entry) in entries {
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(key)
+                .trim();
+            if name.is_empty() {
+                continue;
+            }
+            folders.insert(
+                name.to_string(),
+                json!({
+                    "name": name,
+                    "pinned": entry.get("pinned").and_then(Value::as_bool).unwrap_or(false),
+                    "sessionCount": counts.get(name).copied().unwrap_or(0),
+                    "createdAt": entry.get("createdAt").cloned().unwrap_or(Value::Null),
+                    "updatedAt": entry.get("updatedAt").cloned().unwrap_or(Value::Null)
+                }),
+            );
+        }
+    }
+
+    for (name, count) in counts {
+        folders.entry(name.clone()).or_insert_with(|| {
+            json!({
+                "name": name,
+                "pinned": false,
+                "sessionCount": count,
+                "createdAt": Value::Null,
+                "updatedAt": Value::Null
+            })
+        });
+    }
+
+    let mut values = folders.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        let left_pinned = left.get("pinned").and_then(Value::as_bool).unwrap_or(false);
+        let right_pinned = right
+            .get("pinned")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        right_pinned.cmp(&left_pinned).then_with(|| {
+            left.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_lowercase()
+                .cmp(
+                    &right
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_lowercase(),
+                )
+        })
+    });
+    values
 }
 
 pub(crate) fn session_selected_skills_from_ui_state(

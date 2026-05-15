@@ -1713,6 +1713,84 @@ async fn updates_session_organization_and_known_tags() {
             .unwrap_or_default(),
         vec![json!("alpha"), json!("beta")]
     );
+    let folders = payload
+        .get("sessionFolders")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(folders.len(), 2);
+    assert_eq!(
+        folders[0].get("name").and_then(Value::as_str),
+        Some("alpha")
+    );
+    assert_eq!(
+        folders[0].get("sessionCount").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(folders[1].get("name").and_then(Value::as_str), Some("beta"));
+    assert_eq!(
+        folders[1].get("sessionCount").and_then(Value::as_u64),
+        Some(1)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn saves_session_folders_with_pin_state_and_empty_membership() {
+    let sandbox = unique_test_dir("session-folders");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+
+    update_session_organization_payload(
+        &state,
+        "default",
+        "session-1",
+        json!({
+            "tags": ["alpha"]
+        }),
+    )
+    .await
+    .expect("session tag should be saved");
+
+    let payload = upsert_session_folder_payload(
+        &state,
+        "default",
+        json!({
+            "name": "beta",
+            "pinned": true
+        }),
+    )
+    .await
+    .expect("folder should be saved");
+
+    let folders = payload
+        .get("sessionFolders")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(folders.len(), 2);
+    assert_eq!(folders[0].get("name").and_then(Value::as_str), Some("beta"));
+    assert_eq!(
+        folders[0].get("pinned").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        folders[0].get("sessionCount").and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        folders[1].get("name").and_then(Value::as_str),
+        Some("alpha")
+    );
+    assert_eq!(
+        folders[1].get("sessionCount").and_then(Value::as_u64),
+        Some(1)
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }

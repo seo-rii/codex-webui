@@ -19,9 +19,11 @@
     AlertCircle,
     CheckCircle2,
     Bell,
-    ExternalLink,
-    Monitor,
-    Pin,
+	    ExternalLink,
+	    Folder,
+	    FolderOpen,
+	    Monitor,
+	    Pin,
     Moon,
     Sun,
     Power,
@@ -38,8 +40,9 @@
     CodexAccountLoginFlow,
     CodexQuotaStatus,
     CodexRuntimeStatus,
-    SavedSessionFilter,
-    SessionSearchScope,
+	    SavedSessionFilter,
+	    SessionFolder,
+	    SessionSearchScope,
     UserRole,
     SessionSummary,
     SessionSummaryFilter
@@ -61,6 +64,8 @@
     sessionFilter,
     savedSessionFilters,
     knownSessionTags,
+    sessionFolders,
+    activeSessionFolder,
     activeSavedSessionFilterId,
     showArchived,
     onSelect,
@@ -69,6 +74,11 @@
     onSearchQueryChange,
     onSearchScopeChange,
     onSessionFilterChange,
+    onSelectSessionFolder,
+    onCreateSessionFolder,
+    onToggleSessionFolderPin,
+    onAddSelectedSessionToFolder,
+    onRemoveSelectedSessionFromFolder,
     onApplySavedFilter,
     onSaveCurrentFilter,
     onDeleteSavedFilter,
@@ -128,6 +138,8 @@
     sessionFilter: SessionSummaryFilter;
     savedSessionFilters: SavedSessionFilter[];
     knownSessionTags: string[];
+    sessionFolders: SessionFolder[];
+    activeSessionFolder: string | null;
     activeSavedSessionFilterId: string | null;
     showArchived: boolean;
     onSelect: (sessionId: string) => void;
@@ -136,6 +148,11 @@
     onSearchQueryChange: (query: string) => void;
     onSearchScopeChange: (scope: SessionSearchScope) => void;
     onSessionFilterChange: (patch: Partial<SessionSummaryFilter>) => void;
+    onSelectSessionFolder: (folderName: string | null) => void;
+    onCreateSessionFolder: () => void;
+    onToggleSessionFolderPin: (folder: SessionFolder) => void;
+    onAddSelectedSessionToFolder: (folderName: string) => void;
+    onRemoveSelectedSessionFromFolder: (folderName: string) => void;
     onApplySavedFilter: (filter: SavedSessionFilter | null) => void;
     onSaveCurrentFilter: () => void;
     onDeleteSavedFilter: (filterId: string) => void;
@@ -209,7 +226,7 @@
   let boundedAutoloadPasses = $state(0);
   let loadMoreOrigin = $state<"manual" | "auto" | null>(null);
 
-  const ui = $derived.by(() => {
+	  const ui = $derived.by(() => {
     const _locale = $localeSignal;
 
     return {
@@ -225,10 +242,18 @@
       runningOnly: m.running_only(),
       queuedOnly: m.queued_only(),
       allActivity: m.all_activity(),
-      savedFilters: m.saved_filters(),
-      saveCurrentFilter: m.save_current_filter(),
-      filterTags: m.filter_tags(),
-      noSavedFilters: m.no_saved_filters(),
+	      savedFilters: m.saved_filters(),
+	      saveCurrentFilter: m.save_current_filter(),
+	      filterTags: m.filter_tags(),
+	      sessionFolders: m.session_folders(),
+	      allFolders: m.all_folders(),
+	      newFolder: m.new_folder(),
+	      createInFolder: m.create_in_folder(),
+	      pinFolder: m.pin_folder(),
+	      unpinFolder: m.unpin_folder(),
+	      addSessionToFolder: m.add_session_to_folder(),
+	      removeSessionFromFolder: m.remove_session_from_folder(),
+	      noSavedFilters: m.no_saved_filters(),
       noArchivedSessions: m.no_archived_sessions(),
       archiveThread: m.archive_thread(),
       restoreThread: m.restore_thread(),
@@ -289,7 +314,9 @@
       roleAdmin: m.role_admin(),
       roleViewer: m.role_viewer()
     };
-  });
+	  });
+
+	  const selectedSession = $derived(sessions.find((session) => session.id === selectedId) ?? null);
 
   function getDateLocale() {
     return getLocale() === "ko" ? "ko-KR" : "en-US";
@@ -822,10 +849,10 @@
   </div>
 
   <div class="px-4 pb-2 space-y-4">
-    <div class="sidebar-mode-toggle flex p-1 bg-gray-200/50 rounded-lg text-sm">
-      <button
-        class="sidebar-mode-toggle__button flex-1 py-1.5 rounded-md transition-all { !showArchived ? 'bg-white shadow-sm text-gray-900 font-medium' : 'text-gray-500 hover:text-gray-700' }"
-        onclick={() => onArchivedChange(false)}
+	    <div class="sidebar-mode-toggle flex p-1 bg-gray-200/50 rounded-lg text-sm">
+	      <button
+	        class="sidebar-mode-toggle__button flex-1 py-1.5 rounded-md transition-all { !showArchived ? 'bg-white shadow-sm text-gray-900 font-medium' : 'text-gray-500 hover:text-gray-700' }"
+	        onclick={() => onArchivedChange(false)}
       >
         {ui.active}
       </button>
@@ -833,12 +860,101 @@
         class="sidebar-mode-toggle__button flex-1 py-1.5 rounded-md transition-all { showArchived ? 'bg-white shadow-sm text-gray-900 font-medium' : 'text-gray-500 hover:text-gray-700' }"
         onclick={() => onArchivedChange(true)}
       >
-        {ui.archived}
-      </button>
-    </div>
+	        {ui.archived}
+	      </button>
+	    </div>
 
-    <div class="relative">
-      <button
+	    <div class="sidebar-folders rounded-2xl border border-gray-200 bg-white/70 p-2 shadow-sm">
+	      <div class="mb-1 flex items-center justify-between gap-2 px-1">
+	        <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.sessionFolders}</p>
+	        <button
+	          class="rounded-lg p-1 text-gray-400 transition-colors hover:bg-amber-50 hover:text-amber-700 disabled:cursor-not-allowed disabled:opacity-45"
+	          disabled={readOnly}
+	          onclick={onCreateSessionFolder}
+	          title={ui.newFolder}
+	          type="button"
+	        >
+	          <Plus size={13} />
+	        </button>
+	      </div>
+	      <div class="grid gap-1">
+	        <button
+	          class={`flex min-w-0 items-center gap-2 rounded-xl px-2 py-1.5 text-left text-xs transition-colors ${
+	            activeSessionFolder === null ? "bg-gray-900 text-white shadow-sm" : "text-gray-600 hover:bg-gray-100"
+	          }`}
+	          onclick={() => onSelectSessionFolder(null)}
+	          type="button"
+	        >
+	          <FolderOpen size={14} class="shrink-0" />
+	          <span class="min-w-0 flex-1 truncate">{ui.allFolders}</span>
+	        </button>
+	        {#each sessionFolders as folder (folder.name)}
+	          <div class={`group/folder flex min-w-0 items-center gap-1 rounded-xl px-1 py-1 transition-colors ${
+	            activeSessionFolder === folder.name ? "bg-amber-50 text-amber-800" : "text-gray-600 hover:bg-gray-100"
+	          }`}>
+	            <button
+	              class="flex min-w-0 flex-1 items-center gap-2 rounded-lg px-1.5 py-1 text-left text-xs"
+	              onclick={() => onSelectSessionFolder(folder.name)}
+	              type="button"
+	            >
+	              {#if activeSessionFolder === folder.name}
+	                <FolderOpen size={14} class="shrink-0 text-amber-600" />
+	              {:else}
+	                <Folder size={14} class="shrink-0 text-gray-400" />
+	              {/if}
+	              <span class="min-w-0 flex-1 truncate font-medium">{folder.name}</span>
+	              <span class="shrink-0 rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-gray-500">{folder.sessionCount}</span>
+	            </button>
+	            {#if activeSessionFolder === folder.name}
+	              <button
+	                class="rounded-lg p-1 text-amber-600 transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-45"
+	                disabled={readOnly}
+	                onclick={() => onCreate()}
+	                title={ui.createInFolder}
+	                type="button"
+	              >
+	                <Plus size={12} />
+	              </button>
+	            {/if}
+	            {#if selectedSession}
+	              <button
+	                class="rounded-lg p-1 text-gray-400 opacity-0 transition-all hover:bg-white hover:text-amber-700 group-hover/folder:opacity-100 group-focus-within/folder:opacity-100 disabled:cursor-not-allowed disabled:opacity-45"
+	                disabled={readOnly}
+	                onclick={() => {
+	                  if (selectedSession.tags.includes(folder.name)) {
+	                    onRemoveSelectedSessionFromFolder(folder.name);
+	                  } else {
+	                    onAddSelectedSessionToFolder(folder.name);
+	                  }
+	                }}
+	                title={selectedSession.tags.includes(folder.name) ? ui.removeSessionFromFolder : ui.addSessionToFolder}
+	                type="button"
+	              >
+	                {#if selectedSession.tags.includes(folder.name)}
+	                  <X size={12} />
+	                {:else}
+	                  <Plus size={12} />
+	                {/if}
+	              </button>
+	            {/if}
+	            <button
+	              class={`rounded-lg p-1 transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
+	                folder.pinned ? "text-amber-600 hover:bg-amber-100" : "text-gray-400 hover:bg-white hover:text-amber-700"
+	              }`}
+	              disabled={readOnly}
+	              onclick={() => onToggleSessionFolderPin(folder)}
+	              title={folder.pinned ? ui.unpinFolder : ui.pinFolder}
+	              type="button"
+	            >
+	              <Pin size={12} />
+	            </button>
+	          </div>
+	        {/each}
+	      </div>
+	    </div>
+
+	    <div class="relative">
+	      <button
         bind:this={searchTriggerElement}
         aria-expanded={searchPanelOpen}
         class={`sidebar-search-trigger flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition-all ${

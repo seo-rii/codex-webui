@@ -344,6 +344,12 @@ pub(crate) async fn execute_ws_method(
                 .await
                 .map_err(anyhow::Error::from)
         }
+        "sessionFolders/upsert" => upsert_session_folder_payload(state, &auth.profile_id, params)
+            .await
+            .map_err(anyhow::Error::from),
+        "sessionFolders/delete" => delete_session_folder_payload(state, &auth.profile_id, params)
+            .await
+            .map_err(anyhow::Error::from),
         "sessionFilters/save" => save_session_filter_payload(
             state,
             &auth.profile_id,

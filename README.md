@@ -267,6 +267,7 @@ If you only want one account at a time, you can still keep a single profile and 
 Resource limits:
 
 - `CODEX_WEBUI_MAX_APP_SERVERS`: maximum active Codex app-server processes across profiles. Default: `1`.
+- `CODEX_WEBUI_APP_SERVER_TIMEOUT_SECONDS`: Codex app-server request timeout. Default: `600` seconds, so very long sessions can finish initial resume/loading before `turn/start` or `thread/read` is reported as failed.
 - `CODEX_WEBUI_SERVER_THREADS`: gateway Tokio worker threads. Default: up to `2` based on available parallelism.
 - `CODEX_WEBUI_BLOCKING_THREADS`: gateway blocking pool threads. Default: `max(server_threads * 2, 4)`.
 - `CODEX_WEBUI_SERVER_THREAD_STACK_BYTES`: gateway worker stack size. Default and minimum: `16777216`.
@@ -306,6 +307,7 @@ The Rust gateway honors a focused set of `CODEX_WEBUI_*` environment variables. 
 - `CODEX_WEBUI_BASE_PATH`
 - `CODEX_WEBUI_DATA_DIR`
 - `CODEX_WEBUI_CODEX_BIN`
+- `CODEX_WEBUI_APP_SERVER_TIMEOUT_SECONDS`
 - `CODEX_HOME`
 - `CODEX_WEBUI_DEFAULT_PROFILE_ID`
 - `CODEX_WEBUI_PROFILES_JSON`

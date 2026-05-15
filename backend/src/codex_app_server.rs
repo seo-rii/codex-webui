@@ -29,6 +29,9 @@ use tokio::{
 use tracing::{info, warn};
 
 const APP_SERVER_THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
+const APP_SERVER_REQUEST_TIMEOUT_DEFAULT_SECONDS: u64 = 600;
+const APP_SERVER_REQUEST_TIMEOUT_MIN_SECONDS: u64 = 5;
+const APP_SERVER_REQUEST_TIMEOUT_MAX_SECONDS: u64 = 7_200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppServerProfile {
@@ -1213,13 +1216,23 @@ fn default_max_process_count() -> usize {
 }
 
 fn default_request_timeout() -> Duration {
-    let seconds = std::env::var("CODEX_WEBUI_APP_SERVER_TIMEOUT_SECONDS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
+    let env_value = std::env::var("CODEX_WEBUI_APP_SERVER_TIMEOUT_SECONDS").ok();
+    Duration::from_secs(app_server_request_timeout_seconds_from_env_value(
+        env_value.as_deref(),
+    ))
+}
+
+fn app_server_request_timeout_seconds_from_env_value(value: Option<&str>) -> u64 {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(30)
-        .clamp(5, 300);
-    Duration::from_secs(seconds)
+        .unwrap_or(APP_SERVER_REQUEST_TIMEOUT_DEFAULT_SECONDS)
+        .clamp(
+            APP_SERVER_REQUEST_TIMEOUT_MIN_SECONDS,
+            APP_SERVER_REQUEST_TIMEOUT_MAX_SECONDS,
+        )
 }
 
 fn default_startup_timeout() -> Duration {
@@ -1591,6 +1604,22 @@ mod tests {
                 })
                 .to_string()),
             })
+        );
+    }
+
+    #[test]
+    fn app_server_request_timeout_defaults_for_long_sessions() {
+        assert_eq!(
+            super::app_server_request_timeout_seconds_from_env_value(None),
+            600
+        );
+        assert_eq!(
+            super::app_server_request_timeout_seconds_from_env_value(Some("1")),
+            5
+        );
+        assert_eq!(
+            super::app_server_request_timeout_seconds_from_env_value(Some("999999")),
+            7_200
         );
     }
 

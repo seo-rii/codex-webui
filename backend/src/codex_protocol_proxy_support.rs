@@ -1,6 +1,6 @@
 use super::*;
 
-const CODEX_PROTOCOL_PROXY_TIMEOUT: Duration = Duration::from_secs(30);
+const CODEX_PROTOCOL_PROXY_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub(crate) async fn proxy_app_server_payload(
     state: &AppState,

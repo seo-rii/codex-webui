@@ -61,6 +61,50 @@ fn goal_from_response(response: &Value, session_id: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+pub(crate) async fn cache_session_goal_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    goal: &Value,
+) {
+    let goal = goal.clone();
+    let _ = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(goals_by_thread_id) = ui_state
+            .get_mut("goalsByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "goal cache state is missing",
+            ));
+        };
+        if goal.is_null() {
+            goals_by_thread_id.remove(session_id);
+        } else {
+            goals_by_thread_id.insert(session_id.to_string(), goal);
+        }
+        Ok(())
+    })
+    .await;
+}
+
+pub(crate) async fn cached_session_goal_or_null_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> Value {
+    with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("goalsByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|goals| goals.get(session_id))
+            .cloned()
+            .unwrap_or(Value::Null))
+    })
+    .await
+    .unwrap_or(Value::Null)
+}
+
 fn is_goal_disabled_error(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("goal") && message.contains("disabled")
@@ -120,25 +164,7 @@ async fn request_thread_goal(
     }
 }
 
-pub(crate) async fn session_goal_or_null_payload(
-    state: &AppState,
-    profile_id: &str,
-    session_id: &str,
-) -> Value {
-    let Ok(response) = request_thread_goal(
-        state,
-        profile_id,
-        "thread/goal/get",
-        json!({ "threadId": session_id }),
-    )
-    .await
-    else {
-        return Value::Null;
-    };
-    goal_from_response(&response, session_id)
-}
-
-pub(crate) async fn get_session_goal_payload(
+pub(crate) async fn fetch_session_goal_payload(
     state: &AppState,
     profile_id: &str,
     session_id: &str,
@@ -150,8 +176,18 @@ pub(crate) async fn get_session_goal_payload(
         json!({ "threadId": session_id }),
     )
     .await?;
+    let goal = goal_from_response(&response, session_id);
+    cache_session_goal_payload(state, profile_id, session_id, &goal).await;
+    Ok(goal)
+}
+
+pub(crate) async fn get_session_goal_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Value> {
     Ok(json!({
-        "goal": goal_from_response(&response, session_id)
+        "goal": fetch_session_goal_payload(state, profile_id, session_id).await?
     }))
 }
 
@@ -219,8 +255,10 @@ pub(crate) async fn set_session_goal_payload(
         Value::Object(app_server_params),
     )
     .await?;
+    let goal = goal_from_response(&response, session_id);
+    cache_session_goal_payload(state, profile_id, session_id, &goal).await;
     Ok(json!({
-        "goal": goal_from_response(&response, session_id)
+        "goal": goal
     }))
 }
 
@@ -236,6 +274,7 @@ pub(crate) async fn clear_session_goal_payload(
         json!({ "threadId": session_id }),
     )
     .await?;
+    cache_session_goal_payload(state, profile_id, session_id, &Value::Null).await;
     Ok(json!({
         "goal": Value::Null,
         "cleared": response

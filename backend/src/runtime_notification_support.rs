@@ -711,6 +711,18 @@ pub(crate) async fn handle_profile_runtime_notification(
                 params.insert("status".to_string(), Value::String("running".to_string()));
             }
         }
+        if matches!(
+            notification.method.as_str(),
+            "thread/goal/updated" | "thread/goal/cleared"
+        ) {
+            let goal = event
+                .get("params")
+                .and_then(|params| params.get("goal"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            cache_session_goal_payload(state, profile_id, &session_id, &goal).await;
+            emit_profile_global_notification(state, profile_id, event.clone()).await;
+        }
         emit_session_notification(state, profile_id, &session_id, event).await;
     }
     if let Some(frame_event) = map_app_server_computer_frame_notification(notification) {

@@ -1566,6 +1566,13 @@ async fn thread_goal_payload_round_trips_through_app_server() {
             .and_then(Value::as_str),
         Some("paused")
     );
+    assert_eq!(
+        cached_session_goal_or_null_payload(&state, "default", "thread-goal-1")
+            .await
+            .get("status")
+            .and_then(Value::as_str),
+        Some("paused")
+    );
 
     let detail = session_detail_payload(&state, "default", "thread-goal-1", 20)
         .await
@@ -1586,6 +1593,11 @@ async fn thread_goal_payload_round_trips_through_app_server() {
         .await
         .unwrap();
     assert!(get.get("goal").is_some_and(Value::is_null));
+    assert!(
+        cached_session_goal_or_null_payload(&state, "default", "thread-goal-1")
+            .await
+            .is_null()
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -1685,6 +1697,89 @@ fn thread_goal_notifications_are_mapped_for_session_streams() {
             .and_then(Value::as_str),
         Some("budgetLimited")
     );
+    assert_eq!(
+        event
+            .get("params")
+            .and_then(|params| params.get("threadId"))
+            .and_then(Value::as_str),
+        Some("thread-goal-2")
+    );
+
+    let cleared = map_app_server_session_notification(&AppServerNotification {
+        method: "thread/goal/cleared".to_string(),
+        params: json!({
+            "thread_id": "thread-goal-2"
+        }),
+    })
+    .unwrap();
+    assert_eq!(
+        cleared
+            .get("params")
+            .and_then(|params| params.get("threadId"))
+            .and_then(Value::as_str),
+        Some("thread-goal-2")
+    );
+    assert!(
+        cleared
+            .get("params")
+            .and_then(|params| params.get("goal"))
+            .is_some_and(Value::is_null)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_goal_notifications_update_cached_goal_snapshot() {
+    let sandbox = unique_test_dir("thread-goal-notification-cache");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "thread/goal/updated".to_string(),
+            params: json!({
+                "threadId": "thread-goal-cache",
+                "goal": {
+                    "threadId": "thread-goal-cache",
+                    "objective": "finish cached goal",
+                    "status": "complete",
+                    "tokensUsed": 42,
+                    "timeUsedSeconds": 12,
+                    "createdAt": 1,
+                    "updatedAt": 2
+                }
+            }),
+        },
+    )
+    .await;
+    let cached = cached_session_goal_or_null_payload(&state, "default", "thread-goal-cache").await;
+    assert_eq!(
+        cached.get("status").and_then(Value::as_str),
+        Some("complete")
+    );
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "thread/goal/cleared".to_string(),
+            params: json!({
+                "threadId": "thread-goal-cache"
+            }),
+        },
+    )
+    .await;
+    assert!(
+        cached_session_goal_or_null_payload(&state, "default", "thread-goal-cache")
+            .await
+            .is_null()
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
 }
 
 #[test]

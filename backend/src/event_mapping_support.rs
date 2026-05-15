@@ -465,9 +465,11 @@ pub(crate) fn map_app_server_session_notification(
         "thread/goal/updated" => {
             let thread_id = mapped
                 .get("threadId")
+                .or_else(|| mapped.get("thread_id"))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            mapped.insert("threadId".to_string(), Value::String(thread_id.clone()));
             mapped.insert(
                 "goal".to_string(),
                 mapped
@@ -480,6 +482,14 @@ pub(crate) fn map_app_server_session_notification(
                 .or_insert_with(|| Value::Null);
         }
         "thread/goal/cleared" => {
+            if let Some(thread_id) = mapped
+                .get("threadId")
+                .or_else(|| mapped.get("thread_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            {
+                mapped.insert("threadId".to_string(), Value::String(thread_id));
+            }
             mapped.insert("goal".to_string(), Value::Null);
         }
         "item/commandExecution/outputDelta" => {

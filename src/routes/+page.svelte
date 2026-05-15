@@ -5186,6 +5186,16 @@
       return;
     }
 
+    if (event.method === "thread/goal/updated" || event.method === "thread/goal/cleared") {
+      const goal = (event.params.goal ?? null) as SessionDetailPayload["goal"];
+      const goalThreadId = goal?.threadId ?? "";
+      const sessionId = String(event.params.threadId ?? event.params.thread_id ?? goalThreadId ?? "");
+      if (sessionId && selectedSessionId === sessionId) {
+        applyGoalPayloadToConversation(sessionId, event.method === "thread/goal/cleared" ? null : goal);
+      }
+      return;
+    }
+
     if (event.method === "codex-webui/sessionAttention") {
       const sessionId = String(event.params.sessionId ?? "");
       const reason = String(event.params.reason ?? "");

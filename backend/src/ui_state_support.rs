@@ -39,6 +39,7 @@ fn default_ui_state_value() -> Value {
         "skillsByThreadId": {},
         "draftsByThreadId": {},
         "queuesByThreadId": {},
+        "goalsByThreadId": {},
         "highlightsByThreadId": {},
         "runtimeStatusByThreadId": {}
     })
@@ -132,6 +133,7 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
         ("skillsByThreadId", json!({})),
         ("draftsByThreadId", json!({})),
         ("queuesByThreadId", json!({})),
+        ("goalsByThreadId", json!({})),
         ("highlightsByThreadId", json!({})),
         ("runtimeStatusByThreadId", json!({})),
     ] {

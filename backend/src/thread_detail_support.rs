@@ -1014,12 +1014,15 @@ pub(crate) async fn session_detail_payload(
         )))
     })
     .await?;
+    let cached_goal = cached_session_goal_or_null_payload(state, profile_id, session_id).await;
     let goal = tokio::time::timeout(
         Duration::from_millis(SESSION_DETAIL_GOAL_TIMEOUT_MS),
-        session_goal_or_null_payload(state, profile_id, session_id),
+        fetch_session_goal_payload(state, profile_id, session_id),
     )
     .await
-    .unwrap_or(Value::Null);
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or(cached_goal);
     clear_completed_session_highlight_on_open(state, profile_id, session_id).await;
 
     let payload = json!({

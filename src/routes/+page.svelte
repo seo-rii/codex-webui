@@ -124,6 +124,8 @@
     WsConnectionState
   } from "$lib/types";
 
+  const SESSION_LIST_BROWSER_CACHE_SCHEMA_VERSION = 2;
+
   type WorkspaceTabId = "chat" | "tasks" | "git" | "settings" | "computer" | `git-diff:${string}` | `code-diff:${string}` | `file:${string}` | `terminal:${string}`;
   type ComposerSettingsTabId = "session" | "security" | "skills";
   type GitDiffTab = {
@@ -3590,6 +3592,7 @@
     }
 
     return JSON.stringify({
+      schema: SESSION_LIST_BROWSER_CACHE_SCHEMA_VERSION,
       profileId: activeProfileId,
       archived: showArchivedSessions,
       cursor,

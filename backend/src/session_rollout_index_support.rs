@@ -267,6 +267,7 @@ fn read_state_thread_metadata_rows_from_codex_home(
             COALESCE(NULLIF(t.updated_at_ms, 0), t.updated_at * 1000), \
             t.agent_nickname, \
             t.agent_role, \
+            t.source, \
             CASE WHEN EXISTS(SELECT 1 FROM thread_spawn_edges edge WHERE edge.child_thread_id = t.id) THEN 1 ELSE 0 END \
         FROM threads t \
         WHERE t.id IN ({placeholders})"
@@ -285,7 +286,14 @@ fn read_state_thread_metadata_rows_from_codex_home(
             let updated_at: i64 = row.get(6)?;
             let agent_nickname: Option<String> = row.get(7)?;
             let agent_role: Option<String> = row.get(8)?;
-            let spawned_subagent: i64 = row.get(9)?;
+            let source_raw: String = row.get(9)?;
+            let spawned_subagent: i64 = row.get(10)?;
+            let source = serde_json::from_str::<Value>(&source_raw)
+                .unwrap_or_else(|_| Value::String(source_raw));
+            let source_has_subagent = source
+                .get("subagent")
+                .and_then(Value::as_object)
+                .is_some_and(|value| !value.is_empty());
             Ok((
                 session_id.clone(),
                 json!({
@@ -297,7 +305,9 @@ fn read_state_thread_metadata_rows_from_codex_home(
                     "createdAt": created_at,
                     "updatedAt": updated_at,
                     "status": "completed",
+                    "source": source,
                     "isSubagent": spawned_subagent != 0
+                        || source_has_subagent
                         || agent_nickname.as_deref().is_some_and(|value| !value.trim().is_empty())
                         || agent_role.as_deref().is_some_and(|value| !value.trim().is_empty()),
                     "agentNickname": agent_nickname,

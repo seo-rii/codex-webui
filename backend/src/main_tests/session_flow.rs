@@ -731,6 +731,118 @@ async fn rollout_file_listing_hydrates_visible_entries_from_state_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollout_file_listing_filters_state_db_source_only_subagents() {
+    let sandbox = unique_test_dir("session-state-source-subagent");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let visible_id = "019e0000-0000-7000-8000-000000000035";
+    let subagent_id = "019e0000-0000-7000-8000-000000000036";
+
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-22-00",
+        visible_id,
+        &workspace,
+        "visible rollout prompt",
+        &[],
+        None,
+    );
+    write_state_thread_fixture(
+        &codex_home,
+        visible_id,
+        "Visible state title",
+        "Visible state preview",
+        &workspace,
+        false,
+        1_713_920_020_000,
+        1_713_920_020_000,
+        None,
+        None,
+        false,
+    );
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-22-10",
+        subagent_id,
+        &workspace,
+        "source-only subagent prompt",
+        &[],
+        None,
+    );
+    write_state_thread_fixture(
+        &codex_home,
+        subagent_id,
+        "Hidden source subagent",
+        "Hidden source preview",
+        &workspace,
+        false,
+        1_713_920_021_000,
+        1_713_920_030_000,
+        None,
+        None,
+        false,
+    );
+    let connection = Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE threads SET source = ?2 WHERE id = ?1",
+            params![
+                subagent_id,
+                json!({
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": visible_id,
+                            "depth": 1,
+                            "agent_nickname": "Turing",
+                            "agent_role": "explorer"
+                        }
+                    }
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let sessions = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions
+            .first()
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some(visible_id)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_detail_hydrates_visible_title_from_state_metadata() {
     let sandbox = unique_test_dir("session-detail-state-title");
     let workspace = sandbox.join("workspace");

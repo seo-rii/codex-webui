@@ -114,6 +114,7 @@
   "autoloading_more_threads": "다음 세션을 자동으로 더 불러오고 있습니다.",
   "load_more_threads": "세션 더 불러오기",
   "loading_next_session_list": "다음 세션 목록을 불러오는 중입니다.",
+  "running_sessions_count": "작업 중 {count}개",
   "account": "계정",
   "appearance": "화면",
   "system": "시스템",

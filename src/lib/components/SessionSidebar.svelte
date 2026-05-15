@@ -226,7 +226,7 @@
   let boundedAutoloadPasses = $state(0);
   let loadMoreOrigin = $state<"manual" | "auto" | null>(null);
 
-	  const ui = $derived.by(() => {
+  const ui = $derived.by(() => {
     const _locale = $localeSignal;
 
     return {
@@ -242,18 +242,18 @@
       runningOnly: m.running_only(),
       queuedOnly: m.queued_only(),
       allActivity: m.all_activity(),
-	      savedFilters: m.saved_filters(),
-	      saveCurrentFilter: m.save_current_filter(),
-	      filterTags: m.filter_tags(),
-	      sessionFolders: m.session_folders(),
-	      allFolders: m.all_folders(),
-	      newFolder: m.new_folder(),
-	      createInFolder: m.create_in_folder(),
-	      pinFolder: m.pin_folder(),
-	      unpinFolder: m.unpin_folder(),
-	      addSessionToFolder: m.add_session_to_folder(),
-	      removeSessionFromFolder: m.remove_session_from_folder(),
-	      noSavedFilters: m.no_saved_filters(),
+      savedFilters: m.saved_filters(),
+      saveCurrentFilter: m.save_current_filter(),
+      filterTags: m.filter_tags(),
+      sessionFolders: m.session_folders(),
+      allFolders: m.all_folders(),
+      newFolder: m.new_folder(),
+      createInFolder: m.create_in_folder(),
+      pinFolder: m.pin_folder(),
+      unpinFolder: m.unpin_folder(),
+      addSessionToFolder: m.add_session_to_folder(),
+      removeSessionFromFolder: m.remove_session_from_folder(),
+      noSavedFilters: m.no_saved_filters(),
       noArchivedSessions: m.no_archived_sessions(),
       archiveThread: m.archive_thread(),
       restoreThread: m.restore_thread(),
@@ -269,6 +269,7 @@
       autoloadingMoreThreads: m.autoloading_more_threads(),
       loadMoreThreads: m.load_more_threads(),
       loadingNextSessionList: m.loading_next_session_list(),
+      runningSessionsCount: (count: number) => m.running_sessions_count({ count: String(count) }),
       notifications: m.notifications(),
       notificationCenter: m.notification_center(),
       noNotifications: m.no_notifications(),
@@ -314,9 +315,10 @@
       roleAdmin: m.role_admin(),
       roleViewer: m.role_viewer()
     };
-	  });
+  });
 
-	  const selectedSession = $derived(sessions.find((session) => session.id === selectedId) ?? null);
+  const selectedSession = $derived(sessions.find((session) => session.id === selectedId) ?? null);
+  const runningSessionCount = $derived(sessions.filter((session) => isSessionRunning(session)).length);
 
   function getDateLocale() {
     return getLocale() === "ko" ? "ko-KR" : "en-US";
@@ -1199,17 +1201,30 @@
     {#if sessionsBusy || sessionsLoadingMore}
       <div class="absolute top-0 left-0 right-0 z-10">
         <div class="h-0.5 w-full bg-gray-100 overflow-hidden">
-          <div 
-            class="h-full bg-amber-500 transition-all duration-300 ease-out" 
+          <div
+            class="h-full bg-amber-500 transition-all duration-300 ease-out"
             style={`width:${Math.max(8, Math.min(100, sessionsLoadPercent))}%`}
           ></div>
         </div>
       </div>
     {/if}
 
-    <div 
-      bind:this={listElement} 
-      class="flex-1 overflow-y-auto px-4 py-2 space-y-1 scrollbar-thin"
+    <div class="px-4 pb-1 pt-2">
+      <div class={`flex h-8 items-center justify-between rounded-xl border px-2.5 text-xs font-semibold ${
+        runningSessionCount > 0
+          ? "border-amber-200 bg-amber-50 text-amber-800"
+          : "border-gray-200 bg-gray-50 text-gray-500"
+      }`}>
+        <span class="flex min-w-0 items-center gap-2">
+          <span class={`h-2 w-2 shrink-0 rounded-full ${runningSessionCount > 0 ? "animate-pulse bg-amber-500" : "bg-gray-300"}`}></span>
+          <span class="truncate">{ui.runningSessionsCount(runningSessionCount)}</span>
+        </span>
+      </div>
+    </div>
+
+    <div
+      bind:this={listElement}
+      class="flex-1 overflow-y-auto px-4 pb-2 pt-1 space-y-1 scrollbar-thin"
       onscroll={handleListScroll}
     >
       {#if sessions.length === 0}

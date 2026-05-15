@@ -114,6 +114,7 @@
   "autoloading_more_threads": "Automatically loading more sessions.",
   "load_more_threads": "Load more threads",
   "loading_next_session_list": "Loading the next sessions.",
+  "running_sessions_count": "{count} running",
   "account": "Account",
   "appearance": "Appearance",
   "system": "System",

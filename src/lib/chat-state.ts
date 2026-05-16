@@ -46,6 +46,14 @@ function normalizeItemTypeName(itemType: string) {
   return itemType;
 }
 
+function isContextCompactionItem(item: CodexItem) {
+  return normalizeItemTypeName(item.type) === "contextCompaction";
+}
+
+function findContextCompactionItemIndex(items: CodexItem[]) {
+  return items.findIndex((item) => isContextCompactionItem(item));
+}
+
 function ensureTurn(state: ConversationState, turnId: string, seed?: Partial<CodexTurn>) {
   const turns = [...state.thread.turns];
   let index = turns.findIndex((turn) => turn.id === turnId);
@@ -72,12 +80,23 @@ function ensureTurn(state: ConversationState, turnId: string, seed?: Partial<Cod
 }
 
 function upsertItem(turn: CodexTurn, item: CodexItem) {
-  const index = turn.items.findIndex((candidate) => candidate.id === item.id);
+  const normalizedItem: CodexItem = {
+    ...item,
+    type: normalizeItemTypeName(item.type)
+  };
+  const index = turn.items.findIndex((candidate) => candidate.id === normalizedItem.id);
   if (index === -1) {
-    turn.items = [...turn.items, item];
+    const contextCompactionIndex = isContextCompactionItem(normalizedItem) ? findContextCompactionItemIndex(turn.items) : -1;
+    if (contextCompactionIndex !== -1) {
+      turn.items = turn.items.map((candidate, candidateIndex) =>
+        candidateIndex === contextCompactionIndex ? mergeItem(candidate, normalizedItem) : candidate
+      );
+      return;
+    }
+    turn.items = [...turn.items, normalizedItem];
     return;
   }
-  turn.items = turn.items.map((candidate, candidateIndex) => (candidateIndex === index ? { ...candidate, ...item } : candidate));
+  turn.items = turn.items.map((candidate, candidateIndex) => (candidateIndex === index ? mergeItem(candidate, normalizedItem) : candidate));
 }
 
 function resolveConversationRunningTurn(state: ConversationState) {
@@ -171,6 +190,9 @@ function mergeItem(existingItem: CodexItem | undefined, incomingItem: CodexItem)
     ...normalizedExistingItem,
     ...normalizedIncomingItem
   };
+  if (normalizedExistingItem.type === "contextCompaction" && normalizedIncomingItem.type === "contextCompaction") {
+    merged.id = normalizedExistingItem.id;
+  }
 
   if (normalizedExistingItem.detailState === "loaded" && normalizedIncomingItem.detailState !== "loaded") {
     merged.detailState = "loaded";
@@ -286,7 +308,17 @@ function mergeTurnItems(existingItems: CodexItem[], incomingItems: CodexItem[]) 
   const userMessageSignatures = new Set<string>();
   const deduped: CodexItem[] = [];
   for (const item of merged) {
-    if (normalizeItemTypeName(item.type) !== "userMessage") {
+    const itemType = normalizeItemTypeName(item.type);
+    if (itemType === "contextCompaction") {
+      const contextCompactionIndex = findContextCompactionItemIndex(deduped);
+      if (contextCompactionIndex === -1) {
+        deduped.push({ ...item, type: itemType });
+      } else {
+        deduped[contextCompactionIndex] = mergeItem(deduped[contextCompactionIndex], { ...item, type: itemType });
+      }
+      continue;
+    }
+    if (itemType !== "userMessage") {
       deduped.push(item);
       continue;
     }
@@ -810,15 +842,14 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
     const turnId = String(params.turnId ?? "");
     const seeded = ensureTurn(next, turnId);
     const streamItem = (params.item as CodexItem) ?? ({ id: String(params.itemId ?? ""), type: "unknown" } satisfies CodexItem);
-    upsertItem(
-      seeded.turn,
-      streamItem.type === "contextCompaction"
-        ? {
-            ...streamItem,
-            lifecycleStatus: method === "item/started" ? "inProgress" : "completed"
-          }
-        : streamItem
-    );
+    const itemType = normalizeItemTypeName(streamItem.type);
+    const lifecycleStatus =
+      itemType === "contextCompaction" ? (method === "item/started" ? "inProgress" : "completed") : streamItem.lifecycleStatus;
+    upsertItem(seeded.turn, {
+      ...streamItem,
+      type: itemType,
+      lifecycleStatus
+    });
     next.thread.turns = seeded.turns;
     return next;
   }

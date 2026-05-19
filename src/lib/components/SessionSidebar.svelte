@@ -870,7 +870,7 @@
 	      <div class="mb-1 flex items-center justify-between gap-2 px-1">
 	        <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.sessionFolders}</p>
 	        <button
-	          class="rounded-lg p-1 text-gray-400 transition-colors hover:bg-amber-50 hover:text-amber-700 disabled:cursor-not-allowed disabled:opacity-45"
+	          class="sidebar-folder-action rounded-lg p-1 text-gray-400 transition-colors hover:bg-amber-50 hover:text-amber-700 disabled:cursor-not-allowed disabled:opacity-45"
 	          disabled={readOnly}
 	          onclick={onCreateSessionFolder}
 	          title={ui.newFolder}
@@ -881,8 +881,8 @@
 	      </div>
 	      <div class="grid gap-1">
 	        <button
-	          class={`flex min-w-0 items-center gap-2 rounded-xl px-2 py-1.5 text-left text-xs transition-colors ${
-	            activeSessionFolder === null ? "bg-gray-900 text-white shadow-sm" : "text-gray-600 hover:bg-gray-100"
+	          class={`sidebar-folder-item flex min-w-0 items-center gap-2 rounded-xl px-2 py-1.5 text-left text-xs transition-colors ${
+	            activeSessionFolder === null ? "sidebar-folder-item--active bg-gray-900 text-white shadow-sm" : "text-gray-600 hover:bg-gray-100"
 	          }`}
 	          onclick={() => onSelectSessionFolder(null)}
 	          type="button"
@@ -891,8 +891,8 @@
 	          <span class="min-w-0 flex-1 truncate">{ui.allFolders}</span>
 	        </button>
 	        {#each sessionFolders as folder (folder.name)}
-	          <div class={`group/folder flex min-w-0 items-center gap-1 rounded-xl px-1 py-1 transition-colors ${
-	            activeSessionFolder === folder.name ? "bg-amber-50 text-amber-800" : "text-gray-600 hover:bg-gray-100"
+	          <div class={`sidebar-folder-item group/folder flex min-w-0 items-center gap-1 rounded-xl px-1 py-1 transition-colors ${
+	            activeSessionFolder === folder.name ? "sidebar-folder-item--active bg-amber-50 text-amber-800" : "text-gray-600 hover:bg-gray-100"
 	          }`}>
 	            <button
 	              class="flex min-w-0 flex-1 items-center gap-2 rounded-lg px-1.5 py-1 text-left text-xs"
@@ -905,11 +905,11 @@
 	                <Folder size={14} class="shrink-0 text-gray-400" />
 	              {/if}
 	              <span class="min-w-0 flex-1 truncate font-medium">{folder.name}</span>
-	              <span class="shrink-0 rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-gray-500">{folder.sessionCount}</span>
+	              <span class="sidebar-folder-count shrink-0 rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-gray-500">{folder.sessionCount}</span>
 	            </button>
 	            {#if activeSessionFolder === folder.name}
 	              <button
-	                class="rounded-lg p-1 text-amber-600 transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-45"
+	                class="sidebar-folder-action rounded-lg p-1 text-amber-600 transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-45"
 	                disabled={readOnly}
 	                onclick={() => onCreate()}
 	                title={ui.createInFolder}
@@ -920,7 +920,7 @@
 	            {/if}
 	            {#if selectedSession}
 	              <button
-	                class="rounded-lg p-1 text-gray-400 opacity-0 transition-all hover:bg-white hover:text-amber-700 group-hover/folder:opacity-100 group-focus-within/folder:opacity-100 disabled:cursor-not-allowed disabled:opacity-45"
+	                class="sidebar-folder-action rounded-lg p-1 text-gray-400 opacity-0 transition-all hover:bg-white hover:text-amber-700 group-hover/folder:opacity-100 group-focus-within/folder:opacity-100 disabled:cursor-not-allowed disabled:opacity-45"
 	                disabled={readOnly}
 	                onclick={() => {
 	                  if (selectedSession.tags.includes(folder.name)) {
@@ -940,7 +940,7 @@
 	              </button>
 	            {/if}
 	            <button
-	              class={`rounded-lg p-1 transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
+	              class={`sidebar-folder-action rounded-lg p-1 transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
 	                folder.pinned ? "text-amber-600 hover:bg-amber-100" : "text-gray-400 hover:bg-white hover:text-amber-700"
 	              }`}
 	              disabled={readOnly}
@@ -1749,15 +1749,57 @@
     color: #94a3b8;
   }
 
-  :global(:root[data-theme="dark"]) .sidebar-mode-toggle__button.bg-white {
-    background: linear-gradient(180deg, rgba(30, 41, 59, 0.96), rgba(15, 23, 42, 0.98)) !important;
-    color: #f8fafc !important;
-    box-shadow:
-      0 14px 28px -24px rgba(2, 6, 23, 0.92),
-      inset 0 0 0 1px rgba(148, 163, 184, 0.14);
-  }
+	  :global(:root[data-theme="dark"]) .sidebar-mode-toggle__button.bg-white {
+	    background: linear-gradient(180deg, rgba(30, 41, 59, 0.96), rgba(15, 23, 42, 0.98)) !important;
+	    color: #f8fafc !important;
+	    box-shadow:
+	      0 14px 28px -24px rgba(2, 6, 23, 0.92),
+	      inset 0 0 0 1px rgba(148, 163, 184, 0.14);
+	  }
 
-  :global(:root[data-theme="dark"]) .sidebar-search-trigger {
+	  :global(:root[data-theme="dark"]) .sidebar-folders {
+	    border-color: rgba(71, 85, 105, 0.36) !important;
+	    background: linear-gradient(180deg, rgba(17, 24, 39, 0.82), rgba(15, 23, 42, 0.92)) !important;
+	    box-shadow:
+	      0 18px 38px -32px rgba(2, 6, 23, 0.92),
+	      inset 0 0 0 1px rgba(148, 163, 184, 0.08);
+	  }
+
+	  :global(:root[data-theme="dark"]) .sidebar-folder-item {
+	    color: #cbd5e1 !important;
+	  }
+
+	  :global(:root[data-theme="dark"]) .sidebar-folder-item:hover {
+	    background: rgba(30, 41, 59, 0.82) !important;
+	    color: #f8fafc !important;
+	  }
+
+	  :global(:root[data-theme="dark"]) .sidebar-folder-item--active {
+	    background: linear-gradient(180deg, rgba(69, 39, 10, 0.42), rgba(15, 23, 42, 0.88)) !important;
+	    color: #fde68a !important;
+	    box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.24);
+	  }
+
+	  :global(:root[data-theme="dark"]) .sidebar-folder-count {
+	    background: rgba(30, 41, 59, 0.9) !important;
+	    color: #94a3b8 !important;
+	  }
+
+	  :global(:root[data-theme="dark"]) .sidebar-folder-item--active .sidebar-folder-count {
+	    background: rgba(245, 158, 11, 0.16) !important;
+	    color: #fde68a !important;
+	  }
+
+	  :global(:root[data-theme="dark"]) .sidebar-folder-action {
+	    color: #94a3b8 !important;
+	  }
+
+	  :global(:root[data-theme="dark"]) .sidebar-folder-action:hover {
+	    background: rgba(51, 65, 85, 0.82) !important;
+	    color: #fde68a !important;
+	  }
+
+	  :global(:root[data-theme="dark"]) .sidebar-search-trigger {
     border-color: rgba(71, 85, 105, 0.48) !important;
     background: linear-gradient(180deg, rgba(17, 24, 39, 0.9), rgba(15, 23, 42, 0.96)) !important;
     box-shadow: 0 20px 40px -34px rgba(2, 6, 23, 0.85) !important;

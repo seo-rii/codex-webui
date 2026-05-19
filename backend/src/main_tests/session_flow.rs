@@ -2360,6 +2360,139 @@ async fn app_server_exit_clears_cached_running_session_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_reconcile_marks_lost_active_session_failed_without_app_server() {
+    let sandbox = unique_test_dir("runtime-reconcile-no-app-server");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let session_id = "thread-lost-no-app-server";
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-lost".to_string());
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][session_id] = json!({
+            "status": "running",
+            "updatedAt": now_unix_ms().saturating_sub(60_000)
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let reconciled = reconcile_lost_runtime_activity_for_profile(&state, "default").await;
+
+    assert_eq!(reconciled, vec![session_id.to_string()]);
+    assert!(state.active_turns.lock().await.get(&runtime_key).is_none());
+    let ui_state = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ui_state["runtimeStatusByThreadId"][session_id]["status"].as_str(),
+        Some("failed")
+    );
+    assert_eq!(
+        ui_state["highlightsByThreadId"][session_id]["kind"].as_str(),
+        Some("attention")
+    );
+    assert_eq!(
+        ui_state["notifications"]["items"][0]["type"].as_str(),
+        Some("sessionAttention")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_reconcile_marks_session_failed_when_app_server_forgets_active_turn() {
+    let sandbox = unique_test_dir("runtime-reconcile-forgotten-turn");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-forgotten-active-turn";
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-forgotten".to_string());
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][session_id] = json!({
+            "status": "running",
+            "updatedAt": now_unix_ms().saturating_sub(60_000)
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Forgotten active turn",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        state.active_turns.lock().await.contains_key(&runtime_key),
+        "test setup should keep the cached active turn"
+    );
+    assert!(
+        state.app_servers.active_process_count().await > 0,
+        "fake app-server should be running before reconciliation"
+    );
+
+    let reconciled = reconcile_lost_runtime_activity_for_profile(&state, "default").await;
+
+    assert_eq!(reconciled, vec![session_id.to_string()]);
+    assert!(state.active_turns.lock().await.get(&runtime_key).is_none());
+    let ui_state = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ui_state["runtimeStatusByThreadId"][session_id]["status"].as_str(),
+        Some("failed")
+    );
+    assert!(
+        ui_state["runtimeStatusByThreadId"][session_id]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no longer has an active turn"))
+    );
+    assert_eq!(
+        ui_state["highlightsByThreadId"][session_id]["kind"].as_str(),
+        Some("attention")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn truncated_local_session_detail_exposes_idle_history_state() {
     let sandbox = unique_test_dir("session-detail-truncated-idle");
     let workspace = sandbox.join("workspace");

@@ -2150,6 +2150,126 @@ async fn session_detail_does_not_resurrect_active_rollout_after_app_server_exit(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_detail_clears_orphaned_active_rollout_after_restart() {
+    let sandbox = unique_test_dir("session-detail-orphaned-active-after-restart");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000998";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    fs::write(
+        rollout_dir.join(format!("rollout-2026-04-24T01-09-00-{session_id}.jsonl")),
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:09:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:09:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-orphaned"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "start and lose the host process"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "work was interrupted before completion",
+                    "phase": "commentary"
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        runtime_status_by_thread_id.insert(
+            session_id.to_string(),
+            json!({
+                "status": "running",
+                "updatedAt": now_unix_ms().saturating_sub(60_000)
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("status"))
+            .and_then(Value::as_str),
+        Some("failed")
+    );
+    assert!(detail.get("activeTurnId").is_some_and(Value::is_null));
+    assert!(
+        state
+            .active_turns
+            .lock()
+            .await
+            .get(&runtime_session_key("default", session_id))
+            .is_none()
+    );
+    let runtime_status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][session_id].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime_status.get("status").and_then(Value::as_str),
+        Some("failed")
+    );
+    assert!(
+        runtime_status
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason.contains("no longer has an active turn"))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_server_exit_clears_cached_running_session_state() {
     let sandbox = unique_test_dir("app-server-exit-clears-running");
     let workspace = sandbox.join("workspace");
@@ -2531,6 +2651,107 @@ async fn local_session_detail_reports_running_when_tail_has_active_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_session_detail_does_not_hide_active_turn_behind_terminal_cache() {
+    let sandbox = unique_test_dir("session-detail-active-terminal-cache");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000114";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    fs::write(
+        rollout_dir.join(format!("rollout-2026-04-24T01-07-00-{session_id}.jsonl")),
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:07:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:07:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:07:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-running"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:07:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "keep this terminal cache from hiding active work"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:07:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "still working",
+                    "phase": "commentary"
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let _client = app_server_client(&state, "default").await.unwrap();
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        runtime_status_by_thread_id.insert(
+            session_id.to_string(),
+            json!({
+                "status": "completed",
+                "updatedAt": now_unix_ms()
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("status"))
+            .and_then(Value::as_str),
+        Some("running")
+    );
+    assert_eq!(
+        detail.get("activeTurnId").and_then(Value::as_str),
+        Some("turn-running")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_summary_uses_local_rollout_metadata_when_thread_read_is_slow() {
     let sandbox = unique_test_dir("session-summary-local-metadata");
     let workspace = sandbox.join("workspace");
@@ -2589,6 +2810,115 @@ async fn session_summary_uses_local_rollout_metadata_when_thread_read_is_slow() 
         summary.get("name").and_then(Value::as_str),
         Some("Local rollout summary")
     );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_summary_confirms_cached_activity_with_app_server_before_clearing() {
+    let sandbox = unique_test_dir("session-summary-confirm-active-before-clear");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000223";
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-11-00",
+        session_id,
+        &workspace,
+        "local rollout still looks completed",
+        &[],
+        Some(",\"name\":\"Locally completed but app-server active\""),
+    );
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Active app-server session",
+                    "preview": "active app-server session",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1_776_970_260_000_i64,
+                    "updatedAt": 1_776_970_261_000_i64,
+                    "status": "running",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": [
+                        {
+                            "id": "turn-app-server-active",
+                            "status": "inProgress",
+                            "error": Value::Null,
+                            "startedAt": 10,
+                            "completedAt": Value::Null,
+                            "durationMs": Value::Null,
+                            "items": []
+                        }
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-cached".to_string());
+    with_ui_state_write(&state, "default", |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        runtime_status_by_thread_id.insert(
+            session_id.to_string(),
+            json!({
+                "status": "running",
+                "updatedAt": now_unix_ms().saturating_sub(10_000)
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let first = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .and_then(|sessions| sessions.first())
+        .cloned()
+        .expect("expected seeded session");
+
+    assert_eq!(first.get("id").and_then(Value::as_str), Some(session_id));
+    assert_eq!(first.get("status").and_then(Value::as_str), Some("running"));
+    assert!(state.active_turns.lock().await.contains_key(&runtime_key));
 
     let _ = fs::remove_dir_all(sandbox);
 }

@@ -4,6 +4,7 @@ const SESSION_DETAIL_ROLLOUT_TAIL_INITIAL_BYTES: u64 = 8 * 1024 * 1024;
 const SESSION_DETAIL_ROLLOUT_TAIL_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const SESSION_OLDER_ROLLOUT_TAIL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_DETAIL_GOAL_TIMEOUT_MS: u64 = 150;
+const SESSION_DETAIL_ACTIVE_RECONCILE_TIMEOUT_MS: u64 = 1_000;
 
 struct LocalRolloutTurnWindow {
     turns: Vec<Value>,
@@ -948,19 +949,92 @@ pub(crate) async fn session_detail_payload(
         session_id,
     );
     let raw_active_turn_id_from_payload = active_turn_id_from_turns(&turns);
-    let terminal_runtime_status = with_ui_state_read(state, profile_id, |ui_state| {
+    let runtime_status_entry = with_ui_state_read(state, profile_id, |ui_state| {
         Ok(ui_state
             .get("runtimeStatusByThreadId")
             .and_then(Value::as_object)
             .and_then(|statuses| statuses.get(session_id))
-            .and_then(|status| {
-                normalized_thread_status(Some(status))
-                    .filter(|status| !is_live_thread_status(status))
-            }))
+            .cloned())
     })
     .await?;
-    let stale_active_turn_after_exit =
-        raw_active_turn_id_from_payload.is_some() && terminal_runtime_status.is_some();
+    let mut terminal_runtime_status = runtime_status_entry
+        .as_ref()
+        .and_then(|status| normalized_thread_status(Some(status)))
+        .filter(|status| !is_live_thread_status(status));
+    let mut terminal_runtime_reason = runtime_status_entry
+        .as_ref()
+        .and_then(|status| status.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if raw_active_turn_id_from_payload.is_some() && terminal_runtime_status.is_none() {
+        let app_server_thread = match app_server_client(state, profile_id).await {
+            Ok(client) => client
+                .request_with_timeout(
+                    "thread/read",
+                    json!({
+                        "threadId": session_id,
+                        "includeTurns": false
+                    }),
+                    Duration::from_millis(SESSION_DETAIL_ACTIVE_RECONCILE_TIMEOUT_MS),
+                    false,
+                )
+                .await
+                .ok()
+                .and_then(|response| response.get("thread").cloned()),
+            Err(_) => None,
+        };
+        let app_server_status = app_server_thread
+            .as_ref()
+            .and_then(|thread| normalized_thread_status(thread.get("status")));
+        if app_server_status
+            .as_deref()
+            .is_some_and(|status| !is_live_thread_status(status))
+        {
+            let status = if app_server_status.as_deref() == Some("completed") {
+                "completed"
+            } else {
+                "failed"
+            };
+            let reason = if status == "completed" {
+                "codex app-server reports the turn is complete"
+            } else {
+                "codex app-server no longer has an active turn"
+            };
+            state.active_turns.lock().await.remove(&runtime_key);
+            state.pending_turn_starts.lock().await.remove(&runtime_key);
+            with_ui_state_write(state, profile_id, |ui_state| {
+                let Some(runtime_status_by_thread_id) = ui_state
+                    .get_mut("runtimeStatusByThreadId")
+                    .and_then(Value::as_object_mut)
+                else {
+                    return Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "runtime status state is missing",
+                    ));
+                };
+                runtime_status_by_thread_id.insert(
+                    session_id.to_string(),
+                    json!({
+                        "status": status,
+                        "updatedAt": now_unix_ms(),
+                        "reason": reason
+                    }),
+                );
+                Ok(())
+            })
+            .await?;
+            terminal_runtime_status = Some(status.to_string());
+            terminal_runtime_reason = Some(reason.to_string());
+            emit_session_summary_updated(state, profile_id, session_id, None, Some(status)).await;
+        }
+    }
+
+    let stale_active_turn_after_exit = raw_active_turn_id_from_payload.is_some()
+        && terminal_runtime_status.is_some()
+        && terminal_runtime_reason.is_some();
     let active_turn_id_from_payload = if stale_active_turn_after_exit {
         None
     } else {

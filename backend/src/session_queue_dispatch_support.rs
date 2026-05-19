@@ -71,6 +71,13 @@ pub(crate) async fn dispatch_session_queue_item_payload(
 
     match queue {
         Some(result) => result,
-        None => Err(api_error(StatusCode::CONFLICT, "QUEUE_ALREADY_DISPATCHING")),
+        None => {
+            spawn_queue_drain(state, profile_id, session_id);
+            let mut queue = get_session_queue_payload(state, profile_id, session_id).await?;
+            if let Some(queue_object) = queue.as_object_mut() {
+                queue_object.insert("dispatchAlreadyInProgress".to_string(), json!(true));
+            }
+            Ok(queue)
+        }
     }
 }

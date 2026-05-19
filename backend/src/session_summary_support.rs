@@ -89,7 +89,7 @@ pub(crate) struct SessionSummaryUiSnapshot {
 
 const ACTIVE_SESSION_STATUS_RECONCILE_AFTER_MS: u64 = 5_000;
 const ACTIVE_SESSION_STATUS_RECONCILE_LIMIT: usize = 4;
-const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS: u64 = 150;
+const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS: u64 = 1_000;
 const LOADED_THREAD_IDS_CACHE_TTL: Duration = Duration::from_secs(5);
 
 fn loaded_thread_ids_cache_key(profile_id: &str) -> String {
@@ -692,10 +692,11 @@ pub(crate) async fn read_session_summary_ui_snapshot(
     for (runtime_key, session_id, has_cached_activity) in reconcile_candidates {
         if has_cached_activity {
             let has_active_turn = async {
-                if let Some(has_active_turn) =
-                    local_session_has_active_turn_payload(state, profile_id, &session_id).await?
+                if local_session_has_active_turn_payload(state, profile_id, &session_id)
+                    .await?
+                    .is_some_and(|has_active_turn| has_active_turn)
                 {
-                    return Ok::<bool, ApiError>(has_active_turn);
+                    return Ok::<bool, ApiError>(true);
                 }
 
                 let client = app_server_client(state, profile_id)

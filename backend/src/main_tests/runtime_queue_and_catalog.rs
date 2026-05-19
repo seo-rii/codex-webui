@@ -2275,6 +2275,63 @@ async fn queue_write_helpers_mutate_queue_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_queue_item_returns_current_queue_when_dispatch_is_busy() {
+    let sandbox = unique_test_dir("queue-dispatch-busy");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["queuesByThreadId"]["thread-1"] = json!({
+            "items": [
+                {
+                    "id": "queue-1",
+                    "prompt": "follow up without surfacing dispatch contention",
+                    "attachmentIds": [],
+                    "attachmentNames": [],
+                    "createdAt": 15
+                }
+            ],
+            "resumePending": false,
+            "updatedAt": 20
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let state_for_guard = state.clone();
+    let guard = tokio::spawn(async move {
+        with_queue_dispatch_guard(&state_for_guard, "default", "thread-1", async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        })
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let queue =
+        dispatch_session_queue_item_payload(&state, "default", "thread-1", "queue-1", "message")
+            .await
+            .unwrap();
+
+    assert_eq!(
+        queue.get("items").and_then(Value::as_array).map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        queue
+            .get("dispatchAlreadyInProgress")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    guard.await.unwrap();
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enqueue_session_queue_payload_auto_dispatches_when_session_is_idle() {
     let sandbox = unique_test_dir("queue-auto-dispatch");
     let workspace = sandbox.join("workspace");
@@ -2429,6 +2486,72 @@ async fn enqueue_session_queue_payload_returns_before_queue_drain_reads_thread()
         "enqueue waited for queue drain: {:?}",
         started.elapsed()
     );
+    assert_eq!(
+        queue.get("items").and_then(Value::as_array).map(Vec::len),
+        Some(1)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_drain_waits_when_app_server_reports_running_without_turn_id() {
+    let sandbox = unique_test_dir("queue-running-without-turn-id");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-running-without-turn-id";
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Running without turn id",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "running",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["queuesByThreadId"][session_id] = json!({
+            "items": [
+                {
+                    "id": "queue-1",
+                    "prompt": "wait for the running turn",
+                    "attachmentIds": [],
+                    "attachmentNames": [],
+                    "createdAt": 15
+                }
+            ],
+            "resumePending": false,
+            "updatedAt": 20
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    maybe_drain_queue(&state, "default", session_id).await;
+    let queue = get_session_queue_payload(&state, "default", session_id)
+        .await
+        .unwrap();
     assert_eq!(
         queue.get("items").and_then(Value::as_array).map(Vec::len),
         Some(1)
@@ -2626,7 +2749,7 @@ async fn queue_drain_clears_stale_cached_active_turn_and_dispatches() {
                     "archived": false,
                     "createdAt": 1,
                     "updatedAt": 10,
-                    "status": "running",
+                    "status": "completed",
                     "isSubagent": false,
                     "agentNickname": Value::Null,
                     "agentRole": Value::Null,

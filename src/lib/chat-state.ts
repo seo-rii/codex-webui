@@ -108,6 +108,12 @@ function resolveConversationRunningTurn(state: ConversationState) {
   return activeTurn ? activeTurn.id : null;
 }
 
+function pruneLivePlansForRunningTurns(livePlans: ConversationState["livePlans"], turns: CodexTurn[]) {
+  const runningTurnIds = new Set(turns.filter((turn) => String(turn.status ?? "") === "inProgress").map((turn) => turn.id));
+  const pruned = Object.fromEntries(Object.entries(livePlans).filter(([turnId]) => runningTurnIds.has(turnId)));
+  return Object.keys(pruned).length === Object.keys(livePlans).length ? livePlans : pruned;
+}
+
 function isLiveThreadStatus(status: string | null | undefined) {
   return status === "running" || status === "active";
 }
@@ -515,6 +521,7 @@ export function mergeConversationState(current: ConversationState, detail: Sessi
   const threadStatus = hasLiveTurn
     ? (isLiveThreadStatus(incoming.thread.status) ? incoming.thread.status : current.thread.status || "running")
     : incoming.thread.status;
+  const livePlans = pruneLivePlansForRunningTurns(current.livePlans, mergedTurns);
 
   return {
     ...incoming,
@@ -530,9 +537,7 @@ export function mergeConversationState(current: ConversationState, detail: Sessi
     goal: incoming.goal ?? current.goal ?? null,
     tokenUsage: incoming.tokenUsage ?? current.tokenUsage ?? null,
     hydration: mergeHydration(current.hydration, incoming.hydration, mergedTurns.length),
-    livePlans: {
-      ...current.livePlans
-    },
+    livePlans,
     liveDiffs: {
       ...current.liveDiffs
     }
@@ -580,6 +585,7 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
     next.thread.status = typeof params.status === "string" ? params.status : next.thread.status;
     if (next.thread.status !== "running" && next.thread.status !== "active") {
       next.activeTurnId = resolveConversationRunningTurn(next);
+      next.livePlans = pruneLivePlansForRunningTurns(next.livePlans, next.thread.turns);
     }
     return next;
   }
@@ -682,6 +688,7 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
     if (next.thread.status !== "running" && next.thread.status !== "active") {
       next.activeTurnId = resolveConversationRunningTurn(next);
     }
+    next.livePlans = pruneLivePlansForRunningTurns(next.livePlans, next.thread.turns);
     return next;
   }
 
@@ -826,6 +833,9 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
     seeded.turn.durationMs = turn.durationMs;
     next.thread.turns = seeded.turns;
     next.activeTurnId = method === "turn/started" ? turn.id : next.activeTurnId === turn.id ? null : next.activeTurnId;
+    if (method === "turn/completed") {
+      delete next.livePlans[turn.id];
+    }
     if (method === "turn/started") {
       next.thread.status = "running";
     }

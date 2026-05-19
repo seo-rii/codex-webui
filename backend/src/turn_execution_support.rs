@@ -307,8 +307,8 @@ pub(crate) async fn send_turn_payload(
             state.active_turns.lock().await.remove(&runtime_key);
         }
 
-        set_runtime_session_status(state, profile_id, session_id, "running").await;
-        emit_session_summary_updated(state, profile_id, session_id, None, Some("running")).await;
+        set_runtime_session_status(state, profile_id, session_id, "starting").await;
+        emit_session_summary_updated(state, profile_id, session_id, None, Some("starting")).await;
         emit_session_notification(
             state,
             profile_id,
@@ -318,7 +318,7 @@ pub(crate) async fn send_turn_payload(
                 "method": "thread/status/changed",
                 "params": {
                     "threadId": session_id,
-                    "status": "running"
+                    "status": "starting"
                 }
             }),
         )
@@ -501,6 +501,21 @@ pub(crate) async fn send_turn_payload(
             .await
             .insert(runtime_key.clone(), turn_id);
     }
+    set_runtime_session_status(state, profile_id, session_id, "running").await;
+    emit_session_notification(
+        state,
+        profile_id,
+        session_id,
+        json!({
+            "kind": "notification",
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": session_id,
+                "status": "running"
+            }
+        }),
+    )
+    .await;
     state.pending_turn_starts.lock().await.remove(&runtime_key);
 
     clear_session_draft_payload(state, profile_id, session_id).await?;
@@ -527,7 +542,38 @@ pub(crate) async fn send_turn_payload(
     if result.is_err() {
         let was_pending = state.pending_turn_starts.lock().await.remove(&runtime_key);
         if was_pending {
-            emit_session_summary_updated(state, profile_id, session_id, None, None).await;
+            let was_starting = with_ui_state_read(state, profile_id, |ui_state| {
+                Ok(ui_state
+                    .get("runtimeStatusByThreadId")
+                    .and_then(Value::as_object)
+                    .and_then(|entries| entries.get(session_id))
+                    .and_then(|status| normalized_thread_status(Some(status)))
+                    .as_deref()
+                    == Some("starting"))
+            })
+            .await
+            .unwrap_or(false);
+            if was_starting {
+                set_runtime_session_status(state, profile_id, session_id, "failed").await;
+                emit_session_notification(
+                    state,
+                    profile_id,
+                    session_id,
+                    json!({
+                        "kind": "notification",
+                        "method": "thread/status/changed",
+                        "params": {
+                            "threadId": session_id,
+                            "status": "failed"
+                        }
+                    }),
+                )
+                .await;
+                emit_session_summary_updated(state, profile_id, session_id, None, Some("failed"))
+                    .await;
+            } else {
+                emit_session_summary_updated(state, profile_id, session_id, None, None).await;
+            }
         }
     }
     result

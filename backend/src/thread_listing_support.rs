@@ -123,16 +123,13 @@ pub(crate) fn build_session_summary_from_thread_payload(
         .and_then(Value::as_i64)
         .map(normalize_session_timestamp)
         .unwrap_or(0);
+    let has_status_override = status_override
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
     let mut status = status_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .or_else(|| {
-            snapshot
-                .active_thread_ids
-                .contains(session_id)
-                .then_some("running".to_string())
-        })
         .or_else(
             || match (thread_status.as_deref(), runtime_status.as_deref()) {
                 (Some(thread_status), Some(runtime_status)) => {
@@ -150,6 +147,15 @@ pub(crate) fn build_session_summary_from_thread_payload(
             },
         )
         .unwrap_or_else(|| "unknown".to_string());
+    if !has_status_override
+        && snapshot.active_thread_ids.contains(session_id)
+        && !matches!(
+            status.as_str(),
+            "completed" | "failed" | "error" | "cancelled" | "canceled" | "aborted"
+        )
+    {
+        status = "running".to_string();
+    }
     if snapshot.loaded_thread_ids_available
         && is_live_thread_status(&status)
         && !snapshot.active_thread_ids.contains(session_id)

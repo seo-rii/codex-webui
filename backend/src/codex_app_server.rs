@@ -24,7 +24,7 @@ use tokio::{
     runtime::{Builder as TokioRuntimeBuilder, Handle as TokioRuntimeHandle},
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast, oneshot},
     task::JoinHandle,
-    time::timeout,
+    time::{Instant as TokioInstant, timeout, timeout_at},
 };
 use tracing::{info, warn};
 
@@ -32,6 +32,9 @@ const APP_SERVER_THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
 const APP_SERVER_REQUEST_TIMEOUT_DEFAULT_SECONDS: u64 = 600;
 const APP_SERVER_REQUEST_TIMEOUT_MIN_SECONDS: u64 = 5;
 const APP_SERVER_REQUEST_TIMEOUT_MAX_SECONDS: u64 = 7_200;
+const APP_SERVER_DEFAULT_CPU_DIVISOR: usize = 2;
+const APP_SERVER_DEFAULT_MEMORY_BYTES_PER_PROCESS: u64 = 2 * 1024 * 1024 * 1024;
+const APP_SERVER_DEFAULT_MAX_PROCESSES_CAP: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppServerProfile {
@@ -327,7 +330,8 @@ impl AppServerClient {
         request_timeout: Duration,
         recover_handoff_on_timeout: bool,
     ) -> Result<Value> {
-        match timeout(request_timeout, self.ensure_started()).await {
+        let deadline = TokioInstant::now() + request_timeout;
+        match timeout_at(deadline, self.ensure_started()).await {
             Ok(result) => result?,
             Err(_) => {
                 let recovered = if recover_handoff_on_timeout {
@@ -343,13 +347,9 @@ impl AppServerClient {
                 .into());
             }
         }
-        self.request_started_with_timeout(
-            method,
-            params,
-            request_timeout,
-            recover_handoff_on_timeout,
-        )
-        .await
+        let remaining = deadline.saturating_duration_since(TokioInstant::now());
+        self.request_started_with_timeout(method, params, remaining, recover_handoff_on_timeout)
+            .await
     }
 
     async fn respond_on_controller(&self, id: Value, result: Value) -> Result<()> {
@@ -397,8 +397,24 @@ impl AppServerClient {
 
     async fn ensure_started(&self) -> Result<()> {
         let _guard = self.inner.start_lock.lock().await;
-        if self.inner.process.lock().await.is_some() {
-            return Ok(());
+        let existing_process = {
+            let mut process = self.inner.process.lock().await;
+            match process.as_ref() {
+                Some(process_state) if process_state_is_alive(process_state) => return Ok(()),
+                Some(_) => process.take(),
+                None => None,
+            }
+        };
+        if let Some(process) = existing_process {
+            warn!(
+                profile_id = %self.inner.profile.id,
+                "clearing stale codex app-server process state before restart"
+            );
+            self.terminate_unresponsive_process_state(
+                process,
+                "codex app-server process state was stale",
+            )
+            .await;
         }
 
         let mut last_start_error: Option<anyhow::Error> = None;
@@ -546,11 +562,10 @@ impl AppServerClient {
     async fn recover_handoff_after_request_timeout(&self) -> bool {
         let should_recover_handoff = {
             let process = self.inner.process.lock().await;
-            let process_uses_handoff = process
+            process
                 .as_ref()
                 .map(|process| process.handoff_proxy)
-                .unwrap_or(false);
-            process_uses_handoff || handoff_paths(&self.inner.config, &self.inner.profile).is_some()
+                .unwrap_or(false)
         };
         if !should_recover_handoff {
             return false;
@@ -572,19 +587,32 @@ impl AppServerClient {
     async fn detach_unresponsive_process(&self, reason: &str) {
         fail_pending_requests(&self.inner, reason).await;
         let process = self.inner.process.lock().await.take();
-        if let Some(mut process) = process {
-            if let Some(shutdown_tx) = process.shutdown_tx.take() {
-                let _ = shutdown_tx.send(());
+        if let Some(process) = process {
+            self.terminate_unresponsive_process_state(process, reason)
+                .await;
+        }
+    }
+
+    async fn terminate_unresponsive_process_state(&self, mut process: ProcessState, reason: &str) {
+        warn!(
+            profile_id = %self.inner.profile.id,
+            pid = ?process.pid,
+            "{reason}; terminating codex app-server process group"
+        );
+        terminate_managed_process_group(process.pid, process.process_identity).await;
+        if let Some(shutdown_tx) = process.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        let mut join_handle = process.join_handle;
+        match timeout(Duration::from_secs(2), &mut join_handle).await {
+            Ok(_) => {}
+            Err(_) => {
+                warn!(
+                    profile_id = %self.inner.profile.id,
+                    "timed out while waiting for unresponsive codex app-server supervisor to exit"
+                );
+                join_handle.abort();
             }
-            let mut join_handle = process.join_handle;
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = &mut join_handle => {}
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        join_handle.abort();
-                    }
-                }
-            });
         }
     }
 
@@ -849,7 +877,14 @@ impl AppServerManager {
         };
         let mut active = 0;
         for client in clients {
-            if client.inner.process.lock().await.is_some() {
+            if client
+                .inner
+                .process
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(process_state_is_alive)
+            {
                 active += 1;
             }
         }
@@ -871,6 +906,9 @@ impl AppServerManager {
             let Some(process) = process.as_ref() else {
                 continue;
             };
+            if !process_state_is_alive(process) {
+                continue;
+            }
             status.active_process_count += 1;
             if process.handoff_proxy {
                 status.handoff_proxy_process_count += 1;
@@ -1211,8 +1249,67 @@ fn default_max_process_count() -> usize {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(1)
+        .unwrap_or_else(|| {
+            auto_max_process_count(
+                std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1),
+                detected_memory_limit_bytes(),
+            )
+        })
         .clamp(1, 16)
+}
+
+fn auto_max_process_count(available_cpus: usize, memory_limit_bytes: Option<u64>) -> usize {
+    let cpu_limit = available_cpus
+        .max(1)
+        .div_ceil(APP_SERVER_DEFAULT_CPU_DIVISOR)
+        .max(1);
+    let memory_limit = memory_limit_bytes
+        .map(|bytes| (bytes / APP_SERVER_DEFAULT_MEMORY_BYTES_PER_PROCESS).max(1) as usize)
+        .unwrap_or(APP_SERVER_DEFAULT_MAX_PROCESSES_CAP);
+    cpu_limit
+        .min(memory_limit)
+        .clamp(1, APP_SERVER_DEFAULT_MAX_PROCESSES_CAP)
+}
+
+fn detected_memory_limit_bytes() -> Option<u64> {
+    cgroup_memory_limit_bytes().or_else(proc_mem_total_bytes)
+}
+
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ] {
+        let Ok(value) = fs::read_to_string(path) else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("max") || trimmed.is_empty() {
+            continue;
+        }
+        let bytes = trimmed.parse::<u64>().ok()?;
+        if bytes > 0 && bytes < i64::MAX as u64 {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+fn proc_mem_total_bytes() -> Option<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        let Some(rest) = line.strip_prefix("MemTotal:") else {
+            continue;
+        };
+        let kb = rest
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())?;
+        return kb.checked_mul(1024);
+    }
+    None
 }
 
 fn default_request_timeout() -> Duration {
@@ -1354,6 +1451,26 @@ async fn fail_pending_requests(inner: &Arc<AppServerClientInner>, reason: &str) 
 
     for sender in pending {
         let _ = sender.send(Err(reason.to_string()));
+    }
+}
+
+fn process_state_is_alive(process: &ProcessState) -> bool {
+    if process.join_handle.is_finished() {
+        return false;
+    }
+    let Some(pid) = process.pid else {
+        return true;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        process
+            .process_identity
+            .is_some_and(|identity| managed_process_identity_matches(pid, identity))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
     }
 }
 
@@ -1621,6 +1738,27 @@ mod tests {
             super::app_server_request_timeout_seconds_from_env_value(Some("999999")),
             7_200
         );
+    }
+
+    #[test]
+    fn default_app_server_process_count_scales_with_cpu_and_memory() {
+        assert_eq!(
+            super::auto_max_process_count(1, Some(8 * 1024 * 1024 * 1024)),
+            1
+        );
+        assert_eq!(
+            super::auto_max_process_count(4, Some(4 * 1024 * 1024 * 1024)),
+            2
+        );
+        assert_eq!(
+            super::auto_max_process_count(16, Some(8 * 1024 * 1024 * 1024)),
+            4
+        );
+        assert_eq!(
+            super::auto_max_process_count(16, Some(1024 * 1024 * 1024)),
+            1
+        );
+        assert_eq!(super::auto_max_process_count(16, None), 4);
     }
 
     #[test]

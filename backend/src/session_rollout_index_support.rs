@@ -290,10 +290,7 @@ fn read_state_thread_metadata_rows_from_codex_home(
             let spawned_subagent: i64 = row.get(10)?;
             let source = serde_json::from_str::<Value>(&source_raw)
                 .unwrap_or_else(|_| Value::String(source_raw));
-            let source_has_subagent = source
-                .get("subagent")
-                .and_then(Value::as_object)
-                .is_some_and(|value| !value.is_empty());
+            let source_has_subagent = thread_source_marks_subagent(&source);
             Ok((
                 session_id.clone(),
                 json!({
@@ -397,9 +394,7 @@ fn read_rollout_thread_metadata_from_path(
                 .or(name);
             is_subagent = payload
                 .get("source")
-                .and_then(|value| value.get("subagent"))
-                .and_then(Value::as_object)
-                .is_some_and(|value| !value.is_empty())
+                .is_some_and(thread_source_marks_subagent)
                 || payload
                     .get("agent_nickname")
                     .and_then(Value::as_str)

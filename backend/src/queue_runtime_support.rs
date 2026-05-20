@@ -197,12 +197,35 @@ async fn session_turn_activity(
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
     let runtime_key = runtime_session_key(resolved_profile_id, session_id);
     let cached_active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
+    let has_profile_process = state
+        .app_servers
+        .profile_has_active_process(resolved_profile_id)
+        .await;
 
-    match local_session_has_active_turn_payload(state, profile_id, session_id).await {
-        Ok(Some(true)) => return SessionTurnActivity::Active,
-        Ok(Some(false)) => {}
-        Ok(None) => {}
-        Err(_) => return SessionTurnActivity::Unknown,
+    if !has_profile_process
+        && clear_stale_session_runtime_activity_if_app_server_missing(
+            state,
+            profile_id,
+            session_id,
+            QUEUE_ACTIVE_STATUS_FRESH_MS,
+            "codex app-server is not running",
+        )
+        .await
+    {
+        return SessionTurnActivity::Idle;
+    }
+
+    let local_has_active_turn =
+        match local_session_has_active_turn_payload(state, profile_id, session_id).await {
+            Ok(value) => value.unwrap_or(false),
+            Err(_) => return SessionTurnActivity::Unknown,
+        };
+    if local_has_active_turn && !has_profile_process {
+        return SessionTurnActivity::Idle;
+    }
+
+    if !has_profile_process && cached_active_turn_id.is_none() {
+        return SessionTurnActivity::Idle;
     }
 
     let client = match app_server_client(state, profile_id).await {
@@ -222,7 +245,8 @@ async fn session_turn_activity(
         .await
     {
         Ok(response) => response,
-        Err(_) => return SessionTurnActivity::Unknown,
+        Err(_) if cached_active_turn_id.is_some() => return SessionTurnActivity::Unknown,
+        Err(_) => return SessionTurnActivity::Idle,
     };
     let thread = response.get("thread").cloned().unwrap_or(Value::Null);
     let Some(thread) = thread.as_object() else {
@@ -243,6 +267,12 @@ async fn session_turn_activity(
     if let Some(turn_id) = active_turn_id {
         state.active_turns.lock().await.insert(runtime_key, turn_id);
         return SessionTurnActivity::Active;
+    }
+
+    if local_has_active_turn && cached_active_turn_id.is_none() {
+        state.active_turns.lock().await.remove(&runtime_key);
+        state.pending_turn_starts.lock().await.remove(&runtime_key);
+        return SessionTurnActivity::Idle;
     }
 
     if cached_active_turn_id.is_some() {
@@ -302,8 +332,18 @@ async fn maybe_drain_queue_with_attempt(
             .await
             .contains(&runtime_key)
         {
-            schedule_queue_drain_retry(state, profile_id, session_id, attempt);
-            return;
+            if !clear_stale_session_runtime_activity_if_app_server_missing(
+                state,
+                profile_id,
+                session_id,
+                QUEUE_ACTIVE_STATUS_FRESH_MS,
+                "codex app-server is not running",
+            )
+            .await
+            {
+                schedule_queue_drain_retry(state, profile_id, session_id, attempt);
+                return;
+            }
         }
 
         let queue = match get_session_queue_payload(state, profile_id, session_id).await {

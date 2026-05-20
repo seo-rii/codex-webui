@@ -367,6 +367,7 @@ async fn app_server_listing_filters_projected_state_db_subagents() {
     );
     let visible_id = "019e0000-0000-7000-8000-000000000011";
     let subagent_id = "019e0000-0000-7000-8000-000000000012";
+    let exec_id = "019e0000-0000-7000-8000-000000000013";
     let workspace_path = workspace.display().to_string();
     let client = app_server_client(&state, "default").await.unwrap();
     client
@@ -408,6 +409,25 @@ async fn app_server_listing_filters_projected_state_db_subagents() {
         )
         .await
         .unwrap();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": exec_id,
+                    "name": "Hidden exec worker session",
+                    "preview": "exec prompt",
+                    "source": "exec",
+                    "cwd": workspace_path,
+                    "archived": false,
+                    "createdAt": 1_713_920_002_000i64,
+                    "updatedAt": 1_713_920_030_000i64,
+                    "status": "completed"
+                }
+            }),
+        )
+        .await
+        .unwrap();
 
     let projected = project_thread_listing_payload(&json!({
         "id": subagent_id,
@@ -416,6 +436,11 @@ async fn app_server_listing_filters_projected_state_db_subagents() {
         "agent_role": "explorer"
     }));
     assert!(thread_is_subagent(&projected));
+    let exec_projected = project_thread_listing_payload(&json!({
+        "id": exec_id,
+        "source": "exec"
+    }));
+    assert!(thread_is_subagent(&exec_projected));
 
     let payload = list_sessions_payload(
         &state,
@@ -745,6 +770,8 @@ async fn rollout_file_listing_filters_state_db_source_only_subagents() {
     );
     let visible_id = "019e0000-0000-7000-8000-000000000035";
     let subagent_id = "019e0000-0000-7000-8000-000000000036";
+    let exec_state_id = "019e0000-0000-7000-8000-000000000037";
+    let exec_rollout_id = "019e0000-0000-7000-8000-000000000038";
 
     write_rollout_fixture(
         &codex_home,
@@ -814,6 +841,47 @@ async fn rollout_file_listing_filters_state_db_source_only_subagents() {
             ],
         )
         .unwrap();
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-22-20",
+        exec_state_id,
+        &workspace,
+        "exec source state prompt",
+        &[],
+        None,
+    );
+    write_state_thread_fixture(
+        &codex_home,
+        exec_state_id,
+        "Hidden exec state session",
+        "Hidden exec state preview",
+        &workspace,
+        false,
+        1_713_920_022_000,
+        1_713_920_031_000,
+        None,
+        None,
+        false,
+    );
+    connection
+        .execute(
+            "UPDATE threads SET source = 'exec' WHERE id = ?1",
+            params![exec_state_id],
+        )
+        .unwrap();
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-22-30",
+        exec_rollout_id,
+        &workspace,
+        "exec source rollout prompt",
+        &[],
+        Some(",\"source\":\"exec\""),
+    );
 
     let payload = list_sessions_payload(
         &state,
@@ -2239,7 +2307,7 @@ async fn session_detail_clears_orphaned_active_rollout_after_restart() {
             .get("thread")
             .and_then(|thread| thread.get("status"))
             .and_then(Value::as_str),
-        Some("failed")
+        Some("completed")
     );
     assert!(detail.get("activeTurnId").is_some_and(Value::is_null));
     assert!(
@@ -2257,13 +2325,23 @@ async fn session_detail_clears_orphaned_active_rollout_after_restart() {
     .unwrap();
     assert_eq!(
         runtime_status.get("status").and_then(Value::as_str),
-        Some("failed")
+        Some("completed")
+    );
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("turns"))
+            .and_then(Value::as_array)
+            .and_then(|turns| turns.first())
+            .and_then(|turn| turn.get("status"))
+            .and_then(Value::as_str),
+        Some("completed")
     );
     assert!(
         runtime_status
             .get("reason")
             .and_then(Value::as_str)
-            .is_some_and(|reason| reason.contains("no longer has an active turn"))
+            .is_some_and(|reason| reason.contains("did not report an active turn"))
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -2285,7 +2363,24 @@ async fn app_server_exit_clears_cached_running_session_state() {
         .lock()
         .await
         .insert(runtime_key.clone(), "turn-crashed".to_string());
-    state.pending_turn_starts.lock().await.insert(runtime_key);
+    state
+        .pending_turn_starts
+        .lock()
+        .await
+        .insert(runtime_key.clone());
+    {
+        let mut pending = state.pending_server_requests.lock().await;
+        pending.entry(runtime_key.clone()).or_default().insert(
+            "request-crashed".to_string(),
+            PendingServerRequestEntry {
+                raw_id: json!("request-crashed"),
+                method: "input/request".to_string(),
+                params: json!({ "threadId": session_id }),
+                created_at: "2026-05-20T00:00:00Z".to_string(),
+                created_at_ms: 1,
+            },
+        );
+    }
     with_ui_state_write(&state, "default", |ui_state| {
         let Some(runtime_status_by_thread_id) = ui_state
             .get_mut("runtimeStatusByThreadId")
@@ -2303,6 +2398,23 @@ async fn app_server_exit_clears_cached_running_session_state() {
                 "updatedAt": now_unix_ms()
             }),
         );
+        ui_state["highlightsByThreadId"][session_id] = json!({
+            "kind": "attention",
+            "at": 1,
+            "reason": "approval"
+        });
+        ui_state["notifications"]["items"] = json!([{
+            "id": "notification-crashed",
+            "type": "sessionAttention",
+            "createdAt": 1,
+            "readAt": Value::Null,
+            "sessionId": session_id,
+            "sessionName": "Crashed session",
+            "payload": {
+                "reason": "approval",
+                "requestId": "request-crashed"
+            }
+        }]);
         ui_state["automationRuns"] = json!([{
             "id": "run-crashed",
             "automationId": "auto-crashed",
@@ -2333,6 +2445,14 @@ async fn app_server_exit_clears_cached_running_session_state() {
         .unwrap();
 
     assert!(snapshot.active_thread_ids.is_empty());
+    assert!(
+        state
+            .pending_server_requests
+            .lock()
+            .await
+            .get(&runtime_key)
+            .is_none()
+    );
     assert_eq!(
         snapshot
             .runtime_status_by_thread_id
@@ -2341,6 +2461,44 @@ async fn app_server_exit_clears_cached_running_session_state() {
             .and_then(Value::as_str),
         Some("failed")
     );
+    assert_eq!(
+        snapshot
+            .highlights_by_thread_id
+            .get(session_id)
+            .and_then(|highlight| highlight.get("kind"))
+            .and_then(Value::as_str),
+        Some("attention")
+    );
+    assert_eq!(
+        snapshot
+            .highlights_by_thread_id
+            .get(session_id)
+            .and_then(|highlight| highlight.get("reason"))
+            .and_then(Value::as_str),
+        Some("stopped")
+    );
+    let ui_state = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .unwrap();
+    let notifications = ui_state["notifications"]["items"]
+        .as_array()
+        .expect("notifications should be available");
+    assert!(!notifications.iter().any(|notification| {
+        notification.get("type").and_then(Value::as_str) == Some("sessionAttention")
+            && notification
+                .get("payload")
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str)
+                == Some("approval")
+    }));
+    assert!(notifications.iter().any(|notification| {
+        notification.get("type").and_then(Value::as_str) == Some("sessionAttention")
+            && notification
+                .get("payload")
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str)
+                == Some("stopped")
+    }));
     let runs = with_ui_state_read(&state, "default", |ui_state| {
         Ok(recent_automation_runs_from_ui_state(ui_state, 10))
     })
@@ -2399,6 +2557,10 @@ async fn runtime_reconcile_marks_lost_active_session_failed_without_app_server()
     assert_eq!(
         ui_state["highlightsByThreadId"][session_id]["kind"].as_str(),
         Some("attention")
+    );
+    assert_eq!(
+        ui_state["highlightsByThreadId"][session_id]["reason"].as_str(),
+        Some("stopped")
     );
     assert_eq!(
         ui_state["notifications"]["items"][0]["type"].as_str(),
@@ -2706,8 +2868,8 @@ async fn session_detail_uses_task_complete_last_agent_message_fallback() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_session_detail_reports_running_when_tail_has_active_turn() {
-    let sandbox = unique_test_dir("session-detail-local-running");
+async fn local_session_detail_marks_orphaned_active_tail_completed_without_runtime_evidence() {
+    let sandbox = unique_test_dir("session-detail-local-orphaned-active");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
     fs::create_dir_all(&workspace).unwrap();
@@ -2773,18 +2935,25 @@ async fn local_session_detail_reports_running_when_tail_has_active_turn() {
             .get("thread")
             .and_then(|thread| thread.get("status"))
             .and_then(Value::as_str),
-        Some("running")
+        Some("completed")
     );
     assert_eq!(
-        detail.get("activeTurnId").and_then(Value::as_str),
-        Some("turn-running")
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("turns"))
+            .and_then(Value::as_array)
+            .and_then(|turns| turns.first())
+            .and_then(|turn| turn.get("status"))
+            .and_then(Value::as_str),
+        Some("completed")
     );
+    assert!(detail.get("activeTurnId").is_some_and(Value::is_null));
 
     let _ = fs::remove_dir_all(sandbox);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_session_detail_does_not_hide_active_turn_behind_terminal_cache() {
+async fn local_session_detail_does_not_resurrect_active_tail_behind_terminal_cache() {
     let sandbox = unique_test_dir("session-detail-active-terminal-cache");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -2874,12 +3043,9 @@ async fn local_session_detail_does_not_hide_active_turn_behind_terminal_cache() 
             .get("thread")
             .and_then(|thread| thread.get("status"))
             .and_then(Value::as_str),
-        Some("running")
+        Some("completed")
     );
-    assert_eq!(
-        detail.get("activeTurnId").and_then(Value::as_str),
-        Some("turn-running")
-    );
+    assert!(detail.get("activeTurnId").is_some_and(Value::is_null));
 
     let _ = fs::remove_dir_all(sandbox);
 }

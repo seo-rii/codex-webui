@@ -39,6 +39,129 @@ pub(crate) async fn set_session_highlight(
     }
 }
 
+pub(crate) async fn clear_session_pending_requests(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) {
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        session_id,
+    );
+    let removed = state
+        .pending_server_requests
+        .lock()
+        .await
+        .remove(&runtime_key)
+        .unwrap_or_default();
+    let removed_request_ids = removed.keys().cloned().collect::<HashSet<_>>();
+    for request_id in removed.keys() {
+        emit_session_notification(
+            state,
+            profile_id,
+            session_id,
+            json!({
+                "kind": "notification",
+                "method": "serverRequest/resolved",
+                "params": {
+                    "threadId": session_id,
+                    "requestId": request_id
+                }
+            }),
+        )
+        .await;
+    }
+    if !removed.is_empty() {
+        let unread_count = with_ui_state_write(state, profile_id, |ui_state| {
+            let Some(items) = ui_state
+                .get_mut("notifications")
+                .and_then(Value::as_object_mut)
+                .and_then(|notifications| notifications.get_mut("items"))
+                .and_then(Value::as_array_mut)
+            else {
+                return Ok(None);
+            };
+            let before = items.len();
+            items.retain(|item| {
+                let payload = item.get("payload").unwrap_or(&Value::Null);
+                let request_id = payload.get("requestId").and_then(Value::as_str);
+                let is_stale_approval = item.get("type").and_then(Value::as_str)
+                    == Some("sessionAttention")
+                    && item.get("sessionId").and_then(Value::as_str) == Some(session_id)
+                    && payload
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .is_none_or(|reason| reason == "approval")
+                    && request_id.is_none_or(|id| removed_request_ids.contains(id));
+                !is_stale_approval
+            });
+            if items.len() == before {
+                return Ok(None);
+            }
+            Ok(Some(unread_notification_count(items)))
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(unread_count) = unread_count {
+            emit_profile_global_notification(
+                state,
+                profile_id,
+                json!({
+                    "kind": "notification",
+                    "method": "codex-webui/notificationStateUpdated",
+                    "params": {
+                        "unreadCount": unread_count
+                    }
+                }),
+            )
+            .await;
+            emit_profile_config_updated(
+                state,
+                profile_id,
+                json!({
+                    "notifications": {
+                        "unreadCount": unread_count
+                    }
+                }),
+            )
+            .await;
+        }
+        let clear_approval_highlight = with_ui_state_read(state, profile_id, |ui_state| {
+            Ok(ui_state
+                .get("highlightsByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id))
+                .is_some_and(|highlight| {
+                    highlight.get("kind").and_then(Value::as_str) == Some("attention")
+                        && highlight
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .is_none_or(|reason| reason == "approval")
+                }))
+        })
+        .await
+        .unwrap_or(false);
+        if clear_approval_highlight {
+            let _ = with_ui_state_write(state, profile_id, |ui_state| {
+                if let Some(highlights_by_thread_id) = ui_state
+                    .get_mut("highlightsByThreadId")
+                    .and_then(Value::as_object_mut)
+                {
+                    highlights_by_thread_id.remove(session_id);
+                }
+                Ok(())
+            })
+            .await;
+        }
+    }
+}
+
+async fn session_accepts_server_request(state: &AppState, runtime_key: &str) -> bool {
+    state.active_turns.lock().await.contains_key(runtime_key)
+        || state.pending_turn_starts.lock().await.contains(runtime_key)
+}
+
 pub(crate) async fn handle_profile_server_request(
     state: &AppState,
     profile_id: &str,
@@ -52,6 +175,22 @@ pub(crate) async fn handle_profile_server_request(
     else {
         return;
     };
+
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        &session_id,
+    );
+    if !session_accepts_server_request(state, &runtime_key).await {
+        if let Ok(client) = app_server_client(state, profile_id).await {
+            let _ = client
+                .reject(
+                    request.id.clone(),
+                    "Session is no longer active; ignoring stale app-server request.".to_string(),
+                )
+                .await;
+        }
+        return;
+    }
 
     let preferences = with_ui_state_read(state, profile_id, |ui_state| {
         Ok(ui_state
@@ -111,10 +250,6 @@ pub(crate) async fn handle_profile_server_request(
     }
 
     let request_id = pending_request_id(&request.id);
-    let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, profile_id).0,
-        &session_id,
-    );
     let created_at_ms = now_unix_ms();
     {
         let mut pending_requests = state.pending_server_requests.lock().await;
@@ -188,7 +323,8 @@ pub(crate) async fn handle_profile_server_request(
         &session_id,
         Some(json!({
             "kind": "attention",
-            "at": now_unix_ms()
+            "at": now_unix_ms(),
+            "reason": "approval"
         })),
     )
     .await;

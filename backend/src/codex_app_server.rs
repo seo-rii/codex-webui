@@ -32,7 +32,8 @@ const APP_SERVER_THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
 const APP_SERVER_REQUEST_TIMEOUT_DEFAULT_SECONDS: u64 = 600;
 const APP_SERVER_REQUEST_TIMEOUT_MIN_SECONDS: u64 = 5;
 const APP_SERVER_REQUEST_TIMEOUT_MAX_SECONDS: u64 = 7_200;
-const APP_SERVER_DEFAULT_CPU_DIVISOR: usize = 2;
+const APP_SERVER_DEFAULT_CPU_SUB: usize = 2;
+const APP_SERVER_DEFAULT_CPU_DIVISOR: usize = 1;
 const APP_SERVER_DEFAULT_MEMORY_BYTES_PER_PROCESS: u64 = 2 * 1024 * 1024 * 1024;
 const APP_SERVER_DEFAULT_MAX_PROCESSES_CAP: usize = 4;
 
@@ -891,6 +892,23 @@ impl AppServerManager {
         active
     }
 
+    pub async fn profile_has_active_process(&self, profile_id: &str) -> bool {
+        let client = {
+            let clients = self.clients.lock().await;
+            clients.get(profile_id).cloned()
+        };
+        let Some(client) = client else {
+            return false;
+        };
+        client
+            .inner
+            .process
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(process_state_is_alive)
+    }
+
     pub async fn handoff_status(&self) -> AppServerHandoffStatus {
         let clients = {
             let clients = self.clients.lock().await;
@@ -1264,6 +1282,8 @@ fn auto_max_process_count(available_cpus: usize, memory_limit_bytes: Option<u64>
     let cpu_limit = available_cpus
         .max(1)
         .div_ceil(APP_SERVER_DEFAULT_CPU_DIVISOR)
+        .checked_sub(APP_SERVER_DEFAULT_CPU_SUB)
+        .unwrap_or(1)
         .max(1);
     let memory_limit = memory_limit_bytes
         .map(|bytes| (bytes / APP_SERVER_DEFAULT_MEMORY_BYTES_PER_PROCESS).max(1) as usize)

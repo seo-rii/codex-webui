@@ -1,5 +1,12 @@
 use super::*;
 
+async fn mark_test_session_active(state: &AppState, session_id: &str) {
+    state.active_turns.lock().await.insert(
+        runtime_session_key("default", session_id),
+        "turn-1".to_string(),
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolve_server_request_payload_uses_pending_request_store() {
     let sandbox = unique_test_dir("approval-rust");
@@ -10,6 +17,7 @@ async fn resolve_server_request_payload_uses_pending_request_store() {
 
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    mark_test_session_active(&state, "thread-1").await;
     handle_profile_server_request(
         &state,
         "default",
@@ -92,6 +100,7 @@ async fn computer_input_resolves_pending_computer_tool_request() {
 
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    mark_test_session_active(&state, "thread-computer-input").await;
     handle_profile_server_request(
         &state,
         "default",
@@ -142,6 +151,55 @@ async fn computer_input_resolves_pending_computer_tool_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_server_request_without_runtime_activity_is_ignored() {
+    let sandbox = unique_test_dir("approval-stale-runtime");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    handle_profile_server_request(
+        &state,
+        "default",
+        &backend::codex_app_server::AppServerRequest {
+            id: json!("stale-approval"),
+            method: "input/request".to_string(),
+            params: json!({
+                "threadId": "thread-stale",
+                "question": "Continue?"
+            }),
+        },
+    )
+    .await;
+
+    let pending = state.pending_server_requests.lock().await;
+    assert!(
+        pending
+            .get(&runtime_session_key("default", "thread-stale"))
+            .is_none()
+    );
+    drop(pending);
+
+    let ui_state = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .unwrap();
+    assert!(
+        ui_state["highlightsByThreadId"]
+            .get("thread-stale")
+            .is_none()
+    );
+    assert!(
+        ui_state["notifications"]["items"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolve_server_request_payload_returns_not_found_without_pending_request() {
     let sandbox = unique_test_dir("approval-missing");
     let workspace = sandbox.join("workspace");
@@ -178,6 +236,7 @@ async fn dynamic_tool_call_requests_can_be_resolved_with_content_items() {
 
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    mark_test_session_active(&state, "thread-dynamic").await;
     handle_profile_server_request(
         &state,
         "default",
@@ -2833,6 +2892,208 @@ async fn queue_drain_clears_stale_cached_active_turn_and_dispatches() {
             .and_then(|value| value.get("text"))
             .and_then(Value::as_str),
         Some("Dispatch after stale active cache is reconciled.")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_drain_clears_stale_pending_start_without_app_server_and_dispatches() {
+    let sandbox = unique_test_dir("queue-stale-pending-no-app-server");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-stale-pending-no-app-server";
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .pending_turn_starts
+        .lock()
+        .await
+        .insert(runtime_key.clone());
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][session_id] = json!({
+            "status": "running",
+            "updatedAt": now_unix_ms().saturating_sub(60_000)
+        });
+        ui_state["highlightsByThreadId"][session_id] = json!({
+            "kind": "attention",
+            "at": 1,
+            "reason": "failed"
+        });
+        ui_state["queuesByThreadId"][session_id] = json!({
+            "items": [
+                {
+                    "id": "queue-1",
+                    "prompt": "Run after the crashed app-server state is cleared.",
+                    "attachmentIds": [],
+                    "attachmentNames": [],
+                    "createdAt": 15
+                }
+            ],
+            "resumePending": false,
+            "updatedAt": 20
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    maybe_drain_queue(&state, "default", session_id).await;
+
+    let queue_after = get_session_queue_payload(&state, "default", session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue_after
+            .get("items")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    assert!(
+        state
+            .pending_turn_starts
+            .lock()
+            .await
+            .get(&runtime_key)
+            .is_none()
+    );
+    let ui_state = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .unwrap();
+    assert!(ui_state["highlightsByThreadId"].get(session_id).is_none());
+
+    let thread = read_thread_payload(&state, "default", session_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        thread
+            .get("lastTurnStart")
+            .and_then(|value| value.get("input"))
+            .and_then(Value::as_array)
+            .and_then(|input| input.first())
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str),
+        Some("Run after the crashed app-server state is cleared.")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_drain_ignores_orphaned_local_active_tail_without_cached_runtime_activity() {
+    let sandbox = unique_test_dir("queue-orphaned-local-active-tail");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "thread-orphaned-local-active-tail";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    fs::write(
+        rollout_dir.join(format!("rollout-2026-04-24T01-12-00-{session_id}.jsonl")),
+        format!(
+            "{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:12:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:12:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:12:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-orphaned"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:12:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "this turn was interrupted before completion"
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Orphaned local active tail",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    enqueue_session_queue_payload(
+        &state,
+        "default",
+        session_id,
+        "Dispatch after ignoring the stale local active tail.",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    maybe_drain_queue(&state, "default", session_id).await;
+
+    let queue_after = get_session_queue_payload(&state, "default", session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue_after
+            .get("items")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    let thread = read_thread_payload(&state, "default", session_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        thread
+            .get("lastTurnStart")
+            .and_then(|value| value.get("input"))
+            .and_then(Value::as_array)
+            .and_then(|input| input.first())
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str),
+        Some("Dispatch after ignoring the stale local active tail.")
     );
 
     let _ = fs::remove_dir_all(sandbox);

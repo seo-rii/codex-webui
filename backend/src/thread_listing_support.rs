@@ -123,6 +123,7 @@ pub(crate) fn build_session_summary_from_thread_payload(
         .and_then(Value::as_i64)
         .map(normalize_session_timestamp)
         .unwrap_or(0);
+    let has_direct_live_evidence = snapshot.active_thread_ids.contains(session_id);
     let has_status_override = status_override
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
@@ -151,10 +152,13 @@ pub(crate) fn build_session_summary_from_thread_payload(
         && snapshot.active_thread_ids.contains(session_id)
         && !matches!(
             status.as_str(),
-            "completed" | "failed" | "error" | "cancelled" | "canceled" | "aborted"
+            "failed" | "error" | "cancelled" | "canceled" | "aborted"
         )
     {
         status = "running".to_string();
+    }
+    if !has_status_override && is_live_thread_status(&status) && !has_direct_live_evidence {
+        status = "completed".to_string();
     }
     if snapshot.loaded_thread_ids_available
         && is_live_thread_status(&status)

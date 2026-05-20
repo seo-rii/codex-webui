@@ -230,6 +230,14 @@ pub(crate) async fn send_turn_payload(
         resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
+    clear_stale_session_runtime_activity_if_app_server_missing(
+        state,
+        profile_id,
+        session_id,
+        DUPLICATE_TURN_START_ACTIVE_GRACE_MS,
+        "codex app-server is not running",
+    )
+    .await;
     {
         let mut pending_turn_starts = state.pending_turn_starts.lock().await;
         if !pending_turn_starts.insert(runtime_key.clone()) {
@@ -502,6 +510,7 @@ pub(crate) async fn send_turn_payload(
             .insert(runtime_key.clone(), turn_id);
     }
     set_runtime_session_status(state, profile_id, session_id, "running").await;
+    set_session_highlight(state, profile_id, session_id, None).await;
     emit_session_notification(
         state,
         profile_id,

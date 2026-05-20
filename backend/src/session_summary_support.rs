@@ -160,7 +160,12 @@ async fn loaded_thread_ids_from_app_server(
     state: &AppState,
     profile_id: &str,
 ) -> Option<HashSet<String>> {
-    if state.app_servers.active_process_count().await == 0 {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    if !state
+        .app_servers
+        .profile_has_active_process(resolved_profile_id)
+        .await
+    {
         return Some(HashSet::new());
     }
 
@@ -578,7 +583,10 @@ pub(crate) async fn read_session_summary_ui_snapshot(
     .await?;
     let runtime_key_prefix = format!("profile::{resolved_profile_id}::session-runtime::");
     let now_ms = now_unix_ms();
-    let has_active_app_server_process = state.app_servers.active_process_count().await > 0;
+    let has_active_app_server_process = state
+        .app_servers
+        .profile_has_active_process(&resolved_profile_id)
+        .await;
     if !has_active_app_server_process {
         let has_cached_active_work = state
             .active_turns
@@ -692,13 +700,6 @@ pub(crate) async fn read_session_summary_ui_snapshot(
     for (runtime_key, session_id, has_cached_activity) in reconcile_candidates {
         if has_cached_activity {
             let has_active_turn = async {
-                if local_session_has_active_turn_payload(state, profile_id, &session_id)
-                    .await?
-                    .is_some_and(|has_active_turn| has_active_turn)
-                {
-                    return Ok::<bool, ApiError>(true);
-                }
-
                 let client = app_server_client(state, profile_id)
                     .await
                     .map_err(|error| {

@@ -62,6 +62,32 @@ pub(crate) fn thread_agent_role(thread: &Value) -> Option<String> {
         })
 }
 
+pub(crate) fn thread_source_marks_subagent(source: &Value) -> bool {
+    if source
+        .get("subagent")
+        .and_then(Value::as_object)
+        .is_some_and(|value| !value.is_empty())
+    {
+        return true;
+    }
+
+    let Some(source_text) = source
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let source_text = source_text.to_ascii_lowercase();
+    // Codex keeps non-interactive worker sessions out of the default thread list.
+    // The web UI maps those to the existing hidden-subagent path for compatibility.
+    source_text == "exec"
+        || source_text == "subagent"
+        || source_text.starts_with("subagent_")
+        || source_text.starts_with("internal_")
+        || source_text == "memory_consolidation"
+}
+
 pub(crate) fn thread_is_subagent(thread: &Value) -> bool {
     thread
         .get("isSubagent")
@@ -81,9 +107,7 @@ pub(crate) fn thread_is_subagent(thread: &Value) -> bool {
             .is_some_and(|value| value != 0)
         || thread
             .get("source")
-            .and_then(|value| value.get("subagent"))
-            .and_then(Value::as_object)
-            .is_some_and(|value| !value.is_empty())
+            .is_some_and(thread_source_marks_subagent)
         || thread_agent_nickname(thread).is_some()
         || thread_agent_role(thread).is_some()
 }

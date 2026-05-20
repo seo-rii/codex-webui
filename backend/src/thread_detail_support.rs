@@ -817,7 +817,7 @@ pub(crate) async fn session_detail_payload(
 ) -> ApiResult<Value> {
     let (
         thread,
-        visible_turns,
+        mut visible_turns,
         total_turns,
         start,
         hydration_state,
@@ -961,13 +961,6 @@ pub(crate) async fn session_detail_payload(
         .as_ref()
         .and_then(|status| normalized_thread_status(Some(status)))
         .filter(|status| !is_live_thread_status(status));
-    let mut terminal_runtime_reason = runtime_status_entry
-        .as_ref()
-        .and_then(|status| status.get("reason"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
 
     if raw_active_turn_id_from_payload.is_some() && terminal_runtime_status.is_none() {
         let app_server_thread = match app_server_client(state, profile_id).await {
@@ -976,7 +969,7 @@ pub(crate) async fn session_detail_payload(
                     "thread/read",
                     json!({
                         "threadId": session_id,
-                        "includeTurns": false
+                        "includeTurns": true
                     }),
                     Duration::from_millis(SESSION_DETAIL_ACTIVE_RECONCILE_TIMEOUT_MS),
                     false,
@@ -989,17 +982,25 @@ pub(crate) async fn session_detail_payload(
         let app_server_status = app_server_thread
             .as_ref()
             .and_then(|thread| normalized_thread_status(thread.get("status")));
-        if app_server_status
-            .as_deref()
-            .is_some_and(|status| !is_live_thread_status(status))
-        {
-            let status = if app_server_status.as_deref() == Some("completed") {
-                "completed"
-            } else {
-                "failed"
+        let app_server_active_turn_id = app_server_thread
+            .as_ref()
+            .and_then(|thread| thread.get("turns"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .and_then(active_turn_id_from_turns);
+        if app_server_active_turn_id.is_none() && app_server_status.is_some() {
+            let status = match app_server_status.as_deref() {
+                Some("failed" | "error") => "failed",
+                Some("cancelled" | "canceled" | "aborted") => "cancelled",
+                _ => "completed",
             };
             let reason = if status == "completed" {
-                "codex app-server reports the turn is complete"
+                "codex app-server did not report an active turn"
+            } else if app_server_status
+                .as_deref()
+                .is_some_and(is_live_thread_status)
+            {
+                "codex app-server did not report an active turn"
             } else {
                 "codex app-server no longer has an active turn"
             };
@@ -1027,14 +1028,32 @@ pub(crate) async fn session_detail_payload(
             })
             .await?;
             terminal_runtime_status = Some(status.to_string());
-            terminal_runtime_reason = Some(reason.to_string());
             emit_session_summary_updated(state, profile_id, session_id, None, Some(status)).await;
         }
     }
 
-    let stale_active_turn_after_exit = raw_active_turn_id_from_payload.is_some()
-        && terminal_runtime_status.is_some()
-        && terminal_runtime_reason.is_some();
+    let stale_active_turn_after_exit =
+        raw_active_turn_id_from_payload.is_some() && terminal_runtime_status.is_some();
+    if stale_active_turn_after_exit {
+        let settled_turn_status = match terminal_runtime_status.as_deref() {
+            Some("failed" | "error") => "failed",
+            Some("cancelled" | "canceled" | "aborted") => "cancelled",
+            _ => "completed",
+        };
+        for turn in &mut visible_turns {
+            if turn.get("status").and_then(Value::as_str) == Some("inProgress") {
+                if let Some(turn_object) = turn.as_object_mut() {
+                    turn_object.insert(
+                        "status".to_string(),
+                        Value::String(settled_turn_status.to_string()),
+                    );
+                    turn_object
+                        .entry("completedAt".to_string())
+                        .or_insert_with(|| json!(now_unix_ms()));
+                }
+            }
+        }
+    }
     let active_turn_id_from_payload = if stale_active_turn_after_exit {
         None
     } else {

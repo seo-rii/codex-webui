@@ -411,10 +411,11 @@ async fn session_has_cached_runtime_activity(state: &AppState, runtime_key: &str
         || state.pending_turn_starts.lock().await.contains(runtime_key)
 }
 
-async fn mark_runtime_session_failed_attention(
+async fn mark_runtime_session_attention(
     state: &AppState,
     profile_id: &str,
     session_id: &str,
+    attention_reason: &str,
     reason: &str,
 ) {
     let _ = with_ui_state_write(state, profile_id, |ui_state| {
@@ -432,7 +433,7 @@ async fn mark_runtime_session_failed_attention(
             json!({
                 "kind": "attention",
                 "at": now_unix_ms(),
-                "reason": "failed"
+                "reason": attention_reason
             }),
         );
         Ok(())
@@ -446,7 +447,7 @@ async fn mark_runtime_session_failed_attention(
             "method": "codex-webui/sessionAttention",
             "params": {
                 "sessionId": session_id,
-                "reason": "failed",
+                "reason": attention_reason,
                 "message": reason
             }
         }),
@@ -488,7 +489,7 @@ async fn mark_runtime_session_failed_attention(
         "sessionId": session_id,
         "sessionName": Value::Null,
         "payload": {
-            "reason": "failed",
+            "reason": attention_reason,
             "message": reason
         }
     });
@@ -617,6 +618,7 @@ pub(crate) async fn clear_profile_runtime_activity_after_app_server_exit(
 
     let affected_session_ids = affected_session_ids.into_iter().collect::<Vec<_>>();
     for session_id in &affected_session_ids {
+        clear_session_pending_requests(state, profile_id, session_id).await;
         complete_active_automation_runs_for_session(
             state,
             profile_id,
@@ -640,15 +642,59 @@ pub(crate) async fn clear_profile_runtime_activity_after_app_server_exit(
             }),
         )
         .await;
-        mark_runtime_session_failed_attention(
+        mark_runtime_session_attention(
             state,
             profile_id,
             session_id,
+            "stopped",
             reason_value.as_str().unwrap_or("codex app-server exited"),
         )
         .await;
     }
     affected_session_ids
+}
+
+pub(crate) async fn clear_stale_session_runtime_activity_if_app_server_missing(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    stale_after_ms: u64,
+    reason: &str,
+) -> bool {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    if state
+        .app_servers
+        .profile_has_active_process(resolved_profile_id)
+        .await
+    {
+        return false;
+    }
+
+    let status_is_stale =
+        with_ui_state_read(state, profile_id, |ui_state| {
+            Ok(ui_state
+                .get("runtimeStatusByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id))
+                .is_some_and(|status| {
+                    normalized_thread_status(Some(status))
+                        .as_deref()
+                        .is_some_and(is_live_thread_status)
+                        && status.get("updatedAt").and_then(Value::as_u64).is_some_and(
+                            |updated_at| now_unix_ms().saturating_sub(updated_at) >= stale_after_ms,
+                        )
+                }))
+        })
+        .await
+        .unwrap_or(false);
+    if !status_is_stale {
+        return false;
+    }
+
+    clear_profile_runtime_activity_after_app_server_exit(state, profile_id, Some(reason))
+        .await
+        .iter()
+        .any(|affected_session_id| affected_session_id == session_id)
 }
 
 async fn cached_runtime_session_ids(
@@ -761,6 +807,7 @@ async fn mark_runtime_session_terminal_after_reconcile(
         automation_error,
     )
     .await;
+    clear_session_pending_requests(state, profile_id, session_id).await;
     emit_session_notification(
         state,
         profile_id,
@@ -780,7 +827,7 @@ async fn mark_runtime_session_terminal_after_reconcile(
         spawn_queue_drain(state, profile_id, session_id);
         maybe_schedule_global_shutdown(state, profile_id, None).await;
     } else {
-        mark_runtime_session_failed_attention(state, profile_id, session_id, reason).await;
+        mark_runtime_session_attention(state, profile_id, session_id, "failed", reason).await;
     }
     emit_session_summary_updated(state, profile_id, session_id, None, Some(status)).await;
 }
@@ -1014,6 +1061,7 @@ pub(crate) async fn handle_profile_runtime_notification(
                 } else {
                     state.pending_turn_starts.lock().await.remove(&runtime_key);
                     state.active_turns.lock().await.remove(&runtime_key);
+                    clear_session_pending_requests(state, profile_id, &session_id).await;
                     set_runtime_session_status(state, profile_id, &session_id, &status).await;
                     let (automation_status, automation_error) =
                         automation_status_for_thread_status(&status);

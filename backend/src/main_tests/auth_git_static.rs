@@ -567,7 +567,7 @@ fn external_or_configured_owner_modes_require_owner_role_for_owner_actions() {
 }
 
 #[test]
-fn session_summary_normalizes_unloaded_live_thread_to_completed() {
+fn session_summary_normalizes_live_thread_without_runtime_evidence_to_completed() {
     let mut snapshot = SessionSummaryUiSnapshot {
         loaded_thread_ids_available: true,
         ..SessionSummaryUiSnapshot::default()
@@ -589,11 +589,22 @@ fn session_summary_normalizes_unloaded_live_thread_to_completed() {
     );
 
     snapshot.loaded_thread_ids.insert("thread-live".to_string());
+    let loaded_without_activity =
+        build_session_summary_from_thread_payload(&thread, &snapshot, None, None)
+            .expect("loaded summary should be built");
+    assert_eq!(
+        loaded_without_activity
+            .get("status")
+            .and_then(Value::as_str),
+        Some("completed")
+    );
+
+    snapshot.active_thread_ids.insert("thread-live".to_string());
     let loaded_summary = build_session_summary_from_thread_payload(&thread, &snapshot, None, None)
         .expect("loaded summary should be built");
     assert_eq!(
         loaded_summary.get("status").and_then(Value::as_str),
-        Some("active")
+        Some("running")
     );
 }
 
@@ -2643,6 +2654,11 @@ async fn pending_server_requests_are_capped_per_session() {
         }
     }
 
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-1".to_string());
     handle_profile_server_request(
         &state,
         "default",

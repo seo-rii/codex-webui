@@ -108,6 +108,8 @@
   "no_threads_matching_search": "검색 조건에 맞는 스레드를 찾지 못했습니다.",
   "create_new_thread_prompt": "새 스레드를 만들어 시작하세요.",
   "needs_input": "입력 필요",
+  "session_failed": "세션 실패",
+  "session_stopped": "세션 중단됨",
   "done": "완료",
   "new_codex_session": "새 Codex 세션",
   "loading_more_threads": "세션을 더 불러오는 중…",

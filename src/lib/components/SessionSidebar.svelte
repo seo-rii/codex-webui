@@ -127,7 +127,7 @@
     notifications: AppNotification[];
     notificationsBusy: boolean;
     notificationsUnreadCount: number;
-    sessionHighlights: Record<string, { kind: "completed" | "attention"; at: number }>;
+    sessionHighlights: Record<string, { kind: "completed" | "attention"; at: number; reason?: string }>;
     selectedId: string | null;
     sessionsBusy: boolean;
     sessionsHasMore: boolean;
@@ -263,6 +263,8 @@
       noThreadsMatchingSearch: m.no_threads_matching_search(),
       createNewThreadPrompt: m.create_new_thread_prompt(),
       needsInput: m.needs_input(),
+      sessionFailed: m.session_failed(),
+      sessionStopped: m.session_stopped(),
       done: m.done(),
       newCodexSession: m.new_codex_session(),
       loadingMoreThreads: m.loading_more_threads(),
@@ -440,7 +442,7 @@
       return ui.notificationSessionCompleted;
     }
     if (notification.type === "sessionAttention") {
-      return ui.notificationInputRequired;
+      return attentionReasonLabel(notification.payload.reason);
     }
     if (notification.type === "queueDispatchFailed") {
       return ui.notificationQueueFailed;
@@ -454,7 +456,8 @@
       return sessionLabel ? `${sessionLabel} · ${ui.done}` : ui.done;
     }
     if (notification.type === "sessionAttention") {
-      return sessionLabel ? `${sessionLabel} · ${ui.needsInput}` : ui.needsInput;
+      const label = attentionReasonLabel(notification.payload.reason);
+      return sessionLabel ? `${sessionLabel} · ${label}` : label;
     }
     if (notification.type === "queueDispatchFailed") {
       const message = describeUiError(notification.payload).trim();
@@ -478,6 +481,52 @@
       return m.dark();
     }
     return m.system();
+  }
+
+  function attentionReasonLabel(reason: unknown) {
+    if (reason === "failed") {
+      return ui.sessionFailed;
+    }
+    if (reason === "stopped") {
+      return ui.sessionStopped;
+    }
+    return ui.needsInput;
+  }
+
+  function isFailedAttention(highlight: { reason?: string } | undefined) {
+    return highlight?.reason === "failed";
+  }
+
+  function isStoppedAttention(highlight: { reason?: string } | undefined) {
+    return highlight?.reason === "stopped";
+  }
+
+  function attentionLabel(highlight: { reason?: string } | undefined) {
+    return attentionReasonLabel(highlight?.reason);
+  }
+
+  function attentionPillClass(highlight: { reason?: string } | undefined) {
+    if (isFailedAttention(highlight)) {
+      return "bg-red-100 text-red-700";
+    }
+    return isStoppedAttention(highlight)
+      ? "bg-slate-200 text-slate-700"
+      : "bg-amber-100 text-amber-700";
+  }
+
+  function sessionCardHighlightClass(sessionId: string) {
+    const highlight = sessionHighlights[sessionId];
+    if (highlight?.kind === "attention") {
+      return isFailedAttention(highlight)
+        ? "bg-red-50 border border-red-200/80 ring-1 ring-red-200/60"
+        : isStoppedAttention(highlight)
+          ? "bg-slate-50 border border-slate-200/80 ring-1 ring-slate-200/60"
+        : "bg-amber-50 border border-amber-200/80 ring-1 ring-amber-200/60";
+    }
+    if (highlight?.kind === "completed") {
+      return "bg-emerald-50 border border-emerald-200/80 ring-1 ring-emerald-200/60";
+    }
+    return "hover:bg-gray-200/50 border border-transparent";
   }
 
   function getResolvedThemeLabel() {
@@ -1248,7 +1297,7 @@
       {#each sessions as session (session.id)}
         <div class="group relative">
           <button
-            class="w-full text-left p-3 pr-11 rounded-xl transition-all relative { session.id === selectedId ? 'bg-white shadow-sm border border-gray-200 ring-1 ring-gray-200/50' : sessionHighlights[session.id]?.kind === 'attention' ? 'bg-amber-50 border border-amber-200/80 ring-1 ring-amber-200/60' : sessionHighlights[session.id]?.kind === 'completed' ? 'bg-emerald-50 border border-emerald-200/80 ring-1 ring-emerald-200/60' : 'hover:bg-gray-200/50 border border-transparent' }"
+            class="w-full text-left p-3 pr-11 rounded-xl transition-all relative { session.id === selectedId ? 'bg-white shadow-sm border border-gray-200 ring-1 ring-gray-200/50' : sessionCardHighlightClass(session.id) }"
             onclick={() => onSelect(session.id)}
             type="button"
           >
@@ -1272,7 +1321,7 @@
                     </span>
                   {/if}
                   {#if sessionHighlights[session.id]?.kind === "attention"}
-                    <span class="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 font-bold uppercase tracking-widest">{ui.needsInput}</span>
+                    <span class="text-[9px] px-1.5 py-0.5 rounded-full {attentionPillClass(sessionHighlights[session.id])} font-bold uppercase tracking-widest">{attentionLabel(sessionHighlights[session.id])}</span>
                   {:else if sessionHighlights[session.id]?.kind === "completed"}
                     <span class="text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 font-bold uppercase tracking-widest">{ui.done}</span>
                   {/if}

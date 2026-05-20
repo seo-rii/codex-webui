@@ -163,6 +163,7 @@ export type AutomationWorktreeCleanupPayload = {
 export type SessionSummaryHighlight = {
   kind: "completed" | "attention";
   at: number;
+  reason?: "approval" | "failed" | string;
 };
 
 export type SessionListPayload = {

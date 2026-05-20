@@ -516,7 +516,16 @@ export function createConversationState(detail: SessionDetailPayload): Conversat
 
 export function mergeConversationState(current: ConversationState, detail: SessionDetailPayload): ConversationState {
   const incoming = createConversationState(detail);
-  const mergedTurns = mergeTurns(current.thread.turns, incoming.thread.turns);
+  const incomingSettled = !isLiveThreadStatus(incoming.thread.status) && !incoming.activeTurnId;
+  const mergedTurns = mergeTurns(current.thread.turns, incoming.thread.turns).map((turn) =>
+    incomingSettled && String(turn.status ?? "") === "inProgress"
+      ? {
+          ...turn,
+          status: incoming.thread.status === "failed" || incoming.thread.status === "error" ? "failed" : "completed",
+          completedAt: turn.completedAt ?? Date.now()
+        }
+      : turn
+  );
   const hasLiveTurn = mergedTurns.some((turn) => String(turn.status ?? "") === "inProgress");
   const threadStatus = hasLiveTurn
     ? (isLiveThreadStatus(incoming.thread.status) ? incoming.thread.status : current.thread.status || "running")

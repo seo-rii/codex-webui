@@ -108,6 +108,8 @@
   "no_threads_matching_search": "No threads matched your search.",
   "create_new_thread_prompt": "Create a new thread to get started.",
   "needs_input": "Needs input",
+  "session_failed": "Session failed",
+  "session_stopped": "Сеанс остановлен",
   "done": "Done",
   "new_codex_session": "New Codex session",
   "loading_more_threads": "Loading more threads…",

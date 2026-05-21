@@ -508,21 +508,21 @@
 
   function attentionPillClass(highlight: { reason?: string } | undefined) {
     if (isFailedAttention(highlight)) {
-      return "bg-red-100 text-red-700";
+      return "session-attention-pill--failed bg-red-100 text-red-700";
     }
     return isStoppedAttention(highlight)
-      ? "bg-slate-200 text-slate-700"
-      : "bg-amber-100 text-amber-700";
+      ? "session-attention-pill--stopped bg-slate-200 text-slate-700"
+      : "session-attention-pill--needs-input bg-amber-100 text-amber-700";
   }
 
   function sessionCardHighlightClass(sessionId: string) {
     const highlight = sessionHighlights[sessionId];
     if (highlight?.kind === "attention") {
       return isFailedAttention(highlight)
-        ? "bg-red-50 border border-red-200/80 ring-1 ring-red-200/60"
+        ? "session-card--attention-failed bg-red-50 border border-red-200/80 ring-1 ring-red-200/60"
         : isStoppedAttention(highlight)
-          ? "bg-slate-50 border border-slate-200/80 ring-1 ring-slate-200/60"
-        : "bg-amber-50 border border-amber-200/80 ring-1 ring-amber-200/60";
+          ? "session-card--attention-stopped bg-slate-50 border border-slate-200/80 ring-1 ring-slate-200/60"
+          : "session-card--attention-needs-input bg-amber-50 border border-amber-200/80 ring-1 ring-amber-200/60";
     }
     if (highlight?.kind === "completed") {
       return "bg-emerald-50 border border-emerald-200/80 ring-1 ring-emerald-200/60";
@@ -1885,8 +1885,22 @@
 	    color: #fde68a !important;
 	  }
 
+	  :global(:root[data-theme="dark"]) .session-card--attention-stopped {
+	    border-color: rgba(148, 163, 184, 0.24) !important;
+	    background: linear-gradient(180deg, rgba(30, 41, 59, 0.72), rgba(15, 23, 42, 0.9)) !important;
+	    box-shadow:
+	      0 18px 34px -32px rgba(2, 6, 23, 0.88),
+	      inset 0 0 0 1px rgba(148, 163, 184, 0.08) !important;
+	  }
+
+	  :global(:root[data-theme="dark"]) .session-attention-pill--stopped {
+	    background: rgba(51, 65, 85, 0.92) !important;
+	    color: #cbd5e1 !important;
+	    box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.18);
+	  }
+
 	  :global(:root[data-theme="dark"]) .sidebar-search-trigger {
-    border-color: rgba(71, 85, 105, 0.48) !important;
+	    border-color: rgba(71, 85, 105, 0.48) !important;
     background: linear-gradient(180deg, rgba(17, 24, 39, 0.9), rgba(15, 23, 42, 0.96)) !important;
     box-shadow: 0 20px 40px -34px rgba(2, 6, 23, 0.85) !important;
   }

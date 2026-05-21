@@ -438,6 +438,16 @@
   const toolOutputInitialChars = 24_000;
   const composerTextareaMinHeight = 52;
   const sessionQueryParamKey = "session";
+  const sessionSearchQueryParamKey = "sessionSearch";
+  const sessionSearchScopeParamKey = "sessionSearchScope";
+  const sessionArchivedParamKey = "sessionArchived";
+  const sessionFilterPinnedParamKey = "sessionPinned";
+  const sessionFilterRunningParamKey = "sessionRunning";
+  const sessionFilterQueuedParamKey = "sessionQueued";
+  const sessionFilterHighlightParamKey = "sessionHighlight";
+  const sessionFilterTagParamKey = "sessionTag";
+  const sessionFolderParamKey = "sessionFolder";
+  const sessionSavedFilterParamKey = "sessionSavedFilter";
   const notificationPromptStorageKey = "codex-webui.notifications.permission-prompted";
   const sendOnEnterPreferenceStorageKey = "codex-webui.composer.send-on-enter";
   let loginHcaptchaScriptPromise: Promise<void> | null = null;
@@ -3073,6 +3083,110 @@
     return !filter.pinnedOnly && !filter.runningOnly && !filter.queuedOnly && filter.highlight === "all" && filter.tags.length === 0;
   }
 
+  function isEnabledQueryParam(value: string | null) {
+    return value === "1" || value === "true";
+  }
+
+  function readSessionListStateFromUrl() {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const params = new URL(window.location.href).searchParams;
+    const query = params.get(sessionSearchQueryParamKey)?.trim() ?? "";
+    const scope = params.get(sessionSearchScopeParamKey);
+    const highlight = params.get(sessionFilterHighlightParamKey);
+    const folder = params.get(sessionFolderParamKey)?.trim() ?? "";
+    const tags = params
+      .getAll(sessionFilterTagParamKey)
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+
+    sessionSearchQuery = query;
+    sessionSearchScope = scope === "full" ? "full" : "summary";
+    showArchivedSessions = isEnabledQueryParam(params.get(sessionArchivedParamKey));
+    activeSavedSessionFilterId = params.get(sessionSavedFilterParamKey)?.trim() || null;
+    activeSessionFolder = folder || null;
+    sessionFilter = normalizeSessionFilterState({
+      pinnedOnly: isEnabledQueryParam(params.get(sessionFilterPinnedParamKey)),
+      runningOnly: isEnabledQueryParam(params.get(sessionFilterRunningParamKey)),
+      queuedOnly: isEnabledQueryParam(params.get(sessionFilterQueuedParamKey)),
+      highlight: highlight === "attention" || highlight === "completed" ? highlight : "all",
+      tags: folder ? [...new Set([folder, ...tags])] : tags
+    });
+  }
+
+  function syncSessionListStateInUrl() {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const url = new URL(window.location.href);
+    const query = sessionSearchQuery.trim();
+    if (query) {
+      url.searchParams.set(sessionSearchQueryParamKey, query);
+    } else {
+      url.searchParams.delete(sessionSearchQueryParamKey);
+    }
+
+    if (sessionSearchScope === "full") {
+      url.searchParams.set(sessionSearchScopeParamKey, sessionSearchScope);
+    } else {
+      url.searchParams.delete(sessionSearchScopeParamKey);
+    }
+
+    if (showArchivedSessions) {
+      url.searchParams.set(sessionArchivedParamKey, "1");
+    } else {
+      url.searchParams.delete(sessionArchivedParamKey);
+    }
+
+    const normalizedFilter = normalizeSessionFilterState(sessionFilter);
+    const filterParams: Array<[string, boolean]> = [
+      [sessionFilterPinnedParamKey, normalizedFilter.pinnedOnly],
+      [sessionFilterRunningParamKey, normalizedFilter.runningOnly],
+      [sessionFilterQueuedParamKey, normalizedFilter.queuedOnly]
+    ];
+    for (const [key, enabled] of filterParams) {
+      if (enabled) {
+        url.searchParams.set(key, "1");
+      } else {
+        url.searchParams.delete(key);
+      }
+    }
+
+    if (normalizedFilter.highlight !== "all") {
+      url.searchParams.set(sessionFilterHighlightParamKey, normalizedFilter.highlight);
+    } else {
+      url.searchParams.delete(sessionFilterHighlightParamKey);
+    }
+
+    url.searchParams.delete(sessionFilterTagParamKey);
+    for (const tag of normalizedFilter.tags) {
+      if (tag !== activeSessionFolder) {
+        url.searchParams.append(sessionFilterTagParamKey, tag);
+      }
+    }
+
+    if (activeSessionFolder) {
+      url.searchParams.set(sessionFolderParamKey, activeSessionFolder);
+    } else {
+      url.searchParams.delete(sessionFolderParamKey);
+    }
+
+    if (activeSavedSessionFilterId) {
+      url.searchParams.set(sessionSavedFilterParamKey, activeSavedSessionFilterId);
+    } else {
+      url.searchParams.delete(sessionSavedFilterParamKey);
+    }
+
+    const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+    const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (nextUrl !== currentUrl) {
+      window.history.replaceState(window.history.state, "", nextUrl);
+    }
+  }
+
   function updateConfigSessionOrganization(patch: Partial<AppConfigPayload["sessionOrganization"]>) {
     if (!config) {
       return;
@@ -4203,6 +4317,7 @@
       ensureGlobalStreamSubscription();
       void refreshRuntimeStatus(false, { silent: true });
 
+      readSessionListStateFromUrl();
       const requestedSessionId = getRequestedSessionIdFromUrl();
       const [nextConfig] = await Promise.all([api.getConfig(), refreshSessions()]);
       config = applyLocalComposerPreferencesToConfig(nextConfig);
@@ -4490,6 +4605,7 @@
     resetSessionTurnSearch();
     loadingDetail = true;
     selectedSessionId = sessionId;
+    syncSelectedSessionInUrl(sessionId);
     conversation = null;
     pendingSessionEvents = {
       [sessionId]: []
@@ -7845,11 +7961,13 @@
 
   function updateSessionSearchQuery(query: string) {
     sessionSearchQuery = query;
+    syncSessionListStateInUrl();
     scheduleSessionRefresh(query.trim() ? 180 : 60);
   }
 
   function updateSessionSearchScope(scope: SessionSearchScope) {
     sessionSearchScope = scope;
+    syncSessionListStateInUrl();
     scheduleSessionRefresh(60);
   }
 
@@ -7864,6 +7982,7 @@
         ? sessionFilter.tags[0]
         : null;
     activeSavedSessionFilterId = null;
+    syncSessionListStateInUrl();
     scheduleSessionRefresh(60);
   }
 
@@ -7871,6 +7990,7 @@
     sessionFilter = normalizeSessionFilterState(filter);
     activeSavedSessionFilterId = filter?.id ?? null;
     activeSessionFolder = null;
+    syncSessionListStateInUrl();
     scheduleSessionRefresh(0);
   }
 
@@ -7882,6 +8002,7 @@
       tags: folderName ? [folderName] : []
     });
     showArchivedSessions = false;
+    syncSessionListStateInUrl();
     scheduleSessionRefresh(0);
   }
 
@@ -7980,6 +8101,7 @@
         knownTags: response.knownTags
       });
       activeSavedSessionFilterId = savedFilter.id;
+      syncSessionListStateInUrl();
       noticeText = m.saved_filter_saved();
     } catch (error) {
       errorText = describeError(error);
@@ -7999,6 +8121,7 @@
       });
       if (activeSavedSessionFilterId === filterId) {
         activeSavedSessionFilterId = null;
+        syncSessionListStateInUrl();
       }
       noticeText = m.saved_filter_deleted();
     } catch (error) {
@@ -8131,6 +8254,7 @@
 
   function updateArchivedSessions(nextValue: boolean) {
     showArchivedSessions = nextValue;
+    syncSessionListStateInUrl();
     scheduleSessionRefresh(0);
   }
 

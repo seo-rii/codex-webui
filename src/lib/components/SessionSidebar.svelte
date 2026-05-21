@@ -223,6 +223,7 @@
   let accountButtonElement = $state<HTMLButtonElement | undefined>(undefined);
   let accountPopoverElement = $state<HTMLDivElement | undefined>(undefined);
   let accountPopoverStyle = $state("");
+  let sessionFoldersCollapsed = $state(true);
   let boundedAutoloadPasses = $state(0);
   let loadMoreOrigin = $state<"manual" | "auto" | null>(null);
 
@@ -916,8 +917,27 @@
 	    </div>
 
 	    <div class="sidebar-folders rounded-2xl border border-gray-200 bg-white/70 p-2 shadow-sm">
-	      <div class="mb-1 flex items-center justify-between gap-2 px-1">
-	        <p class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.sessionFolders}</p>
+	      <div class="flex items-center justify-between gap-2">
+	        <button
+	          aria-expanded={!sessionFoldersCollapsed}
+	          class="sidebar-folders-toggle flex min-w-0 flex-1 items-center gap-2 rounded-xl px-1.5 py-1 text-left transition-colors hover:bg-gray-100"
+	          onclick={() => {
+	            sessionFoldersCollapsed = !sessionFoldersCollapsed;
+	          }}
+	          type="button"
+	        >
+	          <ChevronDown
+	            size={14}
+	            class={`shrink-0 text-gray-400 transition-transform ${sessionFoldersCollapsed ? "-rotate-90" : ""}`}
+	          />
+	          <Folder size={14} class="shrink-0 text-gray-400" />
+	          <span class="min-w-0 flex-1 truncate text-[10px] font-bold uppercase tracking-widest text-gray-400">
+	            {ui.sessionFolders}
+	          </span>
+	          <span class="sidebar-folder-count shrink-0 rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-gray-500">
+	            {sessionFolders.length}
+	          </span>
+	        </button>
 	        <button
 	          class="sidebar-folder-action rounded-lg p-1 text-gray-400 transition-colors hover:bg-amber-50 hover:text-amber-700 disabled:cursor-not-allowed disabled:opacity-45"
 	          disabled={readOnly}
@@ -928,80 +948,93 @@
 	          <Plus size={13} />
 	        </button>
 	      </div>
-	      <div class="grid gap-1">
+	      {#if !sessionFoldersCollapsed}
+	        <div class="mt-1 grid gap-1">
+	          <button
+	            class={`sidebar-folder-item flex min-w-0 items-center gap-2 rounded-xl px-2 py-1.5 text-left text-xs transition-colors ${
+	              activeSessionFolder === null ? "sidebar-folder-item--active bg-gray-900 text-white shadow-sm" : "text-gray-600 hover:bg-gray-100"
+	            }`}
+	            onclick={() => onSelectSessionFolder(null)}
+	            type="button"
+	          >
+	            <FolderOpen size={14} class="shrink-0" />
+	            <span class="min-w-0 flex-1 truncate">{ui.allFolders}</span>
+	          </button>
+	          {#each sessionFolders as folder (folder.name)}
+	            <div class={`sidebar-folder-item group/folder flex min-w-0 items-center gap-1 rounded-xl px-1 py-1 transition-colors ${
+	              activeSessionFolder === folder.name ? "sidebar-folder-item--active bg-amber-50 text-amber-800" : "text-gray-600 hover:bg-gray-100"
+	            }`}>
+	              <button
+	                class="flex min-w-0 flex-1 items-center gap-2 rounded-lg px-1.5 py-1 text-left text-xs"
+	                onclick={() => onSelectSessionFolder(folder.name)}
+	                type="button"
+	              >
+	                {#if activeSessionFolder === folder.name}
+	                  <FolderOpen size={14} class="shrink-0 text-amber-600" />
+	                {:else}
+	                  <Folder size={14} class="shrink-0 text-gray-400" />
+	                {/if}
+	                <span class="min-w-0 flex-1 truncate font-medium">{folder.name}</span>
+	                <span class="sidebar-folder-count shrink-0 rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-gray-500">{folder.sessionCount}</span>
+	              </button>
+	              {#if activeSessionFolder === folder.name}
+	                <button
+	                  class="sidebar-folder-action rounded-lg p-1 text-amber-600 transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-45"
+	                  disabled={readOnly}
+	                  onclick={() => onCreate()}
+	                  title={ui.createInFolder}
+	                  type="button"
+	                >
+	                  <Plus size={12} />
+	                </button>
+	              {/if}
+	              {#if selectedSession}
+	                <button
+	                  class="sidebar-folder-action rounded-lg p-1 text-gray-400 opacity-0 transition-all hover:bg-white hover:text-amber-700 group-hover/folder:opacity-100 group-focus-within/folder:opacity-100 disabled:cursor-not-allowed disabled:opacity-45"
+	                  disabled={readOnly}
+	                  onclick={() => {
+	                    if (selectedSession.tags.includes(folder.name)) {
+	                      onRemoveSelectedSessionFromFolder(folder.name);
+	                    } else {
+	                      onAddSelectedSessionToFolder(folder.name);
+	                    }
+	                  }}
+	                  title={selectedSession.tags.includes(folder.name) ? ui.removeSessionFromFolder : ui.addSessionToFolder}
+	                  type="button"
+	                >
+	                  {#if selectedSession.tags.includes(folder.name)}
+	                    <X size={12} />
+	                  {:else}
+	                    <Plus size={12} />
+	                  {/if}
+	                </button>
+	              {/if}
+	              <button
+	                class={`sidebar-folder-action rounded-lg p-1 transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
+	                  folder.pinned ? "text-amber-600 hover:bg-amber-100" : "text-gray-400 hover:bg-white hover:text-amber-700"
+	                }`}
+	                disabled={readOnly}
+	                onclick={() => onToggleSessionFolderPin(folder)}
+	                title={folder.pinned ? ui.unpinFolder : ui.pinFolder}
+	                type="button"
+	              >
+	                <Pin size={12} />
+	              </button>
+	            </div>
+	          {/each}
+	        </div>
+	      {:else if activeSessionFolder}
 	        <button
-	          class={`sidebar-folder-item flex min-w-0 items-center gap-2 rounded-xl px-2 py-1.5 text-left text-xs transition-colors ${
-	            activeSessionFolder === null ? "sidebar-folder-item--active bg-gray-900 text-white shadow-sm" : "text-gray-600 hover:bg-gray-100"
-	          }`}
-	          onclick={() => onSelectSessionFolder(null)}
+	          class="sidebar-folder-item sidebar-folder-item--active mt-1 flex min-w-0 items-center gap-2 rounded-xl bg-amber-50 px-2 py-1.5 text-left text-xs text-amber-800 transition-colors"
+	          onclick={() => {
+	            sessionFoldersCollapsed = false;
+	          }}
 	          type="button"
 	        >
-	          <FolderOpen size={14} class="shrink-0" />
-	          <span class="min-w-0 flex-1 truncate">{ui.allFolders}</span>
+	          <FolderOpen size={14} class="shrink-0 text-amber-600" />
+	          <span class="min-w-0 flex-1 truncate font-medium">{activeSessionFolder}</span>
 	        </button>
-	        {#each sessionFolders as folder (folder.name)}
-	          <div class={`sidebar-folder-item group/folder flex min-w-0 items-center gap-1 rounded-xl px-1 py-1 transition-colors ${
-	            activeSessionFolder === folder.name ? "sidebar-folder-item--active bg-amber-50 text-amber-800" : "text-gray-600 hover:bg-gray-100"
-	          }`}>
-	            <button
-	              class="flex min-w-0 flex-1 items-center gap-2 rounded-lg px-1.5 py-1 text-left text-xs"
-	              onclick={() => onSelectSessionFolder(folder.name)}
-	              type="button"
-	            >
-	              {#if activeSessionFolder === folder.name}
-	                <FolderOpen size={14} class="shrink-0 text-amber-600" />
-	              {:else}
-	                <Folder size={14} class="shrink-0 text-gray-400" />
-	              {/if}
-	              <span class="min-w-0 flex-1 truncate font-medium">{folder.name}</span>
-	              <span class="sidebar-folder-count shrink-0 rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-gray-500">{folder.sessionCount}</span>
-	            </button>
-	            {#if activeSessionFolder === folder.name}
-	              <button
-	                class="sidebar-folder-action rounded-lg p-1 text-amber-600 transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-45"
-	                disabled={readOnly}
-	                onclick={() => onCreate()}
-	                title={ui.createInFolder}
-	                type="button"
-	              >
-	                <Plus size={12} />
-	              </button>
-	            {/if}
-	            {#if selectedSession}
-	              <button
-	                class="sidebar-folder-action rounded-lg p-1 text-gray-400 opacity-0 transition-all hover:bg-white hover:text-amber-700 group-hover/folder:opacity-100 group-focus-within/folder:opacity-100 disabled:cursor-not-allowed disabled:opacity-45"
-	                disabled={readOnly}
-	                onclick={() => {
-	                  if (selectedSession.tags.includes(folder.name)) {
-	                    onRemoveSelectedSessionFromFolder(folder.name);
-	                  } else {
-	                    onAddSelectedSessionToFolder(folder.name);
-	                  }
-	                }}
-	                title={selectedSession.tags.includes(folder.name) ? ui.removeSessionFromFolder : ui.addSessionToFolder}
-	                type="button"
-	              >
-	                {#if selectedSession.tags.includes(folder.name)}
-	                  <X size={12} />
-	                {:else}
-	                  <Plus size={12} />
-	                {/if}
-	              </button>
-	            {/if}
-	            <button
-	              class={`sidebar-folder-action rounded-lg p-1 transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
-	                folder.pinned ? "text-amber-600 hover:bg-amber-100" : "text-gray-400 hover:bg-white hover:text-amber-700"
-	              }`}
-	              disabled={readOnly}
-	              onclick={() => onToggleSessionFolderPin(folder)}
-	              title={folder.pinned ? ui.unpinFolder : ui.pinFolder}
-	              type="button"
-	            >
-	              <Pin size={12} />
-	            </button>
-	          </div>
-	        {/each}
-	      </div>
+	      {/if}
 	    </div>
 
 	    <div class="relative">
@@ -1812,6 +1845,10 @@
 	    box-shadow:
 	      0 18px 38px -32px rgba(2, 6, 23, 0.92),
 	      inset 0 0 0 1px rgba(148, 163, 184, 0.08);
+	  }
+
+	  :global(:root[data-theme="dark"]) .sidebar-folders-toggle:hover {
+	    background: rgba(30, 41, 59, 0.82) !important;
 	  }
 
 	  :global(:root[data-theme="dark"]) .sidebar-folder-item {

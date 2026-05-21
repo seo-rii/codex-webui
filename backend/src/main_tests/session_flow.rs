@@ -2953,6 +2953,113 @@ async fn local_session_detail_marks_orphaned_active_tail_completed_without_runti
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_session_detail_marks_failed_context_compaction_tail_terminal() {
+    let sandbox = unique_test_dir("session-detail-context-compaction-failed");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000115";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    fs::write(
+        rollout_dir.join(format!("rollout-2026-04-24T01-08-00-{session_id}.jsonl")),
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:08:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:08:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:08:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-compacting"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:08:02.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "context_compaction",
+                    "id": "compact-1"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:08:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "error",
+                    "message": "You've hit your usage limit.",
+                    "codex_error_info": "usage_limit_exceeded"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:08:04.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-compacting",
+                    "last_agent_message": null
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("status"))
+            .and_then(Value::as_str),
+        Some("completed")
+    );
+    let turn = detail
+        .get("thread")
+        .and_then(|thread| thread.get("turns"))
+        .and_then(Value::as_array)
+        .and_then(|turns| turns.first())
+        .expect("failed compaction turn should be visible");
+    assert_eq!(turn.get("status").and_then(Value::as_str), Some("failed"));
+    assert_eq!(
+        turn.get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str),
+        Some("contextCompaction")
+    );
+    assert_eq!(
+        turn.get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("status"))
+            .and_then(Value::as_str),
+        Some("failed")
+    );
+    assert!(detail.get("activeTurnId").is_some_and(Value::is_null));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_session_detail_does_not_resurrect_active_tail_behind_terminal_cache() {
     let sandbox = unique_test_dir("session-detail-active-terminal-cache");
     let workspace = sandbox.join("workspace");

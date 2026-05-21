@@ -111,7 +111,10 @@ fn summarize_session_turn_for_detail_payload(
             }
             if compact_completed_process
                 && compact_non_running_turn
-                && !matches!(item_type, "userMessage" | "agentMessage" | "plan")
+                && !matches!(
+                    item_type,
+                    "userMessage" | "agentMessage" | "plan" | "contextCompaction"
+                )
             {
                 hidden_item_count = hidden_item_count.saturating_add(1);
                 return None;
@@ -279,6 +282,22 @@ fn command_item_from_rollout_function_call(payload: &Value) -> Value {
     }
 }
 
+fn context_compaction_item_from_rollout_payload(
+    payload: &Value,
+    fallback_id: String,
+    status: &str,
+) -> Value {
+    json!({
+        "id": payload
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or(fallback_id),
+        "type": "contextCompaction",
+        "status": status
+    })
+}
+
 fn file_change_item_from_patch_apply_payload(payload: &Value) -> Value {
     let changes = payload
         .get("changes")
@@ -371,6 +390,10 @@ fn rollout_tail_line_may_affect_detail(line: &str) -> bool {
         || line.contains(r#""type": "custom_tool_call""#)
         || line.contains(r#""type":"reasoning""#)
         || line.contains(r#""type": "reasoning""#)
+        || line.contains(r#""type":"context_compaction""#)
+        || line.contains(r#""type": "context_compaction""#)
+        || line.contains(r#""type":"contextCompaction""#)
+        || line.contains(r#""type": "contextCompaction""#)
 }
 
 fn build_turn_window_from_rollout_records(
@@ -421,7 +444,9 @@ fn build_turn_window_from_rollout_records(
                     timestamp_ms,
                 );
                 if let Some(turn) = turns.get_mut(index).and_then(Value::as_object_mut) {
-                    turn.insert("status".to_string(), json!("completed"));
+                    if turn.get("status").and_then(Value::as_str) != Some("failed") {
+                        turn.insert("status".to_string(), json!("completed"));
+                    }
                     turn.insert(
                         "completedAt".to_string(),
                         payload
@@ -473,6 +498,53 @@ fn build_turn_window_from_rollout_records(
                     }
                 }
             }
+            ("event_msg", "error") => {
+                let error_info = payload
+                    .get("codex_error_info")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let affects_turn_status = !matches!(
+                    error_info,
+                    "thread_rollback_failed" | "active_turn_not_steerable"
+                );
+                if !affects_turn_status {
+                    continue;
+                }
+                let Some(index) = current_index else {
+                    continue;
+                };
+                if let Some(turn_object) = turns.get_mut(index).and_then(Value::as_object_mut) {
+                    turn_object.insert("status".to_string(), json!("failed"));
+                    turn_object.insert(
+                        "completedAt".to_string(),
+                        timestamp_ms.map(Value::from).unwrap_or(Value::Null),
+                    );
+                    turn_object.insert(
+                        "error".to_string(),
+                        json!({
+                            "message": payload
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Session failed"),
+                            "codexErrorInfo": payload
+                                .get("codex_error_info")
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        }),
+                    );
+                    if let Some(items) = turn_object.get_mut("items").and_then(Value::as_array_mut)
+                    {
+                        for item in items {
+                            let item_status = item.get("status").and_then(Value::as_str);
+                            if matches!(item_status, Some("running" | "inProgress") | None) {
+                                if let Some(item_object) = item.as_object_mut() {
+                                    item_object.insert("status".to_string(), json!("failed"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             ("event_msg", "user_message") => {
                 let index =
                     ensure_rollout_turn_index(&mut turns, &mut current_index, None, timestamp_ms);
@@ -494,6 +566,74 @@ fn build_turn_window_from_rollout_records(
                             "type": "userMessage",
                             "text": message
                         }),
+                    );
+                }
+            }
+            ("event_msg", "item_started") => {
+                let item = payload.get("item").unwrap_or(&Value::Null);
+                let item_type = item.get("type").and_then(Value::as_str);
+                if !matches!(item_type, Some("context_compaction" | "contextCompaction")) {
+                    continue;
+                }
+                let turn_id = payload.get("turn_id").and_then(Value::as_str);
+                let index = ensure_rollout_turn_index(
+                    &mut turns,
+                    &mut current_index,
+                    turn_id,
+                    timestamp_ms,
+                );
+                let turn_item_prefix = turns[index]
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("turn")
+                    .to_string();
+                push_rollout_item(
+                    &mut turns[index],
+                    context_compaction_item_from_rollout_payload(
+                        item,
+                        format!("{turn_item_prefix}:context-compaction:{record_index}"),
+                        "running",
+                    ),
+                );
+            }
+            ("event_msg", "item_completed") => {
+                let item = payload.get("item").unwrap_or(&Value::Null);
+                let item_type = item.get("type").and_then(Value::as_str);
+                if !matches!(item_type, Some("context_compaction" | "contextCompaction")) {
+                    continue;
+                }
+                let turn_id = payload.get("turn_id").and_then(Value::as_str);
+                let index = ensure_rollout_turn_index(
+                    &mut turns,
+                    &mut current_index,
+                    turn_id,
+                    timestamp_ms,
+                );
+                let turn_item_prefix = turns[index]
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("turn")
+                    .to_string();
+                let compaction_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        format!("{turn_item_prefix}:context-compaction:{record_index}")
+                    });
+                let updated = update_rollout_item(&mut turns[index], &compaction_id, |existing| {
+                    if let Some(object) = existing.as_object_mut() {
+                        object.insert("status".to_string(), json!("completed"));
+                    }
+                });
+                if !updated {
+                    push_rollout_item(
+                        &mut turns[index],
+                        context_compaction_item_from_rollout_payload(
+                            item,
+                            compaction_id,
+                            "completed",
+                        ),
                     );
                 }
             }
@@ -652,6 +792,27 @@ fn build_turn_window_from_rollout_records(
                         "text": text,
                         "summary": summary
                     }),
+                );
+            }
+            ("response_item", "context_compaction") | ("response_item", "contextCompaction") => {
+                let index =
+                    ensure_rollout_turn_index(&mut turns, &mut current_index, None, timestamp_ms);
+                let turn_item_prefix = turns[index]
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("turn")
+                    .to_string();
+                push_rollout_item(
+                    &mut turns[index],
+                    context_compaction_item_from_rollout_payload(
+                        payload,
+                        format!("{turn_item_prefix}:context-compaction:{record_index}"),
+                        if payload.get("encrypted_content").is_some() {
+                            "completed"
+                        } else {
+                            "running"
+                        },
+                    ),
                 );
             }
             ("response_item", "message") => {}

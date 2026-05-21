@@ -2370,10 +2370,11 @@ async fn dispatch_queue_item_returns_current_queue_when_dispatch_is_busy() {
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let queue =
-        dispatch_session_queue_item_payload(&state, "default", "thread-1", "queue-1", "message")
-            .await
-            .unwrap();
+    let queue = dispatch_session_queue_item_payload(
+        &state, "default", "thread-1", "queue-1", "message", None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         queue.get("items").and_then(Value::as_array).map(Vec::len),

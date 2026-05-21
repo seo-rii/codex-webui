@@ -6685,6 +6685,7 @@
       clearComposer || draft.trim() === normalizedPrompt ? [...draftAttachments] : [];
     const attachmentIds = steerAttachmentSnapshot.map((attachment) => attachment.id);
     const selectedSkillsSnapshot = [...selectedBinding.state.selectedSkills];
+    const activeTurnId = selectedBinding.state.activeTurnId ?? getConversationLiveTurn(selectedBinding.state)?.id ?? null;
     const mutationSignature = buildComposerMutationSignature("steer", sessionId, normalizedPrompt, selectedSkillsSnapshot, attachmentIds);
     if (!beginComposerMutation(mutationSignature)) {
       return;
@@ -6705,7 +6706,8 @@
         sessionId,
         normalizedPrompt,
         attachmentIds,
-        selectedSkillsSnapshot
+        selectedSkillsSnapshot,
+        activeTurnId
       );
       scheduleSessionRefresh(80);
       scheduleSelectedSessionStateRefresh(sessionId, 80);
@@ -6755,7 +6757,11 @@
     setOptimisticMessageState(sessionId, queuedItem.prompt, queuedItem.skills, queuedItem.attachmentNames, selectedBinding.state);
 
     try {
-      const queue = await api.dispatchQueuedMessage(sessionId, queueId, mode);
+      const activeTurnId =
+        mode === "steer"
+          ? selectedBinding.state.activeTurnId ?? getConversationLiveTurn(selectedBinding.state)?.id ?? null
+          : null;
+      const queue = await api.dispatchQueuedMessage(sessionId, queueId, mode, activeTurnId);
       applyQueuePayloadToSession(sessionId, queue);
       scheduleSessionRefresh(80);
       scheduleSelectedSessionStateRefresh(sessionId, 80);
@@ -10955,12 +10961,12 @@
                         {/if}
                         
                         {#if conversation.livePlans[turn.id] && turn.id !== conversation.activeTurnId}
-                          <div class="turn-card-shell border border-amber-100 rounded-xl bg-amber-50/30 overflow-hidden">
+                          <div class="turn-card-shell w-full min-w-0 border border-amber-100 rounded-xl bg-amber-50/30 overflow-hidden">
                             <div class="turn-card-header turn-card-header--amber px-4 py-2 border-b border-amber-100 flex items-center gap-2 text-[10px] font-bold text-amber-700 uppercase tracking-widest" data-sticky-level="0"><ListTodo size={12} /><span>{ui.livePlan}</span></div>
                             <div class="p-4 text-sm text-gray-700 space-y-3">
                               {#if conversation.livePlans[turn.id].explanation}<p class="leading-relaxed">{conversation.livePlans[turn.id].explanation}</p>{/if}
                               <ul class="space-y-1.5 pl-2">
-                                {#each conversation.livePlans[turn.id].plan as step}
+                                {#each conversation.livePlans[turn.id].plan as step (`${step.step}:${step.status}`)}
                                   <li class="flex items-start gap-2 text-xs">
                                     <span class="mt-1 flex-shrink-0 w-1.5 h-1.5 rounded-full {step.status === 'completed' ? 'bg-emerald-500' : 'bg-amber-400 animate-pulse'}"></span>
                                     <span class="font-medium {step.status === 'completed' ? 'text-gray-400 line-through' : 'text-gray-600'}">{step.step}</span>
@@ -11358,7 +11364,7 @@
                         </div>
                       {/if}
                       {#if activeLiveTurnPlan}
-                        <div class="turn-card-shell rounded-xl border border-amber-100 bg-white/85 p-2.5">
+                        <div class="turn-card-shell w-full min-w-0 rounded-xl border border-amber-100 bg-white/85 p-2.5 lg:col-span-full">
                           <div class="turn-card-header turn-card-header--amber mb-1.5 flex items-center gap-2 rounded-xl px-2 py-2 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-700" data-sticky-level="1">
                             <ListTodo size={12} />
                             <span>{ui.livePlan}</span>
@@ -13253,7 +13259,7 @@
       </div>
     </div>
   {:else if item.type === "plan"}
-    <div class="turn-card-shell overflow-hidden rounded-2xl border border-amber-100 bg-amber-50/25 shadow-sm">
+    <div class="turn-card-shell w-full min-w-0 overflow-hidden rounded-2xl border border-amber-100 bg-amber-50/25 shadow-sm">
       <div class="turn-card-header turn-card-header--amber flex items-center gap-3 border-b border-amber-100 px-4 py-2.5" data-sticky-level={stickyLevel}>
         <ListTodo size={14} class="text-amber-700" />
         <span class="text-[10px] font-bold uppercase tracking-widest text-amber-700">{ui.plannedStrategy}</span>

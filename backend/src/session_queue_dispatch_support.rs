@@ -42,6 +42,7 @@ pub(crate) async fn dispatch_session_queue_item_payload(
     session_id: &str,
     queue_id: &str,
     mode: &str,
+    expected_turn_id: Option<&str>,
 ) -> ApiResult<Value> {
     if mode != "message" && mode != "steer" {
         return Err(api_error(StatusCode::BAD_REQUEST, "INVALID_QUEUE_MODE"));
@@ -61,7 +62,15 @@ pub(crate) async fn dispatch_session_queue_item_payload(
             .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "QUEUE_ITEM_NOT_FOUND"))?;
 
         cancel_scheduled_shutdown_for_activity(state, profile_id).await;
-        dispatch_queue_item(state, profile_id, session_id, &queued_item, mode).await?;
+        dispatch_queue_item(
+            state,
+            profile_id,
+            session_id,
+            &queued_item,
+            mode,
+            expected_turn_id,
+        )
+        .await?;
         let next_queue =
             remove_session_queue_item_after_dispatch(state, profile_id, session_id, queue_id)
                 .await?;

@@ -249,6 +249,10 @@ pub(crate) async fn handle_session_steer_api_http(
                     .unwrap_or_default(),
                 payload.get("attachmentIds"),
                 payload.get("skills"),
+                payload
+                    .get("activeTurnId")
+                    .or_else(|| payload.get("expectedTurnId"))
+                    .and_then(Value::as_str),
             )
             .await
         }

@@ -570,9 +570,16 @@ pub(crate) async fn send_computer_input_payload(
                     .await?
                     .is_some()
                 {
-                    upstream =
-                        steer_turn_payload(state, profile_id, session_id, &input_text, None, None)
-                            .await?;
+                    upstream = steer_turn_payload(
+                        state,
+                        profile_id,
+                        session_id,
+                        &input_text,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
                     routed = "turnSteer";
                 } else {
                     upstream = client

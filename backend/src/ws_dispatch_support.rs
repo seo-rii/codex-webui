@@ -583,6 +583,10 @@ pub(crate) async fn execute_ws_method(
                 &session_id,
                 &queue_id,
                 &require_string(&params, "mode")?,
+                params
+                    .get("activeTurnId")
+                    .or_else(|| params.get("expectedTurnId"))
+                    .and_then(Value::as_str),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -660,6 +664,10 @@ pub(crate) async fn execute_ws_method(
                 &prompt,
                 params.get("attachmentIds"),
                 params.get("skills"),
+                params
+                    .get("activeTurnId")
+                    .or_else(|| params.get("expectedTurnId"))
+                    .and_then(Value::as_str),
             )
             .await
             .map_err(anyhow::Error::from)

@@ -3982,6 +3982,7 @@ async fn steer_turn_payload_uses_active_turn_from_thread_reads() {
         "Focus on the queue deduplication race first.",
         Some(&json!(["att-file"])),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -4027,6 +4028,78 @@ async fn steer_turn_payload_uses_active_turn_from_thread_reads() {
         .await
         .unwrap();
     assert_eq!(draft.get("draft").and_then(Value::as_str), Some(""));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_turn_payload_uses_expected_turn_id_without_thread_read() {
+    let sandbox = unique_test_dir("turn-steer-expected-turn-rust");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-expected",
+                    "name": "Expected steer",
+                    "preview": "Expected steer",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "running",
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let payload = steer_turn_payload(
+        &state,
+        "default",
+        "thread-expected",
+        "Apply this immediately.",
+        None,
+        None,
+        Some("turn-known"),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        payload.get("turnId").and_then(Value::as_str),
+        Some("turn-known")
+    );
+    let thread_read_count = app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request("debug/requestCount", json!({ "target": "thread/read" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        thread_read_count.get("count").and_then(Value::as_u64),
+        Some(0)
+    );
+    let thread = read_thread_payload(&state, "default", "thread-expected", false)
+        .await
+        .unwrap();
+    assert_eq!(
+        thread
+            .get("lastTurnSteer")
+            .and_then(|steer| steer.get("expectedTurnId"))
+            .and_then(Value::as_str),
+        Some("turn-known")
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }

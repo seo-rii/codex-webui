@@ -512,11 +512,12 @@ export const api = {
     });
   },
 
-  dispatchQueuedMessage(sessionId: string, queueId: string, mode: "message" | "steer") {
+  dispatchQueuedMessage(sessionId: string, queueId: string, mode: "message" | "steer", activeTurnId: string | null = null) {
     return ws.request<SessionDetailPayload["queue"]>("session/queue/dispatch", {
       sessionId,
       queueId,
-      mode
+      mode,
+      activeTurnId
     });
   },
 
@@ -654,12 +655,13 @@ export const api = {
     });
   },
 
-  steerTurn(sessionId: string, prompt: string, attachmentIds: string[] = [], skills: SelectedSkill[] = []) {
+  steerTurn(sessionId: string, prompt: string, attachmentIds: string[] = [], skills: SelectedSkill[] = [], activeTurnId: string | null = null) {
     return ws.request<{ ok: true }>("turn/steer", {
       sessionId,
       prompt,
       skills,
-      attachmentIds
+      attachmentIds,
+      activeTurnId
     });
   },
 

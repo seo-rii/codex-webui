@@ -149,6 +149,7 @@ pub(crate) async fn dispatch_queue_item(
     session_id: &str,
     queued_item: &Value,
     mode: &str,
+    expected_turn_id: Option<&str>,
 ) -> ApiResult<()> {
     let prompt = queued_item
         .get("prompt")
@@ -171,6 +172,7 @@ pub(crate) async fn dispatch_queue_item(
             prompt,
             Some(&attachment_ids),
             Some(&selected_skills),
+            expected_turn_id,
         )
         .await
         .map(|_| ())
@@ -393,7 +395,9 @@ async fn maybe_drain_queue_with_attempt(
             .unwrap_or_default()
             .to_string();
 
-        match dispatch_queue_item(state, profile_id, session_id, &queued_item, "message").await {
+        match dispatch_queue_item(state, profile_id, session_id, &queued_item, "message", None)
+            .await
+        {
             Ok(()) => {
                 let _ = remove_session_queue_item_after_dispatch(
                     state, profile_id, session_id, &queue_id,

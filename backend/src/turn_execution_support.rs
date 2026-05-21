@@ -196,6 +196,22 @@ pub(crate) async fn resolve_active_turn_id_payload(
     profile_id: &str,
     session_id: &str,
 ) -> ApiResult<Option<String>> {
+    resolve_active_turn_id_payload_with_hint(state, profile_id, session_id, None).await
+}
+
+async fn resolve_active_turn_id_payload_with_hint(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    expected_turn_id: Option<&str>,
+) -> ApiResult<Option<String>> {
+    if let Some(turn_id) = expected_turn_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(turn_id.to_string()));
+    }
+
     let runtime_key = runtime_session_key(
         resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
@@ -595,13 +611,16 @@ pub(crate) async fn steer_turn_payload(
     prompt: &str,
     attachment_ids: Option<&Value>,
     selected_skills: Option<&Value>,
+    expected_turn_id: Option<&str>,
 ) -> ApiResult<Value> {
     let trimmed_prompt = prompt.trim();
     if trimmed_prompt.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
     }
 
-    let active_turn_id = resolve_active_turn_id_payload(state, profile_id, session_id).await?;
+    let active_turn_id =
+        resolve_active_turn_id_payload_with_hint(state, profile_id, session_id, expected_turn_id)
+            .await?;
     let Some(active_turn_id) = active_turn_id else {
         return Err(api_error(StatusCode::CONFLICT, "NO_ACTIVE_TURN"));
     };
@@ -647,6 +666,15 @@ pub(crate) async fn steer_turn_payload(
         .await);
     }
 
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        session_id,
+    );
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key, active_turn_id.clone());
     clear_session_draft_payload(state, profile_id, session_id).await?;
     Ok(json!({
         "ok": true,

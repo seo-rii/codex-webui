@@ -127,6 +127,10 @@ pub(crate) async fn handle_session_queue_api_http(
                                     .get("mode")
                                     .and_then(Value::as_str)
                                     .unwrap_or_default(),
+                                payload
+                                    .get("activeTurnId")
+                                    .or_else(|| payload.get("expectedTurnId"))
+                                    .and_then(Value::as_str),
                             )
                             .await
                         }

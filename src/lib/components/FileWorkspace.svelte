@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Edit3, FileText, GitBranch, RefreshCw, Save, X } from "lucide-svelte";
+  import { Edit3, FileDiff, FileText, GitBranch, RefreshCw, Save, X } from "lucide-svelte";
 
   import { api } from "$lib/api";
   import MarkdownMessage from "$lib/components/MarkdownMessage.svelte";
@@ -13,12 +13,14 @@
     filePath,
     readOnly = false,
     onClose,
+    onOpenDiff,
     onOpenGit,
     onOpenLocalPath
   }: {
     filePath: string;
     readOnly?: boolean;
     onClose: () => void | Promise<void>;
+    onOpenDiff?: (filePath: string) => void | Promise<void>;
     onOpenGit?: (filePath: string) => void | Promise<void>;
     onOpenLocalPath?: (href: string) => void | Promise<void>;
   } = $props();
@@ -121,6 +123,12 @@
         <p title={activePath}>{activePath}</p>
       </div>
       <div class="file-workspace__actions">
+        {#if onOpenDiff}
+          <button class="file-workspace__button" onclick={() => void onOpenDiff(activePath)} type="button">
+            <FileDiff size={14} />
+            <span>{m.diff()}</span>
+          </button>
+        {/if}
         {#if onOpenGit}
           <button class="file-workspace__button" onclick={() => void onOpenGit(activePath)} type="button">
             <GitBranch size={14} />

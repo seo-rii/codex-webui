@@ -300,6 +300,7 @@
   let workspaceMenuOpen = $state(false);
   let tasksTabOpen = $state(false);
   let gitTabOpen = $state(false);
+  let gitOpenRequest = $state<GitOpenRequest | null>(null);
   let settingsTabOpen = $state(false);
   let computerTabOpen = $state(false);
   let settingsInitialTab = $state<"config" | "startup" | "audit" | "theme" | "notifications" | "presets" | "automations" | "apps" | "plugins" | "skills" | null>(null);
@@ -7948,17 +7949,41 @@
     openFileTab(extractLocalFilePath(href));
   }
 
-  async function openGitFileFromPath(filePath: string) {
+  async function resolveGitFileForPath(filePath: string) {
+    const resolved = await api.resolveGitFile(extractLocalFilePath(filePath));
+    if ((viewerGitRepoPath ?? conversation?.preferences.gitRepoPath ?? null) !== resolved.repoPath) {
+      handleRepoSelect(resolved.repoPath);
+    }
+    return resolved;
+  }
+
+  async function openGitWorkspaceFileFromPath(filePath: string) {
     try {
-      const resolved = await api.resolveGitFile(extractLocalFilePath(filePath));
-      if ((viewerGitRepoPath ?? conversation?.preferences.gitRepoPath ?? null) !== resolved.repoPath) {
-        handleRepoSelect(resolved.repoPath);
+      const resolved = await resolveGitFileForPath(filePath);
+      gitTabOpen = true;
+      activeWorkspaceTabId = "git";
+      workspaceMenuOpen = false;
+      if (resolved.filePath) {
+        gitOpenRequest = {
+          repoPath: resolved.repoPath,
+          filePath: resolved.filePath,
+          filePaths: null,
+          title: baseName(resolved.filePath),
+          requestId: Date.now()
+        };
       }
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function openGitDiffFromPath(filePath: string) {
+    try {
+      const resolved = await resolveGitFileForPath(filePath);
       if (resolved.filePath) {
         openGitDiffTab(resolved.repoPath, resolved.filePath);
         return;
       }
-
       openGitTab();
     } catch (error) {
       errorText = describeError(error);
@@ -12168,6 +12193,7 @@
       {:else if activeWorkspaceTabId === "git"}
         {#if GitWorkspaceView}
           <GitWorkspaceView
+            openRequest={gitOpenRequest}
             onOpenCommitDiff={openGitCommitDiffTab}
             onOpenDiffTab={openGitDiffTab}
             onSelectRepo={handleRepoSelect}
@@ -12211,7 +12237,8 @@
             filePath={activeFileTab.path}
             readOnly={readOnlyRole}
             onClose={() => closeFileTab(activeFileTab.id)}
-            onOpenGit={(filePath) => void openGitFileFromPath(filePath)}
+            onOpenDiff={(filePath) => void openGitDiffFromPath(filePath)}
+            onOpenGit={(filePath) => void openGitWorkspaceFileFromPath(filePath)}
             onOpenLocalPath={(href) => openFileFromMessage(href)}
           />
         {:else}

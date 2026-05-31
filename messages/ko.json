@@ -45,6 +45,7 @@
   "filter_tags": "태그",
   "session_folders": "폴더",
   "all_folders": "전체 세션",
+  "unfiled_sessions": "폴더 없음",
   "new_folder": "새 폴더",
   "session_folder_name_prompt": "폴더 이름",
   "session_folder_created_notice": "{name} 폴더를 만들었습니다.",

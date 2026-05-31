@@ -66,6 +66,21 @@ pub struct AppServerHandoffStatus {
     pub handoff_proxy_process_count: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct AppServerProcessSnapshot {
+    pub client_key: String,
+    pub profile_id: String,
+    pub codex_home: PathBuf,
+    pub pid: u32,
+    pub kind: String,
+    pub handoff_proxy: bool,
+    pub socket_path: Option<PathBuf>,
+    pub log_path: Option<PathBuf>,
+    pub started_at_ms: Option<u128>,
+    pub codex_bin: String,
+    pub pending_request_count: usize,
+}
+
 impl Default for AppServerClientConfig {
     fn default() -> Self {
         Self {
@@ -110,6 +125,7 @@ pub struct AppServerManager {
 }
 
 struct AppServerClientInner {
+    client_key: String,
     profile: AppServerProfile,
     config: AppServerClientConfig,
     controller: Arc<AppServerControllerRuntime>,
@@ -144,6 +160,8 @@ struct HandoffMeta {
     pid: u32,
     #[serde(default)]
     process_identity: Option<ManagedProcessIdentity>,
+    #[serde(default)]
+    enabled_features: Vec<String>,
     profile_id: String,
     socket_path: String,
     codex_bin: String,
@@ -216,10 +234,12 @@ impl AppServerClient {
     pub fn new(profile: AppServerProfile, config: AppServerClientConfig) -> Self {
         let controller =
             AppServerControllerRuntime::new(config.controller_threads, config.max_processes);
-        Self::with_controller(profile, config, controller)
+        let client_key = profile.id.clone();
+        Self::with_controller(client_key, profile, config, controller)
     }
 
     fn with_controller(
+        client_key: String,
         profile: AppServerProfile,
         config: AppServerClientConfig,
         controller: Arc<AppServerControllerRuntime>,
@@ -229,6 +249,7 @@ impl AppServerClient {
 
         Self {
             inner: Arc::new(AppServerClientInner {
+                client_key,
                 profile,
                 config,
                 controller,
@@ -463,7 +484,12 @@ impl AppServerClient {
                     self.inner
                         .handoff_disabled_after_failure
                         .store(true, Ordering::SeqCst);
-                    let _ = stop_handoff_server(&self.inner.config, &self.inner.profile).await;
+                    let _ = stop_handoff_server(
+                        &self.inner.config,
+                        &self.inner.client_key,
+                        &self.inner.profile,
+                    )
+                    .await;
                     last_start_error = Some(error);
                     continue;
                 }
@@ -581,7 +607,12 @@ impl AppServerClient {
         self.inner
             .handoff_disabled_after_failure
             .store(true, Ordering::SeqCst);
-        let _ = stop_handoff_server(&self.inner.config, &self.inner.profile).await;
+        let _ = stop_handoff_server(
+            &self.inner.config,
+            &self.inner.client_key,
+            &self.inner.profile,
+        )
+        .await;
         true
     }
 
@@ -667,7 +698,12 @@ impl AppServerClient {
                 .arg("--sock")
                 .arg(&handoff_paths.socket_path);
         } else {
-            command.arg("app-server").arg("--listen").arg("stdio://");
+            command
+                .arg("app-server")
+                .arg("--enable")
+                .arg("goals")
+                .arg("--listen")
+                .arg("stdio://");
         }
 
         command
@@ -724,7 +760,11 @@ impl AppServerClient {
         {
             return Ok(None);
         }
-        let Some(paths) = handoff_paths(&self.inner.config, &self.inner.profile) else {
+        let Some(paths) = handoff_paths(
+            &self.inner.config,
+            &self.inner.client_key,
+            &self.inner.profile,
+        ) else {
             return Ok(None);
         };
 
@@ -737,7 +777,37 @@ impl AppServerClient {
         #[cfg(unix)]
         {
             if handoff_socket_is_live(&paths.socket_path).await {
-                return Ok(Some(paths));
+                let meta = tokio::fs::read(&paths.meta_path)
+                    .await
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<HandoffMeta>(&bytes).ok());
+                if meta.as_ref().is_some_and(|meta| {
+                    meta.enabled_features
+                        .iter()
+                        .any(|feature| feature == "goals")
+                }) {
+                    return Ok(Some(paths));
+                }
+
+                warn!(
+                    profile_id = %self.inner.profile.id,
+                    socket = %paths.socket_path.display(),
+                    "codex app-server handoff socket was started without required goal support; avoiding stale handoff daemon"
+                );
+                let _ = stop_handoff_server(
+                    &self.inner.config,
+                    &self.inner.client_key,
+                    &self.inner.profile,
+                )
+                .await;
+                if handoff_socket_is_live(&paths.socket_path).await {
+                    warn!(
+                        profile_id = %self.inner.profile.id,
+                        socket = %paths.socket_path.display(),
+                        "stale codex app-server handoff socket is still live; using stdio app-server for required goal support"
+                    );
+                    return Ok(None);
+                }
             }
 
             if let Some(parent) = paths.socket_path.parent() {
@@ -764,6 +834,8 @@ impl AppServerClient {
             let mut command = Command::new(&self.inner.config.codex_bin);
             command
                 .arg("app-server")
+                .arg("--enable")
+                .arg("goals")
                 .arg("--listen")
                 .arg(format!("unix://{}", paths.socket_path.display()))
                 .env("CODEX_HOME", &self.inner.profile.codex_home)
@@ -796,6 +868,7 @@ impl AppServerClient {
                     let meta = HandoffMeta {
                         pid,
                         process_identity,
+                        enabled_features: vec!["goals".to_string()],
                         profile_id: self.inner.profile.id.clone(),
                         socket_path: paths.socket_path.display().to_string(),
                         codex_bin: self.inner.config.codex_bin.clone(),
@@ -843,26 +916,47 @@ impl AppServerManager {
     }
 
     pub async fn get_or_create(&self, profile: AppServerProfile) -> AppServerClient {
+        self.get_or_create_with_key(profile.id.clone(), profile)
+            .await
+    }
+
+    pub async fn get_or_create_with_key(
+        &self,
+        client_key: String,
+        profile: AppServerProfile,
+    ) -> AppServerClient {
         let mut clients = self.clients.lock().await;
-        if let Some(existing) = clients.get(&profile.id) {
+        if let Some(existing) = clients.get(&client_key) {
             return existing.clone();
         }
 
         let client = AppServerClient::with_controller(
+            client_key.clone(),
             profile.clone(),
             self.config.clone(),
             Arc::clone(&self.controller),
         );
-        clients.insert(profile.id, client.clone());
+        clients.insert(client_key, client.clone());
         client
     }
 
     pub async fn close_profile(&self, profile_id: &str) -> Result<()> {
-        let client = self.clients.lock().await.remove(profile_id);
-        if let Some(client) = client {
+        let clients = {
+            let mut clients = self.clients.lock().await;
+            let keys = clients
+                .iter()
+                .filter_map(|(key, client)| {
+                    (client.inner.profile.id == profile_id).then(|| key.clone())
+                })
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| clients.remove(&key).map(|client| (key, client)))
+                .collect::<Vec<_>>()
+        };
+        for (client_key, client) in clients {
             let profile = client.inner.profile.clone();
             client.close().await?;
-            stop_handoff_server(&self.config, &profile).await?;
+            stop_handoff_server(&self.config, &client_key, &profile).await?;
         }
         Ok(())
     }
@@ -893,11 +987,35 @@ impl AppServerManager {
     }
 
     pub async fn profile_has_active_process(&self, profile_id: &str) -> bool {
+        let clients = {
+            let clients = self.clients.lock().await;
+            clients
+                .values()
+                .filter(|client| client.inner.profile.id == profile_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for client in clients {
+            if client
+                .inner
+                .process
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(process_state_is_alive)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub async fn client_key_has_active_process(&self, profile_id: &str, client_key: &str) -> bool {
         let client = {
             let clients = self.clients.lock().await;
-            clients.get(profile_id).cloned()
+            clients.get(client_key).cloned()
         };
-        let Some(client) = client else {
+        let Some(client) = client.filter(|client| client.inner.profile.id == profile_id) else {
             return false;
         };
         client
@@ -938,6 +1056,207 @@ impl AppServerManager {
         status
     }
 
+    pub async fn process_snapshots_for_profiles(
+        &self,
+        profiles: Vec<AppServerProfile>,
+    ) -> Vec<AppServerProcessSnapshot> {
+        let clients = {
+            let clients = self.clients.lock().await;
+            clients
+                .iter()
+                .map(|(key, client)| (key.clone(), client.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut snapshots = Vec::new();
+
+        for (client_key, client) in &clients {
+            let process = client.inner.process.lock().await;
+            let Some(process) = process.as_ref() else {
+                continue;
+            };
+            if !process_state_is_alive(process) {
+                continue;
+            }
+            let Some(pid) = process.pid else {
+                continue;
+            };
+            snapshots.push(AppServerProcessSnapshot {
+                client_key: client_key.clone(),
+                profile_id: client.inner.profile.id.clone(),
+                codex_home: client.inner.profile.codex_home.clone(),
+                pid,
+                kind: if process.handoff_proxy {
+                    "handoffProxy".to_string()
+                } else {
+                    "stdio".to_string()
+                },
+                handoff_proxy: process.handoff_proxy,
+                socket_path: None,
+                log_path: None,
+                started_at_ms: None,
+                codex_bin: client.inner.config.codex_bin.clone(),
+                pending_request_count: client.inner.pending.lock().await.len(),
+            });
+        }
+
+        for (client_key, client) in &clients {
+            if let Some(snapshot) = self
+                .handoff_process_snapshot_for_client_key(&client.inner.profile, client_key)
+                .await
+            {
+                let duplicate = snapshots.iter().any(|existing| {
+                    existing.client_key == snapshot.client_key
+                        && existing.profile_id == snapshot.profile_id
+                        && existing.pid == snapshot.pid
+                        && existing.kind == snapshot.kind
+                });
+                if !duplicate {
+                    snapshots.push(snapshot);
+                }
+            }
+        }
+
+        for profile in profiles {
+            if let Some(snapshot) = self
+                .handoff_process_snapshot_for_client_key(&profile, &profile.id)
+                .await
+            {
+                let duplicate = snapshots.iter().any(|existing| {
+                    existing.client_key == snapshot.client_key
+                        && existing.profile_id == snapshot.profile_id
+                        && existing.pid == snapshot.pid
+                        && existing.kind == snapshot.kind
+                });
+                if !duplicate {
+                    snapshots.push(snapshot);
+                }
+            }
+        }
+
+        snapshots.sort_by(|left, right| {
+            left.profile_id
+                .cmp(&right.profile_id)
+                .then_with(|| left.client_key.cmp(&right.client_key))
+                .then_with(|| left.kind.cmp(&right.kind))
+                .then_with(|| left.pid.cmp(&right.pid))
+        });
+        snapshots
+    }
+
+    pub async fn force_kill_process(
+        &self,
+        profile: AppServerProfile,
+        pid: u32,
+    ) -> Result<AppServerProcessSnapshot> {
+        if pid == 0 {
+            anyhow::bail!("Invalid Codex process id.");
+        }
+
+        let clients = {
+            let clients = self.clients.lock().await;
+            clients
+                .iter()
+                .filter(|(_, client)| client.inner.profile.id == profile.id)
+                .map(|(key, client)| (key.clone(), client.clone()))
+                .collect::<Vec<_>>()
+        };
+        for (client_key, client) in &clients {
+            let process = {
+                let mut process = client.inner.process.lock().await;
+                if process.as_ref().and_then(|process| process.pid) == Some(pid) {
+                    process.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(process) = process {
+                let snapshot = AppServerProcessSnapshot {
+                    client_key: client_key.clone(),
+                    profile_id: client.inner.profile.id.clone(),
+                    codex_home: client.inner.profile.codex_home.clone(),
+                    pid,
+                    kind: if process.handoff_proxy {
+                        "handoffProxy".to_string()
+                    } else {
+                        "stdio".to_string()
+                    },
+                    handoff_proxy: process.handoff_proxy,
+                    socket_path: None,
+                    log_path: None,
+                    started_at_ms: None,
+                    codex_bin: client.inner.config.codex_bin.clone(),
+                    pending_request_count: client.inner.pending.lock().await.len(),
+                };
+                let reason = "codex app-server process force killed from settings";
+                fail_pending_requests(&client.inner, reason).await;
+                client
+                    .terminate_unresponsive_process_state(process, reason)
+                    .await;
+                return Ok(snapshot);
+            }
+        }
+
+        for (client_key, client) in &clients {
+            if let Some(snapshot) = self
+                .handoff_process_snapshot_for_client_key(&client.inner.profile, client_key)
+                .await
+            {
+                if snapshot.pid == pid {
+                    stop_handoff_server(&self.config, client_key, &client.inner.profile).await?;
+                    return Ok(snapshot);
+                }
+            }
+        }
+
+        if let Some(snapshot) = self
+            .handoff_process_snapshot_for_client_key(&profile, &profile.id)
+            .await
+        {
+            if snapshot.pid == pid {
+                stop_handoff_server(&self.config, &profile.id, &profile).await?;
+                return Ok(snapshot);
+            }
+        }
+
+        anyhow::bail!("Codex process was not found or is no longer managed by this WebUI.")
+    }
+
+    async fn handoff_process_snapshot_for_client_key(
+        &self,
+        profile: &AppServerProfile,
+        client_key: &str,
+    ) -> Option<AppServerProcessSnapshot> {
+        #[cfg(not(unix))]
+        {
+            let _ = (profile, client_key);
+            None
+        }
+        #[cfg(unix)]
+        {
+            let paths = handoff_paths(&self.config, client_key, profile)?;
+            let meta = tokio::fs::read(&paths.meta_path)
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<HandoffMeta>(&bytes).ok())?;
+            if meta.pid == 0 || !handoff_socket_is_live(&paths.socket_path).await {
+                return None;
+            }
+            Some(AppServerProcessSnapshot {
+                client_key: client_key.to_string(),
+                profile_id: profile.id.clone(),
+                codex_home: profile.codex_home.clone(),
+                pid: meta.pid,
+                kind: "handoffDaemon".to_string(),
+                handoff_proxy: false,
+                socket_path: Some(paths.socket_path),
+                log_path: Some(paths.log_path),
+                started_at_ms: Some(meta.started_at_ms),
+                codex_bin: meta.codex_bin,
+                pending_request_count: 0,
+            })
+        }
+    }
+
     pub async fn close_all(&self) -> Result<()> {
         let clients = {
             let mut clients = self.clients.lock().await;
@@ -949,8 +1268,9 @@ impl AppServerManager {
 
         for client in clients {
             let profile = client.inner.profile.clone();
+            let client_key = client.inner.client_key.clone();
             client.close().await?;
-            stop_handoff_server(&self.config, &profile).await?;
+            stop_handoff_server(&self.config, &client_key, &profile).await?;
         }
         Ok(())
     }
@@ -973,11 +1293,13 @@ impl AppServerManager {
 
 fn handoff_paths(
     config: &AppServerClientConfig,
+    client_key: &str,
     profile: &AppServerProfile,
 ) -> Option<HandoffPaths> {
     let handoff_dir = config.handoff_dir.as_ref()?;
     #[cfg(not(unix))]
     {
+        let _ = client_key;
         let _ = profile;
         let _ = handoff_dir;
         return None;
@@ -985,6 +1307,8 @@ fn handoff_paths(
     #[cfg(unix)]
     {
         let mut hasher = Sha256::new();
+        hasher.update(client_key.as_bytes());
+        hasher.update(b"\0");
         hasher.update(profile.id.as_bytes());
         hasher.update(b"\0");
         hasher.update(profile.codex_home.display().to_string().as_bytes());
@@ -996,8 +1320,7 @@ fn handoff_paths(
             .take(8)
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let safe_profile = profile
-            .id
+        let safe_profile = client_key
             .chars()
             .map(|ch| match ch {
                 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => ch,
@@ -1152,9 +1475,10 @@ fn managed_process_identity_matches(pid: u32, expected: ManagedProcessIdentity) 
 #[cfg(unix)]
 async fn stop_handoff_server(
     config: &AppServerClientConfig,
+    client_key: &str,
     profile: &AppServerProfile,
 ) -> Result<()> {
-    let Some(paths) = handoff_paths(config, profile) else {
+    let Some(paths) = handoff_paths(config, client_key, profile) else {
         return Ok(());
     };
     let Some(meta) = tokio::fs::read(&paths.meta_path)
@@ -1193,6 +1517,7 @@ async fn stop_handoff_server(
 #[cfg(not(unix))]
 async fn stop_handoff_server(
     _config: &AppServerClientConfig,
+    _client_key: &str,
     _profile: &AppServerProfile,
 ) -> Result<()> {
     Ok(())
@@ -1792,8 +2117,8 @@ mod tests {
             codex_home: PathBuf::from("/tmp/codex-home"),
         };
 
-        let first = handoff_paths(&config, &profile);
-        let second = handoff_paths(&config, &profile);
+        let first = handoff_paths(&config, &profile.id, &profile);
+        let second = handoff_paths(&config, &profile.id, &profile);
 
         #[cfg(unix)]
         {
@@ -1875,7 +2200,8 @@ def log(message):
 def respond(payload, result=None):
     print(json.dumps({"id": payload.get("id"), "result": result or {}}), flush=True)
 
-if sys.argv[1:] == ["app-server", "--listen", "stdio://"]:
+args = sys.argv[1:]
+if "app-server" in args and "--listen" in args and args[args.index("--listen") + 1] == "stdio://":
     for raw_line in sys.stdin:
         payload = json.loads(raw_line)
         method = payload.get("method")
@@ -1969,7 +2295,8 @@ if sys.argv[1:] == ["app-server", "--listen", "stdio://"]:
 import json
 import sys
 
-if sys.argv[1:] == ["app-server", "--listen", "stdio://"]:
+args = sys.argv[1:]
+if "app-server" in args and "--listen" in args and args[args.index("--listen") + 1] == "stdio://":
     for raw_line in sys.stdin:
         payload = json.loads(raw_line)
         method = payload.get("method")

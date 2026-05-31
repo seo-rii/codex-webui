@@ -66,6 +66,24 @@ pub(crate) async fn normalize_session_preferences_payload(
             .map(Value::from)
             .unwrap_or(Value::Null),
     );
+    next_preferences.insert(
+        "languageBridgeEnabled".to_string(),
+        Value::Bool(
+            next_preferences
+                .get("languageBridgeEnabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+    );
+    next_preferences.insert(
+        "languageBridgeOutputLanguage".to_string(),
+        Value::String(normalize_language_bridge_output_language(
+            next_preferences
+                .get("languageBridgeOutputLanguage")
+                .and_then(Value::as_str)
+                .unwrap_or("auto"),
+        )),
+    );
 
     Ok(Value::Object(next_preferences))
 }

@@ -21,6 +21,7 @@ async fn resolve_server_request_payload_uses_pending_request_store() {
     handle_profile_server_request(
         &state,
         "default",
+        "default",
         &backend::codex_app_server::AppServerRequest {
             id: json!("srv-1"),
             method: "input/request".to_string(),
@@ -104,6 +105,7 @@ async fn computer_input_resolves_pending_computer_tool_request() {
     handle_profile_server_request(
         &state,
         "default",
+        "default",
         &backend::codex_app_server::AppServerRequest {
             id: json!("computer-call-1"),
             method: "item/tool/call".to_string(),
@@ -162,6 +164,7 @@ async fn stale_server_request_without_runtime_activity_is_ignored() {
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
     handle_profile_server_request(
         &state,
+        "default",
         "default",
         &backend::codex_app_server::AppServerRequest {
             id: json!("stale-approval"),
@@ -239,6 +242,7 @@ async fn dynamic_tool_call_requests_can_be_resolved_with_content_items() {
     mark_test_session_active(&state, "thread-dynamic").await;
     handle_profile_server_request(
         &state,
+        "default",
         "default",
         &backend::codex_app_server::AppServerRequest {
             id: json!("dynamic-1"),
@@ -1534,9 +1538,17 @@ async fn app_server_start_enables_goals_by_default() {
 
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
-    let count = app_server_client(&state, "default")
-        .await
-        .unwrap()
+    let client = app_server_client(&state, "default").await.unwrap();
+    let argv = client.request("debug/argv", json!({})).await.unwrap();
+    let args = argv
+        .get("args")
+        .and_then(Value::as_array)
+        .expect("fake app-server should expose argv");
+    assert!(args.windows(2).any(|window| {
+        window[0].as_str() == Some("--enable") && window[1].as_str() == Some("goals")
+    }));
+
+    let count = client
         .request(
             "debug/requestCount",
             json!({
@@ -1549,6 +1561,142 @@ async fn app_server_start_enables_goals_by_default() {
     assert_eq!(count.get("count").and_then(Value::as_u64), Some(1));
 
     let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unassigned_goal_session_gets_dedicated_app_server_client() {
+    let sandbox = unique_test_dir("goal-dedicated-client");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let _default_client = app_server_client(&state, "default").await.unwrap();
+    let _goal_client =
+        app_server_client_for_goal_session(&state, "default", "thread-goal-dedicated")
+            .await
+            .unwrap();
+
+    assert_eq!(state.app_servers.client_count().await, 2);
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-goal-dedicated"))
+            .cloned(),
+        Some("default::goal::thread-goal-dedicated".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assigned_session_goal_reuses_existing_app_server_client() {
+    let sandbox = unique_test_dir("goal-existing-client");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let _turn_client =
+        app_server_client_for_session_turn(&state, "default", "thread-goal-existing")
+            .await
+            .unwrap();
+    let _goal_client =
+        app_server_client_for_goal_session(&state, "default", "thread-goal-existing")
+            .await
+            .unwrap();
+
+    assert_eq!(state.app_servers.client_count().await, 1);
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-goal-existing"))
+            .cloned(),
+        Some("default".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn regular_session_turns_share_profile_app_server_by_default() {
+    let sandbox = unique_test_dir("session-app-server-default");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let _first = app_server_client_for_session_turn(&state, "default", "thread-a")
+        .await
+        .unwrap();
+    let _second = app_server_client_for_session_turn(&state, "default", "thread-b")
+        .await
+        .unwrap();
+
+    assert_eq!(state.app_servers.client_count().await, 1);
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-a"))
+            .cloned(),
+        Some("default".to_string())
+    );
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-b"))
+            .cloned(),
+        Some("default".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_session_app_server_option_allocates_regular_sessions_separately() {
+    let sandbox = unique_test_dir("session-app-server-opt-in");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let mut state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    Arc::make_mut(&mut state.config).per_session_app_servers = true;
+    let _first = app_server_client_for_session_turn(&state, "default", "thread-a")
+        .await
+        .unwrap();
+    let _second = app_server_client_for_session_turn(&state, "default", "thread-b")
+        .await
+        .unwrap();
+
+    assert_eq!(state.app_servers.client_count().await, 2);
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-a"))
+            .cloned(),
+        Some("default::session::thread-a".to_string())
+    );
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-b"))
+            .cloned(),
+        Some("default::session::thread-b".to_string())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1631,6 +1779,57 @@ async fn thread_goal_payload_round_trips_through_app_server() {
             .get("status")
             .and_then(Value::as_str),
         Some("paused")
+    );
+    let blocked = set_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-1",
+        json!({
+            "status": "blocked"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        blocked
+            .get("goal")
+            .and_then(|goal| goal.get("status"))
+            .and_then(Value::as_str),
+        Some("blocked")
+    );
+    let usage_limited = set_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-1",
+        json!({
+            "status": "usage_limited"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        usage_limited
+            .get("goal")
+            .and_then(|goal| goal.get("status"))
+            .and_then(Value::as_str),
+        Some("usageLimited")
+    );
+    let budget_limited = set_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-1",
+        json!({
+            "status": "budget-limited"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        budget_limited
+            .get("goal")
+            .and_then(|goal| goal.get("status"))
+            .and_then(Value::as_str),
+        Some("budgetLimited")
     );
 
     let detail = session_detail_payload(&state, "default", "thread-goal-1", 20)

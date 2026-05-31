@@ -5,6 +5,8 @@ use crate::thread_read_support::{
 };
 
 const DUPLICATE_TURN_START_ACTIVE_GRACE_MS: u64 = 30_000;
+const LANGUAGE_BRIDGE_TRANSLATION_TIMEOUT: Duration = Duration::from_secs(180);
+const LANGUAGE_BRIDGE_TRANSLATION_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 async fn resolve_selected_attachment_records(
     state: &AppState,
@@ -152,6 +154,292 @@ pub(crate) fn build_turn_input_payload(
     }
 
     (input, additional_readable_roots)
+}
+
+fn language_bridge_enabled(preferences: &Value) -> bool {
+    preferences
+        .get("languageBridgeEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn language_bridge_output_language(preferences: &Value) -> String {
+    normalize_language_bridge_output_language(
+        preferences
+            .get("languageBridgeOutputLanguage")
+            .and_then(Value::as_str)
+            .unwrap_or("auto"),
+    )
+}
+
+fn language_bridge_developer_instructions(
+    preferences: &Value,
+    resolved_output_language: Option<&str>,
+) -> Option<String> {
+    if !preferences
+        .get("languageBridgeEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let output_language = resolved_output_language
+        .map(normalize_language_bridge_output_language)
+        .unwrap_or_else(|| language_bridge_output_language(preferences));
+    let output_language_instruction = if output_language.eq_ignore_ascii_case("auto") {
+        "the same natural language as the user's latest message".to_string()
+    } else {
+        output_language
+    };
+
+    Some(format!(
+        "Language bridge is enabled for this session.\n\
+         - Internally translate non-English user requests into English before planning or tool use.\n\
+         - Do not show translation notes or the translated prompt to the user.\n\
+         - Keep code, commands, file paths, identifiers, logs, errors, and quoted text in their original language unless explicitly asked to translate them.\n\
+         - Write the final user-facing answer in {output_language_instruction}.\n\
+         - Continue following the selected collaboration mode's normal behavior."
+    ))
+}
+
+fn collaboration_mode_payload(
+    preferences: &Value,
+    model: &Value,
+    resolved_output_language: Option<&str>,
+) -> Value {
+    let mode = preferences
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let language_bridge_instructions =
+        language_bridge_developer_instructions(preferences, resolved_output_language);
+    if mode != "plan" && language_bridge_instructions.is_none() {
+        return Value::Null;
+    }
+
+    let model = model
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("gpt-5")
+        .to_string();
+    let reasoning_effort = preferences.get("effort").cloned().unwrap_or(Value::Null);
+    json!({
+        "mode": if mode == "plan" { "plan" } else { "default" },
+        "settings": {
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "developer_instructions": language_bridge_instructions
+                .map(Value::String)
+                .unwrap_or(Value::Null)
+        }
+    })
+}
+
+fn detect_prompt_language(prompt: &str) -> String {
+    if prompt
+        .chars()
+        .any(|ch| ('\u{ac00}'..='\u{d7af}').contains(&ch))
+    {
+        return "Korean".to_string();
+    }
+    if prompt.chars().any(|ch| {
+        ('\u{3040}'..='\u{30ff}').contains(&ch) || ('\u{31f0}'..='\u{31ff}').contains(&ch)
+    }) {
+        return "Japanese".to_string();
+    }
+    if prompt
+        .chars()
+        .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch))
+    {
+        return "Chinese".to_string();
+    }
+    if prompt
+        .chars()
+        .any(|ch| ('\u{0400}'..='\u{04ff}').contains(&ch))
+    {
+        return "Russian".to_string();
+    }
+    "English".to_string()
+}
+
+fn language_bridge_translation_prompt(prompt: &str) -> String {
+    format!(
+        "Translate the following user request into clear, concise English for a coding agent.\n\
+         Do not answer the request. Preserve code blocks, commands, file paths, identifiers, quoted strings, logs, and error messages exactly unless translating surrounding natural language is necessary.\n\
+         Return compact JSON only with this shape: {{\"english\":\"...\",\"language\":\"...\"}}. The language field must be the original user's natural language in English, such as Korean, Japanese, Chinese, French, Spanish, or English.\n\n\
+         <user_request>\n{prompt}\n</user_request>"
+    )
+}
+
+fn strip_json_code_fence(value: &str) -> &str {
+    let trimmed = value.trim();
+    let Some(stripped) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let Some((_, body)) = stripped.split_once('\n') else {
+        return trimmed;
+    };
+    body.rsplit_once("```")
+        .map(|(body, _)| body.trim())
+        .unwrap_or(body.trim())
+}
+
+fn parse_language_bridge_translation_response(
+    response: &str,
+    fallback_language: &str,
+) -> Option<(String, String)> {
+    let parsed = serde_json::from_str::<Value>(strip_json_code_fence(response)).ok()?;
+    let english = parsed
+        .get("english")
+        .or_else(|| parsed.get("text"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let language = parsed
+        .get("language")
+        .or_else(|| parsed.get("sourceLanguage"))
+        .and_then(Value::as_str)
+        .map(normalize_language_bridge_output_language)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| fallback_language.to_string());
+    Some((english, language))
+}
+
+fn extract_agent_message_text(thread: &Value) -> Option<String> {
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)?;
+    for turn in turns.iter().rev() {
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items.iter().rev() {
+            let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+            if !matches!(
+                item_type,
+                "agentMessage" | "assistantMessage" | "agent_message" | "assistant_message"
+            ) {
+                continue;
+            }
+            if let Some(text) = item
+                .get("text")
+                .or_else(|| item.get("message"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn translate_prompt_with_language_bridge(
+    client: &AppServerClient,
+    preferences: &Value,
+    cwd: &str,
+    prompt: &str,
+) -> ApiResult<(String, String)> {
+    let fallback_language = detect_prompt_language(prompt);
+    let requested_output_language = language_bridge_output_language(preferences);
+    let start_response = client
+        .request(
+            "thread/start",
+            json!({
+                "cwd": cwd,
+                "model": preferences.get("model").cloned().unwrap_or(Value::Null),
+                "developerInstructions": "You are a private translation preprocessor for Codex Web UI. Return only the requested JSON. Do not call tools and do not solve the user's task.",
+                "ephemeral": true,
+                "personality": "none"
+            }),
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to start language bridge session: {error}"),
+            )
+        })?;
+    let temp_thread_id = start_response
+        .get("thread")
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "Language bridge session did not return a thread id.",
+            )
+        })?;
+    let translation_prompt = language_bridge_translation_prompt(prompt);
+    let (input, _) = build_turn_input_payload(&translation_prompt, &[], &[]);
+    client
+        .request(
+            "turn/start",
+            json!({
+                "threadId": temp_thread_id,
+                "input": input,
+                "cwd": cwd,
+                "model": preferences.get("model").cloned().unwrap_or(Value::Null),
+                "approvalPolicy": "never",
+                "sandboxPolicy": {
+                    "type": "readOnly",
+                    "access": {
+                        "type": "restricted",
+                        "includePlatformDefaults": true,
+                        "readableRoots": [cwd]
+                    },
+                    "networkAccess": false
+                }
+            }),
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to start language bridge translation: {error}"),
+            )
+        })?;
+
+    let deadline = tokio::time::Instant::now() + LANGUAGE_BRIDGE_TRANSLATION_TIMEOUT;
+    loop {
+        let response = client
+            .request(
+                "thread/read",
+                json!({
+                    "threadId": temp_thread_id,
+                    "includeTurns": true
+                }),
+            )
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to read language bridge translation: {error}"),
+                )
+            })?;
+        if let Some(raw_text) = response.get("thread").and_then(extract_agent_message_text) {
+            let (english, detected_language) =
+                parse_language_bridge_translation_response(&raw_text, &fallback_language)
+                    .unwrap_or_else(|| (raw_text, fallback_language.clone()));
+            let output_language = if requested_output_language.eq_ignore_ascii_case("auto") {
+                detected_language
+            } else {
+                requested_output_language
+            };
+            return Ok((english, output_language));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(api_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "Timed out while translating the prompt with language bridge.",
+            ));
+        }
+        tokio::time::sleep(LANGUAGE_BRIDGE_TRANSLATION_POLL_INTERVAL).await;
+    }
 }
 
 async fn turn_app_server_error(
@@ -396,7 +684,7 @@ pub(crate) async fn send_turn_payload(
     )
     .await;
 
-    let client = app_server_client(state, profile_id)
+    let client = app_server_client_for_session_turn(state, profile_id, session_id)
         .await
         .map_err(|error| {
             api_error(
@@ -423,8 +711,25 @@ pub(crate) async fn send_turn_payload(
             })?;
     }
 
+    let mut effective_prompt = trimmed_prompt.to_string();
+    let mut resolved_output_language = None;
+    if language_bridge_enabled(&next_preferences) && !trimmed_prompt.is_empty() {
+        let (translated_prompt, output_language) = translate_prompt_with_language_bridge(
+            &client,
+            &next_preferences,
+            next_preferences
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or(&cwd),
+            trimmed_prompt,
+        )
+        .await?;
+        effective_prompt = translated_prompt;
+        resolved_output_language = Some(output_language);
+    }
+
     let (input, attachment_readable_roots) =
-        build_turn_input_payload(trimmed_prompt, &attachments, &next_selected_skills);
+        build_turn_input_payload(&effective_prompt, &attachments, &next_selected_skills);
     let mut readable_roots = vec![cwd.clone()];
     for readable_root in attachment_readable_roots {
         if !readable_roots.contains(&readable_root) {
@@ -467,6 +772,8 @@ pub(crate) async fn send_turn_payload(
         .get("model")
         .cloned()
         .unwrap_or(Value::Null);
+    let collaboration_mode =
+        collaboration_mode_payload(&next_preferences, &model, resolved_output_language.as_deref());
     let response = match client
         .request(
             "turn/start",
@@ -488,18 +795,7 @@ pub(crate) async fn send_turn_payload(
                 } else {
                     next_preferences.get("effort").cloned().unwrap_or(Value::Null)
                 },
-                "collaborationMode": if next_preferences.get("mode").and_then(Value::as_str) == Some("plan") {
-                    json!({
-                        "mode": "plan",
-                        "settings": {
-                            "model": model,
-                            "reasoning_effort": next_preferences.get("effort").cloned().unwrap_or(Value::Null),
-                            "developer_instructions": Value::Null
-                        }
-                    })
-                } else {
-                    Value::Null
-                }
+                "collaborationMode": collaboration_mode
             }),
         )
         .await
@@ -636,8 +932,7 @@ pub(crate) async fn steer_turn_payload(
     } else {
         requested_selected_skills
     };
-    let (input, _) = build_turn_input_payload(trimmed_prompt, &attachments, &next_selected_skills);
-    let client = app_server_client(state, profile_id)
+    let client = app_server_client_for_session(state, profile_id, session_id)
         .await
         .map_err(|error| {
             api_error(
@@ -645,6 +940,28 @@ pub(crate) async fn steer_turn_payload(
                 format!("Failed to connect to codex app-server: {error}"),
             )
         })?;
+    let preferences = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("preferencesByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get(session_id))
+            .cloned()
+            .unwrap_or(Value::Null))
+    })
+    .await?;
+    let mut effective_prompt = trimmed_prompt.to_string();
+    if language_bridge_enabled(&preferences) {
+        let cwd = preferences
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (translated_prompt, _) =
+            translate_prompt_with_language_bridge(&client, &preferences, cwd, trimmed_prompt)
+                .await?;
+        effective_prompt = translated_prompt;
+    }
+    let (input, _) =
+        build_turn_input_payload(&effective_prompt, &attachments, &next_selected_skills);
     if let Err(error) = client
         .request(
             "turn/steer",

@@ -199,12 +199,13 @@ async fn session_turn_activity(
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
     let runtime_key = runtime_session_key(resolved_profile_id, session_id);
     let cached_active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
-    let has_profile_process = state
+    let client_key = app_server_client_key_for_session(state, profile_id, session_id).await;
+    let has_session_process = state
         .app_servers
-        .profile_has_active_process(resolved_profile_id)
+        .client_key_has_active_process(resolved_profile_id, &client_key)
         .await;
 
-    if !has_profile_process
+    if !has_session_process
         && clear_stale_session_runtime_activity_if_app_server_missing(
             state,
             profile_id,
@@ -222,15 +223,15 @@ async fn session_turn_activity(
             Ok(value) => value.unwrap_or(false),
             Err(_) => return SessionTurnActivity::Unknown,
         };
-    if local_has_active_turn && !has_profile_process {
+    if local_has_active_turn && !has_session_process {
         return SessionTurnActivity::Idle;
     }
 
-    if !has_profile_process && cached_active_turn_id.is_none() {
+    if !has_session_process && cached_active_turn_id.is_none() {
         return SessionTurnActivity::Idle;
     }
 
-    let client = match app_server_client(state, profile_id).await {
+    let client = match app_server_client_for_session(state, profile_id, session_id).await {
         Ok(client) => client,
         Err(_) => return SessionTurnActivity::Unknown,
     };

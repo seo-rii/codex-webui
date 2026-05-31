@@ -118,7 +118,9 @@ The same principle applies to account routing:
 - each configured account is represented by a profile with its own `CODEX_HOME`
 - Rust chooses the profile from the signed browser cookie and routes app-server RPC to that profile
 - app-server processes start only when a profile receives active Codex work or an account/runtime request
-- `CODEX_WEBUI_MAX_APP_SERVERS` caps concurrent profile runtimes so a host with many configured accounts does not launch every backend at startup
+- by default, sessions in the same profile share a profile app-server; `CODEX_WEBUI_PER_SESSION_APP_SERVERS=true` opts into one app-server per newly active session for heavier same-account parallel work
+- `/goal` updates allocate a dedicated app-server for unassigned sessions even when per-session runtimes are disabled, because goal sessions are usually long-running and expensive
+- `CODEX_WEBUI_MAX_APP_SERVERS` caps concurrent profile and per-session runtimes so a host with many configured accounts or active sessions does not launch every backend at startup
 
 The result is a multi-backend architecture without making the browser manage backend selection, auth files, or process lifetimes.
 

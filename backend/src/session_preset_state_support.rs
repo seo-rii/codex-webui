@@ -58,6 +58,7 @@ pub(crate) async fn save_session_filter_payload(
             "pinnedOnly": filter.get("pinnedOnly").and_then(Value::as_bool).unwrap_or(false),
             "runningOnly": filter.get("runningOnly").and_then(Value::as_bool).unwrap_or(false),
             "queuedOnly": filter.get("queuedOnly").and_then(Value::as_bool).unwrap_or(false),
+            "untaggedOnly": filter.get("untaggedOnly").and_then(Value::as_bool).unwrap_or(false),
             "highlight": highlight,
             "tags": normalized_tags
         });

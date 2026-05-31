@@ -460,7 +460,7 @@ pub(crate) async fn rename_session_payload(
         ));
     }
 
-    app_server_client(state, profile_id)
+    app_server_client_for_session(state, profile_id, session_id)
         .await
         .map_err(|error| {
             api_error(
@@ -511,7 +511,7 @@ pub(crate) async fn archive_session_payload(
     profile_id: &str,
     session_id: &str,
 ) -> ApiResult<Value> {
-    app_server_client(state, profile_id)
+    app_server_client_for_session(state, profile_id, session_id)
         .await
         .map_err(|error| {
             api_error(
@@ -542,7 +542,7 @@ pub(crate) async fn unarchive_session_payload(
     profile_id: &str,
     session_id: &str,
 ) -> ApiResult<Value> {
-    app_server_client(state, profile_id)
+    app_server_client_for_session(state, profile_id, session_id)
         .await
         .map_err(|error| {
             api_error(

@@ -98,6 +98,7 @@ pub(crate) struct Config {
     pub(crate) webhook_allowed_hosts: Vec<String>,
     pub(crate) instance_token: Option<String>,
     pub(crate) app_server_handoff_enabled: bool,
+    pub(crate) per_session_app_servers: bool,
     pub(crate) restart_command: Option<String>,
 }
 
@@ -236,11 +237,21 @@ impl Config {
             app_server_handoff_enabled: parse_app_server_handoff_enabled(
                 env::var("CODEX_WEBUI_APP_SERVER_HANDOFF").ok(),
             ),
+            per_session_app_servers: parse_bool_env("CODEX_WEBUI_PER_SESSION_APP_SERVERS"),
             restart_command: optional_env("CODEX_WEBUI_RESTART_COMMAND"),
         };
         validate_plaintext_password_policy(&config)?;
         Ok(config)
     }
+}
+
+fn parse_bool_env(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn parse_app_server_handoff_enabled(value: Option<String>) -> bool {
@@ -562,6 +573,8 @@ pub(crate) struct CodexTomlDefaults {
     pub(crate) sandbox_mode: Option<String>,
     pub(crate) service_tier: String,
     pub(crate) network_access: Option<bool>,
+    pub(crate) language_bridge_enabled: Option<bool>,
+    pub(crate) language_bridge_output_language: Option<String>,
 }
 
 pub(crate) fn config_toml_path(codex_home: &Path) -> PathBuf {
@@ -695,6 +708,16 @@ pub(crate) fn read_codex_toml_defaults(codex_home: &Path) -> CodexTomlDefaults {
             &raw,
             Some("sandbox_workspace_write"),
             "network_access",
+        )),
+        language_bridge_enabled: parse_toml_bool_value(get_toml_value(
+            &raw,
+            Some("codex_webui"),
+            "language_bridge",
+        )),
+        language_bridge_output_language: parse_toml_string_value(get_toml_value(
+            &raw,
+            Some("codex_webui"),
+            "language_bridge_output_language",
         )),
     }
 }
@@ -913,10 +936,55 @@ pub(crate) async fn sync_codex_toml_with_preferences(
             .to_string(),
         ),
     );
+    raw = upsert_toml_value(
+        &raw,
+        Some("codex_webui"),
+        "language_bridge",
+        Some(
+            if preferences
+                .get("languageBridgeEnabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        ),
+    );
+    raw = upsert_toml_value(
+        &raw,
+        Some("codex_webui"),
+        "language_bridge_output_language",
+        preferences
+            .get("languageBridgeOutputLanguage")
+            .and_then(Value::as_str)
+            .map(normalize_language_bridge_output_language)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| stringify_toml_string(&value)),
+    );
 
     write_file_atomically(&file_path, raw.into_bytes())
         .await
         .context("failed to write config.toml")
+}
+
+pub(crate) fn normalize_language_bridge_output_language(value: &str) -> String {
+    let normalized = value
+        .trim()
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | ' ' | '(' | ')' | '/' | '.')
+        })
+        .take(48)
+        .collect::<String>();
+    if normalized.is_empty() {
+        "auto".to_string()
+    } else {
+        normalized
+    }
 }
 
 pub(crate) fn normalize_origin(value: &str) -> Option<String> {

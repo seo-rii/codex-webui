@@ -75,6 +75,7 @@
     onSearchScopeChange,
     onSessionFilterChange,
     onSelectSessionFolder,
+    onSelectUnfiledSessions,
     onCreateSessionFolder,
     onToggleSessionFolderPin,
     onAddSelectedSessionToFolder,
@@ -149,6 +150,7 @@
     onSearchScopeChange: (scope: SessionSearchScope) => void;
     onSessionFilterChange: (patch: Partial<SessionSummaryFilter>) => void;
     onSelectSessionFolder: (folderName: string | null) => void;
+    onSelectUnfiledSessions: () => void;
     onCreateSessionFolder: () => void;
     onToggleSessionFolderPin: (folder: SessionFolder) => void;
     onAddSelectedSessionToFolder: (folderName: string) => void;
@@ -226,6 +228,8 @@
   let sessionFoldersCollapsed = $state(true);
   let boundedAutoloadPasses = $state(0);
   let loadMoreOrigin = $state<"manual" | "auto" | null>(null);
+  let lastSessionListSignature = "";
+  let pendingSessionListScrollAnchor: { sessionId: string; offset: number } | null = null;
 
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
@@ -248,6 +252,7 @@
       filterTags: m.filter_tags(),
       sessionFolders: m.session_folders(),
       allFolders: m.all_folders(),
+      unfiledSessions: m.unfiled_sessions(),
       newFolder: m.new_folder(),
       createInFolder: m.create_in_folder(),
       pinFolder: m.pin_folder(),
@@ -546,6 +551,44 @@
     }
   }
 
+  function sessionListSignature() {
+    return sessions.map((session) => session.id).join("\u001f");
+  }
+
+  function captureSessionListScrollAnchor() {
+    if (!listElement || listElement.scrollTop <= 0) {
+      return null;
+    }
+    const containerTop = listElement.getBoundingClientRect().top;
+    const sessionRows = Array.from(listElement.querySelectorAll<HTMLElement>("[data-session-id]"));
+    for (const row of sessionRows) {
+      const sessionId = row.dataset.sessionId;
+      if (!sessionId) {
+        continue;
+      }
+      const offset = row.getBoundingClientRect().top - containerTop;
+      if (offset >= -4) {
+        return { sessionId, offset };
+      }
+    }
+    return null;
+  }
+
+  function restoreSessionListScrollAnchor(anchor: { sessionId: string; offset: number }) {
+    if (!listElement) {
+      return;
+    }
+    const containerTop = listElement.getBoundingClientRect().top;
+    const target = Array.from(listElement.querySelectorAll<HTMLElement>("[data-session-id]")).find(
+      (row) => row.dataset.sessionId === anchor.sessionId
+    );
+    if (!target) {
+      return;
+    }
+    const nextOffset = target.getBoundingClientRect().top - containerTop;
+    listElement.scrollTop += nextOffset - anchor.offset;
+  }
+
   function loadMoreByButton() {
     if (!sessionsHasMore || sessionsLoadingMore) {
       return;
@@ -579,6 +622,7 @@
       sessionFilter.pinnedOnly ||
       sessionFilter.runningOnly ||
       sessionFilter.queuedOnly ||
+      sessionFilter.untaggedOnly ||
       sessionFilter.highlight !== "all" ||
       sessionFilter.tags.length > 0;
     if (searchScope === "full") {
@@ -606,6 +650,28 @@
     showArchived;
     boundedAutoloadPasses = 0;
     loadMoreOrigin = null;
+  });
+
+  $effect.pre(() => {
+    const signature = sessionListSignature();
+    if (signature === lastSessionListSignature) {
+      return;
+    }
+    pendingSessionListScrollAnchor = captureSessionListScrollAnchor();
+  });
+
+  $effect(() => {
+    const signature = sessionListSignature();
+    if (signature === lastSessionListSignature) {
+      return;
+    }
+    lastSessionListSignature = signature;
+    const anchor = pendingSessionListScrollAnchor;
+    pendingSessionListScrollAnchor = null;
+    if (!anchor) {
+      return;
+    }
+    void tick().then(() => restoreSessionListScrollAnchor(anchor));
   });
 
   $effect(() => {
@@ -948,19 +1014,31 @@
 	          <Plus size={13} />
 	        </button>
 	      </div>
-	      {#if !sessionFoldersCollapsed}
-	        <div class="mt-1 grid gap-1">
-	          <button
-	            class={`sidebar-folder-item flex min-w-0 items-center gap-2 rounded-xl px-2 py-1.5 text-left text-xs transition-colors ${
-	              activeSessionFolder === null ? "sidebar-folder-item--active bg-gray-900 text-white shadow-sm" : "text-gray-600 hover:bg-gray-100"
-	            }`}
-	            onclick={() => onSelectSessionFolder(null)}
-	            type="button"
+              {#if !sessionFoldersCollapsed}
+                <div class="mt-1 grid gap-1">
+                  <button
+                    class={`sidebar-folder-item flex min-w-0 items-center gap-2 rounded-xl px-2 py-1.5 text-left text-xs transition-colors ${
+                      activeSessionFolder === null && !sessionFilter.untaggedOnly
+                        ? "sidebar-folder-item--active bg-gray-900 text-white shadow-sm"
+                        : "text-gray-600 hover:bg-gray-100"
+                    }`}
+                    onclick={() => onSelectSessionFolder(null)}
+                    type="button"
 	          >
-	            <FolderOpen size={14} class="shrink-0" />
-	            <span class="min-w-0 flex-1 truncate">{ui.allFolders}</span>
-	          </button>
-	          {#each sessionFolders as folder (folder.name)}
+                    <FolderOpen size={14} class="shrink-0" />
+                    <span class="min-w-0 flex-1 truncate">{ui.allFolders}</span>
+                  </button>
+                  <button
+                    class={`sidebar-folder-item flex min-w-0 items-center gap-2 rounded-xl px-2 py-1.5 text-left text-xs transition-colors ${
+                      sessionFilter.untaggedOnly ? "sidebar-folder-item--active bg-amber-50 text-amber-800" : "text-gray-600 hover:bg-gray-100"
+                    }`}
+                    onclick={onSelectUnfiledSessions}
+                    type="button"
+                  >
+                    <Folder size={14} class={`shrink-0 ${sessionFilter.untaggedOnly ? "text-amber-600" : "text-gray-400"}`} />
+                    <span class="min-w-0 flex-1 truncate">{ui.unfiledSessions}</span>
+                  </button>
+                  {#each sessionFolders as folder (folder.name)}
 	            <div class={`sidebar-folder-item group/folder flex min-w-0 items-center gap-1 rounded-xl px-1 py-1 transition-colors ${
 	              activeSessionFolder === folder.name ? "sidebar-folder-item--active bg-amber-50 text-amber-800" : "text-gray-600 hover:bg-gray-100"
 	            }`}>
@@ -1033,6 +1111,17 @@
 	        >
 	          <FolderOpen size={14} class="shrink-0 text-amber-600" />
 	          <span class="min-w-0 flex-1 truncate font-medium">{activeSessionFolder}</span>
+	        </button>
+	      {:else if sessionFilter.untaggedOnly}
+	        <button
+	          class="sidebar-folder-item sidebar-folder-item--active mt-1 flex min-w-0 items-center gap-2 rounded-xl bg-amber-50 px-2 py-1.5 text-left text-xs text-amber-800 transition-colors"
+	          onclick={() => {
+	            sessionFoldersCollapsed = false;
+	          }}
+	          type="button"
+	        >
+	          <Folder size={14} class="shrink-0 text-amber-600" />
+	          <span class="min-w-0 flex-1 truncate font-medium">{ui.unfiledSessions}</span>
 	        </button>
 	      {/if}
 	    </div>
@@ -1235,7 +1324,7 @@
               <div class="flex flex-wrap gap-1.5">
                 <button
                   class={`rounded-full border px-2 py-1 text-[10px] font-semibold transition-all ${
-                    activeSavedSessionFilterId === null && !sessionFilter.pinnedOnly && !sessionFilter.runningOnly && !sessionFilter.queuedOnly && sessionFilter.highlight === "all" && sessionFilter.tags.length === 0
+                    activeSavedSessionFilterId === null && !sessionFilter.pinnedOnly && !sessionFilter.runningOnly && !sessionFilter.queuedOnly && !sessionFilter.untaggedOnly && sessionFilter.highlight === "all" && sessionFilter.tags.length === 0
                       ? "border-gray-900 bg-gray-900 text-white"
                       : "border-gray-200 bg-gray-50 text-gray-500 hover:bg-white hover:text-gray-700"
                   }`}
@@ -1328,7 +1417,7 @@
       {/if}
 
       {#each sessions as session (session.id)}
-        <div class="group relative">
+        <div class="group relative" data-session-id={session.id}>
           <button
             class="w-full text-left p-3 pr-11 rounded-xl transition-all relative { session.id === selectedId ? 'bg-white shadow-sm border border-gray-200 ring-1 ring-gray-200/50' : sessionCardHighlightClass(session.id) }"
             onclick={() => onSelect(session.id)}

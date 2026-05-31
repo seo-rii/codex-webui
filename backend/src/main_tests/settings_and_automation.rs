@@ -1595,7 +1595,9 @@ async fn syncs_codex_toml_with_preferences_for_plan_mode() {
             "speed": "fast",
             "mode": "plan",
             "effort": "high",
-            "networkAccess": true
+            "networkAccess": true,
+            "languageBridgeEnabled": true,
+            "languageBridgeOutputLanguage": "Korean"
         }),
     )
     .await
@@ -1610,6 +1612,9 @@ async fn syncs_codex_toml_with_preferences_for_plan_mode() {
     assert!(raw.contains("plan_mode_reasoning_effort = \"high\""));
     assert!(raw.contains("[sandbox_workspace_write]"));
     assert!(raw.contains("network_access = true"));
+    assert!(raw.contains("[codex_webui]"));
+    assert!(raw.contains("language_bridge = true"));
+    assert!(raw.contains("language_bridge_output_language = \"Korean\""));
     let temp_files = fs::read_dir(&codex_home)
         .unwrap()
         .filter_map(Result::ok)
@@ -1630,7 +1635,9 @@ async fn session_preferences_defaults_include_model_context_window_from_codex_to
     fs::create_dir_all(&codex_home).unwrap();
     fs::write(
         config_toml_path(&codex_home),
-        format!("{CONFIG_SCHEMA_HEADER}\nmodel_context_window = 100000000\n"),
+        format!(
+            "{CONFIG_SCHEMA_HEADER}\nmodel_context_window = 100000000\n[codex_webui]\nlanguage_bridge = true\nlanguage_bridge_output_language = \"Korean\"\n"
+        ),
     )
     .unwrap();
 
@@ -1640,6 +1647,18 @@ async fn session_preferences_defaults_include_model_context_window_from_codex_to
     assert_eq!(
         defaults.get("modelContextWindow").and_then(Value::as_i64),
         Some(100000000)
+    );
+    assert_eq!(
+        defaults
+            .get("languageBridgeEnabled")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        defaults
+            .get("languageBridgeOutputLanguage")
+            .and_then(Value::as_str),
+        Some("Korean")
     );
 
     let _ = fs::remove_dir_all(sandbox);

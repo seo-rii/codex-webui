@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { onMount } from "svelte";
-  import { BellRing, Clock3, History, Info, Monitor, Palette, Pencil, Play, Plug, Power, RefreshCw, RotateCcw, Save, Settings2, Sparkles, Trash2, Wand2 } from "lucide-svelte";
+  import { onMount, untrack } from "svelte";
+  import { BellRing, Clock3, History, Info, Monitor, Palette, Pencil, Play, Plug, Power, RefreshCw, RotateCcw, Save, Server, Settings2, Sparkles, Square, Trash2, Wand2 } from "lucide-svelte";
   import { fade } from "svelte/transition";
 
   import { api } from "$lib/api";
@@ -27,6 +27,7 @@
     AppConfigPayload,
     CatalogPayload,
     CodexAppInfo,
+    CodexRuntimeProcess,
     CodexRuntimeStatus,
     EditableFilePayload,
     NotificationEventType,
@@ -39,6 +40,7 @@
   type SettingsTabId =
     | "config"
     | "startup"
+    | "processes"
     | "audit"
     | "theme"
     | "notifications"
@@ -106,6 +108,7 @@
   let configFile = $state<EditableFilePayload | null>(null);
   let catalog = $state<CatalogPayload | null>(null);
   let apps = $state<CodexAppInfo[]>([]);
+  let runtimeProcesses = $state<CodexRuntimeProcess[]>([]);
   let editorValue = $state("");
   let errorText = $state("");
   let notificationSlackWebhookUrl = $state("");
@@ -140,6 +143,8 @@
   let savingTheme = $state(false);
   let cleaningAutomationWorktrees = $state(false);
   let installingPluginPath = $state<string | null>(null);
+  let runtimeProcessesLoading = $state(false);
+  let killingProcessKey = $state<string | null>(null);
   let auditLoadedForAdmin = $state(false);
   let activeTab = $state<SettingsTabId>("config");
   let appliedInitialTab = $state<SettingsTabId | null>(null);
@@ -214,6 +219,7 @@
   });
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
+    const isKorean = getLocale() === "ko";
 
     return {
       settings: m.settings(),
@@ -235,6 +241,25 @@
       webuiCommit: m.webui_commit(),
       webuiBuiltAt: m.webui_built_at(),
       webuiDirtyBuild: m.webui_dirty_build(),
+      runtimeProcesses: isKorean ? "Codex 프로세스" : "Codex processes",
+      runtimeProcessesDescription: isKorean
+        ? "현재 WebUI가 관리 중인 Codex app-server 프로세스와 연결된 세션입니다."
+        : "Codex app-server processes currently managed by this WebUI and their attached sessions.",
+      runningProcesses: isKorean ? "실행 중" : "Running",
+      noRuntimeProcesses: isKorean ? "현재 관리 중인 Codex 프로세스가 없습니다." : "No managed Codex processes are running.",
+      forceKill: isKorean ? "강제 종료" : "Force kill",
+      forceKillConfirm: isKorean
+        ? "이 Codex 프로세스를 강제 종료할까요? 연결된 실행 중 세션은 실패 상태로 정리됩니다."
+        : "Force kill this Codex process? Attached running sessions will be marked as failed.",
+      processKindStdio: isKorean ? "stdio" : "stdio",
+      processKindHandoffProxy: isKorean ? "핸드오프 프록시" : "handoff proxy",
+      processKindHandoffDaemon: isKorean ? "핸드오프 서버" : "handoff server",
+      pid: "PID",
+      profile: isKorean ? "프로필" : "Profile",
+      sessions: isKorean ? "세션" : "Sessions",
+      pendingRequests: isKorean ? "대기 요청" : "Pending requests",
+      noAttachedSessions: isKorean ? "연결된 실행 중 세션이 없습니다." : "No attached running sessions.",
+      openSession: isKorean ? "세션 열기" : "Open session",
       notifications: m.notifications(),
       startup: m.startup(),
       autostartTitle: m.autostart_title(),
@@ -403,13 +428,24 @@
     ];
 
     if (webRole !== "viewer") {
-      tabs.splice(2, 0, {
-        id: "audit",
-        label: ui.auditLog,
-        icon: History,
-        meta: auditEntries.length > 0 ? String(auditEntries.length) : null,
-        alert: false
-      });
+      tabs.splice(
+        2,
+        0,
+        {
+          id: "processes",
+          label: ui.runtimeProcesses,
+          icon: Server,
+          meta: runtimeProcesses.length > 0 ? String(runtimeProcesses.length) : null,
+          alert: false
+        },
+        {
+          id: "audit",
+          label: ui.auditLog,
+          icon: History,
+          meta: auditEntries.length > 0 ? String(auditEntries.length) : null,
+          alert: false
+        }
+      );
     }
 
     return tabs;
@@ -492,6 +528,13 @@
     return () => {
       cancelled = true;
     };
+  });
+
+  $effect(() => {
+    if (activeTab !== "processes" || webRole === "viewer") {
+      return;
+    }
+    untrack(() => void loadRuntimeProcesses());
   });
 
   function toggleNotificationEvent(eventType: NotificationEventType, enabled: boolean) {
@@ -627,6 +670,60 @@
     } finally {
       installingPluginPath = null;
     }
+  }
+
+  async function loadRuntimeProcesses() {
+    if (runtimeProcessesLoading) {
+      return;
+    }
+
+    runtimeProcessesLoading = true;
+    errorText = "";
+
+    try {
+      const payload = await api.getRuntimeProcesses();
+      runtimeProcesses = payload.processes;
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedLoad;
+    } finally {
+      runtimeProcessesLoading = false;
+    }
+  }
+
+  async function killRuntimeProcess(process: CodexRuntimeProcess) {
+    if (readOnly || killingProcessKey) {
+      return;
+    }
+    if (!window.confirm(ui.forceKillConfirm)) {
+      return;
+    }
+
+    const processKey = `${process.profileId}:${process.pid}`;
+    killingProcessKey = processKey;
+    errorText = "";
+
+    try {
+      await api.killRuntimeProcess(process.profileId, process.pid);
+      await loadRuntimeProcesses();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      killingProcessKey = null;
+    }
+  }
+
+  function runtimeProcessKindLabel(kind: string) {
+    if (kind === "handoffProxy") {
+      return ui.processKindHandoffProxy;
+    }
+    if (kind === "handoffDaemon") {
+      return ui.processKindHandoffDaemon;
+    }
+    return ui.processKindStdio;
+  }
+
+  function runtimeProcessKey(process: CodexRuntimeProcess) {
+    return `${process.profileId}:${process.kind}:${process.pid}`;
   }
 
   async function reloadConfigFile() {
@@ -1005,8 +1102,13 @@
           · {ui.readOnlyMode}
         {/if}
       </span>
-      <button class="ghost-button" disabled={reloading || loading} onclick={() => void reloadConfigFile()} type="button">
-        <RefreshCw size={14} class={reloading ? "animate-spin" : ""} />
+      <button
+        class="ghost-button"
+        disabled={reloading || loading || runtimeProcessesLoading}
+        onclick={() => (activeTab === "processes" ? void loadRuntimeProcesses() : void reloadConfigFile())}
+        type="button"
+      >
+        <RefreshCw size={14} class={reloading || runtimeProcessesLoading ? "animate-spin" : ""} />
         <span>{ui.reload}</span>
       </button>
       {#if activeTab === "config"}
@@ -1197,6 +1299,101 @@
               <span>{autostart?.available ? `${ui.autostartMethod}: ${autostartProviderLabel(autostart.provider)}` : ui.autostartUnavailable}</span>
             </span>
           </label>
+        </section>
+      </div>
+    {:else if activeTab === "processes"}
+      <div
+        aria-labelledby="settings-tab-processes"
+        class="settings-tab-panel"
+        id="settings-panel-processes"
+        role="tabpanel"
+        transition:fade={{ duration: 160 }}
+      >
+        <section class="panel">
+          <div class="panel__header">
+            <div class="panel-title">
+              <Server size={16} />
+              <h3>{ui.runtimeProcesses}</h3>
+            </div>
+            <div class="settings-shell__actions">
+              <span class="meta-pill subtle">{ui.runningProcesses}: {runtimeProcesses.length}</span>
+              <button class="ghost-button" disabled={runtimeProcessesLoading} onclick={() => void loadRuntimeProcesses()} type="button">
+                <RefreshCw size={14} class={runtimeProcessesLoading ? "animate-spin" : ""} />
+                <span>{ui.reload}</span>
+              </button>
+            </div>
+          </div>
+          <p class="field-note">{ui.runtimeProcessesDescription}</p>
+
+          {#if runtimeProcesses.length === 0}
+            <div class="placeholder-card">{runtimeProcessesLoading ? ui.loadingWorkspace : ui.noRuntimeProcesses}</div>
+          {:else}
+            <div class="runtime-process-list">
+              {#each runtimeProcesses as process (runtimeProcessKey(process))}
+                {@const processKey = `${process.profileId}:${process.pid}`}
+                <article class="runtime-process-card">
+                  <div class="runtime-process-card__header">
+                    <div class="runtime-process-card__title">
+                      <span class="runtime-process-card__icon">
+                        <Server size={15} />
+                      </span>
+                      <div>
+                        <strong>{runtimeProcessKindLabel(process.kind)}</strong>
+                        <span>{process.codexBin}</span>
+                      </div>
+                    </div>
+                    <button
+                      class="danger-button"
+                      disabled={readOnly || killingProcessKey !== null}
+                      onclick={() => void killRuntimeProcess(process)}
+                      type="button"
+                    >
+                      <Square size={13} />
+                      <span>{killingProcessKey === processKey ? ui.saving : ui.forceKill}</span>
+                    </button>
+                  </div>
+
+                  <div class="runtime-process-card__meta">
+                    <span>{ui.pid} {process.pid}</span>
+                    <span>{ui.profile}: {process.profileId}</span>
+                    <span>{ui.sessions}: {process.sessionCount}</span>
+                    {#if process.pendingRequestCount > 0}
+                      <span>{ui.pendingRequests}: {process.pendingRequestCount}</span>
+                    {/if}
+                  </div>
+
+                  <div class="runtime-process-card__paths">
+                    <code title={process.codexHome}>{process.codexHome}</code>
+                    {#if process.socketPath}
+                      <code title={process.socketPath}>{process.socketPath}</code>
+                    {/if}
+                    {#if process.logPath}
+                      <code title={process.logPath}>{process.logPath}</code>
+                    {/if}
+                  </div>
+
+                  <div class="runtime-session-list">
+                    {#if process.sessions.length === 0}
+                      <span class="field-note">{ui.noAttachedSessions}</span>
+                    {:else}
+                      {#each process.sessions as session (session.sessionId)}
+                        <button
+                          class="runtime-session-chip"
+                          onclick={() => void onOpenSession?.(session.sessionId)}
+                          title={`${ui.openSession}: ${session.sessionId}`}
+                          type="button"
+                        >
+                          <span class={`runtime-session-chip__dot runtime-session-chip__dot--${session.status}`}></span>
+                          <span>{session.title || session.sessionId}</span>
+                          <small>{session.status}</small>
+                        </button>
+                      {/each}
+                    {/if}
+                  </div>
+                </article>
+              {/each}
+            </div>
+          {/if}
         </section>
       </div>
     {:else if activeTab === "audit"}
@@ -2218,6 +2415,189 @@
     white-space: nowrap;
   }
 
+  .runtime-process-list {
+    display: grid;
+    gap: 0.75rem;
+  }
+
+  .runtime-process-card {
+    display: grid;
+    gap: 0.7rem;
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: 1rem;
+    background: var(--panel-strong);
+    padding: 0.85rem;
+  }
+
+  .runtime-process-card__header,
+  .runtime-process-card__title,
+  .runtime-process-card__meta,
+  .runtime-session-list {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    min-width: 0;
+  }
+
+  .runtime-process-card__header {
+    justify-content: space-between;
+  }
+
+  .runtime-process-card__title {
+    flex: 1 1 auto;
+  }
+
+  .runtime-process-card__title > div {
+    display: grid;
+    gap: 0.18rem;
+    min-width: 0;
+  }
+
+  .runtime-process-card__title strong {
+    color: var(--ink-strong);
+    font-size: 0.9rem;
+  }
+
+  .runtime-process-card__title span {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 0.75rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .runtime-process-card__icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.85rem;
+    height: 1.85rem;
+    flex: 0 0 auto;
+    border-radius: 0.8rem;
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  .runtime-process-card__meta,
+  .runtime-session-list {
+    flex-wrap: wrap;
+  }
+
+  .runtime-process-card__meta span {
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--panel-soft);
+    color: var(--muted);
+    padding: 0.25rem 0.55rem;
+    font-size: 0.7rem;
+    font-weight: 700;
+  }
+
+  .runtime-process-card__paths {
+    display: grid;
+    gap: 0.35rem;
+    min-width: 0;
+  }
+
+  .runtime-process-card__paths code {
+    min-width: 0;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 0.75rem;
+    background: var(--panel-soft);
+    color: var(--ink);
+    padding: 0.45rem 0.55rem;
+    font-size: 0.72rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .runtime-session-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    max-width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--panel-soft);
+    color: var(--ink);
+    padding: 0.35rem 0.55rem;
+    font-size: 0.75rem;
+    transition:
+      transform 160ms ease,
+      border-color 160ms ease,
+      background-color 160ms ease;
+  }
+
+  .runtime-session-chip:hover {
+    transform: translateY(-1px);
+    border-color: rgba(245, 158, 11, 0.28);
+    background: var(--accent-soft);
+  }
+
+  .runtime-session-chip span:not(.runtime-session-chip__dot) {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .runtime-session-chip small {
+    color: var(--muted);
+    font-size: 0.68rem;
+    font-weight: 700;
+  }
+
+  .runtime-session-chip__dot {
+    width: 0.45rem;
+    height: 0.45rem;
+    flex: 0 0 auto;
+    border-radius: 999px;
+    background: var(--muted);
+  }
+
+  .runtime-session-chip__dot--running,
+  .runtime-session-chip__dot--active {
+    background: var(--accent);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+
+  .runtime-session-chip__dot--starting {
+    background: #f59e0b;
+    box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.16);
+  }
+
+  .danger-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    border: 1px solid rgba(220, 38, 38, 0.28);
+    border-radius: 0.8rem;
+    background: color-mix(in srgb, #ef4444 12%, var(--panel-strong));
+    color: color-mix(in srgb, #ef4444 82%, var(--ink-strong));
+    padding: 0.52rem 0.7rem;
+    font-size: 0.76rem;
+    font-weight: 800;
+    white-space: nowrap;
+    transition:
+      transform 160ms ease,
+      border-color 160ms ease,
+      background-color 160ms ease;
+  }
+
+  .danger-button:hover:not(:disabled) {
+    transform: translateY(-1px);
+    border-color: rgba(220, 38, 38, 0.42);
+    background: color-mix(in srgb, #ef4444 18%, var(--panel-strong));
+  }
+
+  .danger-button:disabled {
+    opacity: 0.55;
+  }
+
   .config-context-card {
     display: grid;
     gap: 0.9rem;
@@ -2602,6 +2982,15 @@
     .settings-shell__header {
       flex-direction: column;
       align-items: stretch;
+    }
+
+    .runtime-process-card__header {
+      align-items: stretch;
+      flex-direction: column;
+    }
+
+    .danger-button {
+      width: 100%;
     }
 
     .settings-column {

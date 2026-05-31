@@ -45,6 +45,7 @@
   "filter_tags": "Tags",
   "session_folders": "Folders",
   "all_folders": "All sessions",
+  "unfiled_sessions": "No folder",
   "new_folder": "New folder",
   "session_folder_name_prompt": "Folder name",
   "session_folder_created_notice": "Created folder {name}.",

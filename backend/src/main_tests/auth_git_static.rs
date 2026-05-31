@@ -2662,6 +2662,7 @@ async fn pending_server_requests_are_capped_per_session() {
     handle_profile_server_request(
         &state,
         "default",
+        "default",
         &backend::codex_app_server::AppServerRequest {
             id: json!("request-new"),
             method: "item/commandExecution/requestApproval".to_string(),

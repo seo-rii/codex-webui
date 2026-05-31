@@ -451,9 +451,6 @@ fn candidate_matches_session_filter_snapshot(
             return false;
         }
     }
-    if filter.tags.is_empty() {
-        return true;
-    }
     let session_tags = snapshot
         .session_meta_by_thread_id
         .get(session_id)
@@ -468,6 +465,15 @@ fn candidate_matches_session_filter_snapshot(
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default();
+
+    if filter.untagged_only && !session_tags.is_empty() {
+        return false;
+    }
+
+    if filter.tags.is_empty() {
+        return true;
+    }
+
     filter
         .tags
         .iter()

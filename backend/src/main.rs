@@ -30,8 +30,8 @@ use axum::{
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use backend::codex_app_server::{
     AppServerClient, AppServerClientConfig, AppServerManager, AppServerNotification,
-    AppServerProfile, app_server_request_interrupted, app_server_request_timed_out,
-    app_server_timeout_recovered,
+    AppServerProcessSnapshot, AppServerProfile, app_server_request_interrupted,
+    app_server_request_timed_out, app_server_timeout_recovered,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
@@ -314,6 +314,7 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             automation_timers: Arc::new(Mutex::new(HashMap::new())),
             queue_dispatching: Arc::new(Mutex::new(HashSet::new())),
             queue_drain_retries: Arc::new(Mutex::new(HashMap::new())),
+            session_app_server_assignments: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             pending_turn_starts: Arc::new(Mutex::new(HashSet::new())),
             pending_server_requests: Arc::new(Mutex::new(HashMap::new())),

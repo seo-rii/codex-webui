@@ -96,6 +96,15 @@ pub(crate) async fn session_preferences_defaults_payload(
     )
     .or_else(|| codex_defaults.personality.clone())
     .unwrap_or_else(|| "pragmatic".to_string());
+    let language_bridge_enabled = env_bool("CODEX_WEBUI_DEFAULT_LANGUAGE_BRIDGE")
+        .or(codex_defaults.language_bridge_enabled)
+        .unwrap_or(false);
+    let language_bridge_output_language =
+        env::var("CODEX_WEBUI_DEFAULT_LANGUAGE_BRIDGE_OUTPUT_LANGUAGE")
+            .ok()
+            .or(codex_defaults.language_bridge_output_language.clone())
+            .map(|value| normalize_language_bridge_output_language(&value))
+            .unwrap_or_else(|| "auto".to_string());
 
     json!({
         "cwd": default_cwd,
@@ -127,6 +136,8 @@ pub(crate) async fn session_preferences_defaults_payload(
             &["ask", "auto"]
         )
         .unwrap_or_else(|| "ask".to_string()),
+        "languageBridgeEnabled": language_bridge_enabled,
+        "languageBridgeOutputLanguage": language_bridge_output_language,
         "shutdownOnCompletion": false,
         "gitRepoPath": Value::Null
     })
@@ -488,6 +499,9 @@ pub(crate) async fn get_config_payload(state: &AppState, profile_id: &str) -> Ap
         "gateway": {
             "restartAvailable": build_gateway_restart_plan(&state.config).is_ok(),
             "restartCommandConfigured": state.config.restart_command.is_some()
+        },
+        "runtime": {
+            "perSessionAppServers": state.config.per_session_app_servers
         },
         "systemShutdown": {
             "available": shutdown_available,

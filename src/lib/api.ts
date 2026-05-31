@@ -17,6 +17,8 @@ import type {
   ComputerInputPayload,
   CodexQuotaStatus,
   CodexRuntimeActionPayload,
+  CodexRuntimeProcessKillPayload,
+  CodexRuntimeProcessesPayload,
   CodexRuntimeStatus,
   DirectoryPayload,
   EditableFilePayload,
@@ -275,6 +277,17 @@ export const api = {
 
   getRuntimeStatus() {
     return ws.request<CodexRuntimeStatus>("runtime/status");
+  },
+
+  getRuntimeProcesses() {
+    return ws.request<CodexRuntimeProcessesPayload>("runtime/processes/list");
+  },
+
+  killRuntimeProcess(profileId: string, pid: number) {
+    return ws.request<CodexRuntimeProcessKillPayload>("runtime/process/kill", {
+      profileId,
+      pid
+    });
   },
 
   getCatalog() {

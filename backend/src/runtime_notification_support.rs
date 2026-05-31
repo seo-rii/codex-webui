@@ -654,6 +654,109 @@ pub(crate) async fn clear_profile_runtime_activity_after_app_server_exit(
     affected_session_ids
 }
 
+pub(crate) async fn clear_runtime_activity_after_app_server_client_exit(
+    state: &AppState,
+    profile_id: &str,
+    client_key: &str,
+    reason: Option<&str>,
+) -> Vec<String> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let now_ms = now_unix_ms();
+    let reason_value = reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+    let mut affected_session_ids =
+        session_ids_for_app_server_client(state, &resolved_profile_id, client_key).await;
+
+    {
+        let mut active_turns = state.active_turns.lock().await;
+        for session_id in &affected_session_ids {
+            active_turns.remove(&runtime_session_key(&resolved_profile_id, session_id));
+        }
+    }
+    {
+        let mut pending_turn_starts = state.pending_turn_starts.lock().await;
+        for session_id in &affected_session_ids {
+            pending_turn_starts.remove(&runtime_session_key(&resolved_profile_id, session_id));
+        }
+    }
+
+    let status_session_ids = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(runtime_status_by_thread_id) = ui_state
+            .get_mut("runtimeStatusByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime status state is missing",
+            ));
+        };
+        let mut changed_session_ids = Vec::new();
+        for session_id in &affected_session_ids {
+            let Some(status_value) = runtime_status_by_thread_id.get_mut(session_id) else {
+                continue;
+            };
+            let status = normalized_thread_status(Some(status_value));
+            if !status.as_deref().is_some_and(is_live_thread_status) {
+                continue;
+            }
+            *status_value = json!({
+                "status": "failed",
+                "updatedAt": now_ms,
+                "reason": reason_value.clone(),
+            });
+            changed_session_ids.push(session_id.clone());
+        }
+        Ok(changed_session_ids)
+    })
+    .await
+    .unwrap_or_default();
+    affected_session_ids.extend(status_session_ids);
+
+    let mut affected_session_ids = affected_session_ids.into_iter().collect::<Vec<_>>();
+    affected_session_ids.sort();
+    clear_app_server_assignments_for_sessions(state, profile_id, &affected_session_ids).await;
+    for session_id in &affected_session_ids {
+        clear_session_pending_requests(state, profile_id, session_id).await;
+        complete_active_automation_runs_for_session(
+            state,
+            profile_id,
+            session_id,
+            "failed",
+            Some(reason_value.as_str().unwrap_or("codex app-server exited")),
+        )
+        .await;
+        emit_session_notification(
+            state,
+            profile_id,
+            session_id,
+            json!({
+                "kind": "notification",
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": session_id,
+                    "status": "failed",
+                    "reason": reason_value.clone(),
+                }
+            }),
+        )
+        .await;
+        mark_runtime_session_attention(
+            state,
+            profile_id,
+            session_id,
+            "stopped",
+            reason_value.as_str().unwrap_or("codex app-server exited"),
+        )
+        .await;
+    }
+    affected_session_ids
+}
+
 pub(crate) async fn clear_stale_session_runtime_activity_if_app_server_missing(
     state: &AppState,
     profile_id: &str,
@@ -662,9 +765,10 @@ pub(crate) async fn clear_stale_session_runtime_activity_if_app_server_missing(
     reason: &str,
 ) -> bool {
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let client_key = app_server_client_key_for_session(state, profile_id, session_id).await;
     if state
         .app_servers
-        .profile_has_active_process(resolved_profile_id)
+        .client_key_has_active_process(resolved_profile_id, &client_key)
         .await
     {
         return false;
@@ -854,13 +958,12 @@ pub(crate) async fn reconcile_lost_runtime_activity_for_profile(
     if session_ids.is_empty() {
         return Vec::new();
     }
-    let client = match app_server_client(state, profile_id).await {
-        Ok(client) => client,
-        Err(_) => return Vec::new(),
-    };
-
     let mut reconciled = Vec::new();
     for session_id in session_ids {
+        let client = match app_server_client_for_session(state, profile_id, &session_id).await {
+            Ok(client) => client,
+            Err(_) => continue,
+        };
         let response = client
             .request_with_timeout(
                 "thread/read",
@@ -1290,28 +1393,31 @@ pub(crate) async fn restore_runtime_profile_state(state: AppState, profile_id: S
 pub(crate) fn register_runtime_profile_monitor(
     state: &AppState,
     profile_id: &str,
+    client_key: &str,
     mut notifications: broadcast::Receiver<AppServerNotification>,
     mut requests: broadcast::Receiver<backend::codex_app_server::AppServerRequest>,
 ) {
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
         .0
         .to_string();
+    let monitor_key = format!("{resolved_profile_id}::{client_key}");
     let Ok(mut monitors) = state.runtime_profile_monitors.lock() else {
         warn!("runtime profile monitor registry is poisoned for {resolved_profile_id}");
         return;
     };
     if monitors
-        .get(&resolved_profile_id)
+        .get(&monitor_key)
         .is_some_and(|handle| !handle.is_finished())
     {
         return;
     }
-    if let Some(handle) = monitors.remove(&resolved_profile_id) {
+    if let Some(handle) = monitors.remove(&monitor_key) {
         handle.abort();
     }
 
     let monitor_state = state.clone();
     let monitor_profile_id = resolved_profile_id.clone();
+    let monitor_client_key = client_key.to_string();
     let handle = tokio::spawn(async move {
         let mut automation_reconcile_interval =
             tokio::time::interval(tokio::time::Duration::from_secs(60));
@@ -1329,9 +1435,10 @@ pub(crate) fn register_runtime_profile_monitor(
                     Ok(notification) => {
                         if notification.method == "codex-webui/app-server/exited" {
                             let affected_session_ids =
-                                clear_profile_runtime_activity_after_app_server_exit(
+                                clear_runtime_activity_after_app_server_client_exit(
                                 &monitor_state,
                                 &monitor_profile_id,
+                                &monitor_client_key,
                                 notification.params.get("reason").and_then(Value::as_str),
                             )
                             .await;
@@ -1374,7 +1481,12 @@ pub(crate) fn register_runtime_profile_monitor(
                 },
                 request = requests.recv() => match request {
                     Ok(request) => {
-                        handle_profile_server_request(&monitor_state, &monitor_profile_id, &request)
+                        handle_profile_server_request(
+                            &monitor_state,
+                            &monitor_profile_id,
+                            &monitor_client_key,
+                            &request,
+                        )
                             .await;
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -1412,5 +1524,5 @@ pub(crate) fn register_runtime_profile_monitor(
             }
         }
     });
-    monitors.insert(resolved_profile_id, handle);
+    monitors.insert(monitor_key, handle);
 }

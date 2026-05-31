@@ -67,6 +67,262 @@ pub(crate) async fn codex_runtime_status(state: &AppState, check_latest: bool) -
     }))
 }
 
+pub(crate) async fn codex_runtime_processes_payload(
+    state: &AppState,
+    profile_id: &str,
+) -> Result<Value> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let configured_profiles = state
+        .config
+        .profiles
+        .iter()
+        .map(|(profile_id, profile)| AppServerProfile {
+            id: profile_id.clone(),
+            codex_home: profile.codex_home.clone(),
+        })
+        .collect::<Vec<_>>();
+    let snapshots = state
+        .app_servers
+        .process_snapshots_for_profiles(configured_profiles)
+        .await;
+    let mut profile_ids = snapshots
+        .iter()
+        .map(|snapshot| snapshot.profile_id.clone())
+        .collect::<HashSet<_>>();
+    profile_ids.insert(resolved_profile_id.clone());
+
+    let mut sessions_by_profile: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    for process_profile_id in &profile_ids {
+        sessions_by_profile.insert(process_profile_id.clone(), HashMap::new());
+    }
+
+    {
+        let active_turns = state.active_turns.lock().await;
+        for process_profile_id in &profile_ids {
+            let prefix = format!("profile::{process_profile_id}::session-runtime::");
+            for (runtime_key, turn_id) in active_turns.iter() {
+                let Some(session_id) = runtime_key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                sessions_by_profile
+                    .entry(process_profile_id.clone())
+                    .or_default()
+                    .insert(
+                        session_id.to_string(),
+                        json!({
+                            "sessionId": session_id,
+                            "title": Value::Null,
+                            "status": "running",
+                            "turnId": turn_id,
+                            "source": "activeTurn"
+                        }),
+                    );
+            }
+        }
+    }
+
+    {
+        let pending_turn_starts = state.pending_turn_starts.lock().await;
+        for process_profile_id in &profile_ids {
+            let prefix = format!("profile::{process_profile_id}::session-runtime::");
+            for runtime_key in pending_turn_starts.iter() {
+                let Some(session_id) = runtime_key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                sessions_by_profile
+                    .entry(process_profile_id.clone())
+                    .or_default()
+                    .entry(session_id.to_string())
+                    .or_insert_with(|| {
+                        json!({
+                            "sessionId": session_id,
+                            "title": Value::Null,
+                            "status": "starting",
+                            "turnId": Value::Null,
+                            "source": "pendingStart"
+                        })
+                    });
+            }
+        }
+    }
+
+    for process_profile_id in profile_ids.clone() {
+        let live_runtime_sessions = with_ui_state_read(state, &process_profile_id, |ui_state| {
+            let metadata_by_thread_id = ui_state
+                .get("sessionMetaByThreadId")
+                .and_then(Value::as_object);
+            let sessions = ui_state
+                .get("runtimeStatusByThreadId")
+                .and_then(Value::as_object)
+                .map(|statuses| {
+                    statuses
+                        .iter()
+                        .filter_map(|(session_id, status_value)| {
+                            let status = normalized_thread_status(Some(status_value))?;
+                            if !is_live_thread_status(&status) && status != "starting" {
+                                return None;
+                            }
+                            let metadata = metadata_by_thread_id
+                                .and_then(|entries| entries.get(session_id))
+                                .and_then(Value::as_object);
+                            let title = metadata
+                                .and_then(|entry| entry.get("title"))
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string);
+                            Some(json!({
+                                "sessionId": session_id,
+                                "title": title,
+                                "status": status,
+                                "turnId": status_value.get("turnId").cloned().unwrap_or(Value::Null),
+                                "updatedAt": status_value.get("updatedAt").cloned().unwrap_or(Value::Null),
+                                "reason": status_value.get("reason").cloned().unwrap_or(Value::Null),
+                                "source": "runtimeStatus"
+                            }))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok(sessions)
+        })
+        .await
+        .unwrap_or_default();
+
+        for session in live_runtime_sessions {
+            let Some(session_id) = session.get("sessionId").and_then(Value::as_str) else {
+                continue;
+            };
+            let entries = sessions_by_profile
+                .entry(process_profile_id.clone())
+                .or_default();
+            if let Some(existing) = entries.get_mut(session_id) {
+                if existing.get("title").and_then(Value::as_str).is_none() {
+                    existing["title"] = session.get("title").cloned().unwrap_or(Value::Null);
+                }
+                if existing.get("updatedAt").is_none() {
+                    existing["updatedAt"] =
+                        session.get("updatedAt").cloned().unwrap_or(Value::Null);
+                }
+                if existing.get("reason").is_none() {
+                    existing["reason"] = session.get("reason").cloned().unwrap_or(Value::Null);
+                }
+            } else {
+                entries.insert(session_id.to_string(), session);
+            }
+        }
+    }
+
+    let mut processes = Vec::new();
+    for snapshot in &snapshots {
+        let process_session_ids =
+            session_ids_for_app_server_client(state, &snapshot.profile_id, &snapshot.client_key)
+                .await;
+        let mut sessions = sessions_by_profile
+            .get(&snapshot.profile_id)
+            .map(|entries| {
+                entries
+                    .values()
+                    .filter(|session| {
+                        let Some(session_id) = session.get("sessionId").and_then(Value::as_str)
+                        else {
+                            return false;
+                        };
+                        process_session_ids.contains(session_id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        sessions.sort_by(|left, right| {
+            left.get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .cmp(
+                    right
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )
+        });
+        processes.push(codex_process_snapshot_payload(snapshot, sessions));
+    }
+
+    Ok(json!({
+        "processes": processes,
+        "activeProfileId": resolved_profile_id,
+        "fetchedAt": now_unix_ms(),
+    }))
+}
+
+pub(crate) async fn force_kill_codex_process_payload(
+    state: &AppState,
+    profile_id: &str,
+    params: Value,
+) -> Result<Value> {
+    let target_profile_id = params
+        .get("profileId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(profile_id);
+    let pid = params
+        .get("pid")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0 && *value <= u32::MAX as u64)
+        .ok_or_else(|| anyhow!("Codex process id is required."))? as u32;
+    let (resolved_profile_id, profile) =
+        resolve_runtime_profile_entry(&state.config, target_profile_id);
+    let snapshot = state
+        .app_servers
+        .force_kill_process(
+            AppServerProfile {
+                id: resolved_profile_id.to_string(),
+                codex_home: profile.codex_home.clone(),
+            },
+            pid,
+        )
+        .await?;
+    let reason = format!("Codex process {pid} was force killed from settings.");
+    let affected_session_ids = clear_runtime_activity_after_app_server_client_exit(
+        state,
+        resolved_profile_id,
+        &snapshot.client_key,
+        Some(&reason),
+    )
+    .await;
+
+    Ok(json!({
+        "ok": true,
+        "process": codex_process_snapshot_payload(&snapshot, Vec::new()),
+        "affectedSessionIds": affected_session_ids,
+    }))
+}
+
+fn codex_process_snapshot_payload(
+    snapshot: &AppServerProcessSnapshot,
+    sessions: Vec<Value>,
+) -> Value {
+    let session_count = sessions.len();
+    json!({
+        "clientKey": snapshot.client_key.clone(),
+        "profileId": snapshot.profile_id.clone(),
+        "codexHome": snapshot.codex_home.display().to_string(),
+        "pid": snapshot.pid,
+        "kind": snapshot.kind.clone(),
+        "handoffProxy": snapshot.handoff_proxy,
+        "socketPath": snapshot.socket_path.as_ref().map(|path| path.display().to_string()),
+        "logPath": snapshot.log_path.as_ref().map(|path| path.display().to_string()),
+        "startedAtMs": snapshot.started_at_ms,
+        "codexBin": snapshot.codex_bin.clone(),
+        "pendingRequestCount": snapshot.pending_request_count,
+        "sessions": sessions,
+        "sessionCount": session_count,
+    })
+}
+
 pub(crate) async fn install_or_update_codex(
     state: &AppState,
     install_if_missing: bool,

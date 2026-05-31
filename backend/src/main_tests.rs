@@ -111,6 +111,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
             webhook_allowed_hosts: Vec::new(),
             instance_token: None,
             app_server_handoff_enabled: false,
+            per_session_app_servers: false,
             restart_command: None,
         }),
         app_servers: AppServerManager::new(AppServerClientConfig::default()),
@@ -136,6 +137,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
         automation_timers: Arc::new(Mutex::new(HashMap::new())),
         queue_dispatching: Arc::new(Mutex::new(HashSet::new())),
         queue_drain_retries: Arc::new(Mutex::new(HashMap::new())),
+        session_app_server_assignments: Arc::new(Mutex::new(HashMap::new())),
         active_turns: Arc::new(Mutex::new(HashMap::new())),
         pending_turn_starts: Arc::new(Mutex::new(HashSet::new())),
         pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
@@ -183,7 +185,8 @@ timestamp_counter = 0
 turn_counter = 0
 request_counts = {}
 method_delays = {}
-goals_enabled = False
+args = sys.argv[1:]
+goals_enabled = any(args[index:index + 2] == ["--enable", "goals"] for index in range(len(args)))
 
 for raw_line in sys.stdin:
     line = raw_line.strip()
@@ -219,6 +222,14 @@ for raw_line in sys.stdin:
             "result": {
                 "ok": True,
                 "enabled": goals_enabled
+            }
+        })
+        continue
+    if method == "debug/argv":
+        write({
+            "id": request_id,
+            "result": {
+                "args": args
             }
         })
         continue
@@ -440,6 +451,8 @@ for raw_line in sys.stdin:
             "name": "New thread",
             "preview": "",
             "cwd": params.get("cwd", ""),
+            "ephemeral": bool(params.get("ephemeral", False)),
+            "developerInstructions": params.get("developerInstructions"),
             "archived": False,
             "createdAt": timestamp_counter,
             "updatedAt": timestamp_counter,
@@ -748,24 +761,37 @@ for raw_line in sys.stdin:
         text_value = text_item.get("text") if isinstance(text_item, dict) else ""
         if not isinstance(text_value, str):
             text_value = ""
+        is_ephemeral = bool(thread.get("ephemeral", False))
+        agent_items = []
+        if is_ephemeral:
+            language = "Korean" if any("\uac00" <= ch <= "\ud7af" for ch in text_value) else "English"
+            english = "Summarize it." if language == "Korean" else text_value
+            agent_items.append({
+                "id": f"{turn_id}:agent:0",
+                "type": "agentMessage",
+                "text": json.dumps({
+                    "english": english,
+                    "language": language
+                })
+            })
         turn = {
             "id": turn_id,
-            "status": "inProgress",
+            "status": "completed" if is_ephemeral else "inProgress",
             "error": None,
             "startedAt": timestamp_counter,
-            "completedAt": None,
-            "durationMs": None,
+            "completedAt": timestamp_counter if is_ephemeral else None,
+            "durationMs": 0 if is_ephemeral else None,
             "items": [
                 {
                     "id": f"{turn_id}:user:0",
                     "type": "userMessage",
                     "text": text_value
                 }
-            ]
+            ] + agent_items
         }
         thread["turns"] = list(thread.get("turns") or []) + [turn]
         thread["preview"] = text_value.strip()
-        thread["status"] = "running"
+        thread["status"] = "idle" if is_ephemeral else "running"
         thread["updatedAt"] = timestamp_counter
         thread["lastTurnStart"] = params
         threads[thread_id] = thread

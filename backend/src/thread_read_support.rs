@@ -303,7 +303,7 @@ pub(crate) async fn read_thread_payload(
     session_id: &str,
     include_turns: bool,
 ) -> ApiResult<Value> {
-    let client = app_server_client(state, profile_id)
+    let client = app_server_client_for_session(state, profile_id, session_id)
         .await
         .map_err(|error| {
             api_error(

@@ -1263,6 +1263,38 @@ async fn rust_session_list_and_search_use_app_server_threads() {
         Some(second_id.as_str())
     );
 
+    let untagged_only = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria {
+            untagged_only: true,
+            ..SessionFilterCriteria::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        untagged_only
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("id"))
+            .and_then(Value::as_str),
+        Some(second_id.as_str())
+    );
+    assert!(
+        untagged_only
+            .get("sessions")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| entries.iter().all(|entry| entry
+                .get("tags")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)))
+    );
+
     let matched = search_sessions_payload(
         &state,
         "default",
@@ -3812,6 +3844,89 @@ async fn send_turn_payload_rejects_concurrent_turn_starts() {
         thread.get("turns").and_then(Value::as_array).map(Vec::len),
         Some(1)
     );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn send_turn_payload_translates_language_bridge_prompt_with_temp_session() {
+    let sandbox = unique_test_dir("turn-language-bridge");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5",
+            "languageBridgeEnabled": true,
+            "languageBridgeOutputLanguage": "Korean"
+        }),
+        None,
+        Some("Language bridge"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    send_turn_payload(
+        &state,
+        "default",
+        &session_id,
+        "요약해줘.",
+        None,
+        None,
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5",
+            "languageBridgeEnabled": true,
+            "languageBridgeOutputLanguage": "Korean"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let client = app_server_client(&state, "default").await.unwrap();
+    let raw_thread = client
+        .request(
+            "thread/read",
+            json!({
+                "threadId": session_id,
+                "includeTurns": true
+            }),
+        )
+        .await
+        .unwrap();
+    let last_turn_start = raw_thread
+        .get("thread")
+        .and_then(|thread| thread.get("lastTurnStart"))
+        .expect("fake app-server should record last turn/start params");
+    assert_eq!(
+        last_turn_start
+            .get("input")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str),
+        Some("Summarize it.")
+    );
+    let instructions = last_turn_start
+        .get("collaborationMode")
+        .and_then(|mode| mode.get("settings"))
+        .and_then(|settings| settings.get("developer_instructions"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(instructions.contains("Language bridge is enabled"));
+    assert!(instructions.contains("Korean"));
 
     let _ = fs::remove_dir_all(sandbox);
 }

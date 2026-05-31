@@ -43,7 +43,10 @@ fn main() {
     let mut timestamp_counter = 0_i64;
     let mut turn_counter = 0_u64;
     let mut threads = BTreeMap::<String, Value>::new();
-    let mut goals_enabled = false;
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    let mut goals_enabled = args
+        .windows(2)
+        .any(|window| window[0] == "--enable" && window[1] == "goals");
 
     for line in stdin.lock().lines() {
         let Ok(line) = line else {

@@ -96,6 +96,10 @@ pub(crate) async fn execute_ws_method(
         }
         "runtime/status" => codex_runtime_status(state, false).await,
         "runtime/checkUpdate" => codex_runtime_status(state, true).await,
+        "runtime/processes/list" => codex_runtime_processes_payload(state, &auth.profile_id).await,
+        "runtime/process/kill" => {
+            force_kill_codex_process_payload(state, &auth.profile_id, params).await
+        }
         "runtime/quota" => {
             codex_quota_status(
                 state,

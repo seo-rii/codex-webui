@@ -41,6 +41,8 @@ export type SessionPreferences = {
   networkAccess: boolean;
   autoApproveMode: AutoApproveMode;
   steeringResumeMode: SteeringResumeMode;
+  languageBridgeEnabled: boolean;
+  languageBridgeOutputLanguage: string;
   shutdownOnCompletion: boolean;
   gitRepoPath: string | null;
 };
@@ -68,6 +70,7 @@ export type SessionSummaryFilter = {
   pinnedOnly: boolean;
   runningOnly: boolean;
   queuedOnly: boolean;
+  untaggedOnly: boolean;
   highlight: "all" | "attention" | "completed";
   tags: string[];
 };
@@ -258,7 +261,7 @@ export type ThreadTokenUsage = {
   modelContextWindow: number | null;
 };
 
-export type ThreadGoalStatus = "active" | "paused" | "budgetLimited" | "complete";
+export type ThreadGoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
 
 export type ThreadGoal = {
   threadId: string;
@@ -389,6 +392,9 @@ export type AppConfigPayload = {
   gateway: {
     restartAvailable: boolean;
     restartCommandConfigured: boolean;
+  };
+  runtime: {
+    perSessionAppServers: boolean;
   };
   systemShutdown: {
     available: boolean;
@@ -758,6 +764,44 @@ export type CodexRuntimeActionPayload = {
   ok: true;
   message: string;
   runtime: CodexRuntimeStatus;
+};
+
+export type CodexRuntimeProcessSession = {
+  sessionId: string;
+  title: string | null;
+  status: string;
+  turnId: string | null;
+  updatedAt?: number | null;
+  reason?: string | null;
+  source: "activeTurn" | "pendingStart" | "runtimeStatus" | string;
+};
+
+export type CodexRuntimeProcess = {
+  clientKey: string;
+  profileId: string;
+  codexHome: string;
+  pid: number;
+  kind: "stdio" | "handoffProxy" | "handoffDaemon" | string;
+  handoffProxy: boolean;
+  socketPath: string | null;
+  logPath: string | null;
+  startedAtMs: number | null;
+  codexBin: string;
+  pendingRequestCount: number;
+  sessions: CodexRuntimeProcessSession[];
+  sessionCount: number;
+};
+
+export type CodexRuntimeProcessesPayload = {
+  processes: CodexRuntimeProcess[];
+  activeProfileId: string;
+  fetchedAt: number;
+};
+
+export type CodexRuntimeProcessKillPayload = {
+  ok: true;
+  process: CodexRuntimeProcess;
+  affectedSessionIds: string[];
 };
 
 export type GatewayRestartPayload = {

@@ -71,6 +71,7 @@ pub(crate) struct SessionFilterCriteria {
     pub(crate) pinned_only: bool,
     pub(crate) running_only: bool,
     pub(crate) queued_only: bool,
+    pub(crate) untagged_only: bool,
     pub(crate) highlight: Option<String>,
     pub(crate) tags: Vec<String>,
 }
@@ -126,6 +127,10 @@ pub(crate) fn session_filter_from_value(filter: Option<&Value>) -> SessionFilter
             .and_then(|value| value.get("queuedOnly"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        untagged_only: filter
+            .and_then(|value| value.get("untaggedOnly"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         highlight: filter
             .and_then(|value| value.get("highlight"))
             .and_then(Value::as_str)
@@ -149,6 +154,7 @@ pub(crate) fn session_filter_from_query(query: Option<&str>) -> SessionFilterCri
         pinned_only: query_param_value(query, "filterPinned").as_deref() == Some("true"),
         running_only: query_param_value(query, "filterRunning").as_deref() == Some("true"),
         queued_only: query_param_value(query, "filterQueued").as_deref() == Some("true"),
+        untagged_only: query_param_value(query, "filterUntagged").as_deref() == Some("true"),
         highlight: query_param_value(query, "filterHighlight")
             .map(|value| value.trim().to_string())
             .filter(|value| value == "attention" || value == "completed"),
@@ -296,10 +302,6 @@ pub(crate) fn session_summary_matches_filter(
             return false;
         }
     }
-    if filter.tags.is_empty() {
-        return true;
-    }
-
     let session_tags = summary
         .get("tags")
         .and_then(Value::as_array)
@@ -312,6 +314,14 @@ pub(crate) fn session_summary_matches_filter(
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default();
+
+    if filter.untagged_only && !session_tags.is_empty() {
+        return false;
+    }
+
+    if filter.tags.is_empty() {
+        return true;
+    }
 
     filter
         .tags
@@ -700,7 +710,7 @@ pub(crate) async fn read_session_summary_ui_snapshot(
     for (runtime_key, session_id, has_cached_activity) in reconcile_candidates {
         if has_cached_activity {
             let has_active_turn = async {
-                let client = app_server_client(state, profile_id)
+                let client = app_server_client_for_session(state, profile_id, &session_id)
                     .await
                     .map_err(|error| {
                         api_error(

@@ -250,7 +250,8 @@ Meaning of the main fields:
 - Codex stores `auth.json`, `config.toml`, sessions, plugins, and skills under `CODEX_HOME`, so separating profiles at that level avoids account collisions.
 - The web UI keeps profile state lightweight at startup and starts `codex app-server` processes only when a profile receives an active Codex request.
 - This means two browsers can stay connected to different accounts at the same time without swapping a shared `~/.codex/auth.json` file.
-- Active Codex app-server processes are capped by `CODEX_WEBUI_MAX_APP_SERVERS` and default to `1`; raise it only when the host has enough memory for concurrent profiles.
+- Active Codex app-server processes are capped by `CODEX_WEBUI_MAX_APP_SERVERS` and default to an automatic CPU/memory-based value capped at 4; raise it only when the host has enough memory for concurrent profiles or per-session runtimes.
+- By default, sessions in the same profile share one Codex app-server. Set `CODEX_WEBUI_PER_SESSION_APP_SERVERS=true` to allocate a separate app-server for each newly active session in the same profile. Goal updates still get a dedicated process for unassigned sessions because goals tend to be long-running.
 
 If you only want one account at a time, you can still keep a single profile and swap `auth.json` manually before restart. For simultaneous multi-account use, separate `CODEX_HOME` directories are the intended model.
 
@@ -261,12 +262,14 @@ If you only want one account at a time, you can still keep a single profile and 
 - The Settings workspace can edit `config.toml` directly.
 - Changing session or composer preferences syncs the relevant defaults back into `config.toml`.
 - Existing sessions keep their own persisted preferences; changing defaults mainly affects new sessions and future default state.
+- Language bridge is an opt-in session/default preference. When enabled, Codex Web UI first creates an ephemeral translation thread, sends the translated English prompt to the real session, and adds a developer instruction that keeps the final answer in the selected output language. The default is stored under `[codex_webui]` in `config.toml`.
 - If a saved draft exists while a session is still hydrating, local input typed into the composer wins; draft restore will not clobber text or attachments the user entered during loading.
 - Queued follow-ups are stored server-side and can continue after the page closes as long as the server remains up.
 
 Resource limits:
 
-- `CODEX_WEBUI_MAX_APP_SERVERS`: maximum active Codex app-server processes across profiles. Default: `1`.
+- `CODEX_WEBUI_MAX_APP_SERVERS`: maximum active Codex app-server processes across profiles and optional per-session runtimes. Default: automatic from CPU and memory, capped at `4`.
+- `CODEX_WEBUI_PER_SESSION_APP_SERVERS`: opt-in same-profile multi-session runtime mode. Default: `false`. When enabled, each newly active session gets its own Codex app-server unless it was already assigned.
 - `CODEX_WEBUI_APP_SERVER_TIMEOUT_SECONDS`: Codex app-server request timeout. Default: `600` seconds, so very long sessions can finish initial resume/loading before `turn/start` or `thread/read` is reported as failed.
 - `CODEX_WEBUI_SERVER_THREADS`: gateway Tokio worker threads. Default: up to `2` based on available parallelism.
 - `CODEX_WEBUI_BLOCKING_THREADS`: gateway blocking pool threads. Default: `max(server_threads * 2, 4)`.
@@ -314,6 +317,8 @@ The Rust gateway honors a focused set of `CODEX_WEBUI_*` environment variables. 
 - `CODEX_WEBUI_MAX_UPLOAD_MB`
 - `CODEX_WEBUI_MAX_ATTACHMENT_STORAGE_MB`
 - `CODEX_WEBUI_DEFAULT_*` session defaults such as model, sandbox, approval, speed, effort, network, and steering resume mode
+- `CODEX_WEBUI_DEFAULT_LANGUAGE_BRIDGE`
+- `CODEX_WEBUI_DEFAULT_LANGUAGE_BRIDGE_OUTPUT_LANGUAGE`
 - `CODEX_WEBUI_GIT_DISCOVERY_DEPTH`
 - `CODEX_WEBUI_ENABLE_SYSTEM_SHUTDOWN`
 - `CODEX_WEBUI_SHUTDOWN_DELAY_SECONDS`

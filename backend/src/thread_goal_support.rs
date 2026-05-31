@@ -1,15 +1,23 @@
 use super::*;
 
-fn normalize_goal_status(value: Option<&Value>) -> String {
-    match value_text(value.unwrap_or(&Value::Null))
-        .unwrap_or_else(|| "active".to_string())
-        .as_str()
-    {
-        "paused" => "paused".to_string(),
-        "budgetLimited" | "budget_limited" | "budget-limited" => "budgetLimited".to_string(),
-        "complete" | "completed" => "complete".to_string(),
-        _ => "active".to_string(),
+fn canonical_goal_status(value: &str) -> Option<&'static str> {
+    match value {
+        "active" => Some("active"),
+        "paused" | "pause" => Some("paused"),
+        "blocked" | "block" => Some("blocked"),
+        "usageLimited" | "usage_limited" | "usage-limited" | "usagelimited" => Some("usageLimited"),
+        "budgetLimited" | "budget_limited" | "budget-limited" | "budgetlimited" => {
+            Some("budgetLimited")
+        }
+        "complete" | "completed" => Some("complete"),
+        _ => None,
     }
+}
+
+fn normalize_goal_status(value: Option<&Value>) -> String {
+    value_text(value.unwrap_or(&Value::Null))
+        .and_then(|status| canonical_goal_status(status.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "active".to_string())
 }
 
 pub(crate) fn normalize_thread_goal_payload(goal: &Value, fallback_thread_id: &str) -> Value {
@@ -113,17 +121,22 @@ fn is_goal_disabled_error(error: &anyhow::Error) -> bool {
 async fn request_thread_goal(
     state: &AppState,
     profile_id: &str,
+    session_id: &str,
     method: &str,
     params: Value,
+    dedicate_unassigned_session: bool,
 ) -> ApiResult<Value> {
-    let client = app_server_client(state, profile_id)
-        .await
-        .map_err(|error| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to connect to codex app-server: {error}"),
-            )
-        })?;
+    let client_result = if dedicate_unassigned_session {
+        app_server_client_for_goal_session(state, profile_id, session_id).await
+    } else {
+        app_server_client_for_session(state, profile_id, session_id).await
+    };
+    let client = client_result.map_err(|error| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to connect to codex app-server: {error}"),
+        )
+    })?;
     match client.request(method, params.clone()).await {
         Ok(response) => Ok(response),
         Err(error) if is_goal_disabled_error(&error) => {
@@ -172,8 +185,10 @@ pub(crate) async fn fetch_session_goal_payload(
     let response = request_thread_goal(
         state,
         profile_id,
+        session_id,
         "thread/goal/get",
         json!({ "threadId": session_id }),
+        false,
     )
     .await?;
     let goal = goal_from_response(&response, session_id);
@@ -215,17 +230,12 @@ pub(crate) async fn set_session_goal_payload(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let normalized = match status {
-            "active" | "paused" | "budgetLimited" | "complete" => status,
-            "budget_limited" | "budget-limited" => "budgetLimited",
-            "completed" => "complete",
-            _ => {
-                return Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "Invalid goal status. Use active, paused, budgetLimited, or complete.",
-                ));
-            }
-        };
+        let normalized = canonical_goal_status(status).ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "Invalid goal status. Use active, paused, blocked, usageLimited, budgetLimited, or complete.",
+            )
+        })?;
         app_server_params.insert("status".to_string(), json!(normalized));
     }
 
@@ -251,8 +261,10 @@ pub(crate) async fn set_session_goal_payload(
     let response = request_thread_goal(
         state,
         profile_id,
+        session_id,
         "thread/goal/set",
         Value::Object(app_server_params),
+        true,
     )
     .await?;
     let goal = goal_from_response(&response, session_id);
@@ -270,8 +282,10 @@ pub(crate) async fn clear_session_goal_payload(
     let response = request_thread_goal(
         state,
         profile_id,
+        session_id,
         "thread/goal/clear",
         json!({ "threadId": session_id }),
+        false,
     )
     .await?;
     cache_session_goal_payload(state, profile_id, session_id, &Value::Null).await;

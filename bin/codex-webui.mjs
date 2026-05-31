@@ -115,6 +115,7 @@ function defaultConfigValues() {
     corsAllowedOrigins: [],
     backendBinaryPath: "",
     appServerHandoff: true,
+    perSessionAppServers: false,
     tunnel: defaultTunnelConfigValues()
   };
 }
@@ -240,6 +241,10 @@ function normalizeConfig(rawConfig = {}) {
     ownerPasswordHash: String(rawConfig.ownerPasswordHash ?? rawConfig.owner_password_hash ?? defaults.ownerPasswordHash).trim(),
     backendBinaryPath: expandHome(String(rawConfig.backendBinaryPath ?? defaults.backendBinaryPath)),
     appServerHandoff: rawConfig.appServerHandoff === undefined ? defaults.appServerHandoff : rawConfig.appServerHandoff !== false,
+    perSessionAppServers:
+      rawConfig.perSessionAppServers === undefined
+        ? defaults.perSessionAppServers
+        : rawConfig.perSessionAppServers === true,
     tunnel: normalizeTunnelConfig(rawConfig.tunnel)
   };
 }
@@ -341,6 +346,11 @@ async function promptConfig(existing = null) {
     const allowedRootsRaw = (await rl.question(`Allowed roots (comma separated) [${defaults.allowedRoots.join(", ")}]: `)).trim();
     const corsRaw = (await rl.question(`CORS origins (comma separated, optional) [${defaults.corsAllowedOrigins.join(", ")}]: `)).trim();
     const backendBinaryPath = expandHome((await rl.question(`Backend binary path (optional) [${defaults.backendBinaryPath || "auto"}]: `)).trim() || defaults.backendBinaryPath || "");
+    const perSessionAppServersInput = (
+      await rl.question(
+        `Use a separate Codex app-server per active session? [${defaults.perSessionAppServers ? "Y/n" : "y/N"}]: `
+      )
+    ).trim();
     const tunnelProviderInput = (await rl.question(`Tunnel provider [${defaults.tunnel.provider}]: `)).trim();
     const tunnelBackgroundInput = (await rl.question(`Tunnel runs in background by default? [${defaults.tunnel.background ? "Y/n" : "y/N"}]: `)).trim();
     const tunnelHostnameInput = (await rl.question(`Tunnel hostname (cloudflared only, optional) [${formatOptionalPrompt(defaults.tunnel.hostname)}]: `)).trim();
@@ -384,6 +394,7 @@ async function promptConfig(existing = null) {
       hcaptchaSecretKey,
       sessionSecret: defaults.sessionSecret || createSessionSecret(),
       backendBinaryPath,
+      perSessionAppServers: parseBooleanInput(perSessionAppServersInput, defaults.perSessionAppServers),
       tunnel: {
         ...defaults.tunnel,
         provider: normalizeTunnelProvider(tunnelProviderInput || defaults.tunnel.provider),
@@ -1129,6 +1140,7 @@ async function startServer(config) {
       CODEX_WEBUI_SESSION_SECRET: String(config.sessionSecret),
       CODEX_WEBUI_INSTANCE_TOKEN: instanceToken,
       CODEX_WEBUI_APP_SERVER_HANDOFF: config.appServerHandoff === false ? "false" : "true",
+      CODEX_WEBUI_PER_SESSION_APP_SERVERS: config.perSessionAppServers ? "true" : "false",
       CODEX_WEBUI_CORS_ALLOWED_ORIGINS: config.corsAllowedOrigins.join(",")
     }
   });

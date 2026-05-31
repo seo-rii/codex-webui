@@ -5,20 +5,234 @@ pub(crate) async fn app_server_client(
     profile_id: &str,
 ) -> Result<AppServerClient> {
     let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
+    app_server_client_with_key(
+        state,
+        resolved_profile_id,
+        profile,
+        resolved_profile_id.to_string(),
+    )
+    .await
+}
+
+pub(crate) async fn app_server_client_for_session(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> Result<AppServerClient> {
+    let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
+    let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+    let client_key = state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .get(&runtime_key)
+        .cloned()
+        .unwrap_or_else(|| resolved_profile_id.to_string());
+    app_server_client_with_key(state, resolved_profile_id, profile, client_key).await
+}
+
+pub(crate) async fn app_server_client_for_session_turn(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> Result<AppServerClient> {
+    let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
+    let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+    let client_key = {
+        let mut assignments = state.session_app_server_assignments.lock().await;
+        let desired_client_key = if state.config.per_session_app_servers {
+            format!("{resolved_profile_id}::session::{session_id}")
+        } else {
+            resolved_profile_id.to_string()
+        };
+        assignments
+            .entry(runtime_key)
+            .or_insert(desired_client_key)
+            .clone()
+    };
+    app_server_client_with_key(state, resolved_profile_id, profile, client_key).await
+}
+
+pub(crate) async fn app_server_client_for_goal_session(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> Result<AppServerClient> {
+    let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
+    let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+    let existing_assignment = state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .get(&runtime_key)
+        .cloned();
+    let client_key = if let Some(client_key) = existing_assignment {
+        client_key
+    } else {
+        let has_cached_runtime_activity =
+            state.active_turns.lock().await.contains_key(&runtime_key)
+                || state
+                    .pending_turn_starts
+                    .lock()
+                    .await
+                    .contains(&runtime_key);
+        let desired_client_key = if has_cached_runtime_activity {
+            resolved_profile_id.to_string()
+        } else {
+            format!("{resolved_profile_id}::goal::{session_id}")
+        };
+        let mut assignments = state.session_app_server_assignments.lock().await;
+        assignments
+            .entry(runtime_key)
+            .or_insert(desired_client_key)
+            .clone()
+    };
+    app_server_client_with_key(state, resolved_profile_id, profile, client_key).await
+}
+
+pub(crate) async fn app_server_client_by_key(
+    state: &AppState,
+    profile_id: &str,
+    client_key: &str,
+) -> Result<AppServerClient> {
+    let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
+    app_server_client_with_key(state, resolved_profile_id, profile, client_key.to_string()).await
+}
+
+pub(crate) async fn app_server_client_key_for_session(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> String {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+    state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .get(&runtime_key)
+        .cloned()
+        .unwrap_or_else(|| resolved_profile_id.to_string())
+}
+
+async fn app_server_client_with_key(
+    state: &AppState,
+    resolved_profile_id: &str,
+    profile: &RuntimeProfile,
+    client_key: String,
+) -> Result<AppServerClient> {
     let client = state
         .app_servers
-        .get_or_create(AppServerProfile {
-            id: resolved_profile_id.to_string(),
-            codex_home: profile.codex_home.clone(),
-        })
+        .get_or_create_with_key(
+            client_key.clone(),
+            AppServerProfile {
+                id: resolved_profile_id.to_string(),
+                codex_home: profile.codex_home.clone(),
+            },
+        )
         .await;
     register_runtime_profile_monitor(
         state,
         resolved_profile_id,
+        &client_key,
         client.subscribe_notifications(),
         client.subscribe_requests(),
     );
     Ok(client)
+}
+
+pub(crate) async fn session_ids_for_app_server_client(
+    state: &AppState,
+    profile_id: &str,
+    client_key: &str,
+) -> HashSet<String> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let runtime_key_prefix = format!("profile::{resolved_profile_id}::session-runtime::");
+    let assignments = state.session_app_server_assignments.lock().await.clone();
+    let mut session_ids = HashSet::new();
+
+    for (runtime_key, assigned_client_key) in &assignments {
+        if assigned_client_key != client_key {
+            continue;
+        }
+        if let Some(session_id) = runtime_key.strip_prefix(&runtime_key_prefix) {
+            session_ids.insert(session_id.to_string());
+        }
+    }
+
+    let client_is_default = client_key == resolved_profile_id;
+    {
+        let active_turns = state.active_turns.lock().await;
+        for runtime_key in active_turns.keys() {
+            let Some(session_id) = runtime_key.strip_prefix(&runtime_key_prefix) else {
+                continue;
+            };
+            let assigned_client_key = assignments.get(runtime_key);
+            if assigned_client_key.is_some_and(|assigned| assigned != client_key) {
+                continue;
+            }
+            if client_is_default || assigned_client_key.is_some() {
+                session_ids.insert(session_id.to_string());
+            }
+        }
+    }
+    {
+        let pending_turn_starts = state.pending_turn_starts.lock().await;
+        for runtime_key in pending_turn_starts.iter() {
+            let Some(session_id) = runtime_key.strip_prefix(&runtime_key_prefix) else {
+                continue;
+            };
+            let assigned_client_key = assignments.get(runtime_key);
+            if assigned_client_key.is_some_and(|assigned| assigned != client_key) {
+                continue;
+            }
+            if client_is_default || assigned_client_key.is_some() {
+                session_ids.insert(session_id.to_string());
+            }
+        }
+    }
+
+    if client_is_default {
+        let live_runtime_status_session_ids = with_ui_state_read(state, profile_id, |ui_state| {
+            let session_ids = ui_state
+                .get("runtimeStatusByThreadId")
+                .and_then(Value::as_object)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|(session_id, status)| {
+                            let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+                            if assignments.contains_key(&runtime_key) {
+                                return None;
+                            }
+                            normalized_thread_status(Some(status))
+                                .as_deref()
+                                .is_some_and(is_live_thread_status)
+                                .then(|| session_id.clone())
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok(session_ids)
+        })
+        .await
+        .unwrap_or_default();
+        session_ids.extend(live_runtime_status_session_ids);
+    }
+
+    session_ids
+}
+
+pub(crate) async fn clear_app_server_assignments_for_sessions(
+    state: &AppState,
+    profile_id: &str,
+    session_ids: &[String],
+) {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let mut assignments = state.session_app_server_assignments.lock().await;
+    for session_id in session_ids {
+        assignments.remove(&runtime_session_key(resolved_profile_id, session_id));
+    }
 }
 
 pub(crate) fn resolve_runtime_profile_entry<'a>(

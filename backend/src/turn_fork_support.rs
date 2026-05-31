@@ -118,7 +118,7 @@ pub(crate) async fn fork_session_payload(
             ));
         }
 
-        let client = app_server_client(state, profile_id)
+        let client = app_server_client_for_session(state, profile_id, source_session_id)
             .await
             .map_err(|error| {
                 api_error(

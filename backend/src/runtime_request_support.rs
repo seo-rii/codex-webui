@@ -165,6 +165,7 @@ async fn session_accepts_server_request(state: &AppState, runtime_key: &str) -> 
 pub(crate) async fn handle_profile_server_request(
     state: &AppState,
     profile_id: &str,
+    client_key: &str,
     request: &backend::codex_app_server::AppServerRequest,
 ) {
     let Some(session_id) = request
@@ -181,7 +182,7 @@ pub(crate) async fn handle_profile_server_request(
         &session_id,
     );
     if !session_accepts_server_request(state, &runtime_key).await {
-        if let Ok(client) = app_server_client(state, profile_id).await {
+        if let Ok(client) = app_server_client_by_key(state, profile_id, client_key).await {
             let _ = client
                 .reject(
                     request.id.clone(),
@@ -227,7 +228,7 @@ pub(crate) async fn handle_profile_server_request(
     };
 
     if let Some(result) = auto_approve_result {
-        if let Ok(client) = app_server_client(state, profile_id).await {
+        if let Ok(client) = app_server_client_by_key(state, profile_id, client_key).await {
             if client.respond(request.id.clone(), result).await.is_ok() {
                 emit_session_notification(
                     state,
@@ -340,7 +341,7 @@ pub(crate) async fn abort_turn_payload(
         return Ok(json!({ "interrupted": false }));
     };
 
-    app_server_client(state, profile_id)
+    app_server_client_for_session(state, profile_id, session_id)
         .await
         .map_err(|error| {
             api_error(
@@ -389,7 +390,7 @@ pub(crate) async fn resolve_server_request_payload(
         return Err(api_error(StatusCode::NOT_FOUND, "SERVER_REQUEST_NOT_FOUND"));
     };
 
-    let client = app_server_client(state, profile_id)
+    let client = app_server_client_for_session(state, profile_id, session_id)
         .await
         .map_err(|error| {
             api_error(
@@ -517,7 +518,7 @@ pub(crate) async fn send_computer_input_payload(
                 .await?;
         routed = "pendingDynamicTool";
     } else {
-        let client = app_server_client(state, profile_id)
+        let client = app_server_client_for_session(state, profile_id, session_id)
             .await
             .map_err(|error| {
                 api_error(

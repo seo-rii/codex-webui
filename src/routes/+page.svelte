@@ -202,6 +202,7 @@
     }>;
   };
   const HUNDRED_M_CONTEXT_WINDOW = 100_000_000;
+  const LOCAL_QUEUE_MODE_GRACE_MS = 120_000;
 
   let config = $state<AppConfigPayload | null>(null);
   let catalog = $state<CatalogPayload | null>(null);
@@ -269,6 +270,7 @@
     pinnedOnly: false,
     runningOnly: false,
     queuedOnly: false,
+    untaggedOnly: false,
     highlight: "all",
     tags: []
   });
@@ -319,6 +321,7 @@
   let sessionQueueSnapshotsBySessionId = $state<Record<string, SessionQueuePayload>>({});
   let queuedMessageRequestCountsBySessionId = $state<Record<string, number>>({});
   let pendingQueueModeSessionId = $state<string | null>(null);
+  let pendingQueueModeActivatedAt = $state(0);
   let liveTurnCardExpanded = $state(false);
   let sendIntent = $state<"message" | "steer" | "queue" | null>(null);
   let editingQueueId = $state<string | null>(null);
@@ -445,6 +448,7 @@
   const sessionFilterPinnedParamKey = "sessionPinned";
   const sessionFilterRunningParamKey = "sessionRunning";
   const sessionFilterQueuedParamKey = "sessionQueued";
+  const sessionFilterUntaggedParamKey = "sessionUntagged";
   const sessionFilterHighlightParamKey = "sessionHighlight";
   const sessionFilterTagParamKey = "sessionTag";
   const sessionFolderParamKey = "sessionFolder";
@@ -526,6 +530,50 @@
       editInComposer: m.edit_in_composer(),
       branchIntoNewThread: m.branch_into_new_thread(),
       handoffToNewThread: m.handoff_to_new_thread(),
+      userMessageTimestamp:
+        locale === "ko"
+          ? "보낸 시각"
+          : locale === "ja"
+            ? "送信時刻"
+            : locale === "zh-Hans"
+              ? "发送时间"
+              : locale === "zh-Hant"
+                ? "傳送時間"
+                : locale === "fr"
+                  ? "Envoyé"
+                  : locale === "es"
+                    ? "Enviado"
+                    : locale === "de"
+                      ? "Gesendet"
+                      : locale === "it"
+                        ? "Inviato"
+                        : locale === "pt-BR"
+                          ? "Enviado"
+                          : locale === "ru"
+                            ? "Отправлено"
+                            : "Sent",
+      agentReplyTimestamp:
+        locale === "ko"
+          ? "응답 시각"
+          : locale === "ja"
+            ? "返信時刻"
+            : locale === "zh-Hans"
+              ? "回复时间"
+              : locale === "zh-Hant"
+                ? "回覆時間"
+                : locale === "fr"
+                  ? "Réponse"
+                  : locale === "es"
+                    ? "Respuesta"
+                    : locale === "de"
+                      ? "Antwort"
+                      : locale === "it"
+                        ? "Risposta"
+                        : locale === "pt-BR"
+                          ? "Resposta"
+                          : locale === "ru"
+                            ? "Ответ"
+                            : "Reply",
       livePlan: m.live_plan(),
       aggregatedDiff: m.aggregated_diff(),
       openTab: m.open_tab(),
@@ -692,6 +740,24 @@
       speedAuto: m.speed_auto(),
       speedFast: m.speed_fast(),
       speedFlex: m.speed_flex(),
+      languageBridge:
+        locale === "ko"
+          ? "언어 브리지"
+          : locale === "ja"
+            ? "Language bridge"
+            : locale === "zh-Hans"
+              ? "Language bridge"
+              : locale === "zh-Hant"
+                ? "Language bridge"
+                : "Language bridge",
+      languageBridgeDescription:
+        locale === "ko"
+          ? "비영어 입력은 영어로 내부 처리하고 최종 답변만 지정 언어로 맞춥니다."
+          : "Handle non-English prompts in English internally and keep the final answer in the selected language.",
+      languageBridgeOutput:
+        locale === "ko" ? "최종 답변 언어" : "Final answer language",
+      languageBridgeAuto:
+        locale === "ko" ? "자동: 마지막 사용자 메시지 언어" : "Auto: latest user message language",
       slashPersonalityDescription: m.slash_personality_description(),
       slashPersonalityUpdated: (personality: string) => m.slash_personality_updated({ personality }),
       slashPersonalityInvalid: m.slash_personality_invalid(),
@@ -1413,6 +1479,7 @@
   let notificationPermissionRequested = false;
   const handledResumeDraftKeys = new Set<string>();
   const pendingComposerMutationSignatures = new Set<string>();
+  let pendingComposerMutationRevision = $state(0);
   let lastLoadedConversationId = $state<string | null>(null);
   let lastActiveLiveTurnId = $state<string | null>(null);
 
@@ -1509,7 +1576,7 @@
       return true;
     }
 
-    if (pendingQueueModeSessionId === sessionId) {
+    if (pendingQueueModeWithinGrace(sessionId)) {
       return true;
     }
 
@@ -1522,6 +1589,41 @@
 
   function canQueueComposerMessage(currentConversation: ConversationState | null = conversation) {
     return hasQueueableConversationActivity(currentConversation);
+  }
+
+  function activatePendingQueueMode(sessionId: string) {
+    pendingQueueModeSessionId = sessionId;
+    pendingQueueModeActivatedAt = Date.now();
+  }
+
+  function clearPendingQueueMode(sessionId: string | null = null) {
+    if (sessionId && pendingQueueModeSessionId !== sessionId) {
+      return;
+    }
+
+    pendingQueueModeSessionId = null;
+    pendingQueueModeActivatedAt = 0;
+  }
+
+  function pendingQueueModeWithinGrace(sessionId: string) {
+    return (
+      pendingQueueModeSessionId === sessionId &&
+      pendingQueueModeActivatedAt > 0 &&
+      Date.now() - pendingQueueModeActivatedAt < LOCAL_QUEUE_MODE_GRACE_MS
+    );
+  }
+
+  function canQueueDuringLocalSubmission(sessionId: string | null | undefined) {
+    if (!sessionId || selectedSessionId !== sessionId) {
+      return false;
+    }
+
+    return Boolean(
+      pendingQueueModeWithinGrace(sessionId) ||
+        optimisticMessage?.sessionId === sessionId ||
+        (startingMessage && conversation?.thread.id === sessionId) ||
+        (sending && conversation?.thread.id === sessionId)
+    );
   }
 
   function mergeQueueSnapshot(existingQueue: SessionQueuePayload | null | undefined, incomingQueue: SessionQueuePayload) {
@@ -1598,6 +1700,10 @@
     return sessions.some((session) => isLiveConversationStatus(session.status) || session.queueCount > 0);
   });
   const queueModeActive = $derived.by(() => canQueueComposerMessage());
+  const composerQueueModeActive = $derived.by(() => {
+    const selectedBinding = getSelectedSessionBinding();
+    return canQueueComposerMessage(selectedBinding?.state ?? conversation) || canQueueDuringLocalSubmission(selectedBinding?.sessionId);
+  });
   const lastComposerHistoryPrompt = $derived.by(() => lastComposerPromptChip?.prompt ?? "");
   const composerHasContent = $derived.by(() => draft.trim().length > 0 || draftAttachments.length > 0);
   const selectedSessionQueuedRequestCount = $derived.by(() => {
@@ -1614,14 +1720,21 @@
     }
 
     const selectedBinding = getSelectedSessionBinding();
-    return !selectedBinding || !canQueueComposerMessage(selectedBinding.state);
+    if (!selectedBinding) {
+      return true;
+    }
+
+    return (
+      composerCurrentDraftHasPendingMutation(selectedBinding.sessionId, selectedBinding.state) ||
+      (!canQueueComposerMessage(selectedBinding.state) && !canQueueDuringLocalSubmission(selectedBinding.sessionId))
+    );
   });
   const composerPrimaryActionDisabled = $derived.by(() => {
     if (!composerHasContent) {
       return true;
     }
 
-    if (queueModeActive) {
+    if (composerQueueModeActive) {
       return composerQueueActionDisabled;
     }
 
@@ -1632,7 +1745,7 @@
       return true;
     }
 
-    if (queueModeActive) {
+    if (composerQueueModeActive) {
       return composerQueueActionDisabled;
     }
 
@@ -2845,7 +2958,7 @@
       composerSettingsSummary.model,
       composerSettingsSummary.speed,
       running ? "running" : "idle",
-      queueModeActive ? "queue" : "send",
+      composerQueueModeActive ? "queue" : "send",
       draftAttachments.length
     ].join(":");
     toolbarSignature;
@@ -2960,7 +3073,7 @@
     if (hasQueueableConversationActivity(conversation)) {
       return;
     }
-    pendingQueueModeSessionId = null;
+    clearPendingQueueMode();
   });
 
   $effect(() => {
@@ -3073,6 +3186,7 @@
       pinnedOnly: Boolean(filter?.pinnedOnly),
       runningOnly: Boolean(filter?.runningOnly),
       queuedOnly: Boolean(filter?.queuedOnly),
+      untaggedOnly: Boolean(filter?.untaggedOnly),
       highlight: filter?.highlight === "attention" || filter?.highlight === "completed" ? filter.highlight : "all",
       tags: Array.isArray(filter?.tags)
         ? [...new Set(filter.tags.map((entry) => entry.trim()).filter((entry) => entry.length > 0))]
@@ -3081,7 +3195,14 @@
   }
 
   function isDefaultSessionFilter(filter: SessionSummaryFilter) {
-    return !filter.pinnedOnly && !filter.runningOnly && !filter.queuedOnly && filter.highlight === "all" && filter.tags.length === 0;
+    return (
+      !filter.pinnedOnly &&
+      !filter.runningOnly &&
+      !filter.queuedOnly &&
+      !filter.untaggedOnly &&
+      filter.highlight === "all" &&
+      filter.tags.length === 0
+    );
   }
 
   function isEnabledQueryParam(value: string | null) {
@@ -3098,6 +3219,7 @@
     const scope = params.get(sessionSearchScopeParamKey);
     const highlight = params.get(sessionFilterHighlightParamKey);
     const folder = params.get(sessionFolderParamKey)?.trim() ?? "";
+    const untaggedOnly = !folder && isEnabledQueryParam(params.get(sessionFilterUntaggedParamKey));
     const tags = params
       .getAll(sessionFilterTagParamKey)
       .map((entry) => entry.trim())
@@ -3112,8 +3234,9 @@
       pinnedOnly: isEnabledQueryParam(params.get(sessionFilterPinnedParamKey)),
       runningOnly: isEnabledQueryParam(params.get(sessionFilterRunningParamKey)),
       queuedOnly: isEnabledQueryParam(params.get(sessionFilterQueuedParamKey)),
+      untaggedOnly,
       highlight: highlight === "attention" || highlight === "completed" ? highlight : "all",
-      tags: folder ? [...new Set([folder, ...tags])] : tags
+      tags: untaggedOnly ? [] : folder ? [...new Set([folder, ...tags])] : tags
     });
   }
 
@@ -3146,7 +3269,8 @@
     const filterParams: Array<[string, boolean]> = [
       [sessionFilterPinnedParamKey, normalizedFilter.pinnedOnly],
       [sessionFilterRunningParamKey, normalizedFilter.runningOnly],
-      [sessionFilterQueuedParamKey, normalizedFilter.queuedOnly]
+      [sessionFilterQueuedParamKey, normalizedFilter.queuedOnly],
+      [sessionFilterUntaggedParamKey, normalizedFilter.untaggedOnly && !activeSessionFolder]
     ];
     for (const [key, enabled] of filterParams) {
       if (enabled) {
@@ -3209,6 +3333,9 @@
       return false;
     }
     if (filter.queuedOnly && session.queueCount <= 0) {
+      return false;
+    }
+    if (filter.untaggedOnly && session.tags.some((tag) => tag.trim().length > 0)) {
       return false;
     }
     if (filter.highlight !== "all" && session.highlight?.kind !== filter.highlight) {
@@ -3611,6 +3738,57 @@
     return value >= 1_000_000_000_000 ? value : value * 1000;
   }
 
+  function getDateTimeLocale() {
+    const locale = $activeLocale;
+    if (locale === "ko") {
+      return "ko-KR";
+    }
+    if (locale === "zh-Hans") {
+      return "zh-CN";
+    }
+    if (locale === "zh-Hant") {
+      return "zh-TW";
+    }
+    return locale || "en-US";
+  }
+
+  function isSameLocalDate(left: Date, right: Date) {
+    return (
+      left.getFullYear() === right.getFullYear() &&
+      left.getMonth() === right.getMonth() &&
+      left.getDate() === right.getDate()
+    );
+  }
+
+  function formatTurnTimestamp(value: number | null | undefined, long = false) {
+    const timestamp = normalizeSessionTimestamp(value);
+    if (!timestamp) {
+      return "";
+    }
+
+    const locale = getDateTimeLocale();
+    const date = new Date(timestamp);
+    if (long) {
+      return new Intl.DateTimeFormat(locale, {
+        dateStyle: "medium",
+        timeStyle: "medium"
+      }).format(date);
+    }
+
+    const now = new Date();
+    return new Intl.DateTimeFormat(locale, {
+      month: isSameLocalDate(date, now) ? undefined : "short",
+      day: isSameLocalDate(date, now) ? undefined : "numeric",
+      hour: "2-digit",
+      minute: "2-digit"
+    }).format(date);
+  }
+
+  function turnTimestampIso(value: number | null | undefined) {
+    const timestamp = normalizeSessionTimestamp(value);
+    return timestamp ? new Date(timestamp).toISOString() : undefined;
+  }
+
   function noteTranscriptUserScrollIntent(durationMs = 800) {
     transcriptUserScrollIntentUntil = getTranscriptNow() + durationMs;
   }
@@ -3734,7 +3912,7 @@
     };
   }
 
-  function buildSessionListBrowserCacheKey(cursor: string | null = null) {
+  function buildSessionListBrowserCacheKey(cursor: string | null = null, limit = sessionPageSize) {
     if (!activeProfileId) {
       return null;
     }
@@ -3744,13 +3922,14 @@
       profileId: activeProfileId,
       archived: showArchivedSessions,
       cursor,
-      limit: sessionPageSize,
+      limit,
       query: sessionSearchQuery.trim(),
       scope: sessionSearchScope,
       filter: {
         pinnedOnly: sessionFilter.pinnedOnly,
         runningOnly: sessionFilter.runningOnly,
         queuedOnly: sessionFilter.queuedOnly,
+        untaggedOnly: sessionFilter.untaggedOnly,
         highlight: sessionFilter.highlight,
         tags: [...sessionFilter.tags].sort()
       }
@@ -3853,8 +4032,34 @@
     scheduleSessionDetailCachePersist(null);
   }
 
+  function setSessionsStable(nextSessions: SessionSummary[]) {
+    const sorted = sortSessions(nextSessions);
+    if (sorted.length === sessions.length && sorted.every((session, index) => session === sessions[index])) {
+      return;
+    }
+    sessions = sorted;
+  }
+
+  function reuseUnchangedSessionSummaries(nextSessions: SessionSummary[], nextSummaryVersions: Record<string, string> | null | undefined) {
+    if (!nextSummaryVersions || Object.keys(sessionSummaryVersionsById).length === 0) {
+      return nextSessions;
+    }
+    const currentById = new Map(sessions.map((session) => [session.id, session]));
+    return nextSessions.map((session) => {
+      const existing = currentById.get(session.id);
+      const nextVersion = nextSummaryVersions[session.id];
+      if (existing && nextVersion && sessionSummaryVersionsById[session.id] === nextVersion) {
+        return existing;
+      }
+      return session;
+    });
+  }
+
   function mergeSessionPage(payload: SessionListPayload, pinnedSession: SessionSummary | null, append = false) {
-    const visiblePayloadSessions = payload.sessions.filter((session) => !isSubagentSessionSummary(session));
+    const visiblePayloadSessions = reuseUnchangedSessionSummaries(
+      payload.sessions.filter((session) => !isSubagentSessionSummary(session)),
+      payload.summaryVersions
+    );
     const baseSessions = append ? sessions : [];
     const deduped = [...baseSessions, ...visiblePayloadSessions].filter(
       (session, index, collection) => collection.findIndex((candidate) => candidate.id === session.id) === index
@@ -3864,14 +4069,14 @@
       deduped.unshift(pinnedSession);
     }
 
-    sessions = sortSessions(deduped);
+    setSessionsStable(deduped);
     sessionsCursor = payload.nextCursor;
     sessionsHasMore = Boolean(payload.nextCursor);
     if (!append) {
       sessionListCacheVersion = payload.cacheVersion ?? null;
       sessionListStateHash = payload.stateHash ?? null;
       sessionSummaryVersionsById = payload.summaryVersions ? { ...payload.summaryVersions } : {};
-      sessionListCacheKey = buildSessionListBrowserCacheKey();
+      sessionListCacheKey = buildSessionListBrowserCacheKey(null, Math.max(sessionPageSize, sessions.length));
     } else {
       sessionListCacheVersion = null;
       sessionListStateHash = null;
@@ -3900,20 +4105,23 @@
       return false;
     }
 
-    const deduped = pageSessions.filter(
-      (session, index, collection) => collection.findIndex((candidate) => candidate.id === session.id) === index
+    const deduped = reuseUnchangedSessionSummaries(
+      pageSessions.filter(
+        (session, index, collection) => collection.findIndex((candidate) => candidate.id === session.id) === index
+      ),
+      patch.summaryVersions
     );
     if (shouldPinSession(pinnedSession) && pinnedSession && !deduped.some((session) => session.id === pinnedSession.id)) {
       deduped.unshift(pinnedSession);
     }
 
-    sessions = sortSessions(deduped);
+    setSessionsStable(deduped);
     sessionsCursor = patch.nextCursor;
     sessionsHasMore = Boolean(patch.nextCursor);
     sessionListCacheVersion = payload.cacheVersion;
     sessionListStateHash = patch.finalStateHash;
     sessionSummaryVersionsById = { ...patch.summaryVersions };
-    sessionListCacheKey = buildSessionListBrowserCacheKey();
+    sessionListCacheKey = buildSessionListBrowserCacheKey(null, Math.max(sessionPageSize, sessions.length));
     return true;
   }
 
@@ -3929,7 +4137,7 @@
 
   function upsertSessionSummary(summary: SessionSummary, cacheDirty = true) {
     if (isSubagentSessionSummary(summary)) {
-      sessions = sortSessions(sessions.filter((session) => session.id !== summary.id));
+      setSessionsStable(sessions.filter((session) => session.id !== summary.id));
       if (cacheDirty) {
         sessionListCacheVersion = null;
         sessionListStateHash = null;
@@ -3938,7 +4146,7 @@
       }
       return;
     }
-    sessions = sortSessions([summary, ...sessions.filter((session) => session.id !== summary.id)]);
+    setSessionsStable([summary, ...sessions.filter((session) => session.id !== summary.id)]);
     if (cacheDirty) {
       sessionListCacheVersion = null;
       sessionListStateHash = null;
@@ -3951,7 +4159,7 @@
     if (isSubagentSessionSummary(summary)) {
       const nextSessions = sessions.filter((session) => session.id !== summary.id);
       if (nextSessions.length !== sessions.length) {
-        sessions = sortSessions(nextSessions);
+        setSessionsStable(nextSessions);
         sessionListCacheVersion = null;
         sessionListStateHash = null;
         sessionSummaryVersionsById = {};
@@ -3968,7 +4176,7 @@
     if (summary.archived !== showArchivedSessions) {
       const nextSessions = sessions.filter((session) => session.id !== summary.id);
       if (nextSessions.length !== sessions.length) {
-        sessions = sortSessions(nextSessions);
+        setSessionsStable(nextSessions);
         sessionListCacheVersion = null;
         sessionListStateHash = null;
         sessionSummaryVersionsById = {};
@@ -3980,7 +4188,7 @@
     if (!matchesSessionSummaryFilter(summary, sessionFilter)) {
       const nextSessions = sessions.filter((session) => session.id !== summary.id);
       if (nextSessions.length !== sessions.length) {
-        sessions = sortSessions(nextSessions);
+        setSessionsStable(nextSessions);
         sessionListCacheVersion = null;
         sessionListStateHash = null;
         sessionSummaryVersionsById = {};
@@ -4225,6 +4433,7 @@
     sessionSearchScope = "summary";
     sessionFilter = normalizeSessionFilterState(null);
     activeSavedSessionFilterId = null;
+    activeSessionFolder = null;
     showArchivedSessions = false;
     accountLoginFlow = null;
     composerSettingsOpen = false;
@@ -4249,7 +4458,7 @@
     optimisticMessage = null;
     optimisticQueuedItemsBySessionId = {};
     sessionQueueSnapshotsBySessionId = {};
-    pendingQueueModeSessionId = null;
+    clearPendingQueueMode();
     liveTurnCardExpanded = false;
     sendIntent = null;
     dismissLastComposerPromptChip();
@@ -4357,7 +4566,8 @@
     sessionsBusy = true;
     sessionsLoadingMore = false;
     const query = sessionSearchQuery.trim();
-    const listCacheKey = buildSessionListBrowserCacheKey();
+    const refreshLimit = Math.max(sessionPageSize, sessions.length);
+    const listCacheKey = buildSessionListBrowserCacheKey(null, refreshLimit);
     let knownVersion: string | null = sessionListCacheKey === listCacheKey ? sessionListCacheVersion : null;
     let knownSummaryVersions: Record<string, string> | null =
       knownVersion && sessionListCacheKey === listCacheKey && sessionListStateHash ? { ...sessionSummaryVersionsById } : null;
@@ -4387,7 +4597,7 @@
             sessionSearchScope,
             showArchivedSessions,
             null,
-            sessionPageSize,
+            refreshLimit,
             sessionFilter,
             knownVersion,
             knownSummaryVersions,
@@ -4396,7 +4606,7 @@
         : await api.getSessions(
             showArchivedSessions,
             null,
-            sessionPageSize,
+            refreshLimit,
             sessionFilter,
             knownVersion,
             knownSummaryVersions,
@@ -4422,8 +4632,8 @@
         }
 
         const fallback = query
-          ? await api.searchSessions(query, sessionSearchScope, showArchivedSessions, null, sessionPageSize, sessionFilter)
-          : await api.getSessions(showArchivedSessions, null, sessionPageSize, sessionFilter);
+          ? await api.searchSessions(query, sessionSearchScope, showArchivedSessions, null, refreshLimit, sessionFilter)
+          : await api.getSessions(showArchivedSessions, null, refreshLimit, sessionFilter);
         if (requestVersion !== sessionListRequestVersion || isCacheValidationResponse(fallback) || isSessionListPatchResponse(fallback)) {
           return;
         }
@@ -4807,7 +5017,7 @@
                 String(payload.params.status ?? "") === "active" ||
                 !isLiveConversationStatus(String(payload.params.status ?? "")))))
         ) {
-          pendingQueueModeSessionId = null;
+          clearPendingQueueMode(sessionId);
         }
 
         if (
@@ -5080,7 +5290,7 @@
       pendingQueueModeSessionId === sessionId &&
       (hasConversationLiveTurn(nextConversation) || !isLiveConversationStatus(nextConversation.thread.status))
     ) {
-      pendingQueueModeSessionId = null;
+      clearPendingQueueMode(sessionId);
     }
     titleDraft = getConversationDisplayTitle(nextConversation) ?? "";
     upsertSessionSummary(buildSessionSummaryFromConversation(nextConversation), false);
@@ -5587,7 +5797,7 @@
     const selectedBinding = getSelectedSessionBinding();
     const sessionId = selectedBinding?.sessionId ?? null;
     const currentDraft = draft;
-    const intent: "message" | "queue" = queueModeActive ? "queue" : "message";
+    const intent: "message" | "queue" = composerQueueModeActive ? "queue" : "message";
     const hasPendingSteerResume = pendingSteerResume?.sessionId === sessionId && !currentDraft.trim();
 
     if (!sessionId || draftPersistencePaused || hasPendingSteerResume) {
@@ -6197,9 +6407,15 @@
         ? await api.setSessionGoal(materialized.sessionId, { status: "paused" })
         : normalized === "resume" || normalized === "active"
           ? await api.setSessionGoal(materialized.sessionId, { status: "active" })
-          : normalized === "complete" || normalized === "completed"
-            ? await api.setSessionGoal(materialized.sessionId, { status: "complete" })
-            : await api.setSessionGoal(materialized.sessionId, { objective: args.trim(), status: "active" });
+          : normalized === "block" || normalized === "blocked"
+            ? await api.setSessionGoal(materialized.sessionId, { status: "blocked" })
+            : normalized === "usage-limited" || normalized === "usage_limited" || normalized === "usagelimited"
+              ? await api.setSessionGoal(materialized.sessionId, { status: "usageLimited" })
+              : normalized === "budget-limited" || normalized === "budget_limited" || normalized === "budgetlimited"
+                ? await api.setSessionGoal(materialized.sessionId, { status: "budgetLimited" })
+                : normalized === "complete" || normalized === "completed"
+                  ? await api.setSessionGoal(materialized.sessionId, { status: "complete" })
+                  : await api.setSessionGoal(materialized.sessionId, { objective: args.trim(), status: "active" });
     applyGoalPayloadToConversation(materialized.sessionId, response.goal);
     if (normalized === "pause" || normalized === "paused") {
       noticeText = m.slash_goal_paused();
@@ -6518,7 +6734,7 @@
         return;
       }
       setOptimisticMessageState(sessionId, prompt, selectedSkillsSnapshot, attachmentNames, activeConversation);
-      pendingQueueModeSessionId = sessionId;
+      activatePendingQueueMode(sessionId);
       recordComposerHistory(prompt);
       rememberLastComposerPromptChip(sessionId, prompt);
       if (!preserveComposer) {
@@ -6541,7 +6757,7 @@
       })
         .catch((error) => {
           if (pendingQueueModeSessionId === sessionId) {
-            pendingQueueModeSessionId = null;
+            clearPendingQueueMode(sessionId);
           }
           clearOptimisticMessageState(sessionId, prompt);
           if (!preserveComposer && selectedSessionId === sessionId && !draft.trim() && draftAttachments.length === 0) {
@@ -6575,7 +6791,7 @@
     if (!selectedBinding) {
       return;
     }
-    if (uploading || !canQueueComposerMessage(selectedBinding.state)) {
+    if (uploading || (!canQueueComposerMessage(selectedBinding.state) && !canQueueDuringLocalSubmission(selectedBinding.sessionId))) {
       return;
     }
     if (!options?.promptText?.trim() && !draft.trim() && draftAttachments.length === 0) {
@@ -7042,7 +7258,7 @@
       if (await handleSlashCommand(draft)) {
         return;
       }
-      if (queueModeActive) {
+      if (composerQueueModeActive) {
         await queueMessage();
         return;
       }
@@ -7068,7 +7284,7 @@
       return;
     }
 
-    if (queueModeActive) {
+    if (composerQueueModeActive) {
       await queueMessage({
         promptText: lastComposerHistoryPrompt,
         attachmentSnapshot: [],
@@ -8007,7 +8223,19 @@
       ...sessionFilter,
       ...patch
     });
+    if (patch.untaggedOnly) {
+      sessionFilter = normalizeSessionFilterState({
+        ...sessionFilter,
+        tags: []
+      });
+    } else if (patch.tags && patch.tags.length > 0) {
+      sessionFilter = normalizeSessionFilterState({
+        ...sessionFilter,
+        untaggedOnly: false
+      });
+    }
     activeSessionFolder =
+      !sessionFilter.untaggedOnly &&
       sessionFilter.tags.length === 1 &&
       (config?.sessionOrganization.sessionFolders ?? []).some((folder) => folder.name === sessionFilter.tags[0])
         ? sessionFilter.tags[0]
@@ -8030,7 +8258,21 @@
     activeSavedSessionFilterId = null;
     sessionFilter = normalizeSessionFilterState({
       ...sessionFilter,
-      tags: folderName ? [folderName] : []
+      tags: folderName ? [folderName] : [],
+      untaggedOnly: false
+    });
+    showArchivedSessions = false;
+    syncSessionListStateInUrl();
+    scheduleSessionRefresh(0);
+  }
+
+  function openUnfiledSessions() {
+    activeSessionFolder = null;
+    activeSavedSessionFilterId = null;
+    sessionFilter = normalizeSessionFilterState({
+      ...sessionFilter,
+      tags: [],
+      untaggedOnly: true
     });
     showArchivedSessions = false;
     syncSessionListStateInUrl();
@@ -8433,18 +8675,33 @@
     return `${mode}\u0000${sessionId}\u0000${buildQueueItemSignature(prompt, skills, attachmentIds)}`;
   }
 
+  function composerCurrentDraftHasPendingMutation(sessionId: string, state: ConversationState) {
+    pendingComposerMutationRevision;
+
+    if (!draft.trim() && draftAttachments.length === 0) {
+      return false;
+    }
+
+    const selectedSkillsSnapshot = [...state.selectedSkills];
+    const attachmentIds = draftAttachments.map((attachment) => attachment.id);
+    return (["message", "queue", "steer"] as const).some((mode) =>
+      pendingComposerMutationSignatures.has(buildComposerMutationSignature(mode, sessionId, draft.trim(), selectedSkillsSnapshot, attachmentIds))
+    );
+  }
+
   function beginComposerMutation(signature: string) {
     if (pendingComposerMutationSignatures.has(signature)) {
       return false;
     }
 
     pendingComposerMutationSignatures.add(signature);
+    pendingComposerMutationRevision += 1;
     return true;
   }
 
   function finishComposerMutation(signature: string | null) {
-    if (signature) {
-      pendingComposerMutationSignatures.delete(signature);
+    if (signature && pendingComposerMutationSignatures.delete(signature)) {
+      pendingComposerMutationRevision += 1;
     }
   }
 
@@ -8815,7 +9072,7 @@
       !event.metaKey
     ) {
       event.preventDefault();
-      if (canQueueComposerMessage()) {
+      if (composerQueueModeActive) {
         void queueMessage();
         return;
       }
@@ -8825,7 +9082,7 @@
 
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
       event.preventDefault();
-      if (canQueueComposerMessage()) {
+      if (composerQueueModeActive) {
         void queueMessage();
         return;
       }
@@ -10702,6 +10959,7 @@
       onSearchScopeChange={updateSessionSearchScope}
 	      onSessionFilterChange={updateSessionFilter}
 	      onSelectSessionFolder={openSessionFolder}
+	      onSelectUnfiledSessions={openUnfiledSessions}
 	      onCreateSessionFolder={() => {
 	        void createSessionFolder();
 	      }}
@@ -10932,6 +11190,7 @@
                             </div>
                           {/if}
                         </div>
+                        {@render renderMessageTimestamp(turn.startedAt, ui.userMessageTimestamp, "right")}
                       </div>
                     {/each}
 
@@ -10940,6 +11199,7 @@
                         <div class="px-5 py-3 bg-gray-100 rounded-2xl text-gray-800 shadow-sm border border-gray-200/50">
                           <MarkdownMessage compact expandLabel={ui.showFullMessage} maxInitialChars={compactMarkdownInitialChars} text={visibleOptimisticMessage.prompt} />
                         </div>
+                        {@render renderMessageTimestamp(visibleOptimisticMessage.createdAt, ui.userMessageTimestamp, "right")}
                       </div>
                     {/if}
 
@@ -10976,13 +11236,19 @@
                             </div>
                           {/if}
                           {#each turnModel.visibleSummaryEntries as entry (entry.key)}{@render renderTurnEntry(turn.id, entry, 0)}{/each}
-                          {#if turnModel.finalAgentItem}{@render renderTurnItem(turn.id, turnModel.finalAgentItem, 0)}{/if}
+                          {#if turnModel.finalAgentItem}
+                            {@render renderTurnItem(turn.id, turnModel.finalAgentItem, 0)}
+                            {@render renderMessageTimestamp(turn.completedAt, ui.agentReplyTimestamp, "left")}
+                          {/if}
                         {:else}
                           {@const fullEntries = turnModel.fullEntries}
                           {@const hiddenFullEntryCount = getHiddenTurnEntryCount(turn.id, fullEntries)}
                           {@const visibleFullEntries = getVisibleTurnEntries(turn.id, fullEntries)}
                           {@render renderHiddenTurnEntriesControl(turn.id, hiddenFullEntryCount, fullEntries)}
                           {#each visibleFullEntries as entry (entry.key)}{@render renderTurnEntry(turn.id, entry, 0)}{/each}
+                          {#if turn.completedAt}
+                            {@render renderMessageTimestamp(turn.completedAt, ui.agentReplyTimestamp, "left")}
+                          {/if}
                         {/if}
                         
                         {#if conversation.livePlans[turn.id] && turn.id !== conversation.activeTurnId}
@@ -11487,10 +11753,10 @@
                       class="surface-contrast-button ui-animated-button ui-animated-button--soft flex h-7 shrink-0 items-center gap-1.25 rounded-lg px-2.5 text-[10px] font-bold shadow-sm"
                       disabled={recentComposerActionDisabled}
                       onclick={() => void resendLastComposerMessage()}
-                      title={queueModeActive ? ui.queue : ui.send}
+                      title={composerQueueModeActive ? ui.queue : ui.send}
                       type="button"
                     >
-                      <span class="hidden sm:inline">{queueModeActive ? ui.queue : ui.send}</span>
+                      <span class="hidden sm:inline">{composerQueueModeActive ? ui.queue : ui.send}</span>
                       <Send size={13} />
                     </button>
                   </div>
@@ -11515,7 +11781,7 @@
                   </div>
                 {/if}
                 <form bind:this={composerPanelElement} class="composer-panel bg-white/95 border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200 focus-within:-translate-y-0.5 focus-within:border-amber-400/70 focus-within:bg-white focus-within:shadow-[0_24px_60px_-34px_rgba(245,158,11,0.65)]" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
-                  <textarea bind:this={composerTextareaElement} bind:value={draft} class="composer-textarea w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 outline-none transition-colors duration-150 focus:outline-none focus:ring-0 focus:placeholder:text-amber-500/70 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={queueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} readonly={readOnlyRole} rows="1"></textarea>
+                  <textarea bind:this={composerTextareaElement} bind:value={draft} class="composer-textarea w-full min-h-[3rem] overflow-y-hidden border-none bg-transparent px-4 py-3 pr-12 text-sm leading-6 text-gray-800 placeholder-gray-400 outline-none transition-colors duration-150 focus:outline-none focus:ring-0 focus:placeholder:text-amber-500/70 resize-none sm:min-h-[3.25rem]" oninput={handleComposerInput} onkeydown={handleComposerKeydown} placeholder={composerQueueModeActive ? ui.queueFollowUpPlaceholder : ui.askCodex} readonly={readOnlyRole} rows="1"></textarea>
                   
                   {#if draftAttachments.length > 0}
                     <div class="flex flex-wrap gap-1.5 px-3.5 pb-1.5">
@@ -11598,7 +11864,7 @@
                         <button class="ui-animated-button ui-animated-button--soft inline-flex h-7 items-center justify-center rounded-lg px-2.5 text-[10px] font-bold text-red-600 transition-all hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 sm:h-8 sm:px-3 sm:text-[11px]" disabled={readOnlyRole} onclick={interruptTurn} type="button">{ui.stop}</button>
                         <button class="ui-animated-button ui-animated-button--soft inline-flex h-7 items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-2.5 text-[10px] font-bold text-amber-700 transition-all hover:bg-amber-100 disabled:opacity-50 sm:h-8 sm:px-3 sm:text-[11px]" disabled={readOnlyRole || sending || (!draft.trim() && draftAttachments.length === 0)} onclick={steerTurn} type="button">{ui.steer}</button>
                       {/if}
-                      <button class="surface-contrast-button ui-animated-button ui-animated-button--strong inline-flex h-7 items-center justify-center rounded-lg bg-gray-900 px-3 text-[10px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:h-8 sm:px-4 sm:text-[11px]" disabled={composerPrimaryActionDisabled} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.25 sm:gap-1.5"><span>{queueModeActive ? ui.queue : ui.send}</span><Send size={13} /></div></button>
+                      <button class="surface-contrast-button ui-animated-button ui-animated-button--strong inline-flex h-7 items-center justify-center rounded-lg bg-gray-900 px-3 text-[10px] font-bold text-white shadow-lg shadow-gray-200 transition-all hover:bg-gray-800 disabled:opacity-50 disabled:shadow-none active:scale-[0.98] sm:h-8 sm:px-4 sm:text-[11px]" disabled={composerPrimaryActionDisabled} onclick={() => void submitComposer()} type="button"><div class="flex items-center gap-1.25 sm:gap-1.5"><span>{composerQueueModeActive ? ui.queue : ui.send}</span><Send size={13} /></div></button>
                     </div>
                   </div>
                 </form>
@@ -11823,6 +12089,47 @@
                             </span>
                           </span>
                         </label>
+                        <div class="composer-settings-card flex flex-col gap-2 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
+                          <label class:checkbox-card--disabled={readOnlyRole} class="checkbox-card checkbox-card--compact w-full">
+                            <input
+                              checked={conversation.preferences.languageBridgeEnabled ?? false}
+                              class="checkbox-input"
+                              disabled={readOnlyRole}
+                              onchange={(event) => setPreference("languageBridgeEnabled", (event.currentTarget as HTMLInputElement).checked)}
+                              type="checkbox"
+                            />
+                            <span class="checkbox-control"></span>
+                            <span class="checkbox-copy min-w-0">
+                              <span class="checkbox-title inline-flex items-center gap-1.5">
+                                <ArrowRightLeft size={12} class={(conversation.preferences.languageBridgeEnabled ?? false) ? "text-amber-700" : "text-gray-400"} />
+                                <span>{ui.languageBridge}</span>
+                              </span>
+                              <span class="checkbox-description">{ui.languageBridgeDescription}</span>
+                            </span>
+                          </label>
+                          {#if conversation.preferences.languageBridgeEnabled}
+                            <label class="space-y-1 px-1">
+                              <span class="text-[10px] font-bold uppercase tracking-widest text-gray-400">{ui.languageBridgeOutput}</span>
+                              <input
+                                class="w-full rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 transition-all focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/10 disabled:cursor-not-allowed disabled:opacity-60"
+                                disabled={readOnlyRole}
+                                onblur={(event) => {
+                                  const value = (event.currentTarget as HTMLInputElement).value.trim() || "auto";
+                                  setPreference("languageBridgeOutputLanguage", value);
+                                }}
+                                onkeydown={(event) => {
+                                  if (event.key === "Enter") {
+                                    event.preventDefault();
+                                    (event.currentTarget as HTMLInputElement).blur();
+                                  }
+                                }}
+                                placeholder={ui.languageBridgeAuto}
+                                type="text"
+                                value={conversation.preferences.languageBridgeOutputLanguage ?? "auto"}
+                              />
+                            </label>
+                          {/if}
+                        </div>
                         <div class="composer-settings-card flex flex-col gap-2.5 rounded-xl border border-gray-200/80 bg-gray-50/80 p-2.5">
                           <div class="flex min-w-0 items-start gap-2">
                             <span class={`composer-settings-card__icon inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border ${
@@ -13108,6 +13415,35 @@
     color: #fbbf24 !important;
   }
 
+  .message-timestamp {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    max-width: 100%;
+    color: color-mix(in srgb, var(--muted) 86%, transparent);
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .message-timestamp--right {
+    justify-content: flex-end;
+    align-self: flex-end;
+    padding-right: 0.35rem;
+  }
+
+  .message-timestamp--left {
+    justify-content: flex-start;
+    align-self: flex-start;
+    padding-left: 0.15rem;
+  }
+
+  :global(:root[data-theme="dark"]) .message-timestamp {
+    color: color-mix(in srgb, var(--muted) 92%, white 4%);
+  }
+
   :global(:root[data-theme="dark"]) .large-output-preview pre {
     border-color: rgba(71, 85, 105, 0.54) !important;
     background: rgba(15, 23, 42, 0.82) !important;
@@ -13200,6 +13536,20 @@
       <div class="diff-loading-bar h-1.5 rounded-full bg-gradient-to-r from-amber-300 via-amber-500 to-orange-400"></div>
     </div>
   </div>
+{/snippet}
+
+{#snippet renderMessageTimestamp(value: number | null | undefined, label: string, align: "left" | "right")}
+  {@const timestamp = formatTurnTimestamp(value)}
+  {#if timestamp}
+    <time
+      class={`message-timestamp message-timestamp--${align}`}
+      datetime={turnTimestampIso(value)}
+      title={`${label} · ${formatTurnTimestamp(value, true)}`}
+    >
+      <span>{label}</span>
+      <span>{timestamp}</span>
+    </time>
+  {/if}
 {/snippet}
 
 {#snippet renderTurnItem(turnId: string, item: CodexItem, stickyLevel = 0)}

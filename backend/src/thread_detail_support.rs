@@ -1124,22 +1124,23 @@ pub(crate) async fn session_detail_payload(
         .filter(|status| !is_live_thread_status(status));
 
     if raw_active_turn_id_from_payload.is_some() && terminal_runtime_status.is_none() {
-        let app_server_thread = match app_server_client(state, profile_id).await {
-            Ok(client) => client
-                .request_with_timeout(
-                    "thread/read",
-                    json!({
-                        "threadId": session_id,
-                        "includeTurns": true
-                    }),
-                    Duration::from_millis(SESSION_DETAIL_ACTIVE_RECONCILE_TIMEOUT_MS),
-                    false,
-                )
-                .await
-                .ok()
-                .and_then(|response| response.get("thread").cloned()),
-            Err(_) => None,
-        };
+        let app_server_thread =
+            match app_server_client_for_session(state, profile_id, session_id).await {
+                Ok(client) => client
+                    .request_with_timeout(
+                        "thread/read",
+                        json!({
+                            "threadId": session_id,
+                            "includeTurns": true
+                        }),
+                        Duration::from_millis(SESSION_DETAIL_ACTIVE_RECONCILE_TIMEOUT_MS),
+                        false,
+                    )
+                    .await
+                    .ok()
+                    .and_then(|response| response.get("thread").cloned()),
+                Err(_) => None,
+            };
         let app_server_status = app_server_thread
             .as_ref()
             .and_then(|thread| normalized_thread_status(thread.get("status")));

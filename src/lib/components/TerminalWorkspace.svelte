@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { CornerDownLeft, Paperclip } from "lucide-svelte";
 
   import { api } from "$lib/api";
@@ -234,6 +234,8 @@
     let inputObserver: MutationObserver | null = null;
     let pendingOutput = "";
     let flushFrame: number | null = null;
+    let fitFrame: number | null = null;
+    let scheduleTerminalFit: (() => void) | null = null;
     let mobileInputModeQuery: MediaQueryList | null = null;
     let releaseMobileInputMode: (() => void) | null = null;
     let xterm:
@@ -285,6 +287,22 @@
         }
 
         const fitAddon = new FitAddon();
+        scheduleTerminalFit = () => {
+          if (fitFrame !== null) {
+            cancelAnimationFrame(fitFrame);
+          }
+          fitFrame = requestAnimationFrame(() => {
+            fitFrame = null;
+            if (!xterm || !container || disposed) {
+              return;
+            }
+            const bounds = container.getBoundingClientRect();
+            if (bounds.width <= 0 || bounds.height <= 0) {
+              return;
+            }
+            fitAddon.fit();
+          });
+        };
         mobileInputModeQuery = window.matchMedia("(max-width: 720px)");
         const mobileControlsPreferred = mobileInputModeQuery.matches;
         xterm = new Terminal({
@@ -298,7 +316,7 @@
         xterm.loadAddon(fitAddon);
         xterm.open(container);
         syncTerminalInputAttributes();
-        fitAddon.fit();
+        scheduleTerminalFit();
         if (!mobileControlsPreferred) {
           xterm.focus();
         }
@@ -334,7 +352,7 @@
         });
 
         resizeObserver = new ResizeObserver(() => {
-          fitAddon.fit();
+          scheduleTerminalFit?.();
         });
         resizeObserver.observe(container);
         inputObserver = new MutationObserver(() => {
@@ -354,6 +372,8 @@
           xterm.write(snapshot.snapshot);
         }
         loading = false;
+        await tick();
+        scheduleTerminalFit?.();
 
         releaseTerminal = api.subscribeTerminal(terminalId, (event) => {
           if (!xterm) {
@@ -402,10 +422,14 @@
       if (flushFrame !== null) {
         cancelAnimationFrame(flushFrame);
       }
+      if (fitFrame !== null) {
+        cancelAnimationFrame(fitFrame);
+      }
       resizeObserver?.disconnect();
       inputObserver?.disconnect();
       releaseMobileInputMode?.();
       releaseTerminal?.();
+      scheduleTerminalFit = null;
       terminalInputSender = null;
       focusTerminalViewport = null;
       ctrlModifierArmed = false;
@@ -455,58 +479,66 @@
 
   <div class="terminal-shell__body">
     {#if loading}
-      <div class="placeholder-card">{ui.connecting}</div>
+      <div class="terminal-shell__loading placeholder-card">{ui.connecting}</div>
     {/if}
-    <div bind:this={container} class:hidden={loading} class="terminal-shell__viewport"></div>
+    <div
+      bind:this={container}
+      class:terminal-shell__viewport--loading={loading}
+      class="terminal-shell__viewport"
+    ></div>
   </div>
 
-  {#if !loading}
-    <div class="terminal-shell__mobile-input-bar">
-      <input
-        bind:this={mobileInputElement}
-        bind:value={mobileInput}
-        aria-label={ui.terminal}
-        autocapitalize="none"
-        autocomplete="off"
-        autocorrect="off"
-        class="terminal-shell__mobile-input"
-        enterkeyhint="enter"
-        inputmode="text"
-        onbeforeinput={handleMobileInputBeforeInput}
-        onkeydown={handleMobileInputKeydown}
-        placeholder="$"
-        spellcheck="false"
-        type="text"
-      />
-      <button class="terminal-shell__mobile-submit" disabled={!mobileInput} onclick={submitMobileInput} type="button">
-        <CornerDownLeft size={15} />
-        <span>{ui.send}</span>
-      </button>
-    </div>
-    <div class="terminal-shell__mobile-keys" aria-label="Terminal mobile shortcuts">
-      {#each mobileTerminalKeyRows as row, rowIndex (`row-${rowIndex}`)}
-        <div class="terminal-shell__mobile-key-row">
-          {#each row as key (`${key.label}-${key.value}`)}
-            <button
-              aria-label={key.ariaLabel}
-              class={`terminal-shell__mobile-key ${key.value === "__ctrl__" && ctrlModifierArmed ? "terminal-shell__mobile-key--active" : ""} ${"wide" in key && key.wide ? "terminal-shell__mobile-key--wide" : ""}`}
-              onclick={() => handleMobileTerminalKey(key.value)}
-              onpointerdown={(event) => event.preventDefault()}
-              type="button"
-            >
-              {key.label}
-            </button>
-          {/each}
-        </div>
-      {/each}
-    </div>
-  {/if}
+  <div class:terminal-shell__mobile-controls--loading={loading} class="terminal-shell__mobile-input-bar">
+    <input
+      bind:this={mobileInputElement}
+      bind:value={mobileInput}
+      aria-label={ui.terminal}
+      autocapitalize="none"
+      autocomplete="off"
+      autocorrect="off"
+      class="terminal-shell__mobile-input"
+      disabled={loading}
+      enterkeyhint="enter"
+      inputmode="text"
+      onbeforeinput={handleMobileInputBeforeInput}
+      onkeydown={handleMobileInputKeydown}
+      placeholder="$"
+      spellcheck="false"
+      type="text"
+    />
+    <button class="terminal-shell__mobile-submit" disabled={loading || !mobileInput} onclick={submitMobileInput} type="button">
+      <CornerDownLeft size={15} />
+      <span>{ui.send}</span>
+    </button>
+  </div>
+  <div
+    class:terminal-shell__mobile-controls--loading={loading}
+    class="terminal-shell__mobile-keys"
+    aria-label="Terminal mobile shortcuts"
+  >
+    {#each mobileTerminalKeyRows as row, rowIndex (`row-${rowIndex}`)}
+      <div class="terminal-shell__mobile-key-row">
+        {#each row as key (`${key.label}-${key.value}`)}
+          <button
+            aria-label={key.ariaLabel}
+            class={`terminal-shell__mobile-key ${key.value === "__ctrl__" && ctrlModifierArmed ? "terminal-shell__mobile-key--active" : ""} ${"wide" in key && key.wide ? "terminal-shell__mobile-key--wide" : ""}`}
+            disabled={loading}
+            onclick={() => handleMobileTerminalKey(key.value)}
+            onpointerdown={(event) => event.preventDefault()}
+            type="button"
+          >
+            {key.label}
+          </button>
+        {/each}
+      </div>
+    {/each}
+  </div>
 </section>
 
 <style>
   .terminal-shell {
-    display: grid;
-    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    display: flex;
+    flex-direction: column;
     gap: 0.75rem;
     min-height: 0;
     overflow: hidden;
@@ -586,6 +618,9 @@
   }
 
   .terminal-shell__body {
+    position: relative;
+    display: grid;
+    flex: 1 1 auto;
     min-height: 0;
     overflow: hidden;
     border: 1px solid var(--line);
@@ -595,8 +630,23 @@
   }
 
   .terminal-shell__viewport {
+    width: 100%;
     height: 100%;
     min-height: 0;
+  }
+
+  .terminal-shell__viewport--loading {
+    visibility: hidden;
+  }
+
+  .terminal-shell__loading {
+    position: absolute;
+    inset: 0.2rem;
+    z-index: 1;
+    display: grid;
+    place-items: center;
+    margin: 0;
+    pointer-events: none;
   }
 
   .terminal-shell__viewport :global(.xterm),
@@ -607,10 +657,6 @@
 
   .terminal-shell__mobile-input-bar,
   .terminal-shell__mobile-keys {
-    display: none;
-  }
-
-  .hidden {
     display: none;
   }
 
@@ -647,6 +693,11 @@
       grid-template-columns: minmax(0, 1fr) auto;
       gap: 0.5rem;
       align-items: center;
+    }
+
+    .terminal-shell__mobile-controls--loading {
+      visibility: hidden;
+      pointer-events: none;
     }
 
     .terminal-shell__mobile-input {

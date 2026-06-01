@@ -2653,6 +2653,7 @@ import sys
 import time
 
 log_path = os.environ.get("FAKE_CODEX_START_LOG")
+proxy_pid_path = os.environ.get("FAKE_CODEX_PROXY_PID")
 def log(message):
     if log_path:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -2758,6 +2759,7 @@ if "proxy" in args:
         ));
         let script_path = dir.join("fake-codex.py");
         let log_path = dir.join("starts.log");
+        let proxy_pid_path = dir.join("proxy.pid");
         let handoff_dir = dir.join("handoff");
         std::fs::create_dir_all(&dir).expect("test dir should be created");
         std::fs::write(
@@ -2771,6 +2773,7 @@ import sys
 import time
 
 log_path = os.environ.get("FAKE_CODEX_START_LOG")
+proxy_pid_path = os.environ.get("FAKE_CODEX_PROXY_PID")
 def log(message):
     if log_path:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -2824,6 +2827,9 @@ if "--listen" in args:
 
 if "proxy" in args:
     log("proxy")
+    if proxy_pid_path:
+        with open(proxy_pid_path, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
     for raw_line in sys.stdin:
         payload = json.loads(raw_line)
         method = payload.get("method")
@@ -2857,10 +2863,16 @@ if "proxy" in args:
                 handoff_dir: Some(handoff_dir),
                 startup_timeout: std::time::Duration::from_secs(1),
                 request_timeout: std::time::Duration::from_secs(2),
-                extra_env: HashMap::from([(
-                    "FAKE_CODEX_START_LOG".to_string(),
-                    log_path.display().to_string(),
-                )]),
+                extra_env: HashMap::from([
+                    (
+                        "FAKE_CODEX_START_LOG".to_string(),
+                        log_path.display().to_string(),
+                    ),
+                    (
+                        "FAKE_CODEX_PROXY_PID".to_string(),
+                        proxy_pid_path.display().to_string(),
+                    ),
+                ]),
                 ..AppServerClientConfig::default()
             },
         );
@@ -2876,6 +2888,22 @@ if "proxy" in args:
             .expect_err("stale proxy request should time out");
         assert!(app_server_request_timed_out(&timed_out));
         assert!(app_server_timeout_recovered(&timed_out));
+        let proxy_pid = std::fs::read_to_string(&proxy_pid_path)
+            .expect("proxy pid should be recorded")
+            .trim()
+            .parse::<u32>()
+            .expect("proxy pid should be numeric");
+        let proxy_proc_path = PathBuf::from(format!("/proc/{proxy_pid}"));
+        for _ in 0..20 {
+            if !proxy_proc_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !proxy_proc_path.exists(),
+            "timed-out handoff proxy process should be terminated and reaped"
+        );
 
         let response = client
             .request("echo", json!({ "via": "stdio" }))

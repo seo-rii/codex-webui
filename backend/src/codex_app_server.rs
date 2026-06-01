@@ -2363,6 +2363,90 @@ if "app-server" in args and "--listen" in args and args[args.index("--listen") +
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_timeout_uses_one_deadline_across_startup_and_rpc() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "codex-webui-single-deadline-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script_path = dir.join("fake-codex.py");
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+import time
+
+def respond(payload, result=None):
+    print(json.dumps({"id": payload.get("id"), "result": result or {}}), flush=True)
+
+args = sys.argv[1:]
+if "app-server" in args and "--listen" in args and args[args.index("--listen") + 1] == "stdio://":
+    for raw_line in sys.stdin:
+        payload = json.loads(raw_line)
+        method = payload.get("method")
+        if method == "initialize":
+            time.sleep(0.35)
+            respond(payload, {"serverInfo": {"name": "fake"}})
+        elif method == "initialized":
+            pass
+        elif method == "config/batchWrite":
+            respond(payload, {})
+        elif method == "echo":
+            time.sleep(0.35)
+            respond(payload, payload.get("params") or {})
+        else:
+            print(json.dumps({"id": payload.get("id"), "error": {"message": "unknown method"}}), flush=True)
+"#,
+        )
+        .expect("fake codex should be written");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("fake codex metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("fake codex should be executable");
+
+        let client = AppServerClient::new(
+            AppServerProfile {
+                id: "default".to_string(),
+                codex_home: dir.join("codex-home"),
+            },
+            AppServerClientConfig {
+                codex_bin: script_path.display().to_string(),
+                startup_timeout: std::time::Duration::from_secs(5),
+                request_timeout: std::time::Duration::from_secs(5),
+                ..AppServerClientConfig::default()
+            },
+        );
+
+        let started_at = std::time::Instant::now();
+        let error = client
+            .request_with_timeout(
+                "echo",
+                json!({ "request": "single-deadline" }),
+                std::time::Duration::from_millis(500),
+                false,
+            )
+            .await
+            .expect_err("startup and RPC must share one request deadline");
+        assert!(app_server_request_timed_out(&error));
+        assert!(
+            started_at.elapsed() < std::time::Duration::from_millis(900),
+            "request took too long for a single shared deadline"
+        );
+
+        client.close().await.expect("client should close");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn falls_back_to_stdio_when_handoff_proxy_does_not_initialize() {
         use std::os::unix::fs::PermissionsExt;
 

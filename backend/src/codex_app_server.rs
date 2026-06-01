@@ -2447,6 +2447,99 @@ if "app-server" in args and "--listen" in args and args[args.index("--listen") +
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exited_app_server_is_not_counted_active_and_restarts_on_next_request() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "codex-webui-exited-process-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script_path = dir.join("fake-codex.py");
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+def respond(payload, result=None):
+    print(json.dumps({"id": payload.get("id"), "result": result or {}}), flush=True)
+
+args = sys.argv[1:]
+if "app-server" in args and "--listen" in args and args[args.index("--listen") + 1] == "stdio://":
+    for raw_line in sys.stdin:
+        payload = json.loads(raw_line)
+        method = payload.get("method")
+        if method == "initialize":
+            respond(payload, {"serverInfo": {"name": "fake"}})
+        elif method == "initialized":
+            pass
+        elif method == "config/batchWrite":
+            respond(payload, {})
+        elif method == "echo":
+            respond(payload, payload.get("params") or {})
+            sys.exit(0)
+        else:
+            print(json.dumps({"id": payload.get("id"), "error": {"message": "unknown method"}}), flush=True)
+"#,
+        )
+        .expect("fake codex should be written");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("fake codex metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("fake codex should be executable");
+
+        let manager = AppServerManager::new(AppServerClientConfig {
+            codex_bin: script_path.display().to_string(),
+            startup_timeout: std::time::Duration::from_secs(2),
+            request_timeout: std::time::Duration::from_secs(2),
+            ..AppServerClientConfig::default()
+        });
+        let client = manager
+            .get_or_create(AppServerProfile {
+                id: "default".to_string(),
+                codex_home: dir.join("codex-home"),
+            })
+            .await;
+
+        assert_eq!(
+            client
+                .request("echo", json!({ "request": 1 }))
+                .await
+                .expect("first request should complete before app-server exits"),
+            json!({ "request": 1 })
+        );
+        for _ in 0..20 {
+            if manager.active_process_count().await == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            manager.active_process_count().await,
+            0,
+            "exited app-server must not remain counted as active"
+        );
+
+        assert_eq!(
+            client
+                .request("echo", json!({ "request": 2 }))
+                .await
+                .expect("next request should restart app-server"),
+            json!({ "request": 2 })
+        );
+
+        client.close().await.expect("client should close");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn falls_back_to_stdio_when_handoff_proxy_does_not_initialize() {
         use std::os::unix::fs::PermissionsExt;
 

@@ -41,6 +41,10 @@ type ServerEnvelope =
       event: GlobalStreamEvent;
     }
   | {
+      kind: "resyncRequired";
+      reason: string;
+    }
+  | {
       kind: "pong";
       nonce?: string;
     };
@@ -323,6 +327,11 @@ export class WebSocketRpcClient {
       this.clearPongTimeout();
 
       if (payload.kind === "pong") {
+        return;
+      }
+
+      if (payload.kind === "resyncRequired") {
+        this.forceReconnect();
         return;
       }
 

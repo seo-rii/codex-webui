@@ -857,6 +857,37 @@ async fn websocket_inflight_resolution_drops_saturated_waiters_without_blocking(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saturated_websocket_queue_gets_resync_required_signal() {
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.try_send(ServerEnvelope::Pong { nonce: None })
+        .expect("test channel should fill");
+
+    assert!(!queue_ws_envelope(
+        &tx,
+        ServerEnvelope::Response {
+            id: "dropped".to_string(),
+            ok: true,
+            result: Some(json!({ "ok": true })),
+            error: None,
+        },
+        "test-saturation"
+    ));
+
+    let first = rx.recv().await.expect("filled message should be present");
+    assert!(matches!(first, ServerEnvelope::Pong { .. }));
+    let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("resync message should be queued")
+        .expect("resync message should be readable");
+    match second {
+        ServerEnvelope::ResyncRequired { reason } => {
+            assert!(reason.contains("test-saturation"));
+        }
+        other => panic!("expected resync required envelope, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_response_cache_prunes_oldest_entries_at_cap() {
     let sandbox = unique_test_dir("ws-cache-cap");
     let workspace = sandbox.join("workspace");

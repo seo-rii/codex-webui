@@ -254,6 +254,9 @@ pub(crate) enum ServerEnvelope {
     GlobalEvent {
         event: Value,
     },
+    ResyncRequired {
+        reason: String,
+    },
     Pong {
         nonce: Option<String>,
     },

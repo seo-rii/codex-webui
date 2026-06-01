@@ -177,10 +177,19 @@ pub(crate) fn queue_ws_envelope(
     match out_tx.try_send(message) {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(_)) => {
+            let reason = format!("outbound queue saturated while sending {context}");
             warn!(
                 context = context,
                 "dropping websocket message for saturated outbound queue"
             );
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    out_tx.send(ServerEnvelope::ResyncRequired { reason }),
+                )
+                .await;
+            });
             false
         }
         Err(mpsc::error::TrySendError::Closed(_)) => false,

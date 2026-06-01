@@ -233,7 +233,8 @@ Planned work:
   - link findings to file/diff tabs [partially done with file-tab links]
 - add rollback UI:
   - list rollback targets [partially done for loaded user-message turns]
-  - preview affected files before execution
+  - preview affected files before execution [done for file-change items in the
+    loaded rollback range]
   - require confirmation for destructive rollback actions [done for direct thread rollback]
 
 Acceptance criteria:

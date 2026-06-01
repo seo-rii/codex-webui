@@ -9333,7 +9333,37 @@
     if (affectedTurns.length > previewLines.length) {
       previewLines.push(`... +${affectedTurns.length - previewLines.length}`);
     }
-    const confirmMessage = `${ui.rollbackConfirm}\n\n${numTurns} turn${numTurns === 1 ? "" : "s"}:\n${previewLines.join("\n")}`;
+    const filePreviews: Array<{ path: string; added: number; removed: number }> = [];
+    for (const turn of affectedTurns) {
+      for (const item of turn.items) {
+        if (item.type !== "fileChange") {
+          continue;
+        }
+        for (const change of getFileChangeViews(item)) {
+          const stats = diffLineStats(change.diff);
+          const path = change.movePath ? `${change.path} -> ${change.movePath}` : change.path;
+          const existing = filePreviews.find((entry) => entry.path === path);
+          if (existing) {
+            existing.added += stats.added;
+            existing.removed += stats.removed;
+          } else {
+            filePreviews.push({ path, added: stats.added, removed: stats.removed });
+          }
+        }
+      }
+    }
+    const filePreviewLines = filePreviews.slice(0, 8).map((entry) => {
+      const stats = entry.added || entry.removed ? ` (+${entry.added}/-${entry.removed})` : "";
+      return `- ${entry.path}${stats}`;
+    });
+    if (filePreviews.length > filePreviewLines.length) {
+      filePreviewLines.push(`... +${filePreviews.length - filePreviewLines.length}`);
+    }
+    const filePreviewSection =
+      filePreviews.length > 0
+        ? `\n\nFile changes in affected turns (${filePreviews.length}):\n${filePreviewLines.join("\n")}`
+        : "\n\nFile changes in affected turns: none";
+    const confirmMessage = `${ui.rollbackConfirm}\n\n${numTurns} turn${numTurns === 1 ? "" : "s"}:\n${previewLines.join("\n")}${filePreviewSection}`;
     if (!window.confirm(confirmMessage)) {
       return;
     }

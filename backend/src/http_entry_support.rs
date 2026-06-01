@@ -218,6 +218,19 @@ async fn handle_http_inner(
                     .map(HashMap::len)
                     .sum::<usize>();
                 let app_server_client_count = state.app_servers.client_count().await;
+                let host_resources = host_resource_diagnostics_payload();
+                let host_memory_current_bytes = host_resources
+                    .get("memoryCurrentBytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let host_memory_max_bytes = host_resources
+                    .get("memoryMaxBytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let host_oom_kill_count = host_resources
+                    .get("oomKillCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
 
                 let metrics = format!(
                     "# TYPE codex_webui_profiles gauge\n\
@@ -253,7 +266,13 @@ codex_webui_active_turns {active_turn_count}\n\
 # TYPE codex_webui_pending_turn_starts gauge\n\
 codex_webui_pending_turn_starts {pending_turn_start_count}\n\
 # TYPE codex_webui_pending_server_requests gauge\n\
-codex_webui_pending_server_requests {pending_server_request_count}\n",
+codex_webui_pending_server_requests {pending_server_request_count}\n\
+# TYPE codex_webui_host_memory_current_bytes gauge\n\
+codex_webui_host_memory_current_bytes {host_memory_current_bytes}\n\
+# TYPE codex_webui_host_memory_max_bytes gauge\n\
+codex_webui_host_memory_max_bytes {host_memory_max_bytes}\n\
+# TYPE codex_webui_host_oom_kill_count counter\n\
+codex_webui_host_oom_kill_count {host_oom_kill_count}\n",
                     state.config.profiles.len(),
                     state.config.allowed_roots.len()
                 );

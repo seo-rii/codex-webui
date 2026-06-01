@@ -541,6 +541,13 @@ async fn runtime_status_includes_webui_build_metadata() {
             .and_then(Value::as_bool)
             .is_some()
     );
+    assert!(
+        payload
+            .get("hostResources")
+            .and_then(Value::as_object)
+            .is_some(),
+        "runtime status should expose host resource diagnostics"
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }

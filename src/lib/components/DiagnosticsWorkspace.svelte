@@ -63,6 +63,7 @@
         : "Inspect gateway status, Codex processes, and parser/native parity only when needed.",
       refresh: isKorean ? "새로고침" : "Refresh",
       runtime: isKorean ? "런타임" : "Runtime",
+      resources: isKorean ? "리소스" : "Resources",
       websocket: isKorean ? "웹소켓" : "WebSocket",
       processes: isKorean ? "Codex 프로세스" : "Codex processes",
       noProcesses: isKorean ? "관리 중인 Codex 프로세스가 없습니다." : "No managed Codex processes are running.",
@@ -82,6 +83,9 @@
       openSession: isKorean ? "세션 열기" : "Open session",
       available: isKorean ? "사용 가능" : "Available",
       unavailable: isKorean ? "사용 불가" : "Unavailable",
+      memoryCurrent: isKorean ? "현재 메모리" : "Memory current",
+      memoryLimit: isKorean ? "메모리 한도" : "Memory limit",
+      oomKills: isKorean ? "OOM kill" : "OOM kills",
       mismatches: isKorean ? "불일치" : "Mismatches",
       matched: isKorean ? "일치" : "Matched",
       viewerLimited: isKorean
@@ -162,6 +166,20 @@
       return String(value);
     }
   }
+
+  function formatBytes(value: number | null | undefined) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+      return "-";
+    }
+    const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let next = value;
+    let unitIndex = 0;
+    while (next >= 1024 && unitIndex < units.length - 1) {
+      next /= 1024;
+      unitIndex += 1;
+    }
+    return `${next >= 10 || unitIndex === 0 ? next.toFixed(0) : next.toFixed(1)} ${units[unitIndex]}`;
+  }
 </script>
 
 <div class="diagnostics-workspace">
@@ -207,13 +225,32 @@
       </dl>
       {#if runtimeStatus?.issues?.length}
         <div class="diagnostics-issue-list">
-          {#each runtimeStatus.issues as issue}
+          {#each runtimeStatus.issues as issue (issue)}
             <span>{issue}</span>
           {/each}
         </div>
       {/if}
     </article>
 
+    <article class="diagnostics-card">
+      <div class="diagnostics-card__header">
+        <div class="diagnostics-card__title">
+          <Database size={16} />
+          <h3>{ui.resources}</h3>
+        </div>
+        <span class={`diagnostics-pill ${(runtimeStatus?.hostResources?.oomKillCount ?? 0) > 0 ? "diagnostics-pill--warn" : ""}`}>
+          {(runtimeStatus?.hostResources?.oomKillCount ?? 0) > 0 ? `${runtimeStatus?.hostResources?.oomKillCount} OOM` : "ok"}
+        </span>
+      </div>
+      <dl class="diagnostics-kv">
+        <div><dt>{ui.memoryCurrent}</dt><dd>{formatBytes(runtimeStatus?.hostResources?.memoryCurrentBytes)}</dd></div>
+        <div><dt>{ui.memoryLimit}</dt><dd>{formatBytes(runtimeStatus?.hostResources?.memoryMaxBytes ?? runtimeStatus?.hostResources?.procMemTotalBytes)}</dd></div>
+        <div><dt>{ui.oomKills}</dt><dd>{runtimeStatus?.hostResources?.oomKillCount ?? 0}</dd></div>
+      </dl>
+    </article>
+  </section>
+
+  <section class="diagnostics-grid">
     <article class="diagnostics-card">
       <div class="diagnostics-card__header">
         <div class="diagnostics-card__title">
@@ -227,9 +264,7 @@
         <div><dt>{ui.selectedSession}</dt><dd>{selectedSessionId ?? "-"}</dd></div>
       </dl>
     </article>
-  </section>
 
-  <section class="diagnostics-grid">
     <article class="diagnostics-card">
       <div class="diagnostics-card__header">
         <div class="diagnostics-card__title">

@@ -800,6 +800,15 @@ export type CodexRuntimeStatus = {
   webuiBuildCommitShort: string;
   webuiBuildDirty: boolean;
   webuiBuildTimestamp: string;
+  hostResources?: {
+    memoryCurrentBytes?: number | null;
+    memoryMaxBytes?: number | null;
+    memoryUsageRatio?: number | null;
+    procMemTotalBytes?: number | null;
+    oomCount?: number | null;
+    oomKillCount?: number | null;
+    memoryEvents?: Record<string, number>;
+  };
   issues: string[];
 };
 

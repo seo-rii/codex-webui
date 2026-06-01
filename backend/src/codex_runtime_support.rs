@@ -63,8 +63,71 @@ pub(crate) async fn codex_runtime_status(state: &AppState, check_latest: bool) -
         "webuiBuildCommitShort": option_env!("CODEX_WEBUI_BUILD_COMMIT_SHORT").unwrap_or(webui_build_commit),
         "webuiBuildDirty": option_env!("CODEX_WEBUI_BUILD_DIRTY").unwrap_or("false") == "true",
         "webuiBuildTimestamp": option_env!("CODEX_WEBUI_BUILD_TIMESTAMP").unwrap_or("unknown"),
+        "hostResources": host_resource_diagnostics_payload(),
         "issues": issues,
     }))
+}
+
+pub(crate) fn host_resource_diagnostics_payload() -> Value {
+    let read_trimmed = |path: &str| {
+        fs::read_to_string(path)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let parse_u64 = |value: &str| value.parse::<u64>().ok();
+    let read_u64 = |path: &str| read_trimmed(path).and_then(|value| parse_u64(&value));
+
+    let memory_current_bytes = read_u64("/sys/fs/cgroup/memory.current")
+        .or_else(|| read_u64("/sys/fs/cgroup/memory/memory.usage_in_bytes"));
+    let memory_max_bytes = read_trimmed("/sys/fs/cgroup/memory.max")
+        .and_then(|value| (value != "max").then(|| parse_u64(&value)).flatten())
+        .or_else(|| read_u64("/sys/fs/cgroup/memory/memory.limit_in_bytes"));
+    let proc_mem_total_bytes = fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|content| {
+            content.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemTotal:")?.trim();
+                let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+                Some(kib.saturating_mul(1024))
+            })
+        });
+    let mut memory_events = serde_json::Map::new();
+    if let Some(content) = fs::read_to_string("/sys/fs/cgroup/memory.events").ok() {
+        for line in content.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(key) = parts.next() else {
+                continue;
+            };
+            let Some(value) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+                continue;
+            };
+            memory_events.insert(key.to_string(), json!(value));
+        }
+    } else if let Some(fail_count) = read_u64("/sys/fs/cgroup/memory/memory.failcnt") {
+        memory_events.insert("failcnt".to_string(), json!(fail_count));
+    }
+    let oom_count = memory_events.get("oom").and_then(Value::as_u64);
+    let oom_kill_count = memory_events
+        .get("oom_kill")
+        .and_then(Value::as_u64)
+        .or_else(|| memory_events.get("failcnt").and_then(Value::as_u64));
+    let memory_usage_ratio =
+        memory_current_bytes
+            .zip(memory_max_bytes)
+            .and_then(|(current, max)| {
+                (max > 0 && current <= max).then_some((current as f64) / (max as f64))
+            });
+
+    json!({
+        "memoryCurrentBytes": memory_current_bytes,
+        "memoryMaxBytes": memory_max_bytes,
+        "memoryUsageRatio": memory_usage_ratio,
+        "procMemTotalBytes": proc_mem_total_bytes,
+        "oomCount": oom_count,
+        "oomKillCount": oom_kill_count,
+        "memoryEvents": memory_events
+    })
 }
 
 pub(crate) async fn codex_runtime_processes_payload(

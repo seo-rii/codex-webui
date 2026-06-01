@@ -1297,6 +1297,9 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
     let metrics_text = String::from_utf8(metrics_body.to_vec()).unwrap();
     assert!(metrics_text.contains("codex_webui_profiles 1"));
     assert!(metrics_text.contains("codex_webui_response_cache_entries 0"));
+    assert!(metrics_text.contains("codex_webui_host_memory_current_bytes"));
+    assert!(metrics_text.contains("codex_webui_host_memory_max_bytes"));
+    assert!(metrics_text.contains("codex_webui_host_oom_kill_count"));
 
     let denied_handoff_request = Request::builder()
         .method(Method::POST)

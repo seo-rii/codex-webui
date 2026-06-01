@@ -821,7 +821,8 @@ pub(crate) async fn hydrate_rollout_candidates_to_threads_payload(
         }
     };
 
-    let mut threads = Vec::with_capacity(candidates.len());
+    let mut threads_by_id = HashMap::new();
+    let mut fallback_candidates = Vec::new();
     for candidate in candidates {
         let session_id = candidate
             .get("id")
@@ -831,11 +832,55 @@ pub(crate) async fn hydrate_rollout_candidates_to_threads_payload(
         if let Some(payload) = thread.as_mut() {
             merge_candidate_metadata_into_thread(payload, candidate, archived);
         } else {
-            thread = read_rollout_thread_metadata_from_candidate(candidate, archived).await?;
+            fallback_candidates.push(candidate.clone());
+            continue;
         }
         if let Some(mut payload) = thread {
             merge_candidate_metadata_into_thread(&mut payload, candidate, archived);
-            threads.push(payload);
+            threads_by_id.insert(session_id.to_string(), payload);
+        }
+    }
+
+    let fallback_threads = tokio::task::spawn_blocking(move || {
+        let mut metadata_by_id = HashMap::new();
+        for candidate in fallback_candidates {
+            let Some(path) = candidate.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let modified_at = candidate
+                .get("updatedAt")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            let Some(mut thread) =
+                read_rollout_thread_metadata_from_path(&PathBuf::from(path), archived, modified_at)
+            else {
+                continue;
+            };
+            merge_candidate_metadata_into_thread(&mut thread, &candidate, archived);
+            let Some(session_id) = thread.get("id").and_then(Value::as_str).map(str::to_string)
+            else {
+                continue;
+            };
+            metadata_by_id.insert(session_id, thread);
+        }
+        metadata_by_id
+    })
+    .await
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to batch hydrate session rollout metadata: {error}"),
+        )
+    })?;
+    threads_by_id.extend(fallback_threads);
+
+    let mut threads = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let Some(session_id) = candidate.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(thread) = threads_by_id.remove(session_id) {
+            threads.push(thread);
         }
     }
     Ok(threads)

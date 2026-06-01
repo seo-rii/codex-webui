@@ -895,6 +895,104 @@ async fn rollout_file_listing_hydrates_visible_entries_from_state_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollout_file_listing_batch_hydrates_visible_entries_without_state_metadata() {
+    let sandbox = unique_test_dir("session-rollout-batch-hydration");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let sessions = [
+        (
+            "019e0000-0000-7000-8000-000000000032",
+            "Batch title one",
+            "first fallback prompt",
+            "2026-04-24T01:21:01.000Z",
+        ),
+        (
+            "019e0000-0000-7000-8000-000000000033",
+            "Batch title two",
+            "second fallback prompt",
+            "2026-04-24T01:21:02.000Z",
+        ),
+        (
+            "019e0000-0000-7000-8000-000000000034",
+            "Batch title three",
+            "third fallback prompt",
+            "2026-04-24T01:21:03.000Z",
+        ),
+    ];
+    for (index, (session_id, title, prompt, updated_at)) in sessions.iter().enumerate() {
+        write_rollout_fixture(
+            &codex_home,
+            false,
+            "2026/04/24",
+            &format!("2026-04-24T01-21-0{index}"),
+            session_id,
+            &workspace,
+            prompt,
+            &[],
+            None,
+        );
+        append_session_index_fixture(&codex_home, session_id, title, updated_at);
+    }
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let listed = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let listed_ids = listed
+        .iter()
+        .map(|session| {
+            session
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed_ids,
+        vec![
+            "019e0000-0000-7000-8000-000000000034",
+            "019e0000-0000-7000-8000-000000000033",
+            "019e0000-0000-7000-8000-000000000032"
+        ]
+    );
+    assert_eq!(
+        listed
+            .get(1)
+            .and_then(|session| session.get("name"))
+            .and_then(Value::as_str),
+        Some("Batch title two")
+    );
+    assert_eq!(
+        listed
+            .get(1)
+            .and_then(|session| session.get("preview"))
+            .and_then(Value::as_str),
+        Some("second fallback prompt")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rollout_file_listing_filters_state_db_source_only_subagents() {
     let sandbox = unique_test_dir("session-state-source-subagent");
     let workspace = sandbox.join("workspace");

@@ -361,7 +361,7 @@ fn web_search_item_from_rollout_payload(
     fallback_id: String,
     status: &str,
 ) -> Value {
-    json!({
+    let mut item = json!({
         "id": payload
             .get("call_id")
             .or_else(|| payload.get("id"))
@@ -372,7 +372,27 @@ fn web_search_item_from_rollout_payload(
         "status": status,
         "query": payload.get("query").cloned().unwrap_or(Value::Null),
         "action": payload.get("action").cloned().unwrap_or(Value::Null)
-    })
+    });
+    if let Some(object) = item.as_object_mut() {
+        for (target_key, source_keys) in [
+            ("summary", ["summary", "result_summary", "resultSummary"]),
+            ("results", ["results", "search_results", "searchResults"]),
+            ("sources", ["sources", "source_results", "sourceResults"]),
+            (
+                "citations",
+                ["citations", "citation_results", "citationResults"],
+            ),
+        ] {
+            if let Some(value) = source_keys
+                .iter()
+                .filter_map(|source_key| payload.get(*source_key))
+                .find(|value| !value.is_null())
+            {
+                object.insert(target_key.to_string(), value.clone());
+            }
+        }
+    }
+    item
 }
 
 fn image_generation_item_from_rollout_payload(

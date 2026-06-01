@@ -3977,6 +3977,12 @@
 
     if (sanitized.type === "webSearch") {
       delete sanitized.action;
+      delete sanitized.results;
+      delete sanitized.sources;
+      delete sanitized.citations;
+      delete sanitized.searchResults;
+      delete sanitized.sourceResults;
+      delete sanitized.citationResults;
     }
 
     if (sanitized.type === "mcpToolCall" || sanitized.type === "dynamicToolCall") {
@@ -6359,6 +6365,58 @@
 
   function getWebSearchStatus(item: CodexItem) {
     return formatValue(item.status) || "completed";
+  }
+
+  type WebSearchReference = {
+    title: string;
+    url: string;
+    snippet: string;
+  };
+
+  function normalizeWebSearchReferences(value: unknown): WebSearchReference[] {
+    const entries = Array.isArray(value) ? value : value ? [value] : [];
+    return entries
+      .map((entry) => {
+        const record = getRecordValue(entry);
+        if (!record) {
+          const text = formatValue(entry);
+          return text ? { title: text, url: "", snippet: "" } : null;
+        }
+        const title =
+          formatValue(record.title) ||
+          formatValue(record.name) ||
+          formatValue(record.source) ||
+          formatValue(record.url) ||
+          formatValue(record.link);
+        const url = formatValue(record.url) || formatValue(record.link) || formatValue(record.href);
+        const snippet =
+          formatValue(record.snippet) ||
+          formatValue(record.summary) ||
+          formatValue(record.text) ||
+          formatValue(record.content) ||
+          formatValue(record.description);
+        return title || url || snippet ? { title, url, snippet } : null;
+      })
+      .filter((entry): entry is WebSearchReference => Boolean(entry));
+  }
+
+  function getWebSearchSummary(item: CodexItem) {
+    return formatValue(item.summary) || formatValue(item.resultSummary) || formatValue(item.result_summary);
+  }
+
+  function getWebSearchResults(item: CodexItem) {
+    return normalizeWebSearchReferences(item.results ?? item.searchResults ?? item.search_results);
+  }
+
+  function getWebSearchSources(item: CodexItem) {
+    const references = [
+      ...normalizeWebSearchReferences(item.sources ?? item.sourceResults ?? item.source_results),
+      ...normalizeWebSearchReferences(item.citations ?? item.citationResults ?? item.citation_results)
+    ];
+    return references.filter((entry, index) => {
+      const key = `${entry.url}\n${entry.title}\n${entry.snippet}`;
+      return references.findIndex((candidate) => `${candidate.url}\n${candidate.title}\n${candidate.snippet}` === key) === index;
+    });
   }
 
   function getReviewText(item: CodexItem) {
@@ -14222,36 +14280,78 @@
   {@const actionType = getWebSearchActionType(item)}
   {@const actionUrl = getWebSearchUrl(item)}
   {@const actionPattern = getWebSearchPattern(item)}
+  {@const resultSummary = getWebSearchSummary(item)}
+  {@const results = getWebSearchResults(item)}
+  {@const sources = getWebSearchSources(item)}
   <div class="space-y-3 p-3">
     <div class="grid gap-2 sm:grid-cols-2">
-      <div class="rounded-xl border border-gray-100 bg-gray-50 px-3 py-2">
-        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400">Status</p>
-        <p class="mt-1 text-xs font-semibold text-gray-700">{getWebSearchStatus(item)}</p>
+      <div class="rounded-xl border border-gray-100 bg-gray-50 px-3 py-2 dark:border-white/10 dark:bg-white/5">
+        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Status</p>
+        <p class="mt-1 text-xs font-semibold text-gray-700 dark:text-gray-200">{getWebSearchStatus(item)}</p>
       </div>
       {#if actionType}
-        <div class="rounded-xl border border-gray-100 bg-gray-50 px-3 py-2">
-          <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400">Action</p>
-          <p class="mt-1 text-xs font-semibold text-gray-700">{actionType}</p>
+        <div class="rounded-xl border border-gray-100 bg-gray-50 px-3 py-2 dark:border-white/10 dark:bg-white/5">
+          <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Action</p>
+          <p class="mt-1 text-xs font-semibold text-gray-700 dark:text-gray-200">{actionType}</p>
         </div>
       {/if}
     </div>
+    {#if resultSummary}
+      <div class="rounded-xl border border-blue-100 bg-blue-50/80 px-3 py-2.5 dark:border-blue-300/20 dark:bg-blue-400/10">
+        <p class="text-[9px] font-bold uppercase tracking-widest text-blue-500 dark:text-blue-300">Summary</p>
+        <p class="mt-1 text-xs leading-relaxed text-blue-950 dark:text-blue-100">{resultSummary}</p>
+      </div>
+    {/if}
     {#if queries.length > 0}
-      <div class="rounded-xl border border-gray-100 bg-white px-3 py-2.5">
-        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400">Queries</p>
+      <div class="rounded-xl border border-gray-100 bg-white px-3 py-2.5 dark:border-white/10 dark:bg-white/[0.03]">
+        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Queries</p>
         <ul class="mt-2 space-y-1.5">
           {#each queries as query (`${item.id}:query:${query}`)}
-            <li class="rounded-lg bg-gray-50 px-2.5 py-1.5 text-xs font-medium text-gray-700">{query}</li>
+            <li class="rounded-lg bg-gray-50 px-2.5 py-1.5 text-xs font-medium text-gray-700 dark:bg-white/5 dark:text-gray-200">{query}</li>
           {/each}
         </ul>
       </div>
     {/if}
+    {#if results.length > 0}
+      <div class="rounded-xl border border-gray-100 bg-white px-3 py-2.5 dark:border-white/10 dark:bg-white/[0.03]">
+        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Results</p>
+        <ul class="mt-2 space-y-2">
+          {#each results as result, index (`${item.id}:result:${result.url || result.title || index}`)}
+            <li class="rounded-xl bg-gray-50 px-3 py-2 dark:bg-white/5">
+              {#if result.url}
+                <a class="block truncate text-xs font-semibold text-blue-700 hover:underline dark:text-blue-300" href={result.url} target="_blank" rel="noreferrer">{result.title || result.url}</a>
+              {:else}
+                <p class="truncate text-xs font-semibold text-gray-800 dark:text-gray-100">{result.title}</p>
+              {/if}
+              {#if result.snippet}
+                <p class="mt-1 line-clamp-2 text-[11px] leading-relaxed text-gray-500 dark:text-gray-400">{result.snippet}</p>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
+    {#if sources.length > 0}
+      <div class="rounded-xl border border-gray-100 bg-white px-3 py-2.5 dark:border-white/10 dark:bg-white/[0.03]">
+        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Sources</p>
+        <div class="mt-2 flex flex-wrap gap-1.5">
+          {#each sources as source, index (`${item.id}:source:${source.url || source.title || index}`)}
+            {#if source.url}
+              <a class="max-w-full truncate rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-[11px] font-medium text-gray-700 hover:border-blue-200 hover:text-blue-700 dark:border-white/10 dark:bg-white/5 dark:text-gray-200 dark:hover:border-blue-300/40 dark:hover:text-blue-300" href={source.url} target="_blank" rel="noreferrer">{source.title || source.url}</a>
+            {:else}
+              <span class="max-w-full truncate rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-[11px] font-medium text-gray-700 dark:border-white/10 dark:bg-white/5 dark:text-gray-200">{source.title || source.snippet}</span>
+            {/if}
+          {/each}
+        </div>
+      </div>
+    {/if}
     {#if actionUrl || actionPattern}
-      <div class="rounded-xl border border-gray-100 bg-white px-3 py-2.5">
+      <div class="rounded-xl border border-gray-100 bg-white px-3 py-2.5 dark:border-white/10 dark:bg-white/[0.03]">
         {#if actionUrl}
-          <p class="truncate text-xs font-semibold text-gray-700">{actionUrl}</p>
+          <p class="truncate text-xs font-semibold text-gray-700 dark:text-gray-200">{actionUrl}</p>
         {/if}
         {#if actionPattern}
-          <p class="mt-1 truncate text-[11px] text-gray-500">{actionPattern}</p>
+          <p class="mt-1 truncate text-[11px] text-gray-500 dark:text-gray-400">{actionPattern}</p>
         {/if}
       </div>
     {/if}

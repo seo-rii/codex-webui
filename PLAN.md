@@ -222,8 +222,10 @@ Planned work:
   - avoid embedding large base64 images in default session payloads
 - add standalone web search cards:
   - render query and status [done]
-  - render citations and result summary
-  - keep raw result details lazy-loaded
+  - render citations and result summary [done for rollout payloads that include
+    `summary`, `results`, `sources`, or `citations`; upstream currently exposes
+    `web_search_call.action` as the stable typed field]
+  - keep raw result details lazy-loaded [done]
 - add review mode UI:
   - start review sessions [done via `/review`, with `--detached` support]
   - display review-mode markers [done]

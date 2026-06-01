@@ -3572,7 +3572,21 @@ async fn local_session_detail_parses_rich_transcript_items_and_rollbacks() {
                     "type": "web_search_end",
                     "call_id": "search-1",
                     "query": "codex web search",
-                    "action": { "type": "search", "query": "codex web search" }
+                    "action": { "type": "search", "query": "codex web search" },
+                    "summary": "Found Codex web UI notes.",
+                    "results": [
+                        {
+                            "title": "Codex Web Search",
+                            "url": "https://example.com/codex-web-search",
+                            "snippet": "Search result summary"
+                        }
+                    ],
+                    "citations": [
+                        {
+                            "title": "Codex docs",
+                            "url": "https://example.com/docs"
+                        }
+                    ]
                 }
             }),
             json!({
@@ -3675,6 +3689,31 @@ async fn local_session_detail_parses_rich_transcript_items_and_rollbacks() {
     assert!(item_types.contains(&"imageView"));
     assert!(item_types.contains(&"enteredReviewMode"));
     assert!(item_types.contains(&"exitedReviewMode"));
+    let web_search = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("webSearch"))
+        .expect("web search item should be parsed");
+    assert_eq!(
+        web_search.get("summary").and_then(Value::as_str),
+        Some("Found Codex web UI notes.")
+    );
+    assert_eq!(
+        web_search
+            .get("results")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        web_search
+            .get("citations")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
     assert!(!turns.iter().any(|turn| {
         serde_json::to_string(turn)
             .unwrap()

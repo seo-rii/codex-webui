@@ -188,6 +188,7 @@ timestamp_counter = 0
 turn_counter = 0
 request_counts = {}
 method_delays = {}
+method_errors = {}
 args = sys.argv[1:]
 goals_enabled = any(args[index:index + 2] == ["--enable", "goals"] for index in range(len(args)))
 
@@ -218,6 +219,18 @@ for raw_line in sys.stdin:
             }
         })
         continue
+    if method == "debug/setError":
+        target = str(params.get("method") or "")
+        message = str(params.get("message") or "debug forced error")
+        if target:
+            method_errors[target] = message
+        write({
+            "id": request_id,
+            "result": {
+                "ok": True
+            }
+        })
+        continue
     if method == "debug/setGoalsEnabled":
         goals_enabled = bool(params.get("enabled"))
         write({
@@ -240,6 +253,16 @@ for raw_line in sys.stdin:
     delay_ms = int(method_delays.get(method, 0) or 0)
     if delay_ms > 0:
         time.sleep(delay_ms / 1000)
+    error_message = method_errors.get(method)
+    if error_message:
+        write({
+            "id": request_id,
+            "error": {
+                "code": -32000,
+                "message": str(error_message)
+            }
+        })
+        continue
 
     if method == "initialize":
         write({

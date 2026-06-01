@@ -4614,6 +4614,112 @@ async fn send_turn_payload_rejects_concurrent_turn_starts() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_turn_payload_clears_runtime_state_when_turn_start_fails() {
+    let sandbox = unique_test_dir("turn-send-start-failure");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        None,
+        Some("Turn start failure"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "debug/setError",
+            json!({
+                "method": "turn/start",
+                "message": "forced turn start failure"
+            }),
+        )
+        .await
+        .unwrap();
+
+    let error = send_turn_payload(
+        &state,
+        "default",
+        &session_id,
+        "This turn should fail before it becomes running.",
+        None,
+        None,
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        Some("client-failed-turn"),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+    assert!(error.message.contains("forced turn start failure"));
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, "default").0,
+        &session_id,
+    );
+    assert!(
+        state
+            .pending_turn_starts
+            .lock()
+            .await
+            .get(&runtime_key)
+            .is_none()
+    );
+    assert!(state.active_turns.lock().await.get(&runtime_key).is_none());
+
+    let runtime_status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][&session_id].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime_status.get("status").and_then(Value::as_str),
+        Some("failed")
+    );
+
+    let summary = build_session_summary_payload(&state, "default", &session_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.get("status").and_then(Value::as_str),
+        Some("failed")
+    );
+
+    let request_count = client
+        .request("debug/requestCount", json!({ "target": "turn/start" }))
+        .await
+        .unwrap();
+    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(1));
+
+    let thread = read_thread_payload(&state, "default", &session_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        thread.get("turns").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test]
 async fn send_turn_payload_translates_language_bridge_prompt_with_temp_session() {
     let sandbox = unique_test_dir("turn-language-bridge");

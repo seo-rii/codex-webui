@@ -280,6 +280,11 @@ Resource limits:
 - For constrained code-server containers, start with `CODEX_WEBUI_SERVER_THREADS=1`,
   `CODEX_WEBUI_BLOCKING_THREADS=4`, and the default stack size. Lowering the
   stack can crash deep session/JSON processing with Rust stack overflow.
+- Release checks can run `pnpm gateway:build && pnpm build:e2e-fake &&
+  pnpm verify:low-memory-smoke` to start the gateway under an 8 GB POSIX
+  virtual-memory limit, exercise fake Codex session creation plus message send,
+  and confirm memory diagnostics are exposed. The smoke script only signals the
+  gateway child process it starts.
 - Terminals also stay alive while the Rust gateway remains up.
 - "Shutdown after queue completes" is a server-global operational toggle, not a per-session preference.
 - When that toggle is armed, the gateway waits until every session queue is empty and no live Codex turn is still running before scheduling shutdown.

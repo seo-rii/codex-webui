@@ -145,6 +145,14 @@ Restart uses a handoff path on platforms where Codex supports Unix control socke
 
 Startup keeps runtime profile state lightweight. The gateway restores persisted queue/shutdown metadata for every profile, but it does not start Codex app-server processes until a profile receives an active Codex request. `CODEX_WEBUI_MAX_APP_SERVERS` caps concurrent Codex app-server processes and defaults to an automatic CPU/memory-based value capped at `4`; `CODEX_WEBUI_PER_SESSION_APP_SERVERS=true` opts into one app-server per newly active session in the same profile, while the default keeps same-profile sessions on a shared app-server. `/goal` updates still dedicate an app-server to unassigned sessions because goal work is typically long-running. `CODEX_WEBUI_APP_SERVER_TIMEOUT_SECONDS` defaults to `600` so long-session `thread/read`, resume, and `turn/start` requests are not cut off during initial loading; `CODEX_WEBUI_SERVER_THREADS`, `CODEX_WEBUI_BLOCKING_THREADS`, `CODEX_WEBUI_SERVER_THREAD_STACK_BYTES`, and `CODEX_WEBUI_CONTROLLER_THREADS` can be tuned for larger hosts. On constrained code-server hosts, reduce worker counts before lowering stack size; too small a stack can crash deep session and JSON processing.
 
+For release verification on constrained hosts, run `pnpm gateway:build`,
+`pnpm build:e2e-fake`, then `pnpm verify:low-memory-smoke`. The smoke check
+starts the built gateway with a fake Codex app-server under an 8 GB POSIX
+virtual-memory limit by default, creates a session, sends one turn, reads the
+session back, and asserts that host-memory metrics are present. The script only
+terminates the child gateway process it spawned, avoiding broad process-group
+signals that could kill the invoking shell or code-server.
+
 Terminal sessions store the child PID plus Linux process start metadata when
 available. Cleanup and close actions re-check that identity before sending
 process-group signals, so a stale PID is not allowed to target a reused process

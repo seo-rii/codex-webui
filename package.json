@@ -34,6 +34,7 @@
     "verify:codex-protocol": "pnpm verify:codex-compat",
     "verify:static-build": "node ./scripts/verify-static-build.mjs",
     "verify:security-regressions": "node ./scripts/verify-security-regressions.mjs",
+    "verify:low-memory-smoke": "node ./scripts/verify-low-memory-smoke.mjs",
     "verify:tunnel-safety": "node ./scripts/verify-tunnel-safety.mjs",
     "gateway:dev": "cargo run --manifest-path backend/Cargo.toml",
     "gateway:check": "cargo check --manifest-path backend/Cargo.toml",

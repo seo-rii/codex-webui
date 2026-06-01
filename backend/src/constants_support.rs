@@ -24,6 +24,7 @@ pub(crate) const SESSION_SEARCH_TEXT_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const UI_STATE_CACHE_MAX_ENTRIES: usize = 64;
 pub(crate) const WS_MAX_CONCURRENT_REQUESTS: usize = 32;
 pub(crate) const WS_MAX_PROFILE_CONCURRENT_REQUESTS: usize = 64;
+pub(crate) const WS_REQUEST_SLOT_WAIT: Duration = Duration::from_millis(250);
 pub(crate) const WS_MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const WS_ATTACHMENT_UPLOAD_MAX_DECODED_BYTES: u64 = 1024 * 1024;
 pub(crate) const WS_OUTBOUND_QUEUE_CAPACITY: usize = 1024;

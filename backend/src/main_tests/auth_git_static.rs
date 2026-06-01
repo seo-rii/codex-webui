@@ -888,6 +888,43 @@ async fn saturated_websocket_queue_gets_resync_required_signal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_profile_request_slot_waits_for_transient_capacity() {
+    let sandbox = unique_test_dir("ws-profile-slot-wait");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+
+    let mut permits = Vec::new();
+    for _ in 0..WS_MAX_PROFILE_CONCURRENT_REQUESTS {
+        permits.push(
+            try_acquire_profile_ws_request_slot(&state, "default")
+                .await
+                .expect("profile request slot should be available"),
+        );
+    }
+    let released_permit = permits.pop().expect("held slot should exist");
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(released_permit);
+    });
+
+    let reacquired = try_acquire_profile_ws_request_slot(&state, "default").await;
+    assert!(
+        reacquired.is_some(),
+        "transient profile request saturation should wait instead of failing immediately"
+    );
+    drop(reacquired);
+    drop(permits);
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_response_cache_prunes_oldest_entries_at_cap() {
     let sandbox = unique_test_dir("ws-cache-cap");
     let workspace = sandbox.join("workspace");

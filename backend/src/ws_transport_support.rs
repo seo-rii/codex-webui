@@ -108,26 +108,42 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
                 };
 
                 let request_permit = match &payload {
-                    ClientEnvelope::Request { id, .. } => {
-                        match Arc::clone(&request_slots).try_acquire_owned() {
-                            Ok(permit) => Some(permit),
-                            Err(_) => {
-                                let _ = queue_ws_envelope(
-                                    &out_tx,
-                                    ServerEnvelope::Response {
-                                        id: id.clone(),
-                                        ok: false,
-                                        result: None,
-                                        error: Some(
-                                            "Too many concurrent websocket requests.".to_string(),
-                                        ),
-                                    },
-                                    "connection-concurrency-limit",
-                                );
-                                continue;
-                            }
+                    ClientEnvelope::Request { id, .. } => match tokio::time::timeout(
+                        WS_REQUEST_SLOT_WAIT,
+                        Arc::clone(&request_slots).acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => Some(permit),
+                        Ok(Err(_)) => {
+                            let _ = queue_ws_envelope(
+                                &out_tx,
+                                ServerEnvelope::Response {
+                                    id: id.clone(),
+                                    ok: false,
+                                    result: None,
+                                    error: Some("WebSocket request limiter is closed.".to_string()),
+                                },
+                                "connection-concurrency-closed",
+                            );
+                            continue;
                         }
-                    }
+                        Err(_) => {
+                            let _ = queue_ws_envelope(
+                                &out_tx,
+                                ServerEnvelope::Response {
+                                    id: id.clone(),
+                                    ok: false,
+                                    result: None,
+                                    error: Some(
+                                        "Too many concurrent websocket requests.".to_string(),
+                                    ),
+                                },
+                                "connection-concurrency-limit",
+                            );
+                            continue;
+                        }
+                    },
                     ClientEnvelope::Ping { .. } => None,
                 };
                 let state = state.clone();
@@ -207,7 +223,10 @@ pub(crate) async fn try_acquire_profile_ws_request_slot(
             .or_insert_with(|| Arc::new(Semaphore::new(WS_MAX_PROFILE_CONCURRENT_REQUESTS)))
             .clone()
     };
-    slots.try_acquire_owned().ok()
+    tokio::time::timeout(WS_REQUEST_SLOT_WAIT, slots.acquire_owned())
+        .await
+        .ok()
+        .and_then(Result::ok)
 }
 
 async fn handle_ws_message(

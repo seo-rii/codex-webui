@@ -9214,6 +9214,15 @@
     requestTranscriptBottomScroll(true);
   }
 
+  function summarizeTurnForRollbackPreview(turn: CodexTurn) {
+    const userText = turn.items.map((item) => (item.type === "userMessage" ? getUserText(item) : "")).find((value) => value.trim());
+    const agentText = turn.items
+      .map((item) => (item.type === "agentMessage" && typeof item.text === "string" ? item.text : ""))
+      .find((value) => value.trim());
+    const text = (userText || agentText || turn.id).replace(/\s+/gu, " ").trim();
+    return text.length > 96 ? `${text.slice(0, 96).trimEnd()}...` : text;
+  }
+
   async function forkCurrentThread(
     mode: "fork" | "handoff",
     options: {
@@ -9261,7 +9270,13 @@
       noticeText = m.rollback_no_later_turns();
       return;
     }
-    if (!window.confirm(ui.rollbackConfirm)) {
+    const affectedTurns = conversation.thread.turns.slice(turnIndex + 1);
+    const previewLines = affectedTurns.slice(0, 6).map((turn, index) => `${index + 1}. ${summarizeTurnForRollbackPreview(turn)}`);
+    if (affectedTurns.length > previewLines.length) {
+      previewLines.push(`... +${affectedTurns.length - previewLines.length}`);
+    }
+    const confirmMessage = `${ui.rollbackConfirm}\n\n${numTurns} turn${numTurns === 1 ? "" : "s"}:\n${previewLines.join("\n")}`;
+    if (!window.confirm(confirmMessage)) {
       return;
     }
     const sessionId = selectedSessionId;

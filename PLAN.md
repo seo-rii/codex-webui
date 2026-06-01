@@ -81,6 +81,13 @@ Acceptance criteria:
 Objective: give every user-authored message a stable client id across send,
 steer, and queued dispatch paths.
 
+Status: implemented for current send, steer, queue, queued dispatch, and
+optimistic reconciliation paths. The browser generates stable client ids for
+composer submissions, the backend passes them to native `turn/start` and
+`turn/steer`, queue items persist them, queued dispatch reuses them, and tests
+cover native app-server propagation. Future work should focus on keeping this
+model intact as new message entry points are added.
+
 Planned work:
 
 - generate or preserve a client-side id for every composer submission
@@ -105,6 +112,13 @@ Acceptance criteria:
 Objective: expose runtime and parser diagnostics from the `Open` menu as a
 dedicated tab.
 
+Status: implemented for the current diagnostics surface. The `Open` menu has a
+Diagnostics tab with runtime status, WebSocket status, managed Codex processes,
+active/queued/attention session counts, recent runtime notifications,
+host-memory/OOM indicators, and explicit parser-vs-native comparison for a
+selected session. Expensive native comparison remains user-triggered so sidebar
+loading stays on the bounded parser/index path.
+
 Planned work:
 
 - add `Diagnostics` to the `Open` menu
@@ -122,6 +136,10 @@ Acceptance criteria:
 ### 4. Native Archive And Unarchive
 
 Objective: move archive/restore actions onto upstream Codex APIs where possible.
+
+Status: implemented. Archive and restore actions call native `thread/archive`
+and `thread/unarchive`, runtime archive notifications reconcile sidebar state,
+and tests verify native thread state and sidebar visibility stay aligned.
 
 Planned work:
 

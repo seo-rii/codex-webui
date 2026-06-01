@@ -2540,6 +2540,94 @@ if "app-server" in args and "--listen" in args and args[args.index("--listen") +
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdio_timeout_does_not_use_handoff_recovery_even_with_handoff_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "codex-webui-stdio-timeout-no-handoff-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script_path = dir.join("fake-codex.py");
+        let handoff_dir = dir.join("handoff");
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        std::fs::create_dir_all(&handoff_dir).expect("handoff dir should be created");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+import time
+
+def respond(payload, result=None):
+    print(json.dumps({"id": payload.get("id"), "result": result or {}}), flush=True)
+
+args = sys.argv[1:]
+if "app-server" in args and "--listen" in args and args[args.index("--listen") + 1] == "stdio://":
+    for raw_line in sys.stdin:
+        payload = json.loads(raw_line)
+        method = payload.get("method")
+        if method == "initialize":
+            respond(payload, {"serverInfo": {"name": "fake"}})
+        elif method == "initialized":
+            pass
+        elif method == "config/batchWrite":
+            respond(payload, {})
+        elif method == "echo":
+            time.sleep(60)
+        else:
+            print(json.dumps({"id": payload.get("id"), "error": {"message": "unknown method"}}), flush=True)
+"#,
+        )
+        .expect("fake codex should be written");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("fake codex metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("fake codex should be executable");
+
+        let client = AppServerClient::new(
+            AppServerProfile {
+                id: "default".to_string(),
+                codex_home: dir.join("codex-home"),
+            },
+            AppServerClientConfig {
+                codex_bin: script_path.display().to_string(),
+                handoff_dir: Some(handoff_dir),
+                startup_timeout: std::time::Duration::from_secs(2),
+                request_timeout: std::time::Duration::from_secs(2),
+                ..AppServerClientConfig::default()
+            },
+        );
+        client
+            .inner
+            .handoff_disabled_after_failure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = client
+            .request_with_timeout(
+                "echo",
+                json!({ "via": "stdio" }),
+                std::time::Duration::from_millis(250),
+                true,
+            )
+            .await
+            .expect_err("stdio app-server request should time out");
+        assert!(app_server_request_timed_out(&error));
+        assert!(
+            !app_server_timeout_recovered(&error),
+            "stdio timeout must not be reported as handoff recovery"
+        );
+
+        client.close().await.expect("client should close");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn falls_back_to_stdio_when_handoff_proxy_does_not_initialize() {
         use std::os::unix::fs::PermissionsExt;
 

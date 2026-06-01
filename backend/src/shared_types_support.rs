@@ -23,6 +23,7 @@ pub(crate) struct AppState {
     pub(crate) login_attempts: Arc<Mutex<HashMap<String, Vec<u128>>>>,
     pub(crate) response_cache: Arc<Mutex<HashMap<String, CachedResponse>>>,
     pub(crate) session_thread_cache: Arc<Mutex<HashMap<String, CachedSessionThreads>>>,
+    pub(crate) session_thread_cache_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub(crate) session_search_text_cache: Arc<Mutex<HashMap<String, CachedSessionSearchText>>>,
     pub(crate) static_asset_cache: Arc<Mutex<HashMap<String, CachedStaticAsset>>>,
     pub(crate) catalog_cache: Arc<Mutex<HashMap<String, CachedCatalog>>>,

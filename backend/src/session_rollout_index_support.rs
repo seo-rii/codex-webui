@@ -621,6 +621,22 @@ pub(crate) async fn list_rollout_candidates_payload(
         }
     }
 
+    let scan_lock = {
+        let mut locks = state.session_thread_cache_locks.lock().await;
+        locks
+            .entry(cache_key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _scan_guard = scan_lock.lock().await;
+    {
+        let mut cache = state.session_thread_cache.lock().await;
+        cache.retain(|_, entry| entry.created_at.elapsed() < SESSION_ROLLOUT_INDEX_CACHE_TTL);
+        if let Some(cached) = cache.get(&cache_key) {
+            return Ok(cached.threads.clone());
+        }
+    }
+
     let codex_home = resolve_runtime_profile(&state.config, profile_id)
         .codex_home
         .clone();

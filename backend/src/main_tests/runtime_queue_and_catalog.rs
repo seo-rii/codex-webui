@@ -3879,6 +3879,120 @@ async fn queued_message_retries_after_transient_thread_read_error() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_drain_persists_dispatch_failure_on_item() {
+    let sandbox = unique_test_dir("queue-dispatch-failure-state");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-queue-dispatch-fails";
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Queue dispatch failure",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    client
+        .request(
+            "debug/setError",
+            json!({
+                "method": "turn/start",
+                "message": "queued turn rejected"
+            }),
+        )
+        .await
+        .unwrap();
+
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["queuesByThreadId"][session_id] = json!({
+            "items": [
+                {
+                    "id": "queue-failed",
+                    "prompt": "This queued item should be marked failed.",
+                    "attachmentIds": [],
+                    "attachmentNames": [],
+                    "createdAt": 15
+                }
+            ],
+            "resumePending": false,
+            "updatedAt": 20
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    maybe_drain_queue(&state, "default", session_id).await;
+
+    let queue = get_session_queue_payload(&state, "default", session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.get("resumeRequired").and_then(Value::as_bool),
+        Some(true)
+    );
+    let item = queue
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .expect("failed queue item should remain visible");
+    assert_eq!(item.get("id").and_then(Value::as_str), Some("queue-failed"));
+    assert_eq!(item.get("status").and_then(Value::as_str), Some("failed"));
+    assert!(item.get("failedAt").and_then(Value::as_u64).is_some());
+    assert!(
+        item.get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("queued turn rejected"))
+    );
+
+    let thread = read_thread_payload(&state, "default", session_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        thread.get("turns").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+
+    let ui_state = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .unwrap();
+    let notifications = ui_state["notifications"]["items"]
+        .as_array()
+        .expect("notifications should be available");
+    assert!(notifications.iter().any(|notification| {
+        notification.get("type").and_then(Value::as_str) == Some("queueDispatchFailed")
+            && notification.get("sessionId").and_then(Value::as_str) == Some(session_id)
+            && notification
+                .get("payload")
+                .and_then(|payload| payload.get("queueId"))
+                .and_then(Value::as_str)
+                == Some("queue-failed")
+    }));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test]
 async fn marks_resume_pending_queues_and_lists_paused_entries() {
     let sandbox = unique_test_dir("queue-resume-pending");

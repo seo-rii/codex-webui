@@ -423,7 +423,7 @@ async fn maybe_drain_queue_with_attempt(
                     else {
                         return Ok(());
                     };
-                    queue.insert("resumeRequired".to_string(), json!(true));
+                    queue.insert("resumePending".to_string(), json!(true));
                     queue.insert("updatedAt".to_string(), json!(failed_at));
                     if let Some(item) = queue
                         .get_mut("items")

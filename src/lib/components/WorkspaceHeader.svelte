@@ -1,7 +1,9 @@
 <script lang="ts">
   import {
+    Activity,
     Archive,
     ArrowRightLeft,
+    Brain,
     ChevronDown,
     GitBranch,
     History,
@@ -32,6 +34,8 @@
     gitWorkspace: string;
     settingsSkills: string;
     computer: string;
+    diagnostics: string;
+    memory: string;
     newTerminal: string;
   };
 
@@ -63,6 +67,8 @@
     onOpenTasksTab,
     onOpenGitTab,
     onOpenComputerTab,
+    onOpenDiagnosticsTab,
+    onOpenMemoryTab,
     onOpenSettingsTab,
     onCreateTerminalTab
   }: {
@@ -97,6 +103,8 @@
     onOpenTasksTab: () => void;
     onOpenGitTab: () => void;
     onOpenComputerTab: () => void;
+    onOpenDiagnosticsTab: () => void;
+    onOpenMemoryTab: () => void;
     onOpenSettingsTab: () => void;
     onCreateTerminalTab: () => void | Promise<void>;
   } = $props();
@@ -286,6 +294,14 @@
           <button class="workspace-open-menu__item ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors" onclick={() => { workspaceMenuOpen = false; onOpenComputerTab(); }} type="button">
             <Monitor size={16} class="text-gray-400 group-hover:text-amber-600" />
             <span>{ui.computer}</span>
+          </button>
+          <button class="workspace-open-menu__item ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors" onclick={() => { workspaceMenuOpen = false; onOpenDiagnosticsTab(); }} type="button">
+            <Activity size={16} class="text-gray-400 group-hover:text-amber-600" />
+            <span>{ui.diagnostics}</span>
+          </button>
+          <button class="workspace-open-menu__item ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors" onclick={() => { workspaceMenuOpen = false; onOpenMemoryTab(); }} type="button">
+            <Brain size={16} class="text-gray-400 group-hover:text-amber-600" />
+            <span>{ui.memory}</span>
           </button>
           <button class="workspace-open-menu__item ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors" onclick={() => { workspaceMenuOpen = false; onOpenSettingsTab(); }} type="button">
             <Settings size={16} class="text-gray-400 group-hover:text-amber-600" />

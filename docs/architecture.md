@@ -81,6 +81,9 @@ For cold history reads, `codex-webui` may serve browser-optimized summary and re
 ### 3. Codex execution
 
 - Rust talks to `codex app-server`
+- session-bound native operations such as `review/start` and
+  `thread/rollback` are routed through the app-server client assigned to that
+  session, not through a profile-global default client
 - live notifications from `codex app-server` are normalized into UI events
 - Rust fans those events out to every subscribed browser client
 
@@ -113,6 +116,16 @@ The browser-facing session path is optimized around bounded payloads:
 
 This gives the web UI a different performance profile from a native local surface. A browser reconnect can restore the visible shell quickly, then progressively hydrate deeper history without blocking chat input, queue operations, or live WebSocket notifications.
 
+The custom parser is deliberate and should remain the primary list/search/detail
+bootstrap path. Native Codex thread APIs are useful for live authority and
+correctness comparison, but they are not used as the hot path for sidebar
+listing because native enumeration can require materializing far more session
+state than the browser needs. With many sessions or very long rollouts, that can
+turn a simple sidebar refresh into a multi-minute operation. Parser bugs should
+be fixed by comparing sampled parser output against native output and improving
+the parser, not by replacing bounded local parsing with full native history
+enumeration.
+
 The same principle applies to account routing:
 
 - each configured account is represented by a profile with its own `CODEX_HOME`
@@ -135,12 +148,26 @@ Current proxied families include:
 - plugin list/read/install/uninstall
 - marketplace add/remove/upgrade
 - skill and hook list reads
+- MCP server status, reload, tool/resource inspection, and OAuth login launch
 - app list reads
 - text-oriented realtime start/append/stop/list-voices calls
 
 The browser-facing catalog merges local `CODEX_HOME` plugins and app-server
 marketplace plugins into one composer/search surface. Plugin and app changes
 invalidate the catalog cache and propagate through global WebSocket events.
+Settings exposes the actionable management paths: marketplace add/remove/upgrade,
+plugin detail/install/uninstall, native skill/hook lists, and MCP server refresh
+or OAuth login. Mutating catalog and MCP operations stay owner/admin gated at the
+WebSocket method-policy layer.
+
+Newer transcript item families are represented in the local parser as well as
+the live app-server path. The bounded rollout parser now keeps first-class
+records for standalone web search begin/end events, image generation begin/end
+events, local image-view tool calls, and review-mode entry/exit markers. It also
+applies native rollback markers when reconstructing recent turns, so rolled-back
+tail turns do not reappear when the browser opens a session from local rollout
+data. The UI renders these as compact cards and only expands heavy search/tool
+payloads on demand.
 
 Computer-use is treated as an app/plugin capability, not as a special browser
 runtime. Dynamic tool-call requests are resolved with structured content items,
@@ -302,6 +329,12 @@ Session defaults are resolved from:
 2. the active profile's `<CODEX_HOME>/config.toml`
 
 The UI can edit `config.toml` directly. Session preference changes also write the relevant defaults back into that file so the web UI and Codex CLI do not silently drift apart.
+
+The Memory workspace follows the same source split. Profile-wide memory settings
+are inspected from the active profile's `config.toml` and memory root without
+starting every app-server, while destructive or Codex-owned mutations are routed
+through native app-server methods such as `memory/reset` and
+`thread/memoryMode/set`.
 
 ## Security Model
 

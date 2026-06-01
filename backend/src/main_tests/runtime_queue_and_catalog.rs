@@ -8,6 +8,211 @@ async fn mark_test_session_active(state: &AppState, session_id: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_and_unarchive_use_native_thread_state() {
+    let sandbox = unique_test_dir("native-archive");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-archive-native",
+                    "name": "Archive native",
+                    "preview": "archive me",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let archived = archive_session_payload(&state, "default", "thread-archive-native")
+        .await
+        .unwrap();
+    assert_eq!(archived.get("ok").and_then(Value::as_bool), Some(true));
+    let archived_thread = client
+        .request(
+            "thread/read",
+            json!({ "threadId": "thread-archive-native" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        archived_thread
+            .get("thread")
+            .and_then(|thread| thread.get("archived"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let filter = session_filter_from_value(None);
+    let archived_list = list_sessions_payload(&state, "default", true, None, 20, &filter)
+        .await
+        .unwrap();
+    assert_eq!(
+        archived_list
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|sessions| sessions.first())
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some("thread-archive-native")
+    );
+
+    let unarchived = unarchive_session_payload(&state, "default", "thread-archive-native")
+        .await
+        .unwrap();
+    assert_eq!(unarchived.get("ok").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        unarchived
+            .get("session")
+            .and_then(|session| session.get("archived"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    let active_list = list_sessions_payload(&state, "default", false, None, 20, &filter)
+        .await
+        .unwrap();
+    assert_eq!(
+        active_list
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|sessions| sessions.first())
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some("thread-archive-native")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_status_and_controls_use_native_memory_methods() {
+    let sandbox = unique_test_dir("memory-controls");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(codex_home.join("memories").join("rollout_summaries")).unwrap();
+    fs::write(
+        config_toml_path(&codex_home),
+        r#"[memories]
+generate_memories = false
+use_memories = true
+max_rollouts_per_startup = 7
+extract_model = "gpt-5-mini"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        codex_home.join("memories").join("MEMORY.md"),
+        "remember this\n",
+    )
+    .unwrap();
+    fs::write(
+        codex_home
+            .join("memories")
+            .join("rollout_summaries")
+            .join("thread.md"),
+        "summary\n",
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-memory-native",
+                    "name": "Memory native",
+                    "preview": "memory mode",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let status = memory_status_payload(&state, "default", Some("thread-memory-native"))
+        .await
+        .unwrap();
+    assert_eq!(
+        status
+            .get("settings")
+            .and_then(|settings| settings.get("generateMemories"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        status
+            .get("settings")
+            .and_then(|settings| settings.get("maxRolloutsPerStartup"))
+            .and_then(Value::as_i64),
+        Some(7)
+    );
+    assert_eq!(
+        status
+            .get("storage")
+            .and_then(|storage| storage.get("fileCount"))
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+
+    let set_mode =
+        set_session_memory_mode_payload(&state, "default", "thread-memory-native", "disabled")
+            .await
+            .unwrap();
+    assert_eq!(
+        set_mode.get("memoryMode").and_then(Value::as_str),
+        Some("disabled")
+    );
+    let thread = client
+        .request("thread/read", json!({ "threadId": "thread-memory-native" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        thread
+            .get("thread")
+            .and_then(|thread| thread.get("memoryMode"))
+            .and_then(Value::as_str),
+        Some("disabled")
+    );
+
+    let reset = reset_memory_payload(&state, "default").await.unwrap();
+    assert_eq!(reset.get("ok").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        reset
+            .get("memory")
+            .and_then(|memory| memory.get("storage"))
+            .and_then(|storage| storage.get("fileCount"))
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolve_server_request_payload_uses_pending_request_store() {
     let sandbox = unique_test_dir("approval-rust");
     let workspace = sandbox.join("workspace");
@@ -466,6 +671,51 @@ async fn codex_protocol_proxy_methods_forward_to_app_server() {
     assert_eq!(
         install.get("authPolicy").and_then(Value::as_str),
         Some("ON_USE")
+    );
+
+    let mcp = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "codex/mcp/status/list",
+        json!({ "detail": "toolsAndAuthOnly", "limit": 20 }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        mcp.get("data")
+            .and_then(Value::as_array)
+            .is_some_and(|servers| servers
+                .iter()
+                .any(|server| server.get("name").and_then(Value::as_str) == Some("computer-use")))
+    );
+
+    let refresh = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "codex/mcp/refresh",
+        json!({}),
+    )
+    .await
+    .unwrap();
+    assert!(refresh.as_object().is_some_and(|object| object.is_empty()));
+
+    let oauth = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "codex/mcp/oauth/login",
+        json!({ "name": "computer-use" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        oauth.get("authorizationUrl").and_then(Value::as_str),
+        Some("https://example.com/oauth/authorize")
     );
 
     let voices = execute_ws_method(
@@ -1623,6 +1873,177 @@ async fn assigned_session_goal_reuses_existing_app_server_client() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_goal_session_turn_uses_goal_app_server_after_restart_assignment_loss() {
+    let sandbox = unique_test_dir("goal-turn-dedicated-after-restart");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    cache_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-resume",
+        &json!({
+            "threadId": "thread-goal-resume",
+            "objective": "continue after gateway restart",
+            "status": "active"
+        }),
+    )
+    .await;
+
+    let _turn_client = app_server_client_for_session_turn(&state, "default", "thread-goal-resume")
+        .await
+        .unwrap();
+
+    assert_eq!(state.app_servers.client_count().await, 1);
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-goal-resume"))
+            .cloned(),
+        Some("default::goal::thread-goal-resume".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_goal_fetch_uses_goal_app_server_after_restart_assignment_loss() {
+    let sandbox = unique_test_dir("goal-fetch-dedicated-after-restart");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let goal_client =
+        app_server_client_for_goal_session(&state, "default", "thread-goal-fetch-resume")
+            .await
+            .unwrap();
+    goal_client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-goal-fetch-resume",
+                    "name": "Goal thread",
+                    "preview": "resume goal",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "turns": [],
+                    "goal": {
+                        "threadId": "thread-goal-fetch-resume",
+                        "objective": "continue after restart",
+                        "status": "active",
+                        "createdAt": 1,
+                        "updatedAt": 2
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    cache_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-fetch-resume",
+        &json!({
+            "threadId": "thread-goal-fetch-resume",
+            "objective": "continue after restart",
+            "status": "active"
+        }),
+    )
+    .await;
+    state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .remove(&runtime_session_key("default", "thread-goal-fetch-resume"));
+
+    let _default_client = app_server_client(&state, "default").await.unwrap();
+    let goal = fetch_session_goal_payload(&state, "default", "thread-goal-fetch-resume")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        goal.get("objective").and_then(Value::as_str),
+        Some("continue after restart")
+    );
+    assert_eq!(goal.get("status").and_then(Value::as_str), Some("active"));
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-goal-fetch-resume"))
+            .cloned(),
+        Some("default::goal::thread-goal-fetch-resume".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn created_session_goal_reuses_created_app_server_client() {
+    let sandbox = unique_test_dir("goal-created-client");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5.4"
+        }),
+        None,
+        Some("Goal created session"),
+    )
+    .await
+    .unwrap();
+    let session_id = created.get("id").and_then(Value::as_str).unwrap();
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key("default", session_id))
+            .cloned(),
+        Some("default".to_string())
+    );
+
+    let goal = set_session_goal_payload(
+        &state,
+        "default",
+        session_id,
+        json!({
+            "objective": "keep the created session on its existing runtime"
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(state.app_servers.client_count().await, 1);
+    assert_eq!(
+        goal.get("goal")
+            .and_then(|goal| goal.get("objective"))
+            .and_then(Value::as_str),
+        Some("keep the created session on its existing runtime")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn regular_session_turns_share_profile_app_server_by_default() {
     let sandbox = unique_test_dir("session-app-server-default");
     let workspace = sandbox.join("workspace");
@@ -1891,6 +2312,10 @@ async fn thread_goal_request_reloads_config_when_goals_are_disabled() {
         )
         .await
         .unwrap();
+    let _assigned_client =
+        app_server_client_for_session_turn(&state, "default", "thread-goal-disabled")
+            .await
+            .unwrap();
     client
         .request("debug/setGoalsEnabled", json!({ "enabled": false }))
         .await
@@ -2386,6 +2811,7 @@ async fn queue_write_helpers_mutate_queue_state() {
         "thread-1",
         "first",
         Some("request-first"),
+        Some("client-queue-first"),
         Some(&queue_skills),
         None,
     )
@@ -2402,6 +2828,7 @@ async fn queue_write_helpers_mutate_queue_state() {
         "thread-1",
         "first",
         Some("request-first"),
+        Some("client-queue-first"),
         Some(&queue_skills),
         None,
     )
@@ -2418,12 +2845,22 @@ async fn queue_write_helpers_mutate_queue_state() {
             .map(Vec::len),
         Some(1)
     );
+    assert_eq!(
+        duplicate_first
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("clientUserMessageId"))
+            .and_then(Value::as_str),
+        Some("client-queue-first")
+    );
     let repeated_first = enqueue_session_queue_payload(
         &state,
         "default",
         "thread-1",
         "first",
         Some("request-first-repeat"),
+        None,
         Some(&queue_skills),
         None,
     )
@@ -2442,10 +2879,11 @@ async fn queue_write_helpers_mutate_queue_state() {
             .map(Vec::len),
         Some(2)
     );
-    let second =
-        enqueue_session_queue_payload(&state, "default", "thread-1", "second", None, None, None)
-            .await
-            .unwrap();
+    let second = enqueue_session_queue_payload(
+        &state, "default", "thread-1", "second", None, None, None, None,
+    )
+    .await
+    .unwrap();
     let second_id = second
         .get("enqueueItemId")
         .and_then(Value::as_str)
@@ -2626,6 +3064,7 @@ async fn enqueue_session_queue_payload_auto_dispatches_when_session_is_idle() {
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -2733,6 +3172,7 @@ async fn enqueue_session_queue_payload_returns_before_queue_drain_reads_thread()
         "default",
         session_id,
         "Queue should not wait for a slow thread read.",
+        None,
         None,
         None,
         None,
@@ -2868,6 +3308,7 @@ async fn queue_drain_waits_while_turn_start_is_pending() {
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -2967,6 +3408,7 @@ async fn queue_drain_waits_while_cached_active_turn_is_recent() {
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -3050,6 +3492,7 @@ async fn queue_drain_clears_stale_cached_active_turn_and_dispatches() {
         session_id,
         "Dispatch after stale active cache is reconciled.",
         None,
+        Some("client-queued-dispatch"),
         None,
         None,
     )
@@ -3092,6 +3535,13 @@ async fn queue_drain_clears_stale_cached_active_turn_and_dispatches() {
             .and_then(|value| value.get("text"))
             .and_then(Value::as_str),
         Some("Dispatch after stale active cache is reconciled.")
+    );
+    assert_eq!(
+        thread
+            .get("lastTurnStart")
+            .and_then(|value| value.get("clientUserMessageId"))
+            .and_then(Value::as_str),
+        Some("client-queued-dispatch")
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -3266,6 +3716,7 @@ async fn queue_drain_ignores_orphaned_local_active_tail_without_cached_runtime_a
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -3341,6 +3792,7 @@ async fn queued_message_retries_after_transient_thread_read_error() {
         "default",
         session_id,
         "Dispatch after the transient read failure clears.",
+        None,
         None,
         None,
         None,

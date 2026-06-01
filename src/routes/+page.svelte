@@ -39,7 +39,8 @@
     Shield,
     GripVertical,
     Keyboard,
-    Monitor
+    Monitor,
+    Download
   } from "lucide-svelte";
   import { onMount, tick } from "svelte";
   import { fly, slide } from "svelte/transition";
@@ -92,6 +93,7 @@
     CodexRuntimeStatus,
     CodexTurn,
     DirectoryPayload,
+    FileMentionSearchEntry,
     GitCommit,
     GitOpenRequest,
     GlobalStreamEvent,
@@ -110,6 +112,7 @@
     SessionPreferences,
     SessionQueueItem,
     SessionQueuePayload,
+    SessionReviewTarget,
     SessionRolloutRecoveryPayload,
     SessionSearchScope,
     SessionFolder,
@@ -127,7 +130,18 @@
 
   const SESSION_LIST_BROWSER_CACHE_SCHEMA_VERSION = 2;
 
-  type WorkspaceTabId = "chat" | "tasks" | "git" | "settings" | "computer" | `git-diff:${string}` | `code-diff:${string}` | `file:${string}` | `terminal:${string}`;
+  type WorkspaceTabId =
+    | "chat"
+    | "tasks"
+    | "git"
+    | "settings"
+    | "computer"
+    | "diagnostics"
+    | "memory"
+    | `git-diff:${string}`
+    | `code-diff:${string}`
+    | `file:${string}`
+    | `terminal:${string}`;
   type ComposerSettingsTabId = "session" | "security" | "skills";
   type GitDiffTab = {
     id: `git-diff:${string}`;
@@ -162,6 +176,7 @@
   };
   type OptimisticMessageState = {
     sessionId: string;
+    clientUserMessageId: string;
     prompt: string;
     skills: SelectedSkill[];
     attachmentNames: string[];
@@ -180,11 +195,13 @@
   };
   type ArenaWorkspaceComponent = typeof import("$lib/components/ArenaWorkspace.svelte").default;
   type CodeDiffWorkspaceComponent = typeof import("$lib/components/CodeDiffWorkspace.svelte").default;
+  type DiagnosticsWorkspaceComponent = typeof import("$lib/components/DiagnosticsWorkspace.svelte").default;
   type FileWorkspaceComponent = typeof import("$lib/components/FileWorkspace.svelte").default;
   type GitWorkspaceComponent = typeof import("$lib/components/GitWorkspace.svelte").default;
+  type MemoryWorkspaceComponent = typeof import("$lib/components/MemoryWorkspace.svelte").default;
   type SettingsWorkspaceComponent = typeof import("$lib/components/SettingsWorkspace.svelte").default;
   type TerminalWorkspaceComponent = typeof import("$lib/components/TerminalWorkspace.svelte").default;
-  type LazyWorkspaceKind = "arena" | "codeDiff" | "file" | "git" | "settings" | "terminal";
+  type LazyWorkspaceKind = "arena" | "codeDiff" | "diagnostics" | "file" | "git" | "memory" | "settings" | "terminal";
   type SlashSuggestion = {
     key: string;
     command: string;
@@ -192,6 +209,11 @@
     description: string;
     value: string;
     support?: CodexSlashCommandEntry["support"];
+  };
+  type FileMentionTrigger = {
+    start: number;
+    end: number;
+    query: string;
   };
   type ThemedConfigPayload = AppConfigPayload & { theme?: ThemeSettings };
   type BeforeInstallPromptEvent = Event & {
@@ -212,6 +234,7 @@
   let computerFramesBySessionId = $state<Record<string, ComputerFramePayload>>({});
   let computerInputText = $state("");
   let computerInputBusy = $state(false);
+  let defaultLanguageBridgeBusy = $state(false);
   let computerInputStatus = $state<string | null>(null);
   let dismissedRemoteControlErrorAt = $state(0);
   let sessions = $state<SessionSummary[]>([]);
@@ -242,6 +265,12 @@
   let loginHcaptchaContainer = $state<HTMLDivElement | null>(null);
   let draft = $state("");
   let draftAttachments = $state<AttachmentRecord[]>([]);
+  let fileMentionTrigger = $state<FileMentionTrigger | null>(null);
+  let fileMentionResults = $state<FileMentionSearchEntry[]>([]);
+  let fileMentionBusy = $state(false);
+  let fileMentionActiveIndex = $state(0);
+  let fileMentionRequestVersion = 0;
+  let fileMentionSearchTimer: ReturnType<typeof setTimeout> | null = null;
   let titleDraft = $state("");
   let browserOpen = $state(false);
   let browserBusy = $state(false);
@@ -295,8 +324,10 @@
   let activeWorkspaceTabId = $state<WorkspaceTabId>("chat");
   let ArenaWorkspaceView = $state<ArenaWorkspaceComponent | null>(null);
   let CodeDiffWorkspaceView = $state<CodeDiffWorkspaceComponent | null>(null);
+  let DiagnosticsWorkspaceView = $state<DiagnosticsWorkspaceComponent | null>(null);
   let FileWorkspaceView = $state<FileWorkspaceComponent | null>(null);
   let GitWorkspaceView = $state<GitWorkspaceComponent | null>(null);
+  let MemoryWorkspaceView = $state<MemoryWorkspaceComponent | null>(null);
   let SettingsWorkspaceView = $state<SettingsWorkspaceComponent | null>(null);
   let TerminalWorkspaceView = $state<TerminalWorkspaceComponent | null>(null);
   let workspaceMenuOpen = $state(false);
@@ -305,7 +336,9 @@
   let gitOpenRequest = $state<GitOpenRequest | null>(null);
   let settingsTabOpen = $state(false);
   let computerTabOpen = $state(false);
-  let settingsInitialTab = $state<"config" | "startup" | "audit" | "theme" | "notifications" | "presets" | "automations" | "apps" | "plugins" | "skills" | null>(null);
+  let diagnosticsTabOpen = $state(false);
+  let memoryTabOpen = $state(false);
+  let settingsInitialTab = $state<"config" | "startup" | "audit" | "theme" | "notifications" | "presets" | "automations" | "apps" | "plugins" | "skills" | "mcp" | null>(null);
   let gitDiffTabs = $state<GitDiffTab[]>([]);
   let codeDiffTabs = $state<CodeDiffTab[]>([]);
   let fileTabs = $state<FileTab[]>([]);
@@ -506,6 +539,17 @@
       installedSkills: m.installed_skills(),
       noSkills: m.no_local_skills(),
       newTerminal: m.new_terminal(),
+      diagnostics:
+        locale === "ko"
+          ? "진단"
+          : locale === "ja"
+            ? "Diagnostics"
+            : locale === "zh-Hans"
+              ? "Diagnostics"
+              : locale === "zh-Hant"
+              ? "Diagnostics"
+              : "Diagnostics",
+      memory: locale === "ko" ? "메모리" : "Memory",
       computer: m.computer(),
       computerSnapshotStream: m.computer_snapshot_stream(),
       computerNoFrames: m.computer_no_frames(),
@@ -530,6 +574,8 @@
       editInComposer: m.edit_in_composer(),
       branchIntoNewThread: m.branch_into_new_thread(),
       handoffToNewThread: m.handoff_to_new_thread(),
+      rollbackToThisTurn: m.rollback_to_this_turn(),
+      rollbackConfirm: m.rollback_confirm(),
       userMessageTimestamp:
         locale === "ko"
           ? "보낸 시각"
@@ -2234,7 +2280,7 @@
   });
   const workspaceTabs = $derived.by(() => {
     const _locale = $localeSignal;
-    const tabs: Array<{ id: WorkspaceTabId; label: string; kind: "chat" | "tasks" | "git" | "settings" | "computer" | "git-diff" | "code-diff" | "file" | "terminal" }> = [
+    const tabs: Array<{ id: WorkspaceTabId; label: string; kind: "chat" | "tasks" | "git" | "settings" | "computer" | "diagnostics" | "memory" | "git-diff" | "code-diff" | "file" | "terminal" }> = [
       { id: "chat", label: ui.chat, kind: "chat" }
     ];
     if (tasksTabOpen) {
@@ -2263,6 +2309,20 @@
         id: "computer",
         label: ui.computer,
         kind: "computer"
+      });
+    }
+    if (diagnosticsTabOpen) {
+      tabs.push({
+        id: "diagnostics",
+        label: ui.diagnostics,
+        kind: "diagnostics"
+      });
+    }
+    if (memoryTabOpen) {
+      tabs.push({
+        id: "memory",
+        label: ui.memory,
+        kind: "memory"
       });
     }
     for (const tab of gitDiffTabs) {
@@ -2329,10 +2389,16 @@
     if (kind === "codeDiff" && CodeDiffWorkspaceView) {
       return;
     }
+    if (kind === "diagnostics" && DiagnosticsWorkspaceView) {
+      return;
+    }
     if (kind === "file" && FileWorkspaceView) {
       return;
     }
     if (kind === "git" && GitWorkspaceView) {
+      return;
+    }
+    if (kind === "memory" && MemoryWorkspaceView) {
       return;
     }
     if (kind === "settings" && SettingsWorkspaceView) {
@@ -2359,6 +2425,11 @@
         CodeDiffWorkspaceView = module.default;
         return;
       }
+      if (kind === "diagnostics") {
+        const module = await import("$lib/components/DiagnosticsWorkspace.svelte");
+        DiagnosticsWorkspaceView = module.default;
+        return;
+      }
       if (kind === "file") {
         const module = await import("$lib/components/FileWorkspace.svelte");
         FileWorkspaceView = module.default;
@@ -2367,6 +2438,11 @@
       if (kind === "git") {
         const module = await import("$lib/components/GitWorkspace.svelte");
         GitWorkspaceView = module.default;
+        return;
+      }
+      if (kind === "memory") {
+        const module = await import("$lib/components/MemoryWorkspace.svelte");
+        MemoryWorkspaceView = module.default;
         return;
       }
       if (kind === "settings") {
@@ -2396,6 +2472,12 @@
     if (activeWorkspaceTabId === "settings") {
       return ui.settings;
     }
+    if (activeWorkspaceTabId === "diagnostics") {
+      return ui.diagnostics;
+    }
+    if (activeWorkspaceTabId === "memory") {
+      return ui.memory;
+    }
     if (activeWorkspaceTabId === "git" || activeGitDiffTab) {
       return ui.gitWorkspace;
     }
@@ -2418,6 +2500,14 @@
     }
     if (activeWorkspaceTabId === "settings") {
       void ensureLazyWorkspaceLoaded("settings");
+      return;
+    }
+    if (activeWorkspaceTabId === "diagnostics") {
+      void ensureLazyWorkspaceLoaded("diagnostics");
+      return;
+    }
+    if (activeWorkspaceTabId === "memory") {
+      void ensureLazyWorkspaceLoaded("memory");
       return;
     }
     if (activeWorkspaceTabId === "git" || Boolean(activeGitDiffTab)) {
@@ -6227,6 +6317,77 @@
     );
   }
 
+  function getImageGenerationDownloadName(item: CodexItem) {
+    const savedPath = getImageGenerationSavedPath(item);
+    const fromPath = savedPath ? baseName(savedPath) : "";
+    return fromPath || `${String(item.id || "generated-image")}.png`;
+  }
+
+  function getImageViewPath(item: CodexItem) {
+    return (typeof item.path === "string" && item.path.trim()) || null;
+  }
+
+  function getRecordValue(value: unknown): Record<string, unknown> | null {
+    return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+  }
+
+  function getWebSearchAction(item: CodexItem) {
+    return getRecordValue(item.action);
+  }
+
+  function getWebSearchActionType(item: CodexItem) {
+    const action = getWebSearchAction(item);
+    return typeof action?.type === "string" ? action.type : null;
+  }
+
+  function getWebSearchQueries(item: CodexItem) {
+    const action = getWebSearchAction(item);
+    const queries = Array.isArray(action?.queries) ? action.queries.map((query) => formatValue(query)).filter(Boolean) : [];
+    const query = formatValue(action?.query) || formatValue(item.query);
+    return query ? [query, ...queries.filter((candidate) => candidate !== query)] : queries;
+  }
+
+  function getWebSearchUrl(item: CodexItem) {
+    const action = getWebSearchAction(item);
+    return formatValue(action?.url);
+  }
+
+  function getWebSearchPattern(item: CodexItem) {
+    const action = getWebSearchAction(item);
+    return formatValue(action?.pattern);
+  }
+
+  function getWebSearchStatus(item: CodexItem) {
+    return formatValue(item.status) || "completed";
+  }
+
+  function getReviewText(item: CodexItem) {
+    return formatValue(item.review) || (item.type === "enteredReviewMode" ? "Review requested." : "Review mode completed.");
+  }
+
+  function getReviewOutput(item: CodexItem) {
+    return getRecordValue(item.reviewOutput ?? item.review_output);
+  }
+
+  function getReviewFindings(item: CodexItem) {
+    const output = getReviewOutput(item);
+    return Array.isArray(output?.findings)
+      ? output.findings.filter((finding): finding is Record<string, unknown> => Boolean(getRecordValue(finding)))
+      : [];
+  }
+
+  function getReviewFindingLocation(finding: Record<string, unknown>) {
+    const location = getRecordValue(finding.code_location ?? finding.codeLocation);
+    const lineRange = getRecordValue(location?.line_range ?? location?.lineRange);
+    const path = formatValue(location?.absolute_file_path ?? location?.absoluteFilePath);
+    const start = formatValue(lineRange?.start);
+    const end = formatValue(lineRange?.end);
+    if (!path) {
+      return "";
+    }
+    return start && end ? `${path}:${start}-${end}` : path;
+  }
+
   async function saveAutostartEnabled(enabled: boolean) {
     if (readOnlyRole) {
       errorText = m.error_forbidden_role();
@@ -6254,6 +6415,44 @@
       noticeText = m.theme_saved();
     } catch (error) {
       errorText = describeError(error);
+    }
+  }
+
+  async function saveDefaultLanguageBridgeEnabled(enabled: boolean) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    if (!config || defaultLanguageBridgeBusy) {
+      return;
+    }
+
+    defaultLanguageBridgeBusy = true;
+    try {
+      const nextConfig = applyLocalComposerPreferencesToConfig(
+        await api.saveDefaultSessionPreferences({
+          languageBridgeEnabled: enabled,
+          languageBridgeOutputLanguage: config.defaults.languageBridgeOutputLanguage ?? "auto"
+        })
+      );
+      config = nextConfig;
+      syncConfiguredTheme(config);
+      if (!selectedSessionId && conversation) {
+        conversation = {
+          ...conversation,
+          preferences: {
+            ...conversation.preferences,
+            languageBridgeEnabled: nextConfig.defaults.languageBridgeEnabled,
+            languageBridgeOutputLanguage: nextConfig.defaults.languageBridgeOutputLanguage
+          }
+        };
+        markConversationCacheDirty();
+      }
+      noticeText = enabled ? m.default_language_bridge_enabled_notice() : m.default_language_bridge_disabled_notice();
+    } catch (error) {
+      errorText = describeError(error);
+    } finally {
+      defaultLanguageBridgeBusy = false;
     }
   }
 
@@ -6428,6 +6627,69 @@
     scheduleComposerTextareaResize();
   }
 
+  function parseReviewSlashTarget(args: string): { target: SessionReviewTarget; delivery: "inline" | "detached" } {
+    const detachedPattern = /(?:^|\s)--detached(?:\s|$)/u;
+    const delivery = detachedPattern.test(args) ? "detached" : "inline";
+    const cleaned = args.replace(detachedPattern, " ").trim();
+    const baseMatch = cleaned.match(/^(?:base|base-branch|branch)\s+(.+)$/iu);
+    if (baseMatch?.[1]?.trim()) {
+      return {
+        delivery,
+        target: {
+          type: "baseBranch",
+          branch: baseMatch[1].trim()
+        }
+      };
+    }
+    const commitMatch = cleaned.match(/^commit\s+([^\s]+)(?:\s+(.+))?$/iu);
+    if (commitMatch?.[1]?.trim()) {
+      return {
+        delivery,
+        target: {
+          type: "commit",
+          sha: commitMatch[1].trim(),
+          title: commitMatch[2]?.trim() || null
+        }
+      };
+    }
+    if (cleaned) {
+      return {
+        delivery,
+        target: {
+          type: "custom",
+          instructions: cleaned
+        }
+      };
+    }
+    return {
+      delivery,
+      target: {
+        type: "uncommittedChanges"
+      }
+    };
+  }
+
+  async function startReviewFromSlash(args: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    const materialized = await ensureSessionForComposer();
+    if (!materialized) {
+      return;
+    }
+    const { target, delivery } = parseReviewSlashTarget(args);
+    const response = await api.startReview(materialized.sessionId, { target, delivery });
+    draft = "";
+    scheduleComposerTextareaResize();
+    scheduleSessionRefresh(80);
+    scheduleSelectedSessionStateRefresh(response.reviewThreadId, 80);
+    if (response.reviewThreadId !== materialized.sessionId) {
+      await selectSession(response.reviewThreadId);
+    }
+    noticeText = m.review_started();
+  }
+
   async function handleSlashCommand(rawValue: string) {
     const trimmed = rawValue.trim();
     if (!trimmed.startsWith("/")) {
@@ -6445,6 +6707,15 @@
     if (command === "goal") {
       try {
         await handleGoalSlashCommand(args);
+      } catch (error) {
+        errorText = describeError(error);
+      }
+      return true;
+    }
+
+    if (command === "review") {
+      try {
+        await startReviewFromSlash(args);
       } catch (error) {
         errorText = describeError(error);
       }
@@ -6680,6 +6951,20 @@
       return true;
     }
 
+    if (command === "mcp") {
+      try {
+        const response = await api.listMcpServers({ detail: "toolsAndAuthOnly", limit: 20 });
+        const names = response.data.map((server) => server.name).filter(Boolean);
+        noticeText = names.length > 0 ? `MCP: ${names.slice(0, 8).join(", ")}` : "No MCP servers returned.";
+        openSettingsTab("mcp");
+        draft = "";
+        scheduleComposerTextareaResize();
+      } catch (error) {
+        errorText = describeError(error);
+      }
+      return true;
+    }
+
     const knownCommand = findCodexSlashCommand(command);
     if (knownCommand) {
       errorText = m.slash_command_not_supported({
@@ -6728,18 +7013,20 @@
       const attachmentIds = attachmentSnapshot.map((attachment) => attachment.id);
       const selectedSkillsSnapshot = [...(activeConversation.selectedSkills ?? [])];
       const preferences = activeConversation.preferences;
+      const clientUserMessageId = createClientUserMessageId();
       mutationSignature = buildComposerMutationSignature("message", sessionId, prompt, selectedSkillsSnapshot, attachmentIds);
       if (!beginComposerMutation(mutationSignature)) {
         startingMessage = false;
         return;
       }
-      setOptimisticMessageState(sessionId, prompt, selectedSkillsSnapshot, attachmentNames, activeConversation);
+      setOptimisticMessageState(sessionId, clientUserMessageId, prompt, selectedSkillsSnapshot, attachmentNames, activeConversation);
       activatePendingQueueMode(sessionId);
       recordComposerHistory(prompt);
       rememberLastComposerPromptChip(sessionId, prompt);
       if (!preserveComposer) {
         draft = "";
         draftAttachments = [];
+        closeFileMentionSearch();
         scheduleComposerTextareaResize();
         composerSettingsOpen = false;
       }
@@ -6749,7 +7036,8 @@
           prompt: draftText,
           skills: selectedSkillsSnapshot,
           attachmentIds,
-          preferences
+          preferences,
+          clientUserMessageId
         })
       .then(() => {
         scheduleSessionRefresh(80);
@@ -6810,17 +7098,19 @@
     noticeText = "";
     const selectedSkillsSnapshot = [...selectedBinding.state.selectedSkills];
     const attachmentIds = attachmentSnapshot.map((attachment) => attachment.id);
+    const clientUserMessageId = createClientUserMessageId();
     const mutationSignature = buildComposerMutationSignature("queue", sessionId, prompt, selectedSkillsSnapshot, attachmentIds);
     if (!beginComposerMutation(mutationSignature)) {
       return;
     }
-    const optimisticQueueId = addOptimisticQueuedItem(sessionId, prompt, selectedSkillsSnapshot, attachmentSnapshot);
+    const optimisticQueueId = addOptimisticQueuedItem(sessionId, clientUserMessageId, prompt, selectedSkillsSnapshot, attachmentSnapshot);
 
     recordComposerHistory(prompt);
     rememberLastComposerPromptChip(sessionId, prompt);
     if (!preserveComposer) {
       draft = "";
       draftAttachments = [];
+      closeFileMentionSearch();
       scheduleComposerTextareaResize();
       composerSettingsOpen = false;
       void api.clearSessionDraft(sessionId).catch(() => {});
@@ -6835,6 +7125,7 @@
       .enqueueSessionMessage(sessionId, {
         prompt: draftText,
         clientRequestId: optimisticQueueId,
+        clientUserMessageId,
         skills: selectedSkillsSnapshot,
         attachmentIds
       })
@@ -6903,6 +7194,7 @@
     const attachmentIds = steerAttachmentSnapshot.map((attachment) => attachment.id);
     const selectedSkillsSnapshot = [...selectedBinding.state.selectedSkills];
     const activeTurnId = selectedBinding.state.activeTurnId ?? getConversationLiveTurn(selectedBinding.state)?.id ?? null;
+    const clientUserMessageId = createClientUserMessageId();
     const mutationSignature = buildComposerMutationSignature("steer", sessionId, normalizedPrompt, selectedSkillsSnapshot, attachmentIds);
     if (!beginComposerMutation(mutationSignature)) {
       return;
@@ -6913,6 +7205,7 @@
     noticeText = "";
     setOptimisticMessageState(
       sessionId,
+      clientUserMessageId,
       normalizedPrompt,
       selectedSkillsSnapshot,
       steerAttachmentSnapshot.map((attachment) => attachment.originalName),
@@ -6924,7 +7217,8 @@
         normalizedPrompt,
         attachmentIds,
         selectedSkillsSnapshot,
-        activeTurnId
+        activeTurnId,
+        clientUserMessageId
       );
       scheduleSessionRefresh(80);
       scheduleSelectedSessionStateRefresh(sessionId, 80);
@@ -6933,6 +7227,7 @@
       if (clearComposer || draft.trim() === normalizedPrompt) {
         draft = "";
         draftAttachments = [];
+        closeFileMentionSearch();
         scheduleComposerTextareaResize();
         void api.clearSessionDraft(sessionId).catch(() => {});
       }
@@ -6971,7 +7266,15 @@
     sendIntent = mode;
     errorText = "";
     noticeText = "";
-    setOptimisticMessageState(sessionId, queuedItem.prompt, queuedItem.skills, queuedItem.attachmentNames, selectedBinding.state);
+    const clientUserMessageId = queuedItem.clientUserMessageId ?? queuedItem.clientRequestId ?? queuedItem.id;
+    setOptimisticMessageState(
+      sessionId,
+      clientUserMessageId,
+      queuedItem.prompt,
+      queuedItem.skills,
+      queuedItem.attachmentNames,
+      selectedBinding.state
+    );
 
     try {
       const activeTurnId =
@@ -7885,6 +8188,32 @@
     }
   }
 
+  function openDiagnosticsTab() {
+    diagnosticsTabOpen = true;
+    activeWorkspaceTabId = "diagnostics";
+    workspaceMenuOpen = false;
+  }
+
+  function closeDiagnosticsTab() {
+    diagnosticsTabOpen = false;
+    if (activeWorkspaceTabId === "diagnostics") {
+      activeWorkspaceTabId = "chat";
+    }
+  }
+
+  function openMemoryTab() {
+    memoryTabOpen = true;
+    activeWorkspaceTabId = "memory";
+    workspaceMenuOpen = false;
+  }
+
+  function closeMemoryTab() {
+    memoryTabOpen = false;
+    if (activeWorkspaceTabId === "memory") {
+      activeWorkspaceTabId = "chat";
+    }
+  }
+
   async function sendComputerInput(input: ComputerInputEvent) {
     if (!selectedSessionId || readOnlyRole || computerInputBusy) {
       return;
@@ -8605,6 +8934,10 @@
     ).trim();
   }
 
+  function getUserClientId(item: Record<string, unknown>) {
+    return formatValue(item.clientUserMessageId) || formatValue(item.clientId);
+  }
+
   function getUserAttachmentNames(item: Record<string, unknown>) {
     const names: string[] = [];
     const content = Array.isArray(item.content) ? (item.content as Array<Record<string, unknown>>) : [];
@@ -8626,8 +8959,16 @@
     return text.replace(/\s+/g, " ").trim();
   }
 
+  function createClientUserMessageId() {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return `cu_${crypto.randomUUID()}`;
+    }
+    return `cu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  }
+
   function setOptimisticMessageState(
     sessionId: string,
+    clientUserMessageId: string,
     prompt: string,
     skills: SelectedSkill[],
     attachmentNames: string[],
@@ -8641,6 +8982,7 @@
 
     optimisticMessage = {
       sessionId,
+      clientUserMessageId,
       prompt: normalizedPrompt,
       skills: normalizeSelectedSkills(skills),
       attachmentNames: normalizedAttachmentNames,
@@ -8705,14 +9047,22 @@
     }
   }
 
-  function addOptimisticQueuedItem(sessionId: string, prompt: string, skills: SelectedSkill[], attachments: AttachmentRecord[]) {
+  function addOptimisticQueuedItem(
+    sessionId: string,
+    clientUserMessageId: string,
+    prompt: string,
+    skills: SelectedSkill[],
+    attachments: AttachmentRecord[]
+  ) {
     const item: SessionQueueItem = {
-      id: `optimistic:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+      id: `optimistic:${sessionId}:${clientUserMessageId}`,
       prompt,
       skills: normalizeSelectedSkills(skills),
       attachmentIds: attachments.map((attachment) => attachment.id),
       attachmentNames: attachments.map((attachment) => attachment.originalName),
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      clientRequestId: clientUserMessageId,
+      clientUserMessageId
     };
 
     optimisticQueuedItemsBySessionId = {
@@ -8754,12 +9104,21 @@
     }
 
     const realCounts = new Map<string, number>();
+    const realClientIds = new Set(
+      queueItems
+        .map((item) => item.clientUserMessageId ?? item.clientRequestId ?? "")
+        .filter((value): value is string => value.length > 0)
+    );
     for (const item of queueItems) {
       const signature = buildQueueItemSignature(item.prompt, item.skills, item.attachmentIds);
       realCounts.set(signature, (realCounts.get(signature) ?? 0) + 1);
     }
 
     const nextItems = optimisticItems.filter((item) => {
+      const clientUserMessageId = item.clientUserMessageId ?? item.clientRequestId;
+      if (clientUserMessageId && realClientIds.has(clientUserMessageId)) {
+        return false;
+      }
       const signature = buildQueueItemSignature(item.prompt, item.skills, item.attachmentIds);
       const remaining = realCounts.get(signature) ?? 0;
       if (remaining <= 0) {
@@ -8806,6 +9165,9 @@
       return turn.items.some((item) => {
         if (item.type !== "userMessage") {
           return false;
+        }
+        if (optimistic.clientUserMessageId && getUserClientId(item) === optimistic.clientUserMessageId) {
+          return true;
         }
 
         const userText = normalizeMessageForComparison(getUserText(item));
@@ -8877,6 +9239,48 @@
       draft = response.draft;
       scheduleComposerTextareaResize();
       noticeText = mode === "handoff" ? m.opened_handoff_thread() : m.opened_branch_thread();
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function rollbackCurrentThreadToTurn(turnId: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    if (!selectedSessionId || !conversation) {
+      return;
+    }
+    const turnIndex = conversation.thread.turns.findIndex((turn) => turn.id === turnId);
+    if (turnIndex === -1) {
+      return;
+    }
+    const numTurns = conversation.thread.turns.length - turnIndex - 1;
+    if (numTurns <= 0) {
+      noticeText = m.rollback_no_later_turns();
+      return;
+    }
+    if (!window.confirm(ui.rollbackConfirm)) {
+      return;
+    }
+    const sessionId = selectedSessionId;
+    try {
+      const response = await api.rollbackSession(sessionId, numTurns);
+      if (selectedSessionId === sessionId && conversation) {
+        conversation = normalizeConversationExecutionState({
+          ...conversation,
+          thread: {
+            ...conversation.thread,
+            ...response.thread
+          },
+          activeTurnId: null
+        });
+        applySessionSummaryUpdate(buildSessionSummaryFromConversation(conversation));
+      }
+      scheduleSessionRefresh(80);
+      scheduleSelectedSessionStateRefresh(sessionId, 80);
+      noticeText = m.rollback_complete();
     } catch (error) {
       errorText = describeError(error);
     }
@@ -9016,8 +9420,128 @@
     });
   }
 
+  function closeFileMentionSearch() {
+    if (fileMentionSearchTimer !== null) {
+      clearTimeout(fileMentionSearchTimer);
+      fileMentionSearchTimer = null;
+    }
+    fileMentionTrigger = null;
+    fileMentionResults = [];
+    fileMentionBusy = false;
+    fileMentionActiveIndex = 0;
+  }
+
+  function detectFileMentionTrigger(value: string, cursor: number): FileMentionTrigger | null {
+    if (cursor < 1 || cursor > value.length) {
+      return null;
+    }
+
+    let start = cursor;
+    while (start > 0 && !/\s/u.test(value[start - 1] ?? "")) {
+      start -= 1;
+    }
+
+    const token = value.slice(start, cursor);
+    if (!token.startsWith("@") || token.includes("\n") || token.includes("\r")) {
+      return null;
+    }
+    const previous = value[start - 1] ?? "";
+    if (start > 0 && !/\s/u.test(previous) && !'([{"\'`,;'.includes(previous)) {
+      return null;
+    }
+
+    const query = token.slice(1);
+    if (query.includes("@")) {
+      return null;
+    }
+
+    return {
+      start,
+      end: cursor,
+      query
+    };
+  }
+
+  function scheduleFileMentionSearch() {
+    if (readOnlyRole || typeof window === "undefined") {
+      closeFileMentionSearch();
+      return;
+    }
+
+    window.queueMicrotask(() => {
+      const textarea = composerTextareaElement;
+      if (!textarea) {
+        closeFileMentionSearch();
+        return;
+      }
+
+      const selectionStart = textarea.selectionStart ?? draft.length;
+      const selectionEnd = textarea.selectionEnd ?? draft.length;
+      if (selectionStart !== selectionEnd) {
+        closeFileMentionSearch();
+        return;
+      }
+
+      const trigger = detectFileMentionTrigger(draft, selectionStart);
+      if (!trigger) {
+        closeFileMentionSearch();
+        return;
+      }
+
+      fileMentionTrigger = trigger;
+      fileMentionBusy = true;
+      fileMentionActiveIndex = 0;
+      if (fileMentionSearchTimer !== null) {
+        clearTimeout(fileMentionSearchTimer);
+      }
+
+      const requestVersion = ++fileMentionRequestVersion;
+      fileMentionSearchTimer = setTimeout(async () => {
+        fileMentionSearchTimer = null;
+        try {
+          const payload = await api.searchFileMentions(
+            trigger.query,
+            conversation?.preferences.cwd ?? conversation?.thread.cwd ?? config?.defaults.cwd ?? null,
+            12
+          );
+          if (requestVersion !== fileMentionRequestVersion) {
+            return;
+          }
+          fileMentionResults = payload.entries;
+          fileMentionActiveIndex = 0;
+        } catch {
+          if (requestVersion !== fileMentionRequestVersion) {
+            return;
+          }
+          fileMentionResults = [];
+        } finally {
+          if (requestVersion === fileMentionRequestVersion) {
+            fileMentionBusy = false;
+          }
+        }
+      }, 120);
+    });
+  }
+
+  async function insertFileMention(entry: FileMentionSearchEntry) {
+    const trigger = fileMentionTrigger;
+    if (!trigger) {
+      return;
+    }
+
+    const insertion = `@${entry.relativePath} `;
+    draft = `${draft.slice(0, trigger.start)}${insertion}${draft.slice(trigger.end)}`;
+    closeFileMentionSearch();
+    scheduleComposerTextareaResize();
+    await tick();
+    const cursor = trigger.start + insertion.length;
+    composerTextareaElement?.focus();
+    composerTextareaElement?.setSelectionRange(cursor, cursor);
+  }
+
   function handleComposerInput() {
     scheduleComposerTextareaResize();
+    scheduleFileMentionSearch();
     if (composerHistoryIndex !== -1) {
       resetComposerHistoryNavigation();
     }
@@ -9056,6 +9580,25 @@
   function handleComposerKeydown(event: KeyboardEvent) {
     if (event.isComposing) {
       return;
+    }
+
+    if (fileMentionTrigger) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeFileMentionSearch();
+        return;
+      }
+      if (fileMentionResults.length > 0 && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+        event.preventDefault();
+        const delta = event.key === "ArrowDown" ? 1 : -1;
+        fileMentionActiveIndex = (fileMentionActiveIndex + delta + fileMentionResults.length) % fileMentionResults.length;
+        return;
+      }
+      if (fileMentionResults.length > 0 && (event.key === "Enter" || event.key === "Tab")) {
+        event.preventDefault();
+        void insertFileMention(fileMentionResults[fileMentionActiveIndex] ?? fileMentionResults[0]);
+        return;
+      }
     }
 
     if (event.key === "Enter" && event.repeat) {
@@ -9743,6 +10286,15 @@
     if (item.type === "webSearch") {
       return m.web_search();
     }
+    if (item.type === "imageView") {
+      return "Image";
+    }
+    if (item.type === "enteredReviewMode") {
+      return "Review started";
+    }
+    if (item.type === "exitedReviewMode") {
+      return "Review completed";
+    }
     if (item.type === "contextCompaction") {
       return ui.contextCompression;
     }
@@ -9764,6 +10316,12 @@
     }
     if (item.type === "webSearch") {
       return "travel_explore";
+    }
+    if (item.type === "imageView" || item.type === "imageGeneration") {
+      return "image";
+    }
+    if (item.type === "enteredReviewMode" || item.type === "exitedReviewMode") {
+      return "fact_check";
     }
     if (item.type === "reasoning") {
       return "psychology_alt";
@@ -9791,7 +10349,14 @@
       return formatValue(item.tool) || formatValue(item.toolName) || formatValue(item.server) || m.load_details();
     }
     if (item.type === "webSearch") {
-      return formatValue(item.query) || m.search_details();
+      const queries = getWebSearchQueries(item);
+      return queries[0] || getWebSearchUrl(item) || m.search_details();
+    }
+    if (item.type === "imageView") {
+      return getImageViewPath(item) || m.load_details();
+    }
+    if (item.type === "enteredReviewMode" || item.type === "exitedReviewMode") {
+      return getReviewText(item);
     }
     if (item.type === "contextCompaction") {
       const liveTurn = getConversationLiveTurn();
@@ -10885,6 +11450,8 @@
       showPwaInstall={showPwaInstallAction}
       {pwaInstalled}
       {pwaInstallBusy}
+      defaultLanguageBridgeEnabled={config?.defaults.languageBridgeEnabled ?? false}
+      {defaultLanguageBridgeBusy}
       profiles={config?.profiles ?? []}
       systemShutdownArmed={config?.systemShutdown.armed ?? false}
       systemShutdownAvailable={config?.systemShutdown.available ?? false}
@@ -10941,6 +11508,9 @@
       }}
       onInstallApp={() => {
         void installApp();
+      }}
+      onDefaultLanguageBridgeChange={(enabled) => {
+        void saveDefaultLanguageBridgeEnabled(enabled);
       }}
       onSystemShutdownArmedChange={(armed) => {
         void saveSystemShutdownAfterQueueCompletes(armed);
@@ -11022,7 +11592,9 @@
       onEditTags={() => void editSelectedSessionTags()}
       onForkHandoff={() => void forkCurrentThread("handoff")}
       onOpenComputerTab={openComputerTab}
+      onOpenDiagnosticsTab={openDiagnosticsTab}
       onOpenGitTab={openGitTab}
+      onOpenMemoryTab={openMemoryTab}
       onOpenMobileSidebar={openMobileSidebar}
       onOpenSettingsTab={openSettingsTab}
       onOpenTasksTab={openTasksTab}
@@ -11060,6 +11632,14 @@
           }
           if (kind === "computer") {
             closeComputerTab();
+            return;
+          }
+          if (kind === "diagnostics") {
+            closeDiagnosticsTab();
+            return;
+          }
+          if (kind === "memory") {
+            closeMemoryTab();
             return;
           }
           if (kind === "git-diff") {
@@ -11181,6 +11761,7 @@
                           <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors" onclick={() => editMessageText(getUserText(item))} title={ui.editInComposer} type="button"><Pencil size={13} /></button>
                           <button class="p-1.5 rounded-lg text-gray-400 hover:text-amber-700 hover:bg-amber-50 transition-colors" onclick={() => void forkCurrentThread("fork", { turnId: turn.id, messageText: getUserText(item) })} title={ui.branchIntoNewThread} type="button"><GitBranch size={13} /></button>
                           <button class="p-1.5 rounded-lg text-gray-400 hover:text-amber-700 hover:bg-amber-50 transition-colors" onclick={() => void forkCurrentThread("handoff", { turnId: turn.id, messageText: getUserText(item) })} title={ui.handoffToNewThread} type="button"><ArrowRightLeft size={13} /></button>
+                          <button class="p-1.5 rounded-lg text-gray-400 hover:text-red-700 hover:bg-red-50 transition-colors" onclick={() => void rollbackCurrentThreadToTurn(turn.id)} title={ui.rollbackToThisTurn} type="button"><RotateCcw size={13} /></button>
                         </div>
                         <div class="px-5 py-3 bg-gray-100 rounded-2xl text-gray-800 shadow-sm border border-gray-200/50">
                           <MarkdownMessage compact expandLabel={ui.showFullMessage} maxInitialChars={compactMarkdownInitialChars} on:openLocalPath={(event: CustomEvent<{ href: string }>) => openFileFromMessage(event.detail.href)} text={getUserText(item)} />
@@ -11778,6 +12359,42 @@
                         </span>
                       </button>
                     {/each}
+                  </div>
+                {/if}
+                {#if fileMentionTrigger}
+                  <div class="mb-1.5 overflow-hidden rounded-xl border border-gray-200 bg-white/95 p-1.5 shadow-lg shadow-gray-200/60">
+                    <div class="flex items-center justify-between gap-2 px-2 py-1">
+                      <div class="flex min-w-0 items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">
+                        <FileText size={12} />
+                        <span>{m.file_mentions()}</span>
+                      </div>
+                      {#if fileMentionBusy}
+                        <RefreshCw size={12} class="shrink-0 animate-spin text-amber-500" />
+                      {/if}
+                    </div>
+                    {#if fileMentionResults.length > 0}
+                      <div class="grid gap-0.5">
+                        {#each fileMentionResults as entry, index (entry.path)}
+                          <button
+                            class={`ui-animated-button ui-animated-button--soft flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-left transition-colors ${
+                              index === fileMentionActiveIndex ? "bg-amber-50 text-gray-900" : "text-gray-700 hover:bg-gray-50"
+                            }`}
+                            onmouseenter={() => (fileMentionActiveIndex = index)}
+                            onmousedown={(event) => event.preventDefault()}
+                            onclick={() => void insertFileMention(entry)}
+                            type="button"
+                          >
+                            <FileText size={13} class={index === fileMentionActiveIndex ? "shrink-0 text-amber-600" : "shrink-0 text-gray-400"} />
+                            <div class="min-w-0 flex-1">
+                              <p class="truncate text-[11px] font-bold">{entry.name}</p>
+                              <p class="truncate text-[10px] text-gray-400">{entry.displayPath}</p>
+                            </div>
+                          </button>
+                        {/each}
+                      </div>
+                    {:else if !fileMentionBusy}
+                      <div class="px-2.5 py-2 text-[11px] font-medium text-gray-400">{m.file_mentions_empty()}</div>
+                    {/if}
                   </div>
                 {/if}
                 <form bind:this={composerPanelElement} class="composer-panel bg-white/95 border-2 border-gray-200 rounded-2xl shadow-2xl overflow-hidden transition-all duration-200 focus-within:-translate-y-0.5 focus-within:border-amber-400/70 focus-within:bg-white focus-within:shadow-[0_24px_60px_-34px_rgba(245,158,11,0.65)]" onsubmit={(event) => { event.preventDefault(); void submitComposer(); }}>
@@ -12496,6 +13113,39 @@
               <button class="ui-animated-button ui-animated-button--soft rounded-xl border px-3 py-2 text-xs font-bold disabled:opacity-50" disabled={readOnlyRole || computerInputBusy || !selectedComputerFrame} onclick={() => sendComputerScrollInput(640)} style="border-color: var(--line); color: var(--ink);" type="button">{ui.scrollDown}</button>
             </div>
           </div>
+        </div>
+      {:else if activeWorkspaceTabId === "diagnostics"}
+        <div class="h-full overflow-y-auto" style="background: var(--bg);">
+          {#if DiagnosticsWorkspaceView}
+            <DiagnosticsWorkspaceView
+              connectionState={connectionState}
+              notifications={notifications}
+              runtime={runtime}
+              sessions={sessions}
+              selectedSessionId={selectedSessionId}
+              webRole={webRole}
+              onOpenSession={async (sessionId) => {
+                activeWorkspaceTabId = "chat";
+                await selectSession(sessionId);
+              }}
+            />
+          {:else}
+            <div class="workspace-loading-card h-full">
+              <RefreshCw size={16} class="animate-spin text-gray-300" />
+              <span>{getWorkspaceLoadingLabel()}</span>
+            </div>
+          {/if}
+        </div>
+      {:else if activeWorkspaceTabId === "memory"}
+        <div class="h-full overflow-y-auto" style="background: var(--bg);">
+          {#if MemoryWorkspaceView}
+            <MemoryWorkspaceView selectedSessionId={selectedSessionId} webRole={webRole} />
+          {:else}
+            <div class="workspace-loading-card h-full">
+              <RefreshCw size={16} class="animate-spin text-gray-300" />
+              <span>{getWorkspaceLoadingLabel()}</span>
+            </div>
+          {/if}
         </div>
       {:else if activeWorkspaceTabId === "git"}
         {#if GitWorkspaceView}
@@ -13552,6 +14202,88 @@
   {/if}
 {/snippet}
 
+{#snippet renderWebSearchDetails(item: CodexItem)}
+  {@const queries = getWebSearchQueries(item)}
+  {@const actionType = getWebSearchActionType(item)}
+  {@const actionUrl = getWebSearchUrl(item)}
+  {@const actionPattern = getWebSearchPattern(item)}
+  <div class="space-y-3 p-3">
+    <div class="grid gap-2 sm:grid-cols-2">
+      <div class="rounded-xl border border-gray-100 bg-gray-50 px-3 py-2">
+        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400">Status</p>
+        <p class="mt-1 text-xs font-semibold text-gray-700">{getWebSearchStatus(item)}</p>
+      </div>
+      {#if actionType}
+        <div class="rounded-xl border border-gray-100 bg-gray-50 px-3 py-2">
+          <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400">Action</p>
+          <p class="mt-1 text-xs font-semibold text-gray-700">{actionType}</p>
+        </div>
+      {/if}
+    </div>
+    {#if queries.length > 0}
+      <div class="rounded-xl border border-gray-100 bg-white px-3 py-2.5">
+        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400">Queries</p>
+        <ul class="mt-2 space-y-1.5">
+          {#each queries as query (`${item.id}:query:${query}`)}
+            <li class="rounded-lg bg-gray-50 px-2.5 py-1.5 text-xs font-medium text-gray-700">{query}</li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
+    {#if actionUrl || actionPattern}
+      <div class="rounded-xl border border-gray-100 bg-white px-3 py-2.5">
+        {#if actionUrl}
+          <p class="truncate text-xs font-semibold text-gray-700">{actionUrl}</p>
+        {/if}
+        {#if actionPattern}
+          <p class="mt-1 truncate text-[11px] text-gray-500">{actionPattern}</p>
+        {/if}
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet renderReviewModeItem(item: CodexItem, stickyLevel = 0)}
+  {@const findings = getReviewFindings(item)}
+  <div class="turn-card-shell overflow-hidden rounded-2xl border border-orange-100 bg-white shadow-sm">
+    <div class="turn-card-header turn-card-header--amber flex items-center justify-between gap-3 border-b border-orange-100 px-4 py-3" data-sticky-level={stickyLevel}>
+      <div class="flex min-w-0 items-center gap-3">
+        <div class="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-orange-100 bg-orange-50 text-orange-700">
+          <Shield size={15} />
+        </div>
+        <div class="min-w-0">
+          <h4 class="truncate text-[10px] font-bold uppercase tracking-widest text-orange-700">{getToolItemLabel(item)}</h4>
+          <p class="mt-1 line-clamp-2 text-xs text-gray-600">{getReviewText(item)}</p>
+        </div>
+      </div>
+      {#if findings.length > 0}
+        <span class="shrink-0 rounded-full bg-orange-50 px-2 py-1 text-[10px] font-bold uppercase tracking-widest text-orange-700">{findings.length}</span>
+      {/if}
+    </div>
+    {#if findings.length > 0}
+      <div class="space-y-2 bg-orange-50/35 p-3">
+        {#each findings as finding, index (`${item.id}:finding:${index}`)}
+          {@const location = getReviewFindingLocation(finding)}
+          <article class="rounded-xl border border-orange-100 bg-white px-3 py-2.5">
+            <div class="flex items-start justify-between gap-2">
+              <h5 class="min-w-0 text-xs font-bold text-gray-800">{formatValue(finding.title) || `Finding ${index + 1}`}</h5>
+              {#if formatValue(finding.priority)}
+                <span class="shrink-0 rounded-full bg-gray-100 px-1.5 py-0.5 text-[9px] font-bold uppercase text-gray-500">P{formatValue(finding.priority)}</span>
+              {/if}
+            </div>
+            {#if location}
+              <button class="mt-1 block max-w-full truncate text-left text-[10px] font-mono font-semibold text-orange-700 hover:underline" onclick={() => openFileTab(location.split(":")[0] ?? location)} type="button">{location}</button>
+            {/if}
+            {#if formatValue(finding.body)}
+              <p class="mt-2 text-xs leading-relaxed text-gray-600">{formatValue(finding.body)}</p>
+            {/if}
+          </article>
+        {/each}
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 {#snippet renderTurnItem(turnId: string, item: CodexItem, stickyLevel = 0)}
   {#if item.type === "agentMessage"}
     <div class="space-y-2 group/agent-message">
@@ -13574,24 +14306,56 @@
             <h4 class="truncate text-[10px] font-bold uppercase tracking-widest text-sky-700">{item.title ?? "Generated image"}</h4>
             {#if imagePrompt}
               <p class="mt-1 truncate text-xs text-gray-500">{imagePrompt}</p>
+            {:else if formatValue(item.status)}
+              <p class="mt-1 truncate text-xs text-gray-500">{formatValue(item.status)}</p>
             {/if}
           </div>
         </div>
         {#if imageSrc}
-          <button
-            class="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-50"
-            onclick={() => window.open(imageSrc, "_blank", "noopener,noreferrer")}
-            type="button"
-          >
-            <ExternalLink size={12} />
-            <span>{ui.openInNewTab}</span>
-          </button>
+          <div class="flex shrink-0 items-center gap-1.5">
+            <a
+              class="inline-flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-50"
+              download={getImageGenerationDownloadName(item)}
+              href={imageSrc}
+            >
+              <Download size={12} />
+              <span>{m.save()}</span>
+            </a>
+            <button
+              class="inline-flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-50"
+              onclick={() => window.open(imageSrc, "_blank", "noopener,noreferrer")}
+              type="button"
+            >
+              <ExternalLink size={12} />
+              <span>{ui.openInNewTab}</span>
+            </button>
+          </div>
         {/if}
       </div>
       <div class="space-y-3 bg-sky-50/40 p-3">
         {#if imageSrc}
           <div class="overflow-hidden rounded-2xl border border-sky-100 bg-white">
             <img alt={imagePrompt ?? "Generated image"} class="block h-auto max-h-[34rem] w-full object-contain" loading="lazy" src={imageSrc} />
+          </div>
+        {:else if item.detailState === "deferred" || item.resultOmitted}
+          <div class="rounded-xl border border-dashed border-sky-200 bg-white px-4 py-5 text-center text-xs text-gray-500">
+            <p>{getToolItemSummary(item)}</p>
+            {#if getItemDetailError(turnId, item.id)}
+              <p class="mt-2 text-red-600">{getItemDetailError(turnId, item.id)}</p>
+            {/if}
+            <button
+              class="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-sky-200 bg-sky-50 px-3 py-1.5 text-[10px] font-bold text-sky-700 transition-colors hover:bg-sky-100 disabled:opacity-60"
+              disabled={isItemDetailLoading(turnId, item.id)}
+              onclick={() => void loadItemDetail(turnId, item.id)}
+              type="button"
+            >
+              {#if isItemDetailLoading(turnId, item.id)}
+                <RefreshCw size={12} class="animate-spin" />
+              {:else}
+                <ChevronDown size={12} />
+              {/if}
+              <span>{m.load_details()}</span>
+            </button>
           </div>
         {:else}
           <div class="rounded-xl border border-dashed border-sky-200 bg-white px-4 py-6 text-center text-xs text-gray-500">
@@ -13603,6 +14367,35 @@
         {/if}
       </div>
     </div>
+  {:else if item.type === "imageView"}
+    {@const imagePath = getImageViewPath(item)}
+    <div class="turn-card-shell overflow-hidden rounded-2xl border border-sky-100 bg-white shadow-sm">
+      <div class="turn-card-header turn-card-header--neutral flex items-center justify-between gap-3 border-b border-sky-100 px-4 py-3" data-sticky-level={stickyLevel}>
+        <div class="flex min-w-0 items-center gap-3">
+          <div class="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-sky-100 bg-sky-50 text-sky-700">
+            <Layout size={15} />
+          </div>
+          <div class="min-w-0">
+            <h4 class="truncate text-[10px] font-bold uppercase tracking-widest text-sky-700">{getToolItemLabel(item)}</h4>
+            {#if imagePath}
+              <p class="mt-1 truncate text-xs text-gray-500">{imagePath}</p>
+            {/if}
+          </div>
+        </div>
+        {#if imagePath}
+          <button
+            class="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-50"
+            onclick={() => openFileTab(imagePath)}
+            type="button"
+          >
+            <FileText size={12} />
+            <span>{m.open()}</span>
+          </button>
+        {/if}
+      </div>
+    </div>
+  {:else if item.type === "enteredReviewMode" || item.type === "exitedReviewMode"}
+    {@render renderReviewModeItem(item, stickyLevel)}
   {:else if item.type === "reasoning"}
     <div class="turn-card-shell overflow-hidden rounded-2xl border border-amber-100 bg-amber-50/40 shadow-sm">
       <div class="turn-card-header turn-card-header--amber flex items-start gap-3 border-b border-amber-100 px-4 py-3" data-sticky-level={stickyLevel}>
@@ -13718,6 +14511,8 @@
                 </figure>
               {/each}
             </div>
+          {:else if item.type === "webSearch"}
+            {@render renderWebSearchDetails(item)}
           {:else if getDeferredToolBody(item)}{@render renderCappedOutput(getDeferredToolBody(item), getOutputPreviewKey(turnId, item.id))}
           {:else}<div class="p-4 text-gray-400 text-xs italic text-center">{ui.noAdditionalOutput}</div>{/if}
         </div>

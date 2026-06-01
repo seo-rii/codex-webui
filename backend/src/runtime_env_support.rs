@@ -38,10 +38,23 @@ pub(crate) async fn app_server_client_for_session_turn(
 ) -> Result<AppServerClient> {
     let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
     let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+    let cached_goal_is_active = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("goalsByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|goals| goals.get(session_id))
+            .and_then(|goal| goal.get("status"))
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == "active"))
+    })
+    .await
+    .unwrap_or(false);
     let client_key = {
         let mut assignments = state.session_app_server_assignments.lock().await;
         let desired_client_key = if state.config.per_session_app_servers {
             format!("{resolved_profile_id}::session::{session_id}")
+        } else if cached_goal_is_active {
+            format!("{resolved_profile_id}::goal::{session_id}")
         } else {
             resolved_profile_id.to_string()
         };

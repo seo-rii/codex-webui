@@ -163,6 +163,11 @@ pub(crate) async fn dispatch_queue_item(
         .get("skills")
         .cloned()
         .unwrap_or_else(|| json!([]));
+    let client_user_message_id = queued_item
+        .get("clientUserMessageId")
+        .or_else(|| queued_item.get("clientRequestId"))
+        .and_then(Value::as_str)
+        .or_else(|| queued_item.get("id").and_then(Value::as_str));
 
     if mode == "steer" {
         steer_turn_payload(
@@ -173,6 +178,7 @@ pub(crate) async fn dispatch_queue_item(
             Some(&attachment_ids),
             Some(&selected_skills),
             expected_turn_id,
+            client_user_message_id,
         )
         .await
         .map(|_| ())
@@ -185,6 +191,7 @@ pub(crate) async fn dispatch_queue_item(
             Some(&attachment_ids),
             Some(&selected_skills),
             json!({}),
+            client_user_message_id,
         )
         .await
         .map(|_| ())

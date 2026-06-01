@@ -32,6 +32,7 @@ pub(crate) async fn handle_session_queue_api_http(
                                 .and_then(Value::as_str)
                                 .unwrap_or_default(),
                             payload.get("clientRequestId").and_then(Value::as_str),
+                            payload.get("clientUserMessageId").and_then(Value::as_str),
                             payload.get("skills"),
                             payload.get("attachmentIds"),
                         )

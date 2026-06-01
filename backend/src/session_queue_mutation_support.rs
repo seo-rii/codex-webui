@@ -1,18 +1,12 @@
 use super::*;
 
-fn normalize_queue_client_request_id(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.chars().take(160).collect::<String>())
-}
-
 pub(crate) async fn enqueue_session_queue_payload(
     state: &AppState,
     profile_id: &str,
     session_id: &str,
     prompt: &str,
     client_request_id: Option<&str>,
+    client_user_message_id: Option<&str>,
     selected_skills: Option<&Value>,
     attachment_ids: Option<&Value>,
 ) -> ApiResult<Value> {
@@ -20,7 +14,9 @@ pub(crate) async fn enqueue_session_queue_payload(
     let (resolved_attachment_ids, attachment_names) =
         resolve_queue_attachment_metadata(state, profile_id, session_id, attachment_ids).await?;
     let next_selected_skills = selected_skills_from_value(selected_skills);
-    let client_request_id = normalize_queue_client_request_id(client_request_id);
+    let client_request_id = normalize_client_user_message_id(client_request_id);
+    let client_user_message_id = normalize_client_user_message_id(client_user_message_id)
+        .or_else(|| client_request_id.clone());
     if trimmed_prompt.is_empty() && resolved_attachment_ids.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
     }
@@ -87,13 +83,19 @@ pub(crate) async fn enqueue_session_queue_payload(
             "attachmentNames": attachment_names,
             "createdAt": updated_at
         });
-        if let (Some(item_object), Some(client_request_id)) =
-            (item.as_object_mut(), client_request_id.as_ref())
-        {
-            item_object.insert(
-                "clientRequestId".to_string(),
-                Value::String(client_request_id.clone()),
-            );
+        if let Some(item_object) = item.as_object_mut() {
+            if let Some(client_request_id) = client_request_id.as_ref() {
+                item_object.insert(
+                    "clientRequestId".to_string(),
+                    Value::String(client_request_id.clone()),
+                );
+            }
+            if let Some(client_user_message_id) = client_user_message_id.as_ref() {
+                item_object.insert(
+                    "clientUserMessageId".to_string(),
+                    Value::String(client_user_message_id.clone()),
+                );
+            }
         }
         items.push(item);
         queue.insert("resumePending".to_string(), json!(false));

@@ -32,3 +32,35 @@ pub(crate) async fn proxy_app_server_payload(
             )
         })
 }
+
+pub(crate) async fn proxy_session_app_server_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    upstream_method: &str,
+    params: Value,
+) -> ApiResult<Value> {
+    let client = app_server_client_for_session(state, profile_id, session_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to codex app-server: {error}"),
+            )
+        })?;
+
+    client
+        .request_with_timeout(
+            upstream_method.to_string(),
+            params,
+            CODEX_PROTOCOL_PROXY_TIMEOUT,
+            false,
+        )
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to proxy Codex `{upstream_method}` request: {error}"),
+            )
+        })
+}

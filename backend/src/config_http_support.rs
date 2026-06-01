@@ -603,6 +603,18 @@ pub(crate) async fn update_config_payload(
         }
     }
 
+    if let Some(defaults) = payload.get("defaults").filter(|value| !value.is_null()) {
+        let next_defaults =
+            normalize_session_preferences_payload(state, profile_id, defaults.clone()).await?;
+        sync_codex_toml_with_preferences(
+            &resolve_runtime_profile(&state.config, profile_id).codex_home,
+            &next_defaults,
+        )
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        event_patch.insert("defaults".to_string(), next_defaults);
+    }
+
     if !event_patch.is_empty() {
         emit_profile_config_updated(state, profile_id, Value::Object(event_patch)).await;
     }

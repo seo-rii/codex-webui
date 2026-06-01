@@ -389,6 +389,7 @@ pub(crate) async fn start_arena_run_payload(
             Some(&json!([])),
             None,
             Value::Object(session_preferences),
+            None,
         )
         .await;
 

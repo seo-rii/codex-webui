@@ -619,6 +619,33 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
     return next;
   }
 
+  if (method === "codex-webui/languageBridgeResponseTranslated") {
+    const turnId = String(params.turnId ?? "");
+    const itemId = String(params.itemId ?? "");
+    const translatedText = String(params.text ?? "");
+    if (!turnId || !itemId || !translatedText) {
+      return next;
+    }
+    const seeded = ensureTurn(next, turnId);
+    const existing =
+      seeded.turn.items.find((candidate) => candidate.id === itemId) ??
+      ({
+        id: itemId,
+        type: "agentMessage",
+        text: ""
+      } satisfies CodexItem);
+    upsertItem(seeded.turn, {
+      ...existing,
+      type: existing.type || "agentMessage",
+      originalText: existing.originalText ?? params.originalText ?? existing.text ?? "",
+      text: translatedText,
+      languageBridgeTranslated: true,
+      languageBridgeOutputLanguage: params.language ?? null
+    });
+    next.thread.turns = seeded.turns;
+    return next;
+  }
+
   if (method === "thread/tokenUsage/updated") {
     next.tokenUsage = (params.tokenUsage as SessionDetailPayload["tokenUsage"]) ?? null;
     return next;

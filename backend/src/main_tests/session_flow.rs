@@ -156,6 +156,145 @@ fn write_state_thread_fixture(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parser_diagnostics_reports_native_mismatches_without_hot_path_listing() {
+    let sandbox = unique_test_dir("parser-diagnostics-mismatch");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let session_id = "019e0000-0000-7000-8000-00000000d1a6";
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-11-00",
+        session_id,
+        &workspace,
+        "local parser prompt",
+        &[],
+        None,
+    );
+    write_state_thread_fixture(
+        &codex_home,
+        session_id,
+        "Local parser title",
+        "local parser prompt",
+        &workspace,
+        false,
+        1_777_000_000_000,
+        1_777_000_001_000,
+        None,
+        None,
+        false,
+    );
+
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Native Codex title",
+                    "preview": "native preview",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1_777_000_002_000_i64,
+                    "updatedAt": 1_777_000_003_000_i64,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "turns": [
+                        {
+                            "id": "native-turn-1",
+                            "status": "completed",
+                            "items": [
+                                {
+                                    "id": "native-turn-1:user:0",
+                                    "type": "userMessage",
+                                    "text": "native prompt"
+                                },
+                                {
+                                    "id": "native-turn-1:agent:0",
+                                    "type": "agentMessage",
+                                    "text": "native answer"
+                                }
+                            ]
+                        }
+                    ],
+                    "goal": {
+                        "threadId": session_id,
+                        "objective": "native goal",
+                        "status": "active",
+                        "tokensUsed": 7
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let payload = compare_parser_with_native_session_payload(&state, "default", session_id, 5)
+        .await
+        .unwrap();
+
+    assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(false));
+    assert!(
+        payload
+            .get("mismatchCount")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0)
+    );
+    let mismatches = payload
+        .get("mismatches")
+        .and_then(Value::as_array)
+        .expect("mismatches should be an array");
+    assert!(mismatches.iter().any(|entry| {
+        entry.get("category").and_then(Value::as_str) == Some("summary")
+            && entry.get("field").and_then(Value::as_str) == Some("name")
+    }));
+    assert!(mismatches.iter().any(|entry| {
+        entry.get("category").and_then(Value::as_str) == Some("recentTurns")
+            && entry.get("field").and_then(Value::as_str) == Some("turns")
+    }));
+    assert_eq!(
+        payload
+            .get("local")
+            .and_then(|local| local.get("available"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        payload
+            .get("native")
+            .and_then(|native| native.get("available"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let thread_list = app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "debug/requestCount",
+            json!({
+                "target": "thread/list"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(thread_list.get("count").and_then(Value::as_u64), Some(0));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_session_payload_uses_app_server_and_persists_preferences() {
     let sandbox = unique_test_dir("session-create-rust");
     let workspace = sandbox.join("workspace");
@@ -1510,6 +1649,200 @@ async fn session_list_normalizes_mixed_timestamp_units() {
             .and_then(Value::as_str),
         Some("thread-seconds")
     );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn ws_review_start_proxies_to_session_app_server() {
+    let sandbox = unique_test_dir("session-review-start-proxy");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-review",
+                    "name": "Review target",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": null,
+                    "agentRole": null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let auth = AuthContext {
+        role: UserRole::Admin,
+        profile_id: "default".to_string(),
+    };
+
+    let payload = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "session/review/start",
+        json!({
+            "sessionId": "thread-review",
+            "target": {
+                "type": "custom",
+                "instructions": "Review the current diff for regressions."
+            },
+            "delivery": "detached"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let review_thread_id = payload
+        .get("reviewThreadId")
+        .and_then(Value::as_str)
+        .expect("review start should return a review thread id");
+    assert_ne!(review_thread_id, "thread-review");
+    assert_eq!(
+        payload
+            .get("turn")
+            .and_then(|turn| turn.get("status"))
+            .and_then(Value::as_str),
+        Some("inProgress")
+    );
+
+    let source_thread = client
+        .request("thread/read", json!({ "threadId": "thread-review" }))
+        .await
+        .unwrap();
+    let last_review = source_thread
+        .get("thread")
+        .and_then(|thread| thread.get("lastReviewStart"))
+        .expect("fake app-server should record review/start params");
+    assert_eq!(
+        last_review.get("threadId").and_then(Value::as_str),
+        Some("thread-review")
+    );
+    assert_eq!(
+        last_review
+            .get("target")
+            .and_then(|target| target.get("type"))
+            .and_then(Value::as_str),
+        Some("custom")
+    );
+
+    let request_count = client
+        .request("debug/requestCount", json!({ "target": "review/start" }))
+        .await
+        .unwrap();
+    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(1));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn ws_session_rollback_proxies_to_session_app_server() {
+    let sandbox = unique_test_dir("session-rollback-proxy");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-rollback",
+                    "name": "Rollback target",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": null,
+                    "agentRole": null,
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "completed",
+                            "error": null,
+                            "startedAt": 1,
+                            "completedAt": 2,
+                            "durationMs": 1,
+                            "items": []
+                        },
+                        {
+                            "id": "turn-2",
+                            "status": "completed",
+                            "error": null,
+                            "startedAt": 3,
+                            "completedAt": 4,
+                            "durationMs": 1,
+                            "items": []
+                        }
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let auth = AuthContext {
+        role: UserRole::Admin,
+        profile_id: "default".to_string(),
+    };
+
+    let payload = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "session/rollback",
+        json!({
+            "sessionId": "thread-rollback",
+            "numTurns": 1
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        payload
+            .get("thread")
+            .and_then(|thread| thread.get("turns"))
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    let request_count = client
+        .request("debug/requestCount", json!({ "target": "thread/rollback" }))
+        .await
+        .unwrap();
+    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(1));
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -3190,6 +3523,273 @@ async fn local_session_detail_does_not_resurrect_active_tail_behind_terminal_cac
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_session_detail_parses_rich_transcript_items_and_rollbacks() {
+    let sandbox = unique_test_dir("session-detail-rich-items");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000221";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    fs::write(
+        rollout_dir.join(format!("rollout-2026-04-24T01-09-00-{session_id}.jsonl")),
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:09:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:09:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:01.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-rich" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:02.000Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "show rich transcript items" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:03.000Z",
+                "type": "event_msg",
+                "payload": { "type": "web_search_begin", "call_id": "search-1" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:04.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "web_search_end",
+                    "call_id": "search-1",
+                    "query": "codex web search",
+                    "action": { "type": "search", "query": "codex web search" }
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:05.000Z",
+                "type": "event_msg",
+                "payload": { "type": "image_generation_begin", "call_id": "image-1" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:06.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "image_generation_end",
+                    "call_id": "image-1",
+                    "status": "completed",
+                    "revised_prompt": "small diagram",
+                    "result": "iVBORw0KGgo=",
+                    "saved_path": workspace.join("diagram.png").display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:07.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "view_image_tool_call",
+                    "call_id": "view-image-1",
+                    "path": workspace.join("diagram.png").display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:08.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "entered_review_mode",
+                    "user_facing_hint": "Review requested."
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:09.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "exited_review_mode",
+                    "review_output": {
+                        "findings": [],
+                        "overall_correctness": "patch is correct",
+                        "overall_explanation": "No findings.",
+                        "overall_confidence_score": 0.88
+                    }
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:10.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "turn-rich" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:11.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-rolled" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:12.000Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "this turn should be removed" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:13.000Z",
+                "type": "event_msg",
+                "payload": { "type": "thread_rolled_back", "num_turns": 1 }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+    let turns = detail
+        .get("thread")
+        .and_then(|thread| thread.get("turns"))
+        .and_then(Value::as_array)
+        .expect("rich rollout turns should be visible");
+    assert_eq!(turns.len(), 1);
+    let turn = session_turn_payload(&state, "default", session_id, "turn-rich")
+        .await
+        .unwrap()
+        .get("turn")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let item_types = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(|item| item.get("type").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(item_types.contains(&"webSearch"));
+    assert!(item_types.contains(&"imageGeneration"));
+    assert!(item_types.contains(&"imageView"));
+    assert!(item_types.contains(&"enteredReviewMode"));
+    assert!(item_types.contains(&"exitedReviewMode"));
+    assert!(!turns.iter().any(|turn| {
+        serde_json::to_string(turn)
+            .unwrap()
+            .contains("this turn should be removed")
+    }));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_session_detail_defers_large_image_generation_results() {
+    let sandbox = unique_test_dir("session-detail-large-image");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000223";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let large_result = "a".repeat(300 * 1024);
+    fs::write(
+        rollout_dir.join(format!("rollout-2026-04-24T01-09-30-{session_id}.jsonl")),
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:09:30.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:09:30.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:31.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-large-image" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:32.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "image_generation_end",
+                    "call_id": "image-large",
+                    "status": "completed",
+                    "result": large_result,
+                    "saved_path": workspace.join("large.png").display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:33.000Z",
+                "type": "event_msg",
+                "payload": { "type": "agent_message", "message": "image ready" }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+    let summarized_image = detail
+        .get("thread")
+        .and_then(|thread| thread.get("turns"))
+        .and_then(Value::as_array)
+        .and_then(|turns| turns.first())
+        .and_then(|turn| turn.get("items"))
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("type").and_then(Value::as_str) == Some("imageGeneration"))
+        })
+        .expect("active large image generation item should be summarized");
+    assert!(summarized_image.get("result").is_some_and(Value::is_null));
+    assert_eq!(
+        summarized_image.get("detailState").and_then(Value::as_str),
+        Some("deferred")
+    );
+    assert_eq!(
+        summarized_image
+            .get("resultOmitted")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let detail_item = session_item_detail_payload(
+        &state,
+        "default",
+        session_id,
+        "turn-large-image",
+        "image-large",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        detail_item
+            .get("item")
+            .and_then(|item| item.get("result"))
+            .and_then(Value::as_str)
+            .map(str::len),
+        Some(300 * 1024)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_summary_uses_local_rollout_metadata_when_thread_read_is_slow() {
     let sandbox = unique_test_dir("session-summary-local-metadata");
     let workspace = sandbox.join("workspace");
@@ -3601,6 +4201,7 @@ async fn send_turn_payload_uses_app_server_and_updates_session_state() {
             "effort": "high",
             "networkAccess": true
         }),
+        Some("client-send-1"),
     )
     .await
     .unwrap();
@@ -3642,6 +4243,19 @@ async fn send_turn_payload_uses_app_server_and_updates_session_state() {
         last_turn_start.get("serviceTier").and_then(Value::as_str),
         Some("fast")
     );
+    assert_eq!(
+        last_turn_start
+            .get("clientUserMessageId")
+            .and_then(Value::as_str),
+        Some("client-send-1")
+    );
+    assert_eq!(
+        last_turn_start
+            .get("responsesapiClientMetadata")
+            .and_then(|metadata| metadata.get("clientUserMessageId"))
+            .and_then(Value::as_str),
+        Some("client-send-1")
+    );
     let input = last_turn_start
         .get("input")
         .and_then(Value::as_array)
@@ -3679,6 +4293,19 @@ async fn send_turn_payload_uses_app_server_and_updates_session_state() {
             .and_then(|value| value.get("name"))
             .and_then(Value::as_str),
         Some("imagegen")
+    );
+    let user_message = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| turns.first())
+        .and_then(|turn| turn.get("items"))
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        user_message.get("clientId").and_then(Value::as_str),
+        Some("client-send-1")
     );
 
     handle_profile_runtime_notification(
@@ -3807,6 +4434,7 @@ async fn send_turn_payload_rejects_concurrent_turn_starts() {
         None,
         None,
         preferences.clone(),
+        None,
     );
     let second = async {
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -3818,6 +4446,7 @@ async fn send_turn_payload_rejects_concurrent_turn_starts() {
             None,
             None,
             preferences.clone(),
+            None,
         )
         .await
     };
@@ -3891,6 +4520,7 @@ async fn send_turn_payload_translates_language_bridge_prompt_with_temp_session()
             "languageBridgeEnabled": true,
             "languageBridgeOutputLanguage": "Korean"
         }),
+        None,
     )
     .await
     .unwrap();
@@ -3927,6 +4557,85 @@ async fn send_turn_payload_translates_language_bridge_prompt_with_temp_session()
         .unwrap_or_default();
     assert!(instructions.contains("Language bridge is enabled"));
     assert!(instructions.contains("Korean"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_turn_uses_language_bridge_response_translation_subagent() {
+    let sandbox = unique_test_dir("turn-language-bridge-response-translation");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5",
+            "languageBridgeEnabled": true,
+            "languageBridgeOutputLanguage": "Korean"
+        }),
+        None,
+        Some("Language bridge response"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "turn/completed".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "turn": {
+                    "id": "turn-response",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "id": "turn-response:agent:0",
+                            "type": "agentMessage",
+                            "text": "This is the final English answer."
+                        }
+                    ]
+                }
+            }),
+        },
+    )
+    .await;
+
+    let mut translated = None;
+    for _ in 0..40 {
+        translated = with_ui_state_read(&state, "default", |ui_state| {
+            Ok(ui_state
+                .get("languageBridgeByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(&session_id))
+                .and_then(|entry| entry.get("translationsByItemId"))
+                .and_then(Value::as_object)
+                .and_then(|translations| translations.get("turn-response:agent:0"))
+                .and_then(|translation| translation.get("text"))
+                .and_then(Value::as_str)
+                .map(str::to_string))
+        })
+        .await
+        .unwrap();
+        if translated.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(translated.as_deref(), Some("번역된 응답입니다."));
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -3970,6 +4679,7 @@ async fn send_turn_payload_rejects_recent_active_turn_starts() {
         None,
         None,
         preferences.clone(),
+        None,
     )
     .await
     .unwrap();
@@ -3986,6 +4696,7 @@ async fn send_turn_payload_rejects_recent_active_turn_starts() {
         None,
         None,
         preferences,
+        None,
     )
     .await
     .unwrap_err();
@@ -4098,6 +4809,7 @@ async fn steer_turn_payload_uses_active_turn_from_thread_reads() {
         Some(&json!(["att-file"])),
         None,
         None,
+        Some("client-steer-1"),
     )
     .await
     .unwrap();
@@ -4117,6 +4829,19 @@ async fn steer_turn_payload_uses_active_turn_from_thread_reads() {
             .get("expectedTurnId")
             .and_then(Value::as_str),
         Some("turn-2")
+    );
+    assert_eq!(
+        last_turn_steer
+            .get("clientUserMessageId")
+            .and_then(Value::as_str),
+        Some("client-steer-1")
+    );
+    assert_eq!(
+        last_turn_steer
+            .get("responsesapiClientMetadata")
+            .and_then(|metadata| metadata.get("clientUserMessageId"))
+            .and_then(Value::as_str),
+        Some("client-steer-1")
     );
     let first_text = last_turn_steer
         .get("input")
@@ -4187,6 +4912,7 @@ async fn steer_turn_payload_uses_expected_turn_id_without_thread_read() {
         None,
         None,
         Some("turn-known"),
+        None,
     )
     .await
     .unwrap();

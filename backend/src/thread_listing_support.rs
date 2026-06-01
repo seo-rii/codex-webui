@@ -804,6 +804,13 @@ pub(crate) async fn create_session_payload(
                 "Codex app-server returned a session without an id.",
             )
         })?;
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    state.session_app_server_assignments.lock().await.insert(
+        runtime_session_key(&resolved_profile_id, &session_id),
+        resolved_profile_id,
+    );
 
     with_ui_state_write(state, profile_id, |ui_state| {
         let Some(preferences_by_thread_id) = ui_state

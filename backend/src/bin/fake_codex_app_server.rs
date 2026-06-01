@@ -222,6 +222,81 @@ fn main() {
                     "result": {}
                 }));
             }
+            Some("marketplace/add" | "marketplace/remove" | "marketplace/upgrade") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {}
+                }));
+            }
+            Some("skills/list") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "skills": [
+                            {
+                                "name": "imagegen",
+                                "description": "Generate and edit images.",
+                                "path": "skills/.system/imagegen/SKILL.md",
+                                "source": "system"
+                            }
+                        ],
+                        "nextCursor": null
+                    }
+                }));
+            }
+            Some("hooks/list") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "hooks": [],
+                        "nextCursor": null
+                    }
+                }));
+            }
+            Some("mcpServerStatus/list") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "data": [
+                            {
+                                "name": "computer-use",
+                                "authStatus": "oAuth",
+                                "tools": {
+                                    "computer.screenshot": {
+                                        "name": "computer.screenshot",
+                                        "title": "Screenshot",
+                                        "description": "Capture the current computer frame.",
+                                        "inputSchema": {}
+                                    }
+                                },
+                                "resources": [
+                                    {
+                                        "name": "session-log",
+                                        "uri": "mcp://computer-use/session-log",
+                                        "mimeType": "text/plain"
+                                    }
+                                ],
+                                "resourceTemplates": []
+                            }
+                        ],
+                        "nextCursor": null
+                    }
+                }));
+            }
+            Some("config/mcpServer/reload") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {}
+                }));
+            }
+            Some("mcpServer/oauth/login") => {
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "authorizationUrl": "https://example.com/oauth/authorize"
+                    }
+                }));
+            }
             Some("app/list") => {
                 print_message(&json!({
                     "id": id,
@@ -361,16 +436,20 @@ fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let model = params.get("model").cloned().unwrap_or(Value::Null);
+                let is_subagent =
+                    params.get("threadSource").and_then(Value::as_str) == Some("subagent");
                 let thread = json!({
                     "id": thread_id,
                     "name": "New thread",
                     "preview": "",
                     "cwd": cwd,
+                    "ephemeral": params.get("ephemeral").and_then(Value::as_bool).unwrap_or(false),
+                    "threadSource": params.get("threadSource").cloned().unwrap_or(Value::Null),
                     "archived": false,
                     "createdAt": timestamp_counter,
                     "updatedAt": timestamp_counter,
                     "status": "idle",
-                    "isSubagent": false,
+                    "isSubagent": is_subagent,
                     "agentNickname": Value::Null,
                     "agentRole": Value::Null,
                     "model": model,
@@ -559,6 +638,58 @@ fn main() {
                     }
                 }));
             }
+            Some("thread/memoryMode/set") => {
+                let thread_id = payload
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let mode = payload
+                    .get("params")
+                    .and_then(|params| params.get("mode"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !matches!(mode.as_str(), "enabled" | "disabled") {
+                    print_message(&json!({
+                        "id": id,
+                        "error": {
+                            "code": -32602,
+                            "message": "invalid memory mode"
+                        }
+                    }));
+                    continue;
+                }
+                let Some(thread_object) =
+                    threads.get_mut(&thread_id).and_then(Value::as_object_mut)
+                else {
+                    print_message(&json!({
+                        "id": id,
+                        "error": {
+                            "code": -32000,
+                            "message": "thread not found"
+                        }
+                    }));
+                    continue;
+                };
+                thread_object.insert("memoryMode".to_string(), Value::String(mode));
+                print_message(&json!({
+                    "id": id,
+                    "result": {}
+                }));
+            }
+            Some("memory/reset") => {
+                if let Ok(codex_home) = env::var("CODEX_HOME") {
+                    let memory_root = Path::new(&codex_home).join("memories");
+                    let _ = fs::remove_dir_all(&memory_root);
+                    let _ = fs::create_dir_all(&memory_root);
+                }
+                print_message(&json!({
+                    "id": id,
+                    "result": {}
+                }));
+            }
             Some("thread/seed") => {
                 let thread = payload
                     .get("params")
@@ -582,7 +713,7 @@ fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let thread = threads.get(thread_id).cloned().unwrap_or_else(|| {
-                    json!({
+                    let thread = json!({
                         "id": thread_id,
                         "name": "New thread",
                         "preview": "",
@@ -595,7 +726,11 @@ fn main() {
                         "agentNickname": Value::Null,
                         "agentRole": Value::Null,
                         "turns": []
-                    })
+                    });
+                    if !thread_id.is_empty() {
+                        threads.insert(thread_id.to_string(), thread.clone());
+                    }
+                    thread
                 });
                 let read_error = thread.get("readError").cloned().unwrap_or(Value::Null);
                 if let Some(message) = read_error
@@ -674,6 +809,28 @@ fn main() {
                     "result": {
                         "data": page,
                         "nextCursor": next_cursor
+                    }
+                }));
+            }
+            Some("thread/archive") | Some("thread/unarchive") => {
+                let thread_id = payload
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(thread) = threads.get_mut(&thread_id).and_then(Value::as_object_mut) {
+                    timestamp_counter += 1;
+                    thread.insert(
+                        "archived".to_string(),
+                        Value::Bool(method == Some("thread/archive")),
+                    );
+                    thread.insert("updatedAt".to_string(), Value::from(timestamp_counter));
+                }
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "ok": true
                     }
                 }));
             }
@@ -781,6 +938,101 @@ fn main() {
                     }
                 }));
             }
+            Some("review/start") => {
+                let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
+                let thread_id = params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let delivery = params
+                    .get("delivery")
+                    .and_then(Value::as_str)
+                    .unwrap_or("inline");
+                timestamp_counter += 1;
+                let review_thread_id = if delivery == "detached" {
+                    thread_counter += 1;
+                    let review_thread_id = format!("review-{thread_counter}");
+                    let cwd = threads
+                        .get(&thread_id)
+                        .and_then(Value::as_object)
+                        .and_then(|thread| thread.get("cwd"))
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(String::new()));
+                    threads.insert(
+                        review_thread_id.clone(),
+                        json!({
+                            "id": review_thread_id.clone(),
+                            "name": "Review",
+                            "preview": "Review current changes",
+                            "cwd": cwd,
+                            "archived": false,
+                            "createdAt": timestamp_counter,
+                            "updatedAt": timestamp_counter,
+                            "status": "running",
+                            "isSubagent": false,
+                            "agentNickname": Value::Null,
+                            "agentRole": Value::Null,
+                            "turns": []
+                        }),
+                    );
+                    review_thread_id
+                } else {
+                    thread_id.clone()
+                };
+                let turn_id = format!("review-turn-{timestamp_counter}");
+                if let Some(thread_object) = threads
+                    .get_mut(&review_thread_id)
+                    .and_then(Value::as_object_mut)
+                {
+                    let turn = json!({
+                        "id": turn_id,
+                        "status": "inProgress",
+                        "error": Value::Null,
+                        "startedAt": timestamp_counter,
+                        "completedAt": Value::Null,
+                        "durationMs": Value::Null,
+                        "items": [
+                            {
+                                "id": format!("{turn_id}:review:0"),
+                                "type": "enteredReviewMode",
+                                "review": "Review current changes"
+                            }
+                        ]
+                    });
+                    thread_object
+                        .entry("turns".to_string())
+                        .or_insert_with(|| Value::Array(Vec::new()));
+                    if let Some(turns) =
+                        thread_object.get_mut("turns").and_then(Value::as_array_mut)
+                    {
+                        turns.push(turn);
+                    }
+                    thread_object
+                        .insert("status".to_string(), Value::String("running".to_string()));
+                    thread_object.insert("updatedAt".to_string(), Value::from(timestamp_counter));
+                    thread_object.insert("lastReviewStart".to_string(), params.clone());
+                }
+                if review_thread_id != thread_id {
+                    if let Some(thread_object) =
+                        threads.get_mut(&thread_id).and_then(Value::as_object_mut)
+                    {
+                        thread_object.insert("lastReviewStart".to_string(), params.clone());
+                    }
+                }
+                print_message(&json!({
+                    "id": id,
+                    "result": {
+                        "turn": {
+                            "id": turn_id,
+                            "status": "inProgress",
+                            "itemsView": "notLoaded",
+                            "items": []
+                        },
+                        "reviewThreadId": review_thread_id
+                    }
+                }));
+            }
             Some("turn/start") => {
                 let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
                 let thread_id = params
@@ -820,20 +1072,75 @@ fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                let client_user_message_id = params
+                    .get("clientUserMessageId")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        params
+                            .get("responsesapiClientMetadata")
+                            .and_then(|metadata| metadata.get("clientUserMessageId"))
+                            .and_then(Value::as_str)
+                    })
+                    .map(str::to_string);
+                let is_ephemeral = thread
+                    .get("ephemeral")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let mut user_item = json!({
+                    "id": format!("{turn_id}:user:0"),
+                    "type": "userMessage",
+                    "text": text.clone()
+                });
+                if let (Some(user_object), Some(client_user_message_id)) =
+                    (user_item.as_object_mut(), client_user_message_id.as_ref())
+                {
+                    user_object.insert(
+                        "clientId".to_string(),
+                        Value::String(client_user_message_id.clone()),
+                    );
+                    user_object.insert(
+                        "clientUserMessageId".to_string(),
+                        Value::String(client_user_message_id.clone()),
+                    );
+                }
+                let mut items = vec![user_item];
+                if is_ephemeral {
+                    let agent_text = if text.contains("Translate the following Codex answer") {
+                        "번역된 응답입니다.".to_string()
+                    } else {
+                        let language = if text
+                            .chars()
+                            .any(|ch| ('\u{ac00}'..='\u{d7af}').contains(&ch))
+                        {
+                            "Korean"
+                        } else {
+                            "English"
+                        };
+                        let english = if language == "Korean" {
+                            "Summarize it."
+                        } else {
+                            text.as_str()
+                        };
+                        json!({
+                            "english": english,
+                            "language": language
+                        })
+                        .to_string()
+                    };
+                    items.push(json!({
+                        "id": format!("{turn_id}:agent:0"),
+                        "type": "agentMessage",
+                        "text": agent_text
+                    }));
+                }
                 let turn = json!({
                     "id": turn_id,
-                    "status": "inProgress",
+                    "status": if is_ephemeral { "completed" } else { "inProgress" },
                     "error": Value::Null,
                     "startedAt": timestamp_counter,
-                    "completedAt": Value::Null,
-                    "durationMs": Value::Null,
-                    "items": [
-                        {
-                            "id": format!("{turn_id}:user:0"),
-                            "type": "userMessage",
-                            "text": text.clone()
-                        }
-                    ]
+                    "completedAt": if is_ephemeral { Value::from(timestamp_counter) } else { Value::Null },
+                    "durationMs": if is_ephemeral { Value::from(0) } else { Value::Null },
+                    "items": items
                 });
 
                 if let Some(thread_object) = thread.as_object_mut() {
@@ -847,8 +1154,10 @@ fn main() {
                         "preview".to_string(),
                         Value::String(text.trim().to_string()),
                     );
-                    thread_object
-                        .insert("status".to_string(), Value::String("running".to_string()));
+                    thread_object.insert(
+                        "status".to_string(),
+                        Value::String(if is_ephemeral { "idle" } else { "running" }.to_string()),
+                    );
                     thread_object.insert("updatedAt".to_string(), Value::from(timestamp_counter));
                     thread_object.insert("lastTurnStart".to_string(), params);
                 }

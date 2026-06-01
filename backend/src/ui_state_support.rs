@@ -42,6 +42,7 @@ fn default_ui_state_value() -> Value {
         "queuesByThreadId": {},
         "goalsByThreadId": {},
         "highlightsByThreadId": {},
+        "languageBridgeByThreadId": {},
         "runtimeStatusByThreadId": {}
     })
 }
@@ -137,6 +138,7 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
         ("queuesByThreadId", json!({})),
         ("goalsByThreadId", json!({})),
         ("highlightsByThreadId", json!({})),
+        ("languageBridgeByThreadId", json!({})),
         ("runtimeStatusByThreadId", json!({})),
     ] {
         let is_valid = if default_value.is_array() {

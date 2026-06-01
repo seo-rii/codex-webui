@@ -81,6 +81,46 @@ async fn rejects_sensitive_editable_files_inside_profile_home() {
 }
 
 #[tokio::test]
+async fn file_mention_search_finds_allowed_files_without_sensitive_entries() {
+    let sandbox = unique_test_dir("file-mentions");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(workspace.join("src/lib")).unwrap();
+    fs::create_dir_all(workspace.join("node_modules/pkg")).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(workspace.join("src/lib/foo.ts"), "export const foo = 1;\n").unwrap();
+    fs::write(workspace.join(".env"), "TOKEN=secret\n").unwrap();
+    fs::write(
+        workspace.join("node_modules/pkg/foo.js"),
+        "module.exports = 1;\n",
+    )
+    .unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let payload: FileMentionSearchPayload = serde_json::from_value(
+        search_file_mentions_payload(&state, "foo", None, 10)
+            .await
+            .unwrap(),
+    )
+    .expect("payload should deserialize");
+
+    assert!(
+        payload
+            .entries
+            .iter()
+            .any(|entry| entry.relative_path == "src/lib/foo.ts")
+    );
+    assert!(
+        payload
+            .entries
+            .iter()
+            .all(|entry| !entry.relative_path.contains("node_modules") && entry.name != ".env")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn codex_home_editor_access_is_limited_to_config_toml() {
     let sandbox = unique_test_dir("editor-codex-home-allowlist");
     let workspace = sandbox.join("workspace");
@@ -1372,6 +1412,50 @@ async fn arming_shutdown_while_idle_waits_for_future_activity() {
     .await
     .unwrap();
     assert!(primed_state);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn config_update_saves_default_language_bridge() {
+    let sandbox = unique_test_dir("config-default-language-bridge");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home.clone());
+    let updated = update_config_payload(
+        &state,
+        "default",
+        json!({
+            "defaults": {
+                "languageBridgeEnabled": true,
+                "languageBridgeOutputLanguage": "Korean"
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        updated
+            .get("defaults")
+            .and_then(|defaults| defaults.get("languageBridgeEnabled"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        updated
+            .get("defaults")
+            .and_then(|defaults| defaults.get("languageBridgeOutputLanguage"))
+            .and_then(Value::as_str),
+        Some("Korean")
+    );
+    let raw_config = fs::read_to_string(config_toml_path(&codex_home)).unwrap();
+    assert!(raw_config.contains("[codex_webui]"));
+    assert!(raw_config.contains("language_bridge = true"));
+    assert!(raw_config.contains("language_bridge_output_language = \"Korean\""));
 
     let _ = fs::remove_dir_all(sandbox);
 }

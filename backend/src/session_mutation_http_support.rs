@@ -212,6 +212,7 @@ pub(crate) async fn handle_session_messages_api_http(
                 payload.get("attachmentIds"),
                 payload.get("skills"),
                 preferences,
+                payload.get("clientUserMessageId").and_then(Value::as_str),
             )
             .await
         }
@@ -253,6 +254,7 @@ pub(crate) async fn handle_session_steer_api_http(
                     .get("activeTurnId")
                     .or_else(|| payload.get("expectedTurnId"))
                     .and_then(Value::as_str),
+                payload.get("clientUserMessageId").and_then(Value::as_str),
             )
             .await
         }

@@ -5,6 +5,7 @@ const SESSION_DETAIL_ROLLOUT_TAIL_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const SESSION_OLDER_ROLLOUT_TAIL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_DETAIL_GOAL_TIMEOUT_MS: u64 = 150;
 const SESSION_DETAIL_ACTIVE_RECONCILE_TIMEOUT_MS: u64 = 1_000;
+const SESSION_DETAIL_INLINE_IMAGE_RESULT_MAX_CHARS: usize = 256 * 1024;
 
 struct LocalRolloutTurnWindow {
     turns: Vec<Value>,
@@ -101,25 +102,50 @@ fn summarize_session_turn_for_detail_payload(
         .iter()
         .enumerate()
         .filter_map(|(item_index, item)| {
-            let normalized = normalize_session_item_payload(item, &turn_id, item_index);
+            let mut normalized = normalize_session_item_payload(item, &turn_id, item_index);
             let item_type = normalized
                 .get("type")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            if is_internal_session_item_type(item_type) {
+                .unwrap_or("unknown")
+                .to_string();
+            if is_internal_session_item_type(&item_type) {
                 return None;
+            }
+            if item_type == "imageGeneration" {
+                if let Some(result_len) = normalized
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .map(str::len)
+                {
+                    if result_len > SESSION_DETAIL_INLINE_IMAGE_RESULT_MAX_CHARS {
+                        if let Some(item_object) = normalized.as_object_mut() {
+                            item_object.insert("result".to_string(), Value::Null);
+                            item_object.insert("resultOmitted".to_string(), Value::Bool(true));
+                            item_object.insert(
+                                "detailState".to_string(),
+                                Value::String("deferred".to_string()),
+                            );
+                            item_object.insert(
+                                "detailPreview".to_string(),
+                                Value::String(
+                                    "Generated image payload is available on demand.".to_string(),
+                                ),
+                            );
+                        }
+                    }
+                }
             }
             if compact_completed_process
                 && compact_non_running_turn
                 && !matches!(
-                    item_type,
+                    item_type.as_str(),
                     "userMessage" | "agentMessage" | "plan" | "contextCompaction"
                 )
             {
                 hidden_item_count = hidden_item_count.saturating_add(1);
                 return None;
             }
-            Some(match item_type {
+            Some(match item_type.as_str() {
                 "commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall"
                 | "webSearch" => prepare_session_deferred_item_payload(item, &turn_id, item_index),
                 _ => normalized,
@@ -330,6 +356,92 @@ fn file_change_item_from_patch_apply_payload(payload: &Value) -> Value {
     })
 }
 
+fn web_search_item_from_rollout_payload(
+    payload: &Value,
+    fallback_id: String,
+    status: &str,
+) -> Value {
+    json!({
+        "id": payload
+            .get("call_id")
+            .or_else(|| payload.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or(fallback_id),
+        "type": "webSearch",
+        "status": status,
+        "query": payload.get("query").cloned().unwrap_or(Value::Null),
+        "action": payload.get("action").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn image_generation_item_from_rollout_payload(
+    payload: &Value,
+    fallback_id: String,
+    status: &str,
+) -> Value {
+    json!({
+        "id": payload
+            .get("call_id")
+            .or_else(|| payload.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or(fallback_id),
+        "type": "imageGeneration",
+        "status": payload
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or(status),
+        "revisedPrompt": payload
+            .get("revised_prompt")
+            .or_else(|| payload.get("revisedPrompt"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "result": payload.get("result").cloned().unwrap_or(Value::Null),
+        "savedPath": payload
+            .get("saved_path")
+            .or_else(|| payload.get("savedPath"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    })
+}
+
+fn review_mode_item_from_rollout_payload(
+    payload: &Value,
+    fallback_id: String,
+    item_type: &str,
+) -> Value {
+    let review_output = payload
+        .get("review_output")
+        .or_else(|| payload.get("reviewOutput"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let review = if item_type == "enteredReviewMode" {
+        payload
+            .get("user_facing_hint")
+            .or_else(|| payload.get("userFacingHint"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Review requested.")
+    } else {
+        review_output
+            .get("overall_explanation")
+            .or_else(|| review_output.get("overallExplanation"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Review mode completed.")
+    };
+    json!({
+        "id": fallback_id,
+        "type": item_type,
+        "review": review,
+        "target": payload.get("target").cloned().unwrap_or(Value::Null),
+        "reviewOutput": review_output
+    })
+}
+
 fn rollout_tail_records(
     path: &Path,
     target_turns: usize,
@@ -394,6 +506,18 @@ fn rollout_tail_line_may_affect_detail(line: &str) -> bool {
         || line.contains(r#""type": "context_compaction""#)
         || line.contains(r#""type":"contextCompaction""#)
         || line.contains(r#""type": "contextCompaction""#)
+        || line.contains(r#""type":"web_search_"#)
+        || line.contains(r#""type": "web_search_"#)
+        || line.contains(r#""type":"image_generation_"#)
+        || line.contains(r#""type": "image_generation_"#)
+        || line.contains(r#""type":"view_image_tool_call""#)
+        || line.contains(r#""type": "view_image_tool_call""#)
+        || line.contains(r#""type":"entered_review_mode""#)
+        || line.contains(r#""type": "entered_review_mode""#)
+        || line.contains(r#""type":"exited_review_mode""#)
+        || line.contains(r#""type": "exited_review_mode""#)
+        || line.contains(r#""type":"thread_rolled_back""#)
+        || line.contains(r#""type": "thread_rolled_back""#)
 }
 
 fn build_turn_window_from_rollout_records(
@@ -664,6 +788,155 @@ fn build_turn_window_from_rollout_records(
             }
             ("event_msg", "token_count") => {
                 token_usage = normalize_token_usage_payload(payload.get("info"));
+            }
+            ("event_msg", "thread_rolled_back") => {
+                let rollback_turns = payload
+                    .get("num_turns")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0);
+                if rollback_turns >= turns.len() {
+                    turns.clear();
+                    current_index = None;
+                } else if rollback_turns > 0 {
+                    let next_len = turns.len().saturating_sub(rollback_turns);
+                    turns.truncate(next_len);
+                    current_index = next_len.checked_sub(1);
+                }
+                call_turn_indices.retain(|_, index| *index < turns.len());
+            }
+            ("event_msg", "web_search_begin") => {
+                let index =
+                    ensure_rollout_turn_index(&mut turns, &mut current_index, None, timestamp_ms);
+                let turn_item_prefix = turns[index]
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("turn")
+                    .to_string();
+                push_rollout_item(
+                    &mut turns[index],
+                    web_search_item_from_rollout_payload(
+                        payload,
+                        format!("{turn_item_prefix}:web-search:{record_index}"),
+                        "running",
+                    ),
+                );
+            }
+            ("event_msg", "web_search_end") => {
+                let index =
+                    ensure_rollout_turn_index(&mut turns, &mut current_index, None, timestamp_ms);
+                let turn_item_prefix = turns[index]
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("turn")
+                    .to_string();
+                let item = web_search_item_from_rollout_payload(
+                    payload,
+                    format!("{turn_item_prefix}:web-search:{record_index}"),
+                    "completed",
+                );
+                let item_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !item_id.is_empty() {
+                    let updated = update_rollout_item(&mut turns[index], &item_id, |existing| {
+                        *existing = item.clone();
+                    });
+                    if !updated {
+                        push_rollout_item(&mut turns[index], item);
+                    }
+                }
+            }
+            ("event_msg", "image_generation_begin") => {
+                let index =
+                    ensure_rollout_turn_index(&mut turns, &mut current_index, None, timestamp_ms);
+                let turn_item_prefix = turns[index]
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("turn")
+                    .to_string();
+                push_rollout_item(
+                    &mut turns[index],
+                    image_generation_item_from_rollout_payload(
+                        payload,
+                        format!("{turn_item_prefix}:image-generation:{record_index}"),
+                        "running",
+                    ),
+                );
+            }
+            ("event_msg", "image_generation_end") => {
+                let index =
+                    ensure_rollout_turn_index(&mut turns, &mut current_index, None, timestamp_ms);
+                let turn_item_prefix = turns[index]
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("turn")
+                    .to_string();
+                let item = image_generation_item_from_rollout_payload(
+                    payload,
+                    format!("{turn_item_prefix}:image-generation:{record_index}"),
+                    "completed",
+                );
+                let item_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !item_id.is_empty() {
+                    let updated = update_rollout_item(&mut turns[index], &item_id, |existing| {
+                        *existing = item.clone();
+                    });
+                    if !updated {
+                        push_rollout_item(&mut turns[index], item);
+                    }
+                }
+            }
+            ("event_msg", "view_image_tool_call") => {
+                let index =
+                    ensure_rollout_turn_index(&mut turns, &mut current_index, None, timestamp_ms);
+                let turn_item_prefix = turns[index]
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("turn")
+                    .to_string();
+                push_rollout_item(
+                    &mut turns[index],
+                    json!({
+                        "id": payload
+                            .get("call_id")
+                            .or_else(|| payload.get("id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("{turn_item_prefix}:image-view:{record_index}")),
+                        "type": "imageView",
+                        "path": payload.get("path").cloned().unwrap_or(Value::Null),
+                        "status": "completed"
+                    }),
+                );
+            }
+            ("event_msg", "entered_review_mode") | ("event_msg", "exited_review_mode") => {
+                let index =
+                    ensure_rollout_turn_index(&mut turns, &mut current_index, None, timestamp_ms);
+                let turn_item_prefix = turns[index]
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("turn")
+                    .to_string();
+                let item_type = if payload_type == "entered_review_mode" {
+                    "enteredReviewMode"
+                } else {
+                    "exitedReviewMode"
+                };
+                push_rollout_item(
+                    &mut turns[index],
+                    review_mode_item_from_rollout_payload(
+                        payload,
+                        format!("{turn_item_prefix}:{payload_type}:{record_index}"),
+                        item_type,
+                    ),
+                );
             }
             ("event_msg", "exec_command_end") => {
                 let turn_id = payload.get("turn_id").and_then(Value::as_str);
@@ -954,6 +1227,58 @@ async fn read_local_session_detail_source(
     Ok(Some((thread, turns)))
 }
 
+pub(crate) async fn local_session_diagnostics_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    limit: u64,
+) -> ApiResult<Option<Value>> {
+    let Some((thread, turn_window)) =
+        read_local_session_detail_source(state, profile_id, session_id, limit).await?
+    else {
+        return Ok(None);
+    };
+    let visible_turns = turn_window
+        .turns
+        .iter()
+        .enumerate()
+        .map(|(visible_index, turn)| {
+            summarize_session_turn_for_detail_payload(
+                turn,
+                turn_window.loaded_start + visible_index,
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
+    let remaining_turns = turn_window
+        .loaded_start
+        .saturating_add(usize::from(turn_window.truncated));
+    Ok(Some(json!({
+        "thread": {
+            "id": thread.get("id").cloned().unwrap_or_else(|| json!(session_id)),
+            "preview": thread.get("preview").cloned().unwrap_or_else(|| json!("")),
+            "name": thread.get("name").cloned().unwrap_or(Value::Null),
+            "cwd": thread.get("cwd").cloned().unwrap_or(Value::Null),
+            "status": thread.get("status").cloned().unwrap_or_else(|| json!("unknown")),
+            "createdAt": thread.get("createdAt").cloned().unwrap_or_else(|| json!(0)),
+            "updatedAt": thread.get("updatedAt").cloned().unwrap_or_else(|| json!(0)),
+            "isSubagent": thread.get("isSubagent").cloned().unwrap_or_else(|| json!(false)),
+            "agentNickname": thread.get("agentNickname").cloned().unwrap_or(Value::Null),
+            "agentRole": thread.get("agentRole").cloned().unwrap_or(Value::Null),
+            "turns": visible_turns
+        },
+        "hydration": {
+            "state": if remaining_turns > 0 { "idle" } else { "complete" },
+            "loadedTurns": turn_window.turns.len(),
+            "totalTurns": turn_window
+                .known_total_turns
+                .unwrap_or_else(|| remaining_turns.saturating_add(turn_window.turns.len())),
+            "remainingTurns": remaining_turns,
+            "truncated": turn_window.truncated
+        }
+    })))
+}
+
 pub(crate) async fn local_session_has_active_turn_payload(
     state: &AppState,
     profile_id: &str,
@@ -1216,6 +1541,8 @@ pub(crate) async fn session_detail_payload(
             }
         }
     }
+    apply_language_bridge_translations_to_turns(state, profile_id, session_id, &mut visible_turns)
+        .await?;
     let active_turn_id_from_payload = if stale_active_turn_after_exit {
         None
     } else {

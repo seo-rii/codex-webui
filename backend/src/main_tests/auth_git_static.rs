@@ -442,14 +442,15 @@ async fn owner_config_blocks_admin_from_owner_only_websocket_methods() {
         &out_tx,
         &subscriptions,
         &auth,
-        "runtime/install",
+        "gateway/restart",
         json!({}),
     )
     .await
-    .expect_err("admin should not run owner-only method when owner role is configured");
+    .expect_err("admin should not restart the gateway when owner role is configured");
 
     assert!(error.to_string().contains("OWNER_REQUIRED"));
     assert!(is_ws_method_allowed(UserRole::Owner, "terminal/create"));
+    assert!(ws_method_requires_owner("gateway/restart", &json!({})));
     assert!(ws_method_requires_owner("terminal/create", &json!({})));
     assert!(ws_method_requires_owner(
         "session/savePreferences",
@@ -1339,6 +1340,35 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
         state.restart_plan.lock().await.is_none(),
         "replacement gateway should be spawned before shutdown begins instead of waiting for graceful connections to drain"
     );
+    state
+        .preserve_app_servers_on_shutdown
+        .store(false, Ordering::SeqCst);
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    let ws_restart_payload = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &AuthContext {
+            profile_id: "default".to_string(),
+            role: UserRole::Owner,
+        },
+        "gateway/restart",
+        json!({}),
+    )
+    .await
+    .expect("owner should restart gateway through websocket");
+    assert_eq!(
+        ws_restart_payload
+            .get("restartScheduled")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        state
+            .preserve_app_servers_on_shutdown
+            .load(Ordering::SeqCst)
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -1350,20 +1380,21 @@ async fn restart_handoff_refuses_to_drop_active_app_server_when_disabled() {
     let codex_home = sandbox.join("codex-home");
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
-    let mut state = test_state(workspace.clone(), vec![workspace], codex_home.clone());
+    let mut state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace], codex_home.clone());
     let mut config = (*state.config).clone();
     config.instance_token = Some("probe-token".to_string());
     config.password = Some("admin-secret".to_string());
     config.restart_command = Some("true".to_string());
     config.app_server_handoff_enabled = false;
     state.config = Arc::new(config);
-    state
-        .app_servers
-        .get_or_create(AppServerProfile {
-            id: "default".to_string(),
-            codex_home,
-        })
-        .await;
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request("thread/list", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(state.app_servers.active_process_count().await, 1);
 
     let prepare_request = Request::builder()
         .method(Method::POST)
@@ -1436,6 +1467,7 @@ fn viewer_websocket_permissions_are_session_observation_only() {
         "git/file/get",
         "terminal/list",
         "terminal/read",
+        "gateway/restart",
         "session/draft/get",
         "session/queue/get",
     ] {

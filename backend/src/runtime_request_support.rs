@@ -579,6 +579,7 @@ pub(crate) async fn send_computer_input_payload(
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await?;
                     routed = "turnSteer";

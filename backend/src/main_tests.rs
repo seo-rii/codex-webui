@@ -176,6 +176,8 @@ fn test_state_with_fake_app_server(
             &fake_server_path,
             r#"#!/usr/bin/env python3
 import json
+import os
+import shutil
 import sys
 import time
 
@@ -375,6 +377,75 @@ for raw_line in sys.stdin:
             "id": request_id,
             "result": {}
         })
+    elif method in ("marketplace/add", "marketplace/remove", "marketplace/upgrade"):
+        write({
+            "id": request_id,
+            "result": {}
+        })
+    elif method == "skills/list":
+        write({
+            "id": request_id,
+            "result": {
+                "skills": [
+                    {
+                        "name": "imagegen",
+                        "description": "Generate and edit images.",
+                        "path": "skills/.system/imagegen/SKILL.md",
+                        "source": "system"
+                    }
+                ],
+                "nextCursor": None
+            }
+        })
+    elif method == "hooks/list":
+        write({
+            "id": request_id,
+            "result": {
+                "hooks": [],
+                "nextCursor": None
+            }
+        })
+    elif method == "mcpServerStatus/list":
+        write({
+            "id": request_id,
+            "result": {
+                "data": [
+                    {
+                        "name": "computer-use",
+                        "authStatus": "oAuth",
+                        "tools": {
+                            "computer.screenshot": {
+                                "name": "computer.screenshot",
+                                "title": "Screenshot",
+                                "description": "Capture the current computer frame.",
+                                "inputSchema": {}
+                            }
+                        },
+                        "resources": [
+                            {
+                                "name": "session-log",
+                                "uri": "mcp://computer-use/session-log",
+                                "mimeType": "text/plain"
+                            }
+                        ],
+                        "resourceTemplates": []
+                    }
+                ],
+                "nextCursor": None
+            }
+        })
+    elif method == "config/mcpServer/reload":
+        write({
+            "id": request_id,
+            "result": {}
+        })
+    elif method == "mcpServer/oauth/login":
+        write({
+            "id": request_id,
+            "result": {
+                "authorizationUrl": "https://example.com/oauth/authorize"
+            }
+        })
     elif method == "app/list":
         write({
             "id": request_id,
@@ -453,11 +524,12 @@ for raw_line in sys.stdin:
             "cwd": params.get("cwd", ""),
             "ephemeral": bool(params.get("ephemeral", False)),
             "developerInstructions": params.get("developerInstructions"),
+            "threadSource": params.get("threadSource"),
             "archived": False,
             "createdAt": timestamp_counter,
             "updatedAt": timestamp_counter,
             "status": "idle",
-            "isSubagent": False,
+            "isSubagent": params.get("threadSource") == "subagent",
             "agentNickname": None,
             "agentRole": None,
             "turns": []
@@ -576,6 +648,42 @@ for raw_line in sys.stdin:
                 "cleared": cleared
             }
         })
+    elif method == "thread/memoryMode/set":
+        thread_id = params.get("threadId", "")
+        mode = params.get("mode", "")
+        if mode not in ("enabled", "disabled"):
+            write({
+                "id": request_id,
+                "error": {
+                    "code": -32602,
+                    "message": "invalid memory mode"
+                }
+            })
+            continue
+        thread = threads.get(thread_id)
+        if not isinstance(thread, dict):
+            write({
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "thread not found"
+                }
+            })
+            continue
+        thread["memoryMode"] = mode
+        write({
+            "id": request_id,
+            "result": {}
+        })
+    elif method == "memory/reset":
+        memory_root = os.path.join(os.environ.get("CODEX_HOME", ""), "memories")
+        if memory_root.strip():
+            shutil.rmtree(memory_root, ignore_errors=True)
+            os.makedirs(memory_root, exist_ok=True)
+        write({
+            "id": request_id,
+            "result": {}
+        })
     elif method == "thread/seed":
         thread = params.get("thread") or {}
         thread_id = thread.get("id")
@@ -589,7 +697,9 @@ for raw_line in sys.stdin:
         })
     elif method == "thread/read":
         thread_id = params.get("threadId", "")
-        thread = threads.get(thread_id, {
+        thread = threads.get(thread_id)
+        if not isinstance(thread, dict):
+            thread = {
             "id": thread_id,
             "name": "New thread",
             "preview": "",
@@ -602,7 +712,9 @@ for raw_line in sys.stdin:
             "agentNickname": None,
             "agentRole": None,
             "turns": []
-        })
+            }
+            if thread_id:
+                threads[thread_id] = thread
         read_error = thread.get("readError")
         read_delay_ms = int(thread.get("readDelayMs", 0) or 0)
         if read_delay_ms > 0:
@@ -658,6 +770,18 @@ for raw_line in sys.stdin:
             "result": {
                 "data": data[start:end] if start < len(data) else [],
                 "nextCursor": next_cursor
+            }
+        })
+    elif method in ("thread/archive", "thread/unarchive"):
+        thread_id = params.get("threadId", "")
+        if thread_id in threads:
+            timestamp_counter += 1
+            threads[thread_id]["archived"] = method == "thread/archive"
+            threads[thread_id]["updatedAt"] = timestamp_counter
+        write({
+            "id": request_id,
+            "result": {
+                "ok": True
             }
         })
     elif method == "debug/requestCount":
@@ -731,6 +855,82 @@ for raw_line in sys.stdin:
                 "thread": thread
             }
         })
+    elif method == "review/start":
+        thread_id = params.get("threadId", "")
+        target = params.get("target") or {}
+        delivery = str(params.get("delivery") or "inline")
+        timestamp_counter += 1
+        review_thread_id = thread_id
+        if delivery == "detached":
+            thread_counter += 1
+            review_thread_id = f"review-{thread_counter}"
+            source_thread = threads.get(thread_id) if isinstance(threads.get(thread_id), dict) else {}
+            threads[review_thread_id] = {
+                "id": review_thread_id,
+                "name": "Review",
+                "preview": "Review current changes",
+                "cwd": source_thread.get("cwd", ""),
+                "archived": False,
+                "createdAt": timestamp_counter,
+                "updatedAt": timestamp_counter,
+                "status": "running",
+                "isSubagent": False,
+                "agentNickname": None,
+                "agentRole": None,
+                "turns": []
+            }
+        thread = threads.get(review_thread_id)
+        if not isinstance(thread, dict):
+            thread = {
+                "id": review_thread_id,
+                "name": "Review",
+                "preview": "Review current changes",
+                "cwd": "",
+                "archived": False,
+                "createdAt": timestamp_counter,
+                "updatedAt": timestamp_counter,
+                "status": "running",
+                "isSubagent": False,
+                "agentNickname": None,
+                "agentRole": None,
+                "turns": []
+            }
+        turn_id = f"review-turn-{timestamp_counter}"
+        target_label = target.get("type", "custom") if isinstance(target, dict) else "custom"
+        turn = {
+            "id": turn_id,
+            "status": "inProgress",
+            "error": None,
+            "startedAt": timestamp_counter,
+            "completedAt": None,
+            "durationMs": None,
+            "items": [
+                {
+                    "id": f"{turn_id}:review:0",
+                    "type": "enteredReviewMode",
+                    "review": f"Review target: {target_label}"
+                }
+            ]
+        }
+        thread["turns"] = list(thread.get("turns") or []) + [turn]
+        thread["status"] = "running"
+        thread["updatedAt"] = timestamp_counter
+        thread["lastReviewStart"] = params
+        threads[review_thread_id] = thread
+        if review_thread_id != thread_id and isinstance(threads.get(thread_id), dict):
+            threads[thread_id]["lastReviewStart"] = params
+        write({
+            "id": request_id,
+            "result": {
+                "turn": {
+                    "id": turn_id,
+                    "status": "inProgress",
+                    "itemsView": "notLoaded",
+                    "items": turn["items"]
+                },
+                "reviewThreadId": review_thread_id
+            }
+        })
     elif method == "turn/start":
         thread_id = params.get("threadId", "")
         turn_counter += 1
@@ -761,19 +961,38 @@ for raw_line in sys.stdin:
         text_value = text_item.get("text") if isinstance(text_item, dict) else ""
         if not isinstance(text_value, str):
             text_value = ""
+        client_user_message_id = params.get("clientUserMessageId")
+        if not isinstance(client_user_message_id, str) or not client_user_message_id.strip():
+            metadata = params.get("responsesapiClientMetadata")
+            if isinstance(metadata, dict):
+                client_user_message_id = metadata.get("clientUserMessageId")
+        if not isinstance(client_user_message_id, str) or not client_user_message_id.strip():
+            client_user_message_id = None
         is_ephemeral = bool(thread.get("ephemeral", False))
         agent_items = []
         if is_ephemeral:
-            language = "Korean" if any("\uac00" <= ch <= "\ud7af" for ch in text_value) else "English"
-            english = "Summarize it." if language == "Korean" else text_value
-            agent_items.append({
-                "id": f"{turn_id}:agent:0",
-                "type": "agentMessage",
-                "text": json.dumps({
+            if "Translate the following Codex answer" in text_value:
+                agent_text = "번역된 응답입니다."
+            else:
+                language = "Korean" if any("\uac00" <= ch <= "\ud7af" for ch in text_value) else "English"
+                english = "Summarize it." if language == "Korean" else text_value
+                agent_text = json.dumps({
                     "english": english,
                     "language": language
                 })
+            agent_items.append({
+                "id": f"{turn_id}:agent:0",
+                "type": "agentMessage",
+                "text": agent_text
             })
+        user_item = {
+            "id": f"{turn_id}:user:0",
+            "type": "userMessage",
+            "text": text_value
+        }
+        if client_user_message_id:
+            user_item["clientId"] = client_user_message_id
+            user_item["clientUserMessageId"] = client_user_message_id
         turn = {
             "id": turn_id,
             "status": "completed" if is_ephemeral else "inProgress",
@@ -781,13 +1000,7 @@ for raw_line in sys.stdin:
             "startedAt": timestamp_counter,
             "completedAt": timestamp_counter if is_ephemeral else None,
             "durationMs": 0 if is_ephemeral else None,
-            "items": [
-                {
-                    "id": f"{turn_id}:user:0",
-                    "type": "userMessage",
-                    "text": text_value
-                }
-            ] + agent_items
+            "items": [user_item] + agent_items
         }
         thread["turns"] = list(thread.get("turns") or []) + [turn]
         thread["preview"] = text_value.strip()

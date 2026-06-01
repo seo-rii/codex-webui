@@ -69,6 +69,12 @@ fn goal_from_response(response: &Value, session_id: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn goal_status_is_active(goal: &Value) -> bool {
+    goal.get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| canonical_goal_status(status) == Some("active"))
+}
+
 pub(crate) async fn cache_session_goal_payload(
     state: &AppState,
     profile_id: &str,
@@ -137,6 +143,17 @@ async fn request_thread_goal(
             format!("Failed to connect to codex app-server: {error}"),
         )
     })?;
+    if dedicate_unassigned_session {
+        client
+            .request("thread/read", json!({ "threadId": session_id }))
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to load the session before updating its goal: {error}"),
+                )
+            })?;
+    }
     match client.request(method, params.clone()).await {
         Ok(response) => Ok(response),
         Err(error) if is_goal_disabled_error(&error) => {
@@ -182,13 +199,14 @@ pub(crate) async fn fetch_session_goal_payload(
     profile_id: &str,
     session_id: &str,
 ) -> ApiResult<Value> {
+    let cached_goal = cached_session_goal_or_null_payload(state, profile_id, session_id).await;
     let response = request_thread_goal(
         state,
         profile_id,
         session_id,
         "thread/goal/get",
         json!({ "threadId": session_id }),
-        false,
+        goal_status_is_active(&cached_goal),
     )
     .await?;
     let goal = goal_from_response(&response, session_id);

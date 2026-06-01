@@ -27,9 +27,12 @@
     AppConfigPayload,
     CatalogPayload,
     CodexAppInfo,
+    CodexHookInfo,
     CodexRuntimeProcess,
     CodexRuntimeStatus,
+    CodexSkillInfo,
     EditableFilePayload,
+    McpServerStatus,
     NotificationEventType,
     NotificationSettings,
     PromptPreset,
@@ -48,7 +51,8 @@
     | "automations"
     | "apps"
     | "plugins"
-    | "skills";
+    | "skills"
+    | "mcp";
   const HUNDRED_M_CONTEXT_WINDOW = 100_000_000;
 
   let {
@@ -108,6 +112,9 @@
   let configFile = $state<EditableFilePayload | null>(null);
   let catalog = $state<CatalogPayload | null>(null);
   let apps = $state<CodexAppInfo[]>([]);
+  let nativeSkills = $state<CodexSkillInfo[]>([]);
+  let nativeHooks = $state<CodexHookInfo[]>([]);
+  let mcpServers = $state<McpServerStatus[]>([]);
   let runtimeProcesses = $state<CodexRuntimeProcess[]>([]);
   let editorValue = $state("");
   let errorText = $state("");
@@ -143,6 +150,16 @@
   let savingTheme = $state(false);
   let cleaningAutomationWorktrees = $state(false);
   let installingPluginPath = $state<string | null>(null);
+  let uninstallingPluginId = $state<string | null>(null);
+  let loadingPluginDetailPath = $state<string | null>(null);
+  let pluginDetails = $state<Record<string, unknown>>({});
+  let marketplacePathInput = $state("");
+  let marketplaceNameInput = $state("");
+  let marketplaceBusy = $state<"add" | "remove" | "upgrade" | null>(null);
+  let mcpLoading = $state(false);
+  let mcpRefreshing = $state(false);
+  let mcpLoginServer = $state<string | null>(null);
+  let nativeSkillsLoading = $state(false);
   let runtimeProcessesLoading = $state(false);
   let killingProcessKey = $state<string | null>(null);
   let auditLoadedForAdmin = $state(false);
@@ -317,6 +334,14 @@
       savePreset: m.save_preset(),
       noPromptPresets: m.no_prompt_presets(),
       installedPlugins: m.installed_plugins(),
+      marketplaceManagement: isKorean ? "마켓플레이스" : "Marketplaces",
+      marketplacePath: isKorean ? "마켓플레이스 경로" : "Marketplace path",
+      marketplaceName: isKorean ? "원격 마켓플레이스 이름" : "Remote marketplace name",
+      addMarketplace: isKorean ? "추가" : "Add",
+      removeMarketplace: isKorean ? "제거" : "Remove",
+      upgradeMarketplace: isKorean ? "업데이트" : "Upgrade",
+      pluginDetails: isKorean ? "상세" : "Details",
+      uninstall: isKorean ? "제거" : "Uninstall",
       apps: m.apps(),
       appEnabled: m.app_enabled(),
       appDisabled: m.app_disabled(),
@@ -329,6 +354,22 @@
       noDescription: m.no_description(),
       installedSkills: m.installed_skills(),
       noSkills: m.no_local_skills(),
+      nativeSkills: isKorean ? "Codex 스킬" : "Codex skills",
+      nativeHooks: isKorean ? "Codex 훅" : "Codex hooks",
+      nativeSkillsDescription: isKorean
+        ? "Codex app-server가 직접 반환한 활성 스킬과 훅입니다."
+        : "Active skills and hooks returned directly by the Codex app-server.",
+      noNativeHooks: isKorean ? "등록된 훅이 없습니다." : "No hooks returned.",
+      mcpServers: isKorean ? "MCP 서버" : "MCP servers",
+      mcpServersDescription: isKorean
+        ? "Codex가 인식한 MCP 서버와 도구, 리소스, 인증 상태입니다."
+        : "MCP servers, tools, resources, and auth status visible to Codex.",
+      noMcpServers: isKorean ? "MCP 서버가 없습니다." : "No MCP servers returned.",
+      refreshMcp: isKorean ? "새로고침" : "Refresh",
+      oauthLogin: isKorean ? "인증" : "OAuth",
+      tools: isKorean ? "도구" : "Tools",
+      resources: isKorean ? "리소스" : "Resources",
+      resourceTemplates: isKorean ? "리소스 템플릿" : "Resource templates",
       openThread: m.open_thread(),
       themeEditor: m.theme_editor(),
       themeEditorDescription: m.theme_editor_description(),
@@ -422,7 +463,14 @@
         id: "skills",
         label: ui.installedSkills,
         icon: Sparkles,
-        meta: (catalog?.skills.length ?? 0) > 0 ? String(catalog?.skills.length ?? 0) : null,
+        meta: (catalog?.skills.length ?? 0) + nativeSkills.length > 0 ? String((catalog?.skills.length ?? 0) + nativeSkills.length) : null,
+        alert: false
+      },
+      {
+        id: "mcp",
+        label: ui.mcpServers,
+        icon: Server,
+        meta: mcpServers.length > 0 ? String(mcpServers.length) : null,
         alert: false
       }
     ];
@@ -617,16 +665,22 @@
     errorText = "";
 
     try {
-      const [nextFile, nextCatalog, nextApps, nextAudit] = await Promise.all([
+      const [nextFile, nextCatalog, nextApps, nextNativeSkills, nextNativeHooks, nextMcp, nextAudit] = await Promise.all([
         api.getEditableFile(configFilePath),
         api.getCatalog(),
         api.listCodexApps({ limit: 80 }).catch(() => ({ data: [] as CodexAppInfo[], nextCursor: null })),
+        api.listCodexSkills({ limit: 120 }).catch(() => ({ skills: [] as CodexSkillInfo[], nextCursor: null })),
+        api.listCodexHooks({ limit: 120 }).catch(() => ({ hooks: [] as CodexHookInfo[], nextCursor: null })),
+        api.listMcpServers({ detail: "toolsAndAuthOnly", limit: 80 }).catch(() => ({ data: [] as McpServerStatus[], nextCursor: null })),
         webRole !== "viewer" ? api.getAuditLog(120) : Promise.resolve({ entries: [] as AuditLogEntry[] })
       ]);
       configFile = nextFile;
       editorValue = nextFile.content;
       catalog = nextCatalog;
       apps = nextApps.data;
+      nativeSkills = nextNativeSkills.skills;
+      nativeHooks = nextNativeHooks.hooks;
+      mcpServers = nextMcp.data;
       auditEntries = nextAudit.entries;
       auditLoadedForAdmin = webRole !== "viewer";
     } catch (error) {
@@ -669,6 +723,172 @@
       errorText = error instanceof Error ? error.message : ui.failedSave;
     } finally {
       installingPluginPath = null;
+    }
+  }
+
+  async function uninstallCodexPlugin(plugin: CatalogPayload["plugins"][number]) {
+    if (readOnly || uninstallingPluginId) {
+      return;
+    }
+    const pluginId = plugin.pluginId || plugin.name;
+    if (!pluginId) {
+      return;
+    }
+    uninstallingPluginId = pluginId;
+    errorText = "";
+
+    try {
+      await api.uninstallCodexPlugin(pluginId);
+      catalog = await api.getCatalog();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      uninstallingPluginId = null;
+    }
+  }
+
+  function pluginRemoteParams(plugin: CatalogPayload["plugins"][number]) {
+    const marketplacePath = typeof plugin.marketplacePath === "string" && plugin.marketplacePath.trim() ? plugin.marketplacePath.trim() : null;
+    const remoteMarketplaceName =
+      typeof plugin.marketplaceName === "string" && plugin.marketplaceName.trim() ? plugin.marketplaceName.trim() : null;
+    return {
+      pluginName: plugin.name,
+      marketplacePath,
+      remoteMarketplaceName
+    };
+  }
+
+  async function readCodexPlugin(plugin: CatalogPayload["plugins"][number]) {
+    const pluginKey = plugin.mentionPath ?? plugin.path;
+    if (loadingPluginDetailPath === pluginKey) {
+      return;
+    }
+    loadingPluginDetailPath = pluginKey;
+    errorText = "";
+
+    try {
+      const params = pluginRemoteParams(plugin);
+      const detail = await api.readCodexPlugin({
+        pluginName: params.pluginName,
+        marketplacePath: params.marketplacePath,
+        remoteMarketplaceName: params.remoteMarketplaceName
+      });
+      pluginDetails = {
+        ...pluginDetails,
+        [pluginKey]: detail
+      };
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      loadingPluginDetailPath = null;
+    }
+  }
+
+  async function mutateMarketplace(action: "add" | "remove" | "upgrade") {
+    if (readOnly || marketplaceBusy) {
+      return;
+    }
+    const marketplacePath = marketplacePathInput.trim();
+    const remoteMarketplaceName = marketplaceNameInput.trim();
+    if (!marketplacePath && !remoteMarketplaceName) {
+      return;
+    }
+
+    marketplaceBusy = action;
+    errorText = "";
+
+    try {
+      const payload = {
+        marketplacePath: marketplacePath || null,
+        remoteMarketplaceName: remoteMarketplaceName || null
+      };
+      if (action === "add") {
+        await api.addCodexMarketplace(payload);
+      } else if (action === "remove") {
+        await api.removeCodexMarketplace(payload);
+      } else {
+        await api.upgradeCodexMarketplace(payload);
+      }
+      catalog = await api.getCatalog();
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      marketplaceBusy = null;
+    }
+  }
+
+  async function loadNativeSkillsAndHooks() {
+    if (nativeSkillsLoading) {
+      return;
+    }
+    nativeSkillsLoading = true;
+    errorText = "";
+
+    try {
+      const [nextSkills, nextHooks] = await Promise.all([
+        api.listCodexSkills({ limit: 120 }),
+        api.listCodexHooks({ limit: 120 })
+      ]);
+      nativeSkills = nextSkills.skills;
+      nativeHooks = nextHooks.hooks;
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedLoad;
+    } finally {
+      nativeSkillsLoading = false;
+    }
+  }
+
+  async function loadMcpServers(detail: "full" | "toolsAndAuthOnly" = "toolsAndAuthOnly") {
+    if (mcpLoading) {
+      return;
+    }
+    mcpLoading = true;
+    errorText = "";
+
+    try {
+      const payload = await api.listMcpServers({ detail, limit: 100 });
+      mcpServers = payload.data;
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedLoad;
+    } finally {
+      mcpLoading = false;
+    }
+  }
+
+  async function refreshMcpServers() {
+    if (readOnly || mcpRefreshing) {
+      return;
+    }
+    mcpRefreshing = true;
+    errorText = "";
+
+    try {
+      await api.refreshMcpServers();
+      await loadMcpServers("full");
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      mcpRefreshing = false;
+    }
+  }
+
+  async function startMcpOauthLogin(server: McpServerStatus) {
+    if (readOnly || mcpLoginServer) {
+      return;
+    }
+    mcpLoginServer = server.name;
+    errorText = "";
+
+    try {
+      const response = await api.startMcpOauthLogin({ name: server.name, timeoutSecs: 120 });
+      if (response.authorizationUrl && typeof window !== "undefined") {
+        window.open(response.authorizationUrl, "_blank", "noopener,noreferrer");
+      }
+      await loadMcpServers("toolsAndAuthOnly");
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      mcpLoginServer = null;
     }
   }
 
@@ -1957,6 +2177,39 @@
           <div class="panel__header">
             <div class="panel-title">
               <Plug size={16} />
+              <h3>{ui.marketplaceManagement}</h3>
+            </div>
+            {#if marketplaceBusy}
+              <span class="meta-pill subtle">{ui.saving}</span>
+            {/if}
+          </div>
+          <div class="settings-grid">
+            <label class="field">
+              <span>{ui.marketplacePath}</span>
+              <input bind:value={marketplacePathInput} class="field-input" disabled={readOnly || marketplaceBusy !== null} placeholder="/path/to/marketplace" type="text" />
+            </label>
+            <label class="field">
+              <span>{ui.marketplaceName}</span>
+              <input bind:value={marketplaceNameInput} class="field-input" disabled={readOnly || marketplaceBusy !== null} placeholder="openai-bundled" type="text" />
+            </label>
+          </div>
+          <div class="button-row">
+            <button class="compact-action" disabled={readOnly || marketplaceBusy !== null} onclick={() => void mutateMarketplace("add")} type="button">
+              {ui.addMarketplace}
+            </button>
+            <button class="compact-action" disabled={readOnly || marketplaceBusy !== null} onclick={() => void mutateMarketplace("upgrade")} type="button">
+              {ui.upgradeMarketplace}
+            </button>
+            <button class="compact-action danger" disabled={readOnly || marketplaceBusy !== null} onclick={() => void mutateMarketplace("remove")} type="button">
+              {ui.removeMarketplace}
+            </button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel__header">
+            <div class="panel-title">
+              <Plug size={16} />
               <h3>{ui.installedPlugins}</h3>
             </div>
             <span>{catalog?.plugins.length ?? 0}</span>
@@ -1982,6 +2235,24 @@
                         {ui.install}
                       </button>
                     {/if}
+                    <button
+                      class="compact-action"
+                      disabled={loadingPluginDetailPath === (plugin.mentionPath ?? plugin.path)}
+                      onclick={() => void readCodexPlugin(plugin)}
+                      type="button"
+                    >
+                      {ui.pluginDetails}
+                    </button>
+                    {#if plugin.installed}
+                      <button
+                        class="compact-action danger"
+                        disabled={readOnly || uninstallingPluginId !== null}
+                        onclick={() => void uninstallCodexPlugin(plugin)}
+                        type="button"
+                      >
+                        {ui.uninstall}
+                      </button>
+                    {/if}
                   </div>
                   <p>{plugin.description || ui.noDescription}</p>
                   <small>{plugin.name}{plugin.version ? ` · ${plugin.version}` : ""}{plugin.developerName ? ` · ${plugin.developerName}` : ""}</small>
@@ -2002,6 +2273,96 @@
                     <div class="tag-row">
                       {#each plugin.skills as skillName (skillName)}
                         <span class="meta-pill subtle">{skillName}</span>
+                      {/each}
+                    </div>
+                  {/if}
+                  {#if pluginDetails[plugin.mentionPath ?? plugin.path]}
+                    <pre class="catalog-card__detail">{JSON.stringify(pluginDetails[plugin.mentionPath ?? plugin.path], null, 2)}</pre>
+                  {/if}
+                </article>
+              {/each}
+            {/if}
+          </div>
+        </section>
+      </div>
+    {:else if activeTab === "mcp"}
+      <div
+        aria-labelledby="settings-tab-mcp"
+        class="settings-tab-panel"
+        id="settings-panel-mcp"
+        role="tabpanel"
+        transition:fade={{ duration: 160 }}
+      >
+        <section class="panel">
+          <div class="panel__header">
+            <div class="panel-title">
+              <Server size={16} />
+              <h3>{ui.mcpServers}</h3>
+            </div>
+            <div class="button-row">
+              <button class="compact-action" disabled={mcpLoading || mcpRefreshing} onclick={() => void loadMcpServers("full")} type="button">
+                <RefreshCw size={13} />
+                {ui.reload}
+              </button>
+              <button class="compact-action" disabled={readOnly || mcpRefreshing} onclick={() => void refreshMcpServers()} type="button">
+                <RefreshCw size={13} />
+                {ui.refreshMcp}
+              </button>
+            </div>
+          </div>
+          <p class="field-note">{ui.mcpServersDescription}</p>
+          <div class="catalog-list">
+            {#if mcpLoading}
+              <p class="field-note">{ui.loadingWorkspace}</p>
+            {:else if mcpServers.length === 0}
+              <p class="field-note">{ui.noMcpServers}</p>
+            {:else}
+              {#each mcpServers as server (server.name)}
+                {@const toolEntries = Object.values(server.tools ?? {}).filter(Boolean)}
+                <article class="catalog-card">
+                  <div class="catalog-card__header">
+                    <div class="catalog-card__title">
+                      <Server size={14} />
+                      <strong>{server.name}</strong>
+                    </div>
+                    <div class="tag-row">
+                      <span class="meta-pill subtle">{server.authStatus}</span>
+                      {#if server.authStatus === "notLoggedIn"}
+                        <button
+                          class="compact-action"
+                          disabled={readOnly || mcpLoginServer !== null}
+                          onclick={() => void startMcpOauthLogin(server)}
+                          type="button"
+                        >
+                          {ui.oauthLogin}
+                        </button>
+                      {/if}
+                    </div>
+                  </div>
+                  <div class="tag-row">
+                    <span class="meta-pill subtle">{ui.tools}: {toolEntries.length}</span>
+                    <span class="meta-pill subtle">{ui.resources}: {server.resources.length}</span>
+                    <span class="meta-pill subtle">{ui.resourceTemplates}: {server.resourceTemplates.length}</span>
+                  </div>
+                  {#if toolEntries.length > 0}
+                    <div class="catalog-card__subgrid">
+                      {#each toolEntries as tool (tool?.name ?? "")}
+                        <div class="catalog-card__subitem">
+                          <strong>{tool?.title || tool?.name}</strong>
+                          {#if tool?.description}
+                            <span>{tool.description}</span>
+                          {/if}
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                  {#if server.resources.length > 0 || server.resourceTemplates.length > 0}
+                    <div class="catalog-card__subgrid">
+                      {#each [...server.resources, ...server.resourceTemplates] as resource (resource.uri ?? resource.uriTemplate ?? resource.name)}
+                        <div class="catalog-card__subitem">
+                          <strong>{resource.title || resource.name}</strong>
+                          <span>{resource.uri ?? resource.uriTemplate ?? resource.mimeType ?? ""}</span>
+                        </div>
                       {/each}
                     </div>
                   {/if}
@@ -2039,6 +2400,67 @@
                   </div>
                   <p>{skill.description || ui.noDescription}</p>
                   <small>{skill.source}{skill.pluginName ? ` · ${skill.pluginName}` : ""}</small>
+                </article>
+              {/each}
+            {/if}
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel__header">
+            <div class="panel-title">
+              <Sparkles size={16} />
+              <h3>{ui.nativeSkills}</h3>
+            </div>
+            <div class="button-row">
+              <span>{nativeSkills.length}</span>
+              <button class="compact-action" disabled={nativeSkillsLoading} onclick={() => void loadNativeSkillsAndHooks()} type="button">
+                <RefreshCw size={13} />
+                {ui.reload}
+              </button>
+            </div>
+          </div>
+          <p class="field-note">{ui.nativeSkillsDescription}</p>
+          <div class="catalog-list">
+            {#if nativeSkillsLoading}
+              <p class="field-note">{ui.loadingWorkspace}</p>
+            {:else if nativeSkills.length === 0}
+              <p class="field-note">{ui.noSkills}</p>
+            {:else}
+              {#each nativeSkills as skill, skillIndex (`${skill.source ?? "native"}:${skill.path ?? skill.name}:${skillIndex}`)}
+                <article class="catalog-card">
+                  <div class="catalog-card__title">
+                    <Sparkles size={14} />
+                    <strong>{skill.name}</strong>
+                  </div>
+                  <p>{skill.description || skill.path || ui.noDescription}</p>
+                  <small>{skill.source || "native"}{skill.path ? ` · ${skill.path}` : ""}</small>
+                </article>
+              {/each}
+            {/if}
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel__header">
+            <div class="panel-title">
+              <Plug size={16} />
+              <h3>{ui.nativeHooks}</h3>
+            </div>
+            <span>{nativeHooks.length}</span>
+          </div>
+          <div class="catalog-list">
+            {#if nativeHooks.length === 0}
+              <p class="field-note">{ui.noNativeHooks}</p>
+            {:else}
+              {#each nativeHooks as hook, hookIndex (`${hook.path ?? hook.name ?? hook.event ?? ""}:${hook.command ?? ""}:${hookIndex}`)}
+                <article class="catalog-card">
+                  <div class="catalog-card__title">
+                    <Plug size={14} />
+                    <strong>{hook.name || hook.event || hook.path || ui.nativeHooks}</strong>
+                  </div>
+                  <p>{hook.command || hook.path || ui.noDescription}</p>
+                  {#if hook.event || hook.path}
+                    <small>{hook.event ?? ""}{hook.path ? ` · ${hook.path}` : ""}</small>
+                  {/if}
                 </article>
               {/each}
             {/if}
@@ -2159,6 +2581,13 @@
   .settings-shell__actions,
   .tag-row {
     flex-wrap: wrap;
+  }
+
+  .button-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
   }
 
   .settings-shell__header {
@@ -2753,9 +3182,61 @@
     background: var(--accent-soft);
   }
 
+  .compact-action.danger {
+    border-color: rgba(220, 38, 38, 0.24);
+    color: var(--danger, #b42318);
+  }
+
   .compact-action:disabled {
     cursor: not-allowed;
     opacity: 0.55;
+  }
+
+  .catalog-card__detail {
+    max-height: 16rem;
+    overflow: auto;
+    border: 1px solid var(--border-soft);
+    border-radius: 0.9rem;
+    background: var(--panel-strong);
+    color: var(--ink);
+    padding: 0.75rem;
+    font-size: 0.72rem;
+    line-height: 1.45;
+    white-space: pre-wrap;
+  }
+
+  .catalog-card__subgrid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+    gap: 0.55rem;
+  }
+
+  .catalog-card__subitem {
+    display: grid;
+    gap: 0.18rem;
+    min-width: 0;
+    border: 1px solid var(--border-soft);
+    border-radius: 0.85rem;
+    background: var(--panel-soft);
+    padding: 0.55rem 0.65rem;
+  }
+
+  .catalog-card__subitem strong,
+  .catalog-card__subitem span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .catalog-card__subitem strong {
+    color: var(--ink-strong);
+    font-size: 0.78rem;
+  }
+
+  .catalog-card__subitem span {
+    color: var(--muted);
+    font-size: 0.72rem;
   }
 
   .catalog-card p,

@@ -1108,6 +1108,7 @@ pub(crate) async fn run_automation_payload(
             Some(&json!([])),
             automation.get("skills"),
             Value::Object(preferences),
+            None,
         )
         .await
         .map(|_| ())

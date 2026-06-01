@@ -100,6 +100,9 @@ pub(crate) async fn execute_ws_method(
         "runtime/process/kill" => {
             force_kill_codex_process_payload(state, &auth.profile_id, params).await
         }
+        "gateway/restart" => prepare_gateway_restart_payload(state)
+            .await
+            .map_err(anyhow::Error::from),
         "runtime/quota" => {
             codex_quota_status(
                 state,
@@ -192,6 +195,24 @@ pub(crate) async fn execute_ws_method(
         "codex/apps/list" => proxy_app_server_payload(state, &auth.profile_id, "app/list", params)
             .await
             .map_err(anyhow::Error::from),
+        "codex/mcp/status/list" => {
+            proxy_app_server_payload(state, &auth.profile_id, "mcpServerStatus/list", params)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "codex/mcp/refresh" => proxy_app_server_payload(
+            state,
+            &auth.profile_id,
+            "config/mcpServer/reload",
+            Value::Null,
+        )
+        .await
+        .map_err(anyhow::Error::from),
+        "codex/mcp/oauth/login" => {
+            proxy_app_server_payload(state, &auth.profile_id, "mcpServer/oauth/login", params)
+                .await
+                .map_err(anyhow::Error::from)
+        }
         "codex/realtime/start" => {
             proxy_app_server_payload(state, &auth.profile_id, "thread/realtime/start", params)
                 .await
@@ -424,6 +445,57 @@ pub(crate) async fn execute_ws_method(
             .await
             .map_err(anyhow::Error::from)
         }
+        "session/review/start" => {
+            let session_id = require_session_id(&params, "sessionId")?;
+            let target = params
+                .get("target")
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "uncommittedChanges" }));
+            let delivery = params.get("delivery").cloned().unwrap_or(Value::Null);
+            let payload = proxy_session_app_server_payload(
+                state,
+                &auth.profile_id,
+                &session_id,
+                "review/start",
+                json!({
+                    "threadId": session_id,
+                    "target": target,
+                    "delivery": delivery
+                }),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+            let review_thread_id = payload
+                .get("reviewThreadId")
+                .and_then(Value::as_str)
+                .unwrap_or(session_id.as_str());
+            emit_session_summary_updated(state, &auth.profile_id, review_thread_id, None, None)
+                .await;
+            Ok(payload)
+        }
+        "session/rollback" => {
+            let session_id = require_session_id(&params, "sessionId")?;
+            let num_turns = params
+                .get("numTurns")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0)
+                .ok_or_else(|| anyhow!("numTurns must be greater than zero"))?
+                .min(500) as u32;
+            let payload = proxy_session_app_server_payload(
+                state,
+                &auth.profile_id,
+                &session_id,
+                "thread/rollback",
+                json!({
+                    "threadId": session_id,
+                    "numTurns": num_turns
+                }),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+            emit_session_summary_updated(state, &auth.profile_id, &session_id, None, None).await;
+            Ok(payload)
+        }
         "session/search" => {
             let session_id = require_session_id(&params, "sessionId")?;
             let query_raw = require_string(&params, "query")?;
@@ -469,6 +541,29 @@ pub(crate) async fn execute_ws_method(
             let turn_id = require_string(&params, "turnId")?;
             let item_id = require_string(&params, "itemId")?;
             session_item_detail_payload(state, &auth.profile_id, &session_id, &turn_id, &item_id)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "diagnostics/parser/compare" => {
+            let session_id = require_session_id(&params, "sessionId")?;
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(5);
+            compare_parser_with_native_session_payload(state, &auth.profile_id, &session_id, limit)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "memory/status" => {
+            let session_id = params.get("sessionId").and_then(Value::as_str);
+            memory_status_payload(state, &auth.profile_id, session_id)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "memory/reset" => reset_memory_payload(state, &auth.profile_id)
+            .await
+            .map_err(anyhow::Error::from),
+        "session/memoryMode/set" => {
+            let session_id = require_session_id(&params, "sessionId")?;
+            let mode = require_string(&params, "mode")?;
+            set_session_memory_mode_payload(state, &auth.profile_id, &session_id, &mode)
                 .await
                 .map_err(anyhow::Error::from)
         }
@@ -537,6 +632,7 @@ pub(crate) async fn execute_ws_method(
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
                 params.get("clientRequestId").and_then(Value::as_str),
+                params.get("clientUserMessageId").and_then(Value::as_str),
                 params.get("skills"),
                 params.get("attachmentIds"),
             )
@@ -654,6 +750,7 @@ pub(crate) async fn execute_ws_method(
                     .get("preferences")
                     .cloned()
                     .unwrap_or_else(|| json!({})),
+                params.get("clientUserMessageId").and_then(Value::as_str),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -672,6 +769,7 @@ pub(crate) async fn execute_ws_method(
                     .get("activeTurnId")
                     .or_else(|| params.get("expectedTurnId"))
                     .and_then(Value::as_str),
+                params.get("clientUserMessageId").and_then(Value::as_str),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -709,6 +807,18 @@ pub(crate) async fn execute_ws_method(
         "directories/browse" => {
             let current_path = params.get("currentPath").and_then(Value::as_str);
             list_directories_payload(state, current_path)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        "files/search" => {
+            let query = params.get("query").and_then(Value::as_str).unwrap_or("");
+            let cwd = params.get("cwd").and_then(Value::as_str);
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|value| value.clamp(1, 50) as usize)
+                .unwrap_or(12);
+            search_file_mentions_payload(state, query, cwd, limit)
                 .await
                 .map_err(anyhow::Error::from)
         }

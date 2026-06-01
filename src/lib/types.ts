@@ -294,6 +294,21 @@ export type DirectoryPayload = {
   entries: DirectoryEntry[];
 };
 
+export type FileMentionSearchEntry = {
+  name: string;
+  path: string;
+  displayPath: string;
+  relativePath: string;
+  root: string;
+  score: number;
+};
+
+export type FileMentionSearchPayload = {
+  query: string;
+  cwd: string | null;
+  entries: FileMentionSearchEntry[];
+};
+
 export type ModelOption = {
   id: string;
   displayName: string;
@@ -563,6 +578,33 @@ export type SessionForkPayload = {
   mode: SessionForkMode;
 };
 
+export type SessionReviewTarget =
+  | {
+      type: "uncommittedChanges";
+    }
+  | {
+      type: "baseBranch";
+      branch: string;
+    }
+  | {
+      type: "commit";
+      sha: string;
+      title?: string | null;
+    }
+  | {
+      type: "custom";
+      instructions: string;
+    };
+
+export type SessionReviewStartPayload = {
+  turn: Record<string, unknown>;
+  reviewThreadId: string;
+};
+
+export type SessionRollbackPayload = {
+  thread: CodexThread;
+};
+
 export type SessionTurnSearchMatch = {
   turnId: string;
   turnIndex: number;
@@ -599,6 +641,7 @@ export type SessionQueueItem = {
   attachmentNames: string[];
   createdAt: number;
   clientRequestId?: string | null;
+  clientUserMessageId?: string | null;
 };
 
 export type SessionQueuePayload = {
@@ -802,6 +845,83 @@ export type CodexRuntimeProcessKillPayload = {
   ok: true;
   process: CodexRuntimeProcess;
   affectedSessionIds: string[];
+};
+
+export type ParserDiagnosticsMismatch = {
+  category: string;
+  field: string;
+  local: unknown;
+  native: unknown;
+};
+
+export type ParserDiagnosticsPayload = {
+  sessionId: string;
+  limit: number;
+  ok: boolean;
+  mismatchCount: number;
+  mismatches: ParserDiagnosticsMismatch[];
+  local: {
+    available: boolean;
+    summary: Record<string, unknown> | null;
+    goal: Record<string, unknown> | null;
+    recentTurns: unknown[];
+    hydration?: Record<string, unknown> | null;
+  };
+  native: {
+    available: boolean;
+    summary: Record<string, unknown> | null;
+    goal: Record<string, unknown> | null;
+    recentTurns: unknown[];
+  };
+};
+
+export type CodexMemorySettings = {
+  disableOnExternalContext: boolean;
+  generateMemories: boolean;
+  useMemories: boolean;
+  maxRawMemoriesForConsolidation: number;
+  maxUnusedDays: number;
+  maxRolloutAgeDays: number;
+  maxRolloutsPerStartup: number;
+  minRolloutIdleHours: number;
+  minRateLimitRemainingPercent: number;
+  extractModel: string | null;
+  consolidationModel: string | null;
+  configured: Record<string, unknown>;
+};
+
+export type CodexMemoryStatusPayload = {
+  profileId: string;
+  profileLabel: string;
+  paths: {
+    codexHome: string;
+    configFilePath: string;
+    memoryRoot: string;
+  };
+  storage: {
+    exists: boolean;
+    fileCount: number;
+    directoryCount: number;
+    totalBytes: number;
+    latestModifiedAt: number | null;
+  };
+  settings: CodexMemorySettings;
+  selectedSession: {
+    sessionId: string;
+    memoryMode: "enabled" | "disabled" | null;
+    modeSource: string;
+  } | null;
+};
+
+export type CodexMemoryResetPayload = {
+  ok: true;
+  memory: CodexMemoryStatusPayload;
+};
+
+export type SessionMemoryModePayload = {
+  ok: true;
+  sessionId: string;
+  memoryMode: "enabled" | "disabled";
 };
 
 export type GatewayRestartPayload = {
@@ -1008,6 +1128,71 @@ export type CodexAppInfo = {
 
 export type CodexAppsListPayload = {
   data: CodexAppInfo[];
+  nextCursor: string | null;
+};
+
+export type CodexSkillInfo = {
+  name: string;
+  description?: string | null;
+  path?: string | null;
+  source?: string | null;
+  [key: string]: unknown;
+};
+
+export type CodexSkillsListPayload = {
+  skills: CodexSkillInfo[];
+  nextCursor: string | null;
+};
+
+export type CodexHookInfo = {
+  name?: string | null;
+  path?: string | null;
+  event?: string | null;
+  command?: string | null;
+  [key: string]: unknown;
+};
+
+export type CodexHooksListPayload = {
+  hooks: CodexHookInfo[];
+  nextCursor: string | null;
+};
+
+export type McpAuthStatus = "unsupported" | "notLoggedIn" | "bearerToken" | "oAuth" | string;
+
+export type McpToolInfo = {
+  name: string;
+  title?: string;
+  description?: string;
+  inputSchema?: unknown;
+  outputSchema?: unknown;
+  annotations?: unknown;
+  icons?: unknown[];
+  _meta?: unknown;
+};
+
+export type McpResourceInfo = {
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+  uri?: string;
+  uriTemplate?: string;
+  size?: number;
+  annotations?: unknown;
+  icons?: unknown[];
+  _meta?: unknown;
+};
+
+export type McpServerStatus = {
+  name: string;
+  tools: Record<string, McpToolInfo | undefined>;
+  resources: McpResourceInfo[];
+  resourceTemplates: McpResourceInfo[];
+  authStatus: McpAuthStatus;
+};
+
+export type McpServerStatusPayload = {
+  data: McpServerStatus[];
   nextCursor: string | null;
 };
 

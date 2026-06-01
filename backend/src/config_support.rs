@@ -575,6 +575,17 @@ pub(crate) struct CodexTomlDefaults {
     pub(crate) network_access: Option<bool>,
     pub(crate) language_bridge_enabled: Option<bool>,
     pub(crate) language_bridge_output_language: Option<String>,
+    pub(crate) memories_disable_on_external_context: Option<bool>,
+    pub(crate) memories_generate_memories: Option<bool>,
+    pub(crate) memories_use_memories: Option<bool>,
+    pub(crate) memories_max_raw_memories_for_consolidation: Option<i64>,
+    pub(crate) memories_max_unused_days: Option<i64>,
+    pub(crate) memories_max_rollout_age_days: Option<i64>,
+    pub(crate) memories_max_rollouts_per_startup: Option<i64>,
+    pub(crate) memories_min_rollout_idle_hours: Option<i64>,
+    pub(crate) memories_min_rate_limit_remaining_percent: Option<i64>,
+    pub(crate) memories_extract_model: Option<String>,
+    pub(crate) memories_consolidation_model: Option<String>,
 }
 
 pub(crate) fn config_toml_path(codex_home: &Path) -> PathBuf {
@@ -718,6 +729,68 @@ pub(crate) fn read_codex_toml_defaults(codex_home: &Path) -> CodexTomlDefaults {
             &raw,
             Some("codex_webui"),
             "language_bridge_output_language",
+        )),
+        memories_disable_on_external_context: parse_toml_bool_value(get_toml_value(
+            &raw,
+            Some("memories"),
+            "disable_on_external_context",
+        ))
+        .or_else(|| {
+            parse_toml_bool_value(get_toml_value(
+                &raw,
+                Some("memories"),
+                "no_memories_if_mcp_or_web_search",
+            ))
+        }),
+        memories_generate_memories: parse_toml_bool_value(get_toml_value(
+            &raw,
+            Some("memories"),
+            "generate_memories",
+        )),
+        memories_use_memories: parse_toml_bool_value(get_toml_value(
+            &raw,
+            Some("memories"),
+            "use_memories",
+        )),
+        memories_max_raw_memories_for_consolidation: parse_toml_integer_value(get_toml_value(
+            &raw,
+            Some("memories"),
+            "max_raw_memories_for_consolidation",
+        )),
+        memories_max_unused_days: parse_toml_integer_value(get_toml_value(
+            &raw,
+            Some("memories"),
+            "max_unused_days",
+        )),
+        memories_max_rollout_age_days: parse_toml_integer_value(get_toml_value(
+            &raw,
+            Some("memories"),
+            "max_rollout_age_days",
+        )),
+        memories_max_rollouts_per_startup: parse_toml_integer_value(get_toml_value(
+            &raw,
+            Some("memories"),
+            "max_rollouts_per_startup",
+        )),
+        memories_min_rollout_idle_hours: parse_toml_integer_value(get_toml_value(
+            &raw,
+            Some("memories"),
+            "min_rollout_idle_hours",
+        )),
+        memories_min_rate_limit_remaining_percent: parse_toml_integer_value(get_toml_value(
+            &raw,
+            Some("memories"),
+            "min_rate_limit_remaining_percent",
+        )),
+        memories_extract_model: parse_toml_string_value(get_toml_value(
+            &raw,
+            Some("memories"),
+            "extract_model",
+        )),
+        memories_consolidation_model: parse_toml_string_value(get_toml_value(
+            &raw,
+            Some("memories"),
+            "consolidation_model",
         )),
     }
 }

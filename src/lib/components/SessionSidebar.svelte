@@ -27,7 +27,8 @@
     Moon,
     Sun,
     Power,
-    Download
+    Download,
+    ArrowRightLeft
   } from "lucide-svelte";
 
   import { describeUiError } from "$lib/ui-errors";
@@ -99,6 +100,8 @@
     showPwaInstall = false,
     pwaInstalled = false,
     pwaInstallBusy = false,
+    defaultLanguageBridgeEnabled = false,
+    defaultLanguageBridgeBusy = false,
     systemShutdownArmed,
     systemShutdownAvailable,
     systemShutdownDelaySeconds,
@@ -111,6 +114,7 @@
     onClearNotifications,
     onRefreshRuntime,
     onInstallApp,
+    onDefaultLanguageBridgeChange,
     onSystemShutdownArmedChange,
     onInstallRuntime,
     onUpdateRuntime,
@@ -186,6 +190,8 @@
     showPwaInstall?: boolean;
     pwaInstalled?: boolean;
     pwaInstallBusy?: boolean;
+    defaultLanguageBridgeEnabled?: boolean;
+    defaultLanguageBridgeBusy?: boolean;
     systemShutdownArmed: boolean;
     systemShutdownAvailable: boolean;
     systemShutdownDelaySeconds: number;
@@ -198,6 +204,7 @@
     onClearNotifications: () => void;
     onRefreshRuntime: () => void;
     onInstallApp: () => void;
+    onDefaultLanguageBridgeChange: (enabled: boolean) => void;
     onSystemShutdownArmedChange: (armed: boolean) => void;
     onInstallRuntime: () => void;
     onUpdateRuntime: () => void;
@@ -319,6 +326,9 @@
       localRuntime: m.local_runtime(),
       currentDarkMode: m.current_dark_mode(),
       currentLightMode: m.current_light_mode(),
+      sessionDefaults: m.session_defaults(),
+      defaultLanguageBridge: m.default_language_bridge(),
+      defaultLanguageBridgeDescription: m.default_language_bridge_description(),
       readOnlyMode: m.read_only_mode(),
       roleAdmin: m.role_admin(),
       roleViewer: m.role_viewer()
@@ -1695,6 +1705,32 @@
                 <ChevronDown size={16} />
               </div>
             </div>
+          </div>
+
+          <div class="space-y-4">
+            <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
+              <ArrowRightLeft size={10} /> {ui.sessionDefaults}
+            </h4>
+
+            <label
+              class:checkbox-card--disabled={readOnly || defaultLanguageBridgeBusy}
+              class="checkbox-card checkbox-card--compact w-full max-w-full"
+              for="default-language-bridge"
+            >
+              <input
+                checked={defaultLanguageBridgeEnabled}
+                class="checkbox-input"
+                disabled={readOnly || defaultLanguageBridgeBusy}
+                id="default-language-bridge"
+                onchange={(event) => onDefaultLanguageBridgeChange((event.currentTarget as HTMLInputElement).checked)}
+                type="checkbox"
+              />
+              <span aria-hidden="true" class="checkbox-control"></span>
+              <span class="checkbox-copy min-w-0">
+                <span class="checkbox-title">{ui.defaultLanguageBridge}</span>
+                <span class="checkbox-description">{ui.defaultLanguageBridgeDescription}</span>
+              </span>
+            </label>
           </div>
 
           <div class="space-y-4">

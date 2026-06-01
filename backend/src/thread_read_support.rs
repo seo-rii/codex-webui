@@ -121,9 +121,12 @@ fn normalize_session_item_type_name(item_type: &str) -> &str {
         "mcp_tool_call" => "mcpToolCall",
         "dynamic_tool_call" => "dynamicToolCall",
         "web_search" => "webSearch",
+        "image_view" => "imageView",
         "context_compaction" => "contextCompaction",
         "image_generation" => "imageGeneration",
         "collab_agent_tool_call" => "collabAgentToolCall",
+        "entered_review_mode" => "enteredReviewMode",
+        "exited_review_mode" => "exitedReviewMode",
         _ => item_type,
     }
 }

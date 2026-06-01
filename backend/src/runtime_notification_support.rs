@@ -1138,6 +1138,15 @@ pub(crate) async fn handle_profile_runtime_notification(
                     .await;
                 }
             }
+            if let Some(turn) = notification.params.get("turn") {
+                spawn_language_bridge_response_translation_for_completed_turn(
+                    state,
+                    profile_id,
+                    &session_id,
+                    turn,
+                )
+                .await;
+            }
         }
         "thread/name/updated" => {
             let thread_name = notification_thread_name(&notification.params);
@@ -1221,6 +1230,28 @@ pub(crate) async fn handle_profile_runtime_notification(
                 .unwrap_or(Value::Null);
             cache_session_goal_payload(state, profile_id, &session_id, &goal).await;
             emit_profile_global_notification(state, profile_id, event.clone()).await;
+        }
+        if notification.method == "turn/completed" {
+            if let Some(turn) = event
+                .get_mut("params")
+                .and_then(Value::as_object_mut)
+                .and_then(|params| params.get_mut("turn"))
+            {
+                let mut turns = vec![turn.clone()];
+                if apply_language_bridge_translations_to_turns(
+                    state,
+                    profile_id,
+                    &session_id,
+                    &mut turns,
+                )
+                .await
+                .is_ok()
+                {
+                    if let Some(translated_turn) = turns.into_iter().next() {
+                        *turn = translated_turn;
+                    }
+                }
+            }
         }
         emit_session_notification(state, profile_id, &session_id, event).await;
     }

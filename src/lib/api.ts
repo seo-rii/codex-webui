@@ -13,6 +13,9 @@ import type {
   CatalogPayload,
   CodexAccountLoginResponse,
   CodexAppsListPayload,
+  CodexHooksListPayload,
+  CodexMemoryResetPayload,
+  CodexMemoryStatusPayload,
   ComputerInputEvent,
   ComputerInputPayload,
   CodexQuotaStatus,
@@ -20,8 +23,10 @@ import type {
   CodexRuntimeProcessKillPayload,
   CodexRuntimeProcessesPayload,
   CodexRuntimeStatus,
+  CodexSkillsListPayload,
   DirectoryPayload,
   EditableFilePayload,
+  FileMentionSearchPayload,
   GlobalStreamEvent,
   GatewayRestartPayload,
   GitCommitDiffPayload,
@@ -32,8 +37,10 @@ import type {
   GitRepository,
   GitStatusPayload,
   GitWorktreePayload,
+  McpServerStatusPayload,
   NotificationListPayload,
   NotificationSettings,
+  ParserDiagnosticsPayload,
   PromptPreset,
   SavedSessionFilter,
   SelectedSkill,
@@ -43,7 +50,11 @@ import type {
   SessionItemDetailPayload,
   SessionForkPayload,
   SessionListResponse,
+  SessionMemoryModePayload,
   SessionPreferences,
+  SessionReviewStartPayload,
+  SessionReviewTarget,
+  SessionRollbackPayload,
   SessionRolloutRecoveryPayload,
   SessionSearchScope,
   SessionSummaryFilter,
@@ -229,6 +240,12 @@ export const api = {
     });
   },
 
+  saveDefaultSessionPreferences(preferences: Partial<SessionPreferences>) {
+    return ws.request<AppConfigPayload>("config/update", {
+      defaults: preferences
+    });
+  },
+
   getNotifications(limit = 80) {
     return ws.request<NotificationListPayload>("notifications/list", { limit });
   },
@@ -283,6 +300,28 @@ export const api = {
     return ws.request<CodexRuntimeProcessesPayload>("runtime/processes/list");
   },
 
+  getMemoryStatus(sessionId: string | null = null) {
+    return ws.request<CodexMemoryStatusPayload>("memory/status", { sessionId });
+  },
+
+  resetMemory() {
+    return ws.request<CodexMemoryResetPayload>("memory/reset");
+  },
+
+  setSessionMemoryMode(sessionId: string, mode: "enabled" | "disabled") {
+    return ws.request<SessionMemoryModePayload>("session/memoryMode/set", {
+      sessionId,
+      mode
+    });
+  },
+
+  compareParserWithNativeSession(sessionId: string, limit = 5) {
+    return ws.request<ParserDiagnosticsPayload>("diagnostics/parser/compare", {
+      sessionId,
+      limit
+    });
+  },
+
   killRuntimeProcess(profileId: string, pid: number) {
     return ws.request<CodexRuntimeProcessKillPayload>("runtime/process/kill", {
       profileId,
@@ -310,16 +349,48 @@ export const api = {
     return ws.request<Record<string, unknown>>("codex/plugins/read", params);
   },
 
-  listCodexApps(params: Record<string, unknown> = {}) {
-    return ws.request<CodexAppsListPayload>("codex/apps/list", params);
-  },
-
   installCodexPlugin(params: Record<string, unknown>) {
     return ws.request<Record<string, unknown>>("codex/plugins/install", params);
   },
 
   uninstallCodexPlugin(pluginId: string) {
     return ws.request<Record<string, unknown>>("codex/plugins/uninstall", { pluginId });
+  },
+
+  addCodexMarketplace(params: Record<string, unknown>) {
+    return ws.request<Record<string, unknown>>("codex/marketplaces/add", params);
+  },
+
+  removeCodexMarketplace(params: Record<string, unknown>) {
+    return ws.request<Record<string, unknown>>("codex/marketplaces/remove", params);
+  },
+
+  upgradeCodexMarketplace(params: Record<string, unknown>) {
+    return ws.request<Record<string, unknown>>("codex/marketplaces/upgrade", params);
+  },
+
+  listCodexSkills(params: Record<string, unknown> = {}) {
+    return ws.request<CodexSkillsListPayload>("codex/skills/list", params);
+  },
+
+  listCodexHooks(params: Record<string, unknown> = {}) {
+    return ws.request<CodexHooksListPayload>("codex/hooks/list", params);
+  },
+
+  listCodexApps(params: Record<string, unknown> = {}) {
+    return ws.request<CodexAppsListPayload>("codex/apps/list", params);
+  },
+
+  listMcpServers(params: Record<string, unknown> = {}) {
+    return ws.request<McpServerStatusPayload>("codex/mcp/status/list", params);
+  },
+
+  refreshMcpServers() {
+    return ws.request<Record<string, unknown>>("codex/mcp/refresh", {});
+  },
+
+  startMcpOauthLogin(params: { name: string; scopes?: string[] | null; timeoutSecs?: number | null }) {
+    return ws.request<{ authorizationUrl: string }>("codex/mcp/oauth/login", params);
   },
 
   listRealtimeVoices() {
@@ -383,10 +454,7 @@ export const api = {
   },
 
   restartGateway() {
-    return request<GatewayRestartPayload>(apiPath("/admin/restart"), {
-      method: "POST",
-      body: JSON.stringify({})
-    });
+    return ws.request<GatewayRestartPayload>("gateway/restart");
   },
 
   getSessions(
@@ -471,6 +539,27 @@ export const api = {
     });
   },
 
+  startReview(
+    sessionId: string,
+    payload: {
+      target: SessionReviewTarget;
+      delivery?: "inline" | "detached" | null;
+    }
+  ) {
+    return ws.request<SessionReviewStartPayload>("session/review/start", {
+      sessionId,
+      target: payload.target,
+      delivery: payload.delivery ?? null
+    });
+  },
+
+  rollbackSession(sessionId: string, numTurns: number) {
+    return ws.request<SessionRollbackPayload>("session/rollback", {
+      sessionId,
+      numTurns
+    });
+  },
+
   searchSessionTurns(sessionId: string, query: string, cursor: string | null = null, limit = 20) {
     return ws.request<SessionTurnSearchPayload>("session/search", { sessionId, query, cursor, limit });
   },
@@ -489,12 +578,19 @@ export const api = {
 
   enqueueSessionMessage(
     sessionId: string,
-    payload: { prompt: string; skills?: SelectedSkill[]; attachmentIds: string[]; clientRequestId?: string }
+    payload: {
+      prompt: string;
+      skills?: SelectedSkill[];
+      attachmentIds: string[];
+      clientRequestId?: string;
+      clientUserMessageId?: string;
+    }
   ) {
     return ws.request<SessionDetailPayload["queue"]>("session/queue/enqueue", {
       sessionId,
       prompt: payload.prompt,
       clientRequestId: payload.clientRequestId ?? null,
+      clientUserMessageId: payload.clientUserMessageId ?? null,
       skills: payload.skills ?? [],
       attachmentIds: payload.attachmentIds
     });
@@ -658,23 +754,41 @@ export const api = {
     return ws.request<Record<string, never>>("account/logout");
   },
 
-  sendMessage(sessionId: string, payload: { prompt: string; skills?: SelectedSkill[]; attachmentIds: string[]; preferences: Partial<SessionPreferences> }) {
+  sendMessage(
+    sessionId: string,
+    payload: {
+      prompt: string;
+      skills?: SelectedSkill[];
+      attachmentIds: string[];
+      preferences: Partial<SessionPreferences>;
+      clientUserMessageId?: string;
+    }
+  ) {
     return ws.request<{ ok: true }>("turn/send", {
       sessionId,
       prompt: payload.prompt,
       skills: payload.skills ?? [],
       attachmentIds: payload.attachmentIds,
-      preferences: payload.preferences
+      preferences: payload.preferences,
+      clientUserMessageId: payload.clientUserMessageId ?? null
     });
   },
 
-  steerTurn(sessionId: string, prompt: string, attachmentIds: string[] = [], skills: SelectedSkill[] = [], activeTurnId: string | null = null) {
+  steerTurn(
+    sessionId: string,
+    prompt: string,
+    attachmentIds: string[] = [],
+    skills: SelectedSkill[] = [],
+    activeTurnId: string | null = null,
+    clientUserMessageId: string | null = null
+  ) {
     return ws.request<{ ok: true }>("turn/steer", {
       sessionId,
       prompt,
       skills,
       attachmentIds,
-      activeTurnId
+      activeTurnId,
+      clientUserMessageId
     });
   },
 
@@ -713,6 +827,10 @@ export const api = {
 
   browseDirectories(currentPath: string | null) {
     return ws.request<DirectoryPayload>("directories/browse", { currentPath });
+  },
+
+  searchFileMentions(query: string, cwd: string | null, limit = 12) {
+    return ws.request<FileMentionSearchPayload>("files/search", { query, cwd, limit });
   },
 
   listRepositories() {

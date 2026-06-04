@@ -6437,13 +6437,24 @@
   function getReviewFindingLocation(finding: Record<string, unknown>) {
     const location = getRecordValue(finding.code_location ?? finding.codeLocation);
     const lineRange = getRecordValue(location?.line_range ?? location?.lineRange);
-    const path = formatValue(location?.absolute_file_path ?? location?.absoluteFilePath);
+    const path = getReviewFindingPath(finding);
     const start = formatValue(lineRange?.start);
     const end = formatValue(lineRange?.end);
     if (!path) {
       return "";
     }
     return start && end ? `${path}:${start}-${end}` : path;
+  }
+
+  function getReviewFindingPath(finding: Record<string, unknown>) {
+    const location = getRecordValue(finding.code_location ?? finding.codeLocation);
+    return formatValue(
+      location?.absolute_file_path ??
+        location?.absoluteFilePath ??
+        location?.file_path ??
+        location?.filePath ??
+        location?.path
+    );
   }
 
   async function saveAutostartEnabled(enabled: boolean) {
@@ -14409,6 +14420,7 @@
       <div class="space-y-2 bg-orange-50/35 p-3">
         {#each findings as finding, index (`${item.id}:finding:${index}`)}
           {@const location = getReviewFindingLocation(finding)}
+          {@const findingPath = getReviewFindingPath(finding)}
           <article class="rounded-xl border border-orange-100 bg-white px-3 py-2.5">
             <div class="flex items-start justify-between gap-2">
               <h5 class="min-w-0 text-xs font-bold text-gray-800">{formatValue(finding.title) || `Finding ${index + 1}`}</h5>
@@ -14417,7 +14429,12 @@
               {/if}
             </div>
             {#if location}
-              <button class="mt-1 block max-w-full truncate text-left text-[10px] font-mono font-semibold text-orange-700 hover:underline" onclick={() => openFileTab(location.split(":")[0] ?? location)} type="button">{location}</button>
+              <div class="mt-1 flex min-w-0 flex-wrap items-center gap-1.5">
+                <button class="min-w-0 max-w-full truncate rounded-md border border-orange-100 bg-orange-50 px-2 py-1 text-left font-mono text-[10px] font-semibold text-orange-700 hover:bg-orange-100" onclick={() => openFileTab(findingPath || location)} type="button">{location}</button>
+                {#if findingPath}
+                  <button class="rounded-md border border-gray-200 bg-white px-2 py-1 text-[10px] font-bold text-gray-600 hover:bg-gray-50" onclick={() => void openGitDiffFromPath(findingPath)} type="button">{m.diff()}</button>
+                {/if}
+              </div>
             {/if}
             {#if formatValue(finding.body)}
               <p class="mt-2 text-xs leading-relaxed text-gray-600">{formatValue(finding.body)}</p>

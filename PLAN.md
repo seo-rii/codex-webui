@@ -248,7 +248,7 @@ Planned work:
   - start review sessions [done via `/review`, with `--detached` support]
   - display review-mode markers [done]
   - show findings with file references and severity [done when present]
-  - link findings to file/diff tabs [partially done with file-tab links]
+  - link findings to file/diff tabs [done]
 - add rollback UI:
   - list rollback targets [partially done for loaded user-message turns]
   - preview affected files before execution [done for file-change items in the

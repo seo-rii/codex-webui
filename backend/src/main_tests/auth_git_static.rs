@@ -1589,6 +1589,7 @@ async fn viewer_http_routes_match_websocket_authorization_policy() {
     for (method, uri) in [
         (Method::GET, "/api/config"),
         (Method::GET, "/api/editor?filePath=README.md"),
+        (Method::GET, "/api/editor/download?filePath=README.md"),
         (Method::GET, "/api/directories"),
         (Method::GET, "/api/catalog"),
         (Method::GET, "/api/git/status?repoPath=/tmp/repo"),
@@ -1607,6 +1608,65 @@ async fn viewer_http_routes_match_websocket_authorization_policy() {
             "{method} {uri} should require admin access"
         );
     }
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_download_http_requires_admin_and_returns_bytes() {
+    let sandbox = unique_test_dir("editor-download-http");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let file_path = workspace.join("image.bin");
+    fs::write(&file_path, [0, 1, 2, 3, 4]).unwrap();
+
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let mut config = (*state.config).clone();
+    config.password = Some("admin-secret".to_string());
+    state.config = Arc::new(config);
+
+    let viewer_jar = issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Viewer)
+        .expect("viewer cookie should be issued");
+    let viewer_request = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/api/editor/download?filePath={}",
+            file_path.display()
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let viewer_response = handle_http(State(state.clone()), viewer_jar, viewer_request).await;
+    assert_eq!(viewer_response.status(), StatusCode::FORBIDDEN);
+
+    let admin_jar = issue_auth_cookie(&state.config, CookieJar::new(), false, UserRole::Admin)
+        .expect("admin cookie should be issued");
+    let admin_request = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/api/editor/download?filePath={}",
+            file_path.display()
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let admin_response = handle_http(State(state.clone()), admin_jar, admin_request).await;
+    assert_eq!(admin_response.status(), StatusCode::OK);
+    assert_eq!(
+        admin_response.headers().get(header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static("application/octet-stream"))
+    );
+    assert!(
+        admin_response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("image.bin"))
+    );
+    let body = to_bytes(admin_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), &[0, 1, 2, 3, 4]);
 
     let _ = fs::remove_dir_all(sandbox);
 }

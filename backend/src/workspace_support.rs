@@ -48,6 +48,11 @@ pub(crate) struct EditableFilePayload {
     pub(crate) writable: bool,
 }
 
+pub(crate) struct EditableFileDownloadPayload {
+    pub(crate) display_name: String,
+    pub(crate) bytes: Vec<u8>,
+}
+
 fn directory_entry_payload(path: &Path) -> DirectoryEntryPayload {
     DirectoryEntryPayload {
         name: path
@@ -428,6 +433,74 @@ pub(crate) async fn read_editable_file_payload(
         writable: true,
     })
     .expect("editable file payload should serialize"))
+}
+
+pub(crate) async fn read_editable_file_download_payload(
+    state: &AppState,
+    profile_id: &str,
+    file_path: &str,
+) -> ApiResult<EditableFileDownloadPayload> {
+    let resolved_path = resolve_editable_file_path(state, profile_id, file_path).await?;
+    let canonical_path = tokio_fs::canonicalize(&resolved_path)
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                api_error(StatusCode::NOT_FOUND, "The selected file does not exist.")
+            } else {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to inspect the selected file.",
+                )
+            }
+        })?;
+    ensure_not_sensitive_file_path(&canonical_path)?;
+
+    let roots = editable_file_roots(state, profile_id).await;
+    if !roots
+        .iter()
+        .any(|root| path_is_within(root, &canonical_path))
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "This file is outside editable roots.",
+        ));
+    }
+
+    let metadata = tokio_fs::metadata(&canonical_path).await.map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to inspect the selected file.",
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "The selected path is not a file.",
+        ));
+    }
+    if metadata.len() > EDITOR_FILE_DOWNLOAD_LIMIT_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "The selected file is too large to download.",
+        ));
+    }
+
+    let bytes = tokio_fs::read(&canonical_path).await.map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to read the selected file.",
+        )
+    })?;
+
+    Ok(EditableFileDownloadPayload {
+        display_name: canonical_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| canonical_path.display().to_string()),
+        bytes,
+    })
 }
 
 pub(crate) async fn search_file_mentions_payload(

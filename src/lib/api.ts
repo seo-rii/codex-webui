@@ -135,6 +135,25 @@ async function request<T>(input: string, init?: RequestInit) {
   return (await response.json()) as T;
 }
 
+async function downloadRequest(input: string) {
+  const response = await fetch(input, {
+    credentials: "include",
+    method: "GET"
+  });
+
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || `${response.status} ${response.statusText}`);
+  }
+
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const filenameMatch = /filename="([^"]+)"/iu.exec(disposition);
+  return {
+    blob: await response.blob(),
+    filename: filenameMatch?.[1] ?? null
+  };
+}
+
 const ws = new WebSocketRpcClient();
 
 export const api = {
@@ -431,6 +450,10 @@ export const api = {
 
   getEditableFile(filePath: string) {
     return ws.request<EditableFilePayload>("editor/file/get", { filePath });
+  },
+
+  downloadEditableFile(filePath: string) {
+    return downloadRequest(apiPath(`/editor/download?filePath=${encodeURIComponent(filePath)}`));
   },
 
   saveEditableFile(filePath: string, content: string) {

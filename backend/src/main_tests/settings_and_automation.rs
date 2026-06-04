@@ -180,6 +180,34 @@ async fn rejects_oversized_editable_file_previews() {
 }
 
 #[tokio::test]
+async fn downloads_oversized_editable_files_without_previewing() {
+    let sandbox = unique_test_dir("editor-large-download");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let large_path = workspace.join("large.bin");
+    let bytes = vec![b'x'; TEXT_FILE_PREVIEW_LIMIT_BYTES as usize + 1];
+    fs::write(&large_path, &bytes).unwrap();
+
+    let preview_error = read_editable_file_payload(&state, "default", large_path.to_str().unwrap())
+        .await
+        .expect_err("large files should not be loaded into editor preview");
+    assert_eq!(preview_error.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let download =
+        read_editable_file_download_payload(&state, "default", large_path.to_str().unwrap())
+            .await
+            .expect("large preview-rejected files should still be downloadable");
+    assert_eq!(download.display_name, "large.bin");
+    assert_eq!(download.bytes, bytes);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn rejects_binary_editable_file_previews() {
     let sandbox = unique_test_dir("editor-binary-preview");
     let workspace = sandbox.join("workspace");
@@ -199,6 +227,35 @@ async fn rejects_binary_editable_file_previews() {
         error.message,
         "The selected file appears to be binary and cannot be previewed."
     );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn downloads_binary_editable_files_without_previewing() {
+    let sandbox = unique_test_dir("editor-binary-download");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let binary_path = workspace.join("image.bin");
+    let bytes = vec![0, 1, 2, 3, 4];
+    fs::write(&binary_path, &bytes).unwrap();
+
+    let preview_error =
+        read_editable_file_payload(&state, "default", binary_path.to_str().unwrap())
+            .await
+            .expect_err("binary files should not be loaded into editor preview");
+    assert_eq!(preview_error.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let download =
+        read_editable_file_download_payload(&state, "default", binary_path.to_str().unwrap())
+            .await
+            .expect("binary preview-rejected files should still be downloadable");
+    assert_eq!(download.display_name, "image.bin");
+    assert_eq!(download.bytes, bytes);
 
     let _ = fs::remove_dir_all(sandbox);
 }

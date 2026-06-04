@@ -41,6 +41,7 @@ async fn handle_http_inner(
                         | "/api/config"
                         | "/api/directories"
                         | "/api/editor"
+                        | "/api/editor/download"
                         | "/api/catalog"
                         | "/api/git/repositories"
                 ) || route_path.starts_with("/api/git/")
@@ -420,6 +421,7 @@ codex_webui_host_oom_kill_count {host_oom_kill_count}\n",
                 "/api/config"
                     | "/api/directories"
                     | "/api/editor"
+                    | "/api/editor/download"
                     | "/api/catalog"
                     | "/api/notifications"
                     | "/api/notifications/settings"
@@ -455,6 +457,9 @@ codex_webui_host_oom_kill_count {host_oom_kill_count}\n",
                     "/api/config" => handle_config_api_http(state, request, auth).await,
                     "/api/directories" => handle_directories_api_http(state, request).await,
                     "/api/editor" => handle_editor_api_http(state, request, auth).await,
+                    "/api/editor/download" => {
+                        handle_editor_download_api_http(state, request, auth).await
+                    }
                     "/api/catalog" => handle_catalog_api_http(state, request, auth).await,
                     "/api/notifications" => {
                         handle_notifications_api_http(state, request, auth).await

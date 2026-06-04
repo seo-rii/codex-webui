@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Edit3, FileDiff, FileText, GitBranch, RefreshCw, Save, X } from "lucide-svelte";
+  import { Download, Edit3, FileDiff, FileText, GitBranch, RefreshCw, Save, X } from "lucide-svelte";
 
   import { api } from "$lib/api";
   import MarkdownMessage from "$lib/components/MarkdownMessage.svelte";
@@ -28,6 +28,7 @@
   let payload = $state<EditableFilePayload | null>(null);
   let editorValue = $state("");
   let loading = $state(false);
+  let downloading = $state(false);
   let saving = $state(false);
   let errorText = $state("");
   let noticeText = $state("");
@@ -102,6 +103,35 @@
     }
   }
 
+  async function downloadFile() {
+    if (downloading) {
+      return;
+    }
+    const path = activePath.trim();
+    if (!path) {
+      return;
+    }
+    downloading = true;
+    noticeText = "";
+    try {
+      const { blob, filename } = await api.downloadEditableFile(path);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename || baseName(path) || "download";
+      anchor.rel = "noopener";
+      document.body.append(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      noticeText = m.file_viewer_download_started();
+    } catch (error) {
+      errorText = `${m.file_viewer_download_failed()} ${describeError(error)}`;
+    } finally {
+      downloading = false;
+    }
+  }
+
   $effect(() => {
     const nextPath = filePath.trim();
     if (!nextPath || nextPath === loadedPath) {
@@ -123,6 +153,15 @@
         <p title={activePath}>{activePath}</p>
       </div>
       <div class="file-workspace__actions">
+        <button class="file-workspace__button" disabled={downloading} onclick={() => void downloadFile()} type="button">
+          {#if downloading}
+            <span class="file-workspace__spin"><RefreshCw size={14} /></span>
+            <span>{m.file_viewer_downloading()}</span>
+          {:else}
+            <Download size={14} />
+            <span>{m.file_viewer_download()}</span>
+          {/if}
+        </button>
         {#if onOpenDiff}
           <button class="file-workspace__button" onclick={() => void onOpenDiff(activePath)} type="button">
             <FileDiff size={14} />

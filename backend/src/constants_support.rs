@@ -30,6 +30,7 @@ pub(crate) const WS_ATTACHMENT_UPLOAD_MAX_DECODED_BYTES: u64 = 1024 * 1024;
 pub(crate) const WS_OUTBOUND_QUEUE_CAPACITY: usize = 1024;
 pub(crate) const PENDING_SERVER_REQUEST_MAX_PER_SESSION: usize = 128;
 pub(crate) const TEXT_FILE_PREVIEW_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const EDITOR_FILE_DOWNLOAD_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const GIT_DIFF_PREVIEW_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const GIT_DIFF_PREVIEW_MAX_FILES: usize = 200;
 pub(crate) const GIT_OPERATION_LOCK_MAX_ENTRIES: usize = 512;

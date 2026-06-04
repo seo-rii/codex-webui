@@ -41,6 +41,47 @@ pub(crate) async fn handle_editor_api_http(
     }
 }
 
+pub(crate) async fn handle_editor_download_api_http(
+    state: AppState,
+    request: Request,
+    auth: AuthContext,
+) -> Response {
+    if request.method() != Method::GET {
+        return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
+    }
+
+    let file_path = query_param_value(request.uri().query(), "filePath").unwrap_or_default();
+    match read_editable_file_download_payload(&state, &auth.profile_id, &file_path).await {
+        Ok(payload) => {
+            let content_length = payload.bytes.len().to_string();
+            let safe_name = payload
+                .display_name
+                .chars()
+                .map(|value| match value {
+                    '"' | '\\' | '\r' | '\n' => '_',
+                    value if value.is_control() => '_',
+                    value => value,
+                })
+                .collect::<String>();
+            let disposition = format!("attachment; filename=\"{safe_name}\"");
+            let mut response = Response::new(Body::from(payload.bytes));
+            let headers = response.headers_mut();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            if let Ok(value) = HeaderValue::from_str(&content_length) {
+                headers.insert(header::CONTENT_LENGTH, value);
+            }
+            if let Ok(value) = HeaderValue::from_str(&disposition) {
+                headers.insert(header::CONTENT_DISPOSITION, value);
+            }
+            response
+        }
+        Err(error) => json_error(error.status, &error.message),
+    }
+}
+
 pub(crate) async fn handle_catalog_api_http(
     state: AppState,
     request: Request,

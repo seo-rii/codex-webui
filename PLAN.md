@@ -57,18 +57,27 @@ native settings API is reviewed more deeply.
 Objective: keep the custom parser, but make it easier to prove where it differs
 from native Codex output.
 
+Status: implemented for the current parser-hardening batch. Sidebar
+list/search/detail bootstrapping still uses bounded local parser and index
+reads. Diagnostics exposes a manual parser-vs-native comparison that compares
+summary metadata, timestamps, archive/subagent status, goal snapshots, and
+recent visible turns. Regression fixtures cover subagent filtering, stale
+running/status reconciliation, failed context compression tails, latest-response
+fallbacks, and corrupted/non-UTF-8 rollout recovery paths.
+
 Planned work:
 
-- add a sampled parser-vs-native comparison command or diagnostics panel
+- add a sampled parser-vs-native comparison command or diagnostics panel [done]
 - compare title, created/updated timestamps, archived/subagent flags, latest
-  turn status, goal state, and visible recent items
+  turn status, goal state, and visible recent items [done]
 - record mismatches with stable categories so they can be fixed one by one
+  [done]
 - add regression fixtures for known hard cases:
-  - subagent sessions appearing in the active list
-  - crashed context-compression turns looking active
-  - completed goal sessions retaining stale running state
-  - latest assistant response missing until a full refresh
-  - corrupted or non-UTF-8 rollout tails
+  - subagent sessions appearing in the active list [done]
+  - crashed context-compression turns looking active [done]
+  - completed goal sessions retaining stale running state [done]
+  - latest assistant response missing until a full refresh [done]
+  - corrupted or non-UTF-8 rollout tails [done]
 
 Acceptance criteria:
 
@@ -90,15 +99,15 @@ model intact as new message entry points are added.
 
 Planned work:
 
-- generate or preserve a client-side id for every composer submission
-- pass `clientUserMessageId` to native `turn/start`
-- pass `clientUserMessageId` to native `turn/steer`
-- persist the same id on queue items before dispatch
-- pass the stored id when queued items are dispatched
+- generate or preserve a client-side id for every composer submission [done]
+- pass `clientUserMessageId` to native `turn/start` [done]
+- pass `clientUserMessageId` to native `turn/steer` [done]
+- persist the same id on queue items before dispatch [done]
+- pass the stored id when queued items are dispatched [done]
 - reconcile optimistic user messages against Codex `userMessage.clientId`
-  instead of matching only by text or temporary local ids
+  instead of matching only by text or temporary local ids [done]
 - include the id in retry/dedupe logic so reconnect replay does not duplicate
-  visible messages
+  visible messages [done]
 
 Acceptance criteria:
 
@@ -121,11 +130,12 @@ loading stays on the bounded parser/index path.
 
 Planned work:
 
-- add `Diagnostics` to the `Open` menu
+- add `Diagnostics` to the `Open` menu [done]
 - show gateway health, app-server processes, active sessions, queue drain state,
   WebSocket status, cache sizes, parser/index status, and recent runtime errors
-- include parser-vs-native comparison tools from stage 1
-- make expensive checks explicit actions, not automatic page-load work
+  [done]
+- include parser-vs-native comparison tools from stage 1 [done]
+- make expensive checks explicit actions, not automatic page-load work [done]
 
 Acceptance criteria:
 
@@ -144,11 +154,12 @@ and tests verify native thread state and sidebar visibility stay aligned.
 Planned work:
 
 - call native `thread/archive` and `thread/unarchive` for Codex-owned archive
-  state
+  state [done]
 - keep `codex-webui` local metadata only for browser-specific filters and
-  transition compatibility
+  transition compatibility [done]
 - update sidebar parser/index reconciliation to respect native archive state
-- keep existing snackbar/error-code behavior
+  [done]
+- keep existing snackbar/error-code behavior [done]
 
 Acceptance criteria:
 
@@ -168,11 +179,12 @@ of inventing local state.
 
 Planned work:
 
-- add `Memory` to the `Open` menu
-- display current memory mode/state where upstream exposes it
-- support native memory reset where allowed
-- clearly separate global/profile memory from per-session preferences
+- add `Memory` to the `Open` menu [done]
+- display current memory mode/state where upstream exposes it [done]
+- support native memory reset where allowed [done]
+- clearly separate global/profile memory from per-session preferences [done]
 - include permission gating and audit logging for destructive memory actions
+  [done]
 
 Acceptance criteria:
 
@@ -194,22 +206,23 @@ done through `config.toml`.
 Planned work:
 
 - manage native plugins:
-  - list installed plugins
-  - inspect details
-  - install/uninstall where supported
-  - refresh plugin auth/cache state
+  - list installed plugins [done]
+  - inspect details [done]
+  - install/uninstall where supported [done]
+  - refresh plugin auth/cache state [done]
 - manage marketplace plugins:
-  - browse available plugins
-  - add/remove/upgrade
-  - surface install errors with structured error codes
+  - browse available plugins [done]
+  - add/remove/upgrade [done]
+  - surface install errors with structured error codes [done]
 - manage skills:
-  - list active skill roots
+  - list active skill roots [done]
   - configure extra skill roots where supported
-  - show unavailable or invalid skill metadata clearly
+    [deferred until upstream exposes a native mutable surface]
+  - show unavailable or invalid skill metadata clearly [done]
 - improve MCP management:
-  - list server status with native details
-  - show tools/resources exposed by each server
-  - expose restart/refresh actions only when safe
+  - list server status with native details [done]
+  - show tools/resources exposed by each server [done]
+  - expose restart/refresh actions only when safe [done]
 
 Acceptance criteria:
 
@@ -221,7 +234,7 @@ Acceptance criteria:
 
 Objective: render newer Codex transcript item types as first-class cards.
 
-Status: partially implemented. The local rollout parser now mirrors upstream
+Status: implemented for the current upstream-compatibility batch. The local rollout parser now mirrors upstream
 thread history for standalone web search begin/end events, image generation
 begin/end events, local image-view tool calls, review-mode entry/exit markers,
 and thread rollback markers. The chat UI renders generated images with

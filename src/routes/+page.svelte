@@ -113,6 +113,8 @@
     SessionQueueItem,
     SessionQueuePayload,
     SessionReviewTarget,
+    SessionRollbackTarget,
+    SessionRollbackTargetsPayload,
     SessionRolloutRecoveryPayload,
     SessionSearchScope,
     SessionFolder,
@@ -318,6 +320,12 @@
   let resolvedTheme = $state<ResolvedTheme>("light");
   let loadingOlderTurns = $state(false);
   let olderTurnsAutoLoadEnabled = $state(true);
+  let rollbackTargetsOpen = $state(false);
+  let rollbackTargetsLoading = $state(false);
+  let rollbackTargetsPayload = $state<SessionRollbackTargetsPayload | null>(null);
+  let rollbackTargetsSessionId = $state<string | null>(null);
+  let rollbackTargetsError = $state("");
+  let rollbackTargetsResetSessionId = $state<string | null>(null);
   let olderTurnsAutoLoadPaused = $state(false);
   let olderTurnsAutoTriggerTimestamps = $state<number[]>([]);
   let terminals = $state<TerminalSummary[]>([]);
@@ -565,6 +573,7 @@
       restoreThread: m.restore_thread(),
       archiveThread: m.archive_thread(),
       open: m.open(),
+      refresh: locale === "ko" ? "새로고침" : "Refresh",
       loadingHistory: m.loading_history(),
       historyAvailable: m.history_available(),
       autoLoadPaused: m.auto_load_paused(),
@@ -576,6 +585,36 @@
       handoffToNewThread: m.handoff_to_new_thread(),
       rollbackToThisTurn: m.rollback_to_this_turn(),
       rollbackConfirm: m.rollback_confirm(),
+      rollbackTargets:
+        locale === "ko"
+          ? "롤백 대상"
+          : locale === "ja"
+            ? "Rollback targets"
+            : locale === "zh-Hans"
+              ? "Rollback targets"
+              : locale === "zh-Hant"
+                ? "Rollback targets"
+                : "Rollback targets",
+      rollbackTargetsHint:
+        locale === "ko"
+          ? "되돌릴 기준 메시지를 선택합니다. 파일 변경 자체는 되돌리지 않습니다."
+          : "Choose the message to roll back to. File changes are not reverted.",
+      rollbackTargetsLoading:
+        locale === "ko"
+          ? "롤백 대상을 불러오는 중"
+          : "Loading rollback targets",
+      rollbackTargetsEmpty:
+        locale === "ko"
+          ? "되돌릴 수 있는 이전 메시지가 없습니다."
+          : "No earlier messages can be rolled back to.",
+      rollbackPreviewIncomplete:
+        locale === "ko"
+          ? "일부 이전 턴은 아직 로드되지 않아 파일 변경 미리보기가 불완전할 수 있습니다."
+          : "Some earlier turns are not loaded, so the file-change preview may be incomplete.",
+      rollbackTurnsCount:
+        locale === "ko"
+          ? "제거할 턴"
+          : "Turns to remove",
       userMessageTimestamp:
         locale === "ko"
           ? "보낸 시각"
@@ -9256,14 +9295,27 @@
           return textMatches;
         }
         return textMatches || attachmentMatches;
+      });
     });
-  });
+  }
 
   $effect(() => {
     draft;
     scheduleComposerTextareaResize();
   });
-  }
+
+  $effect(() => {
+    const sessionId = selectedSessionId;
+    if (rollbackTargetsResetSessionId === sessionId) {
+      return;
+    }
+    rollbackTargetsResetSessionId = sessionId;
+    rollbackTargetsOpen = false;
+    rollbackTargetsPayload = null;
+    rollbackTargetsSessionId = null;
+    rollbackTargetsError = "";
+    rollbackTargetsLoading = false;
+  });
 
   async function copyMessageText(text: string) {
     if (typeof navigator === "undefined" || !text.trim()) {
@@ -9290,6 +9342,136 @@
       .find((value) => value.trim());
     const text = (userText || agentText || turn.id).replace(/\s+/gu, " ").trim();
     return text.length > 96 ? `${text.slice(0, 96).trimEnd()}...` : text;
+  }
+
+  function getLoadedAffectedTurnsForRollback(numTurns: number) {
+    if (!conversation || numTurns <= 0) {
+      return [];
+    }
+    return conversation.thread.turns.slice(Math.max(0, conversation.thread.turns.length - numTurns));
+  }
+
+  function getRollbackFilePreviews(turns: CodexTurn[]) {
+    const filePreviews: Array<{ path: string; added: number; removed: number }> = [];
+    for (const turn of turns) {
+      for (const item of turn.items) {
+        if (item.type !== "fileChange") {
+          continue;
+        }
+        for (const change of getFileChangeViews(item)) {
+          const stats = diffLineStats(change.diff);
+          const path = change.movePath ? `${change.path} -> ${change.movePath}` : change.path;
+          const existing = filePreviews.find((entry) => entry.path === path);
+          if (existing) {
+            existing.added += stats.added;
+            existing.removed += stats.removed;
+          } else {
+            filePreviews.push({ path, added: stats.added, removed: stats.removed });
+          }
+        }
+      }
+    }
+    return filePreviews;
+  }
+
+  async function loadRollbackTargets(force = false) {
+    const sessionId = selectedSessionId;
+    if (!sessionId) {
+      return;
+    }
+    if (!force && rollbackTargetsPayload && rollbackTargetsSessionId === sessionId) {
+      return;
+    }
+    rollbackTargetsLoading = true;
+    rollbackTargetsError = "";
+    try {
+      const payload = await api.listRollbackTargets(sessionId);
+      if (selectedSessionId !== sessionId) {
+        return;
+      }
+      rollbackTargetsPayload = payload;
+      rollbackTargetsSessionId = sessionId;
+    } catch (error) {
+      if (selectedSessionId === sessionId) {
+        rollbackTargetsError = describeError(error);
+      }
+    } finally {
+      if (selectedSessionId === sessionId) {
+        rollbackTargetsLoading = false;
+      }
+    }
+  }
+
+  async function toggleRollbackTargetsPanel() {
+    rollbackTargetsOpen = !rollbackTargetsOpen;
+    if (rollbackTargetsOpen) {
+      await loadRollbackTargets();
+    }
+  }
+
+  async function rollbackCurrentThreadToTarget(target: SessionRollbackTarget) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    if (!selectedSessionId || !conversation) {
+      return;
+    }
+    const numTurns = target.numTurns;
+    if (numTurns <= 0) {
+      noticeText = m.rollback_no_later_turns();
+      return;
+    }
+    const affectedTurns = getLoadedAffectedTurnsForRollback(numTurns);
+    const affectedFullyLoaded = affectedTurns.length === numTurns;
+    const previewLines = affectedTurns.slice(0, 6).map((turn, index) => `${index + 1}. ${summarizeTurnForRollbackPreview(turn)}`);
+    if (affectedTurns.length > previewLines.length) {
+      previewLines.push(`... +${affectedTurns.length - previewLines.length}`);
+    }
+    const filePreviews = getRollbackFilePreviews(affectedTurns);
+    const filePreviewLines = filePreviews.slice(0, 8).map((entry) => {
+      const stats = entry.added || entry.removed ? ` (+${entry.added}/-${entry.removed})` : "";
+      return `- ${entry.path}${stats}`;
+    });
+    if (filePreviews.length > filePreviewLines.length) {
+      filePreviewLines.push(`... +${filePreviews.length - filePreviewLines.length}`);
+    }
+    const affectedSection =
+      previewLines.length > 0
+        ? `\n\n${ui.rollbackTurnsCount} (${numTurns}):\n${previewLines.join("\n")}`
+        : `\n\n${ui.rollbackTurnsCount}: ${numTurns}`;
+    const incompleteSection = affectedFullyLoaded ? "" : `\n\n${ui.rollbackPreviewIncomplete}`;
+    const filePreviewSection =
+      filePreviews.length > 0
+        ? `\n\nFile changes in loaded affected turns (${filePreviews.length}):\n${filePreviewLines.join("\n")}`
+        : "\n\nFile changes in loaded affected turns: none";
+    const confirmMessage = `${ui.rollbackConfirm}\n\nTarget: ${target.preview}${affectedSection}${incompleteSection}${filePreviewSection}`;
+    if (!window.confirm(confirmMessage)) {
+      return;
+    }
+    const sessionId = selectedSessionId;
+    try {
+      const response = await api.rollbackSession(sessionId, numTurns);
+      if (selectedSessionId === sessionId && conversation) {
+        conversation = normalizeConversationExecutionState({
+          ...conversation,
+          thread: {
+            ...conversation.thread,
+            ...response.thread
+          },
+          activeTurnId: null
+        });
+        applySessionSummaryUpdate(buildSessionSummaryFromConversation(conversation));
+      }
+      rollbackTargetsPayload = null;
+      rollbackTargetsSessionId = null;
+      rollbackTargetsOpen = false;
+      scheduleSessionRefresh(80);
+      scheduleSelectedSessionStateRefresh(sessionId, 80);
+      noticeText = m.rollback_complete();
+    } catch (error) {
+      errorText = describeError(error);
+    }
   }
 
   async function forkCurrentThread(
@@ -9344,25 +9526,7 @@
     if (affectedTurns.length > previewLines.length) {
       previewLines.push(`... +${affectedTurns.length - previewLines.length}`);
     }
-    const filePreviews: Array<{ path: string; added: number; removed: number }> = [];
-    for (const turn of affectedTurns) {
-      for (const item of turn.items) {
-        if (item.type !== "fileChange") {
-          continue;
-        }
-        for (const change of getFileChangeViews(item)) {
-          const stats = diffLineStats(change.diff);
-          const path = change.movePath ? `${change.path} -> ${change.movePath}` : change.path;
-          const existing = filePreviews.find((entry) => entry.path === path);
-          if (existing) {
-            existing.added += stats.added;
-            existing.removed += stats.removed;
-          } else {
-            filePreviews.push({ path, added: stats.added, removed: stats.removed });
-          }
-        }
-      }
-    }
+    const filePreviews = getRollbackFilePreviews(affectedTurns);
     const filePreviewLines = filePreviews.slice(0, 8).map((entry) => {
       const stats = entry.added || entry.removed ? ` (+${entry.added}/-${entry.removed})` : "";
       return `- ${entry.path}${stats}`;
@@ -11841,6 +12005,86 @@
                         {m.clear_all()}
                       </button>
                     </div>
+                  </div>
+                {/if}
+
+                {#if !readOnlyRole}
+                  <div
+                    class="rounded-2xl border px-3 py-2 shadow-sm"
+                    style="border-color: var(--line); background: var(--panel-strong); color: var(--ink-strong);"
+                  >
+                    <div class="flex min-w-0 items-center justify-between gap-2">
+                      <button
+                        class="ui-animated-button ui-animated-button--soft flex min-w-0 flex-1 items-center gap-2 rounded-xl px-2 py-1.5 text-left text-xs font-bold"
+                        style="color: var(--ink-strong);"
+                        onclick={() => void toggleRollbackTargetsPanel()}
+                        type="button"
+                      >
+                        <RotateCcw size={14} class="shrink-0 text-red-500" />
+                        <span class="truncate">{ui.rollbackTargets}</span>
+                        {#if rollbackTargetsPayload?.targets}
+                          <span class="rounded-full px-1.5 py-0.5 text-[10px]" style="background: var(--panel-soft); color: var(--muted);">
+                            {rollbackTargetsPayload.targets.length}
+                          </span>
+                        {/if}
+                      </button>
+                      <button
+                        class="ui-animated-button ui-animated-button--soft rounded-lg px-2 py-1 text-[10px] font-bold disabled:opacity-50"
+                        disabled={rollbackTargetsLoading}
+                        onclick={() => void loadRollbackTargets(true)}
+                        style="color: var(--muted);"
+                        title={ui.refresh}
+                        type="button"
+                      >
+                        <RefreshCw size={12} class={rollbackTargetsLoading ? "animate-spin" : ""} />
+                      </button>
+                      <ChevronDown size={14} class="shrink-0 text-gray-400 {rollbackTargetsOpen ? 'rotate-180' : ''} transition-transform" />
+                    </div>
+
+                    {#if rollbackTargetsOpen}
+                      <div class="mt-2 space-y-2 border-t pt-2" style="border-color: var(--line);" transition:slide|local={{ duration: 180 }}>
+                        <p class="text-[11px]" style="color: var(--muted);">{ui.rollbackTargetsHint}</p>
+                        {#if rollbackTargetsLoading && !rollbackTargetsPayload}
+                          <div class="flex items-center gap-2 rounded-xl px-3 py-2 text-xs" style="background: var(--panel-soft); color: var(--muted);">
+                            <RefreshCw size={12} class="animate-spin" />
+                            {ui.rollbackTargetsLoading}
+                          </div>
+                        {:else if rollbackTargetsError}
+                          <div class="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{rollbackTargetsError}</div>
+                        {:else if !rollbackTargetsPayload || rollbackTargetsPayload.targets.length === 0}
+                          <div class="rounded-xl px-3 py-2 text-xs" style="background: var(--panel-soft); color: var(--muted);">{ui.rollbackTargetsEmpty}</div>
+                        {:else}
+                          <div class="max-h-72 space-y-1.5 overflow-y-auto pr-1">
+                            {#each rollbackTargetsPayload.targets as target (target.turnId ?? `${target.turnIndex}:${target.numTurns}`)}
+                              <button
+                                class="ui-animated-button ui-animated-button--soft flex w-full min-w-0 items-center gap-3 rounded-xl border px-3 py-2 text-left disabled:opacity-50"
+                                disabled={rollbackTargetsLoading}
+                                onclick={() => void rollbackCurrentThreadToTarget(target)}
+                                style="border-color: var(--line); background: var(--panel-soft); color: var(--ink-strong);"
+                                type="button"
+                              >
+                                <span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border text-[10px] font-bold" style="border-color: var(--line); color: var(--muted);">
+                                  {target.turnIndex + 1}
+                                </span>
+                                <span class="min-w-0 flex-1">
+                                  <span class="block truncate text-xs font-semibold">{target.preview}</span>
+                                  <span class="mt-0.5 block truncate text-[10px]" style="color: var(--muted);">
+                                    {ui.rollbackTurnsCount}: {target.numTurns}
+                                    {#if target.startedAt}
+                                      · {formatTurnTimestamp(target.startedAt)}
+                                    {/if}
+                                  </span>
+                                </span>
+                                <RotateCcw size={13} class="shrink-0 text-red-500" />
+                              </button>
+                            {/each}
+                          </div>
+                        {/if}
+                        {#if rollbackTargetsPayload?.truncatedBefore}
+                          <p class="text-[10px]" style="color: var(--muted);">{ui.rollbackPreviewIncomplete}</p>
+                        {/if}
+                      </div>
+                    {/if}
                   </div>
                 {/if}
 

@@ -1,5 +1,7 @@
 use super::*;
 
+const INLINE_IMAGE_GENERATION_RESULT_MAX_CHARS: usize = 256 * 1024;
+
 fn summarize_command_payload(value: Option<&Value>) -> Option<String> {
     match value {
         Some(Value::Array(entries)) => {
@@ -141,7 +143,6 @@ pub(crate) fn prepare_session_deferred_item_payload(
         }
         "imageGeneration" => {
             normalized.insert("title".to_string(), json!("Generated image"));
-            normalized.insert("detailState".to_string(), json!("inline"));
             normalized.insert(
                 "detailPreview".to_string(),
                 value_text(normalized.get("revised_prompt").unwrap_or(&Value::Null))
@@ -149,6 +150,17 @@ pub(crate) fn prepare_session_deferred_item_payload(
                     .map(Value::String)
                     .unwrap_or(Value::Null),
             );
+            let large_result = normalized
+                .get("result")
+                .and_then(Value::as_str)
+                .is_some_and(|result| result.len() > INLINE_IMAGE_GENERATION_RESULT_MAX_CHARS);
+            if large_result {
+                normalized.insert("result".to_string(), Value::Null);
+                normalized.insert("resultOmitted".to_string(), Value::Bool(true));
+                normalized.insert("detailState".to_string(), json!("deferred"));
+            } else {
+                normalized.insert("detailState".to_string(), json!("inline"));
+            }
         }
         "webSearch" => {
             let detail_preview = value_text(normalized.get("query").unwrap_or(&Value::Null))

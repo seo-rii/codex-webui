@@ -2267,6 +2267,50 @@ fn maps_session_item_notifications_use_item_id_when_payload_omits_item_id() {
 }
 
 #[test]
+fn maps_large_image_generation_notifications_as_deferred() {
+    let large_result = "a".repeat(300 * 1024);
+    let mapped = map_app_server_session_notification(&AppServerNotification {
+        method: "item/completed".to_string(),
+        params: json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "image-1",
+            "item": {
+                "id": "image-1",
+                "type": "imageGeneration",
+                "status": "completed",
+                "revised_prompt": "large diagram",
+                "result": large_result,
+                "savedPath": "/tmp/large.png"
+            }
+        }),
+    })
+    .expect("notification should map");
+
+    let item = mapped
+        .get("params")
+        .and_then(|params| params.get("item"))
+        .expect("mapped item should exist");
+    assert!(item.get("result").is_some_and(Value::is_null));
+    assert_eq!(
+        item.get("resultOmitted").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        item.get("detailState").and_then(Value::as_str),
+        Some("deferred")
+    );
+    assert_eq!(
+        item.get("detailPreview").and_then(Value::as_str),
+        Some("large diagram")
+    );
+    assert!(
+        serde_json::to_string(&mapped).unwrap().len() < 4096,
+        "large image result should not be embedded in the mapped stream event"
+    );
+}
+
+#[test]
 fn maps_thread_name_updates_from_snake_case_payloads() {
     let mapped = map_app_server_session_notification(&AppServerNotification {
         method: "thread/name/updated".to_string(),

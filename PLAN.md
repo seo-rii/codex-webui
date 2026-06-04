@@ -236,9 +236,9 @@ Planned work:
 
 - improve image generation item support:
   - show generated images in chat [done]
-  - lazy-load large image payloads
+  - lazy-load large image payloads [done for session detail, older turns, stream events, and browser cache]
   - include download/open actions [done]
-  - avoid embedding large base64 images in default session payloads
+  - avoid embedding large base64 images in default session payloads [done]
 - add standalone web search cards:
   - render query and status [done]
   - render citations and result summary [done for rollout payloads that include
@@ -288,7 +288,9 @@ Required coverage:
 - WebSocket reconnect tests that replay client ids without duplicating messages
 - role-policy tests for diagnostics, memory, plugin, marketplace, skill, MCP,
   review, rollback, and media payloads
-- lazy-loading tests for image generation and web search item details
+- lazy-loading tests for image generation and web search item details [done for
+  large image generation session detail and stream events; web search item detail
+  remains covered by deferred item payload tests]
 - archive/unarchive reconciliation tests against native Codex responses
 
 Manual checks should focus on:

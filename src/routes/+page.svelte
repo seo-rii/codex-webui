@@ -227,6 +227,7 @@
   };
   const HUNDRED_M_CONTEXT_WINDOW = 100_000_000;
   const LOCAL_QUEUE_MODE_GRACE_MS = 120_000;
+  const SESSION_DETAIL_CACHE_INLINE_IMAGE_RESULT_MAX_CHARS = 256 * 1024;
 
   let config = $state<AppConfigPayload | null>(null);
   let catalog = $state<CatalogPayload | null>(null);
@@ -3982,7 +3983,11 @@
   }
 
   function sanitizeSessionDetailItemForBrowserCache(item: CodexItem) {
-    if (!["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"].includes(item.type)) {
+    const largeImageResult =
+      item.type === "imageGeneration" &&
+      typeof item.result === "string" &&
+      item.result.length > SESSION_DETAIL_CACHE_INLINE_IMAGE_RESULT_MAX_CHARS;
+    if (!largeImageResult && !["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"].includes(item.type)) {
       return clonePayloadForCache(item);
     }
 
@@ -4027,6 +4032,11 @@
     if (sanitized.type === "mcpToolCall" || sanitized.type === "dynamicToolCall") {
       delete sanitized.action;
       delete sanitized.invocation;
+    }
+
+    if (sanitized.type === "imageGeneration") {
+      sanitized.result = null;
+      sanitized.resultOmitted = true;
     }
 
     sanitized.detailState = "deferred";

@@ -175,6 +175,92 @@ fn summarize_session_turn_for_detail_payload(
     Value::Object(summarized)
 }
 
+fn summarize_turn_for_rollback_target(turn: &Value) -> String {
+    let items = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let text = items
+        .iter()
+        .find_map(|item| {
+            if item.get("type").and_then(Value::as_str) != Some("userMessage") {
+                return None;
+            }
+            item.get("text")
+                .or_else(|| item.get("message"))
+                .and_then(value_text)
+        })
+        .or_else(|| {
+            items.iter().find_map(|item| {
+                if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
+                    return None;
+                }
+                item.get("text")
+                    .or_else(|| item.get("message"))
+                    .and_then(value_text)
+            })
+        })
+        .or_else(|| turn.get("id").and_then(value_text))
+        .unwrap_or_else(|| "Rollback target".to_string())
+        .replace(['\r', '\n', '\t'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.chars().count() > 120 {
+        format!(
+            "{}...",
+            text.chars().take(120).collect::<String>().trim_end()
+        )
+    } else {
+        text
+    }
+}
+
+fn rollback_targets_from_turns(
+    turns: &[Value],
+    loaded_start: usize,
+    known_total_turns: Option<usize>,
+    truncated_before: bool,
+) -> Value {
+    let targets = turns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, turn)| {
+            let later_turns = turns.len().saturating_sub(index + 1);
+            if later_turns == 0 {
+                return None;
+            }
+            let items = turn
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !items
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("userMessage"))
+            {
+                return None;
+            }
+            Some(json!({
+                "turnId": turn.get("id").cloned().unwrap_or(Value::Null),
+                "turnIndex": loaded_start.saturating_add(index),
+                "numTurns": later_turns,
+                "preview": summarize_turn_for_rollback_target(turn),
+                "startedAt": turn.get("startedAt").cloned().unwrap_or(Value::Null),
+                "completedAt": turn.get("completedAt").cloned().unwrap_or(Value::Null)
+            }))
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "targets": targets,
+        "loadedStart": loaded_start,
+        "loadedTurns": turns.len(),
+        "totalTurns": known_total_turns.map(Value::from).unwrap_or(Value::Null),
+        "truncatedBefore": truncated_before
+    })
+}
+
 fn parse_rollout_timestamp_ms(record: &Value) -> Option<i64> {
     record
         .get("timestamp")
@@ -1945,6 +2031,42 @@ pub(crate) async fn session_older_turns_payload(
         "totalTurns": turns.len(),
         "remainingTurns": start
     }))
+}
+
+pub(crate) async fn session_rollback_targets_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Value> {
+    if let Some(rollout_path) =
+        find_rollout_path_by_session_id(state, profile_id, session_id).await?
+    {
+        let turn_window = read_local_rollout_turn_window_with_max(
+            rollout_path,
+            500,
+            SESSION_OLDER_ROLLOUT_TAIL_MAX_BYTES,
+        )
+        .await?;
+        return Ok(rollback_targets_from_turns(
+            &turn_window.turns,
+            turn_window.loaded_start,
+            turn_window.known_total_turns,
+            turn_window.truncated,
+        ));
+    }
+
+    let thread = read_thread_payload(state, profile_id, session_id, true).await?;
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(rollback_targets_from_turns(
+        &turns,
+        0,
+        Some(turns.len()),
+        false,
+    ))
 }
 
 pub(crate) async fn session_turn_payload(

@@ -55,6 +55,7 @@ import type {
   SessionReviewStartPayload,
   SessionReviewTarget,
   SessionRollbackPayload,
+  SessionRollbackTargetsPayload,
   SessionRolloutRecoveryPayload,
   SessionSearchScope,
   SessionSummaryFilter,
@@ -580,6 +581,12 @@ export const api = {
     return ws.request<SessionRollbackPayload>("session/rollback", {
       sessionId,
       numTurns
+    });
+  },
+
+  listRollbackTargets(sessionId: string) {
+    return ws.request<SessionRollbackTargetsPayload>("session/rollbackTargets/list", {
+      sessionId
     });
   },
 

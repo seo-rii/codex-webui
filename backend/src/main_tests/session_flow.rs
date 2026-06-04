@@ -3822,6 +3822,126 @@ async fn local_session_detail_parses_rich_transcript_items_and_rollbacks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_rollback_targets_list_uses_explicit_rollout_scan() {
+    let sandbox = unique_test_dir("session-rollback-targets");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000224";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    fs::write(
+        rollout_dir.join(format!("rollout-2026-04-24T01-10-00-{session_id}.jsonl")),
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:10:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:10:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:10:01.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-1" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:10:02.000Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "first rollback target" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:10:03.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "turn-1" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:10:04.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-2" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:10:05.000Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "second rollback target" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:10:06.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "turn-2" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:10:07.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-3" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:10:08.000Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "latest loaded turn" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:10:09.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "turn-3" }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let detail = session_detail_payload(&state, "default", session_id, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("turns"))
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let targets = session_rollback_targets_payload(&state, "default", session_id)
+        .await
+        .unwrap();
+    let target_entries = targets
+        .get("targets")
+        .and_then(Value::as_array)
+        .expect("rollback targets should be listed");
+    assert_eq!(target_entries.len(), 2);
+    assert_eq!(
+        target_entries[0].get("turnId").and_then(Value::as_str),
+        Some("turn-1")
+    );
+    assert_eq!(
+        target_entries[0].get("numTurns").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        target_entries[1].get("turnId").and_then(Value::as_str),
+        Some("turn-2")
+    );
+    assert_eq!(
+        target_entries[1].get("numTurns").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(targets.get("totalTurns").and_then(Value::as_u64), Some(3));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_session_detail_defers_large_image_generation_results() {
     let sandbox = unique_test_dir("session-detail-large-image");
     let workspace = sandbox.join("workspace");

@@ -124,6 +124,7 @@ pub(crate) fn should_audit_ws_method(method: &str) -> bool {
             | "session/draft/get"
             | "session/queue/get"
             | "session/olderTurns/get"
+            | "session/rollbackTargets/list"
             | "session/turn/get"
             | "session/itemDetail/get"
             | "session/goal/get"

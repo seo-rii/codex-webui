@@ -250,7 +250,7 @@ Planned work:
   - show findings with file references and severity [done when present]
   - link findings to file/diff tabs [done]
 - add rollback UI:
-  - list rollback targets [partially done for loaded user-message turns]
+  - list rollback targets [backend support done for explicit full-target listing; UI still exposes loaded user-message actions]
   - preview affected files before execution [done for file-change items in the
     loaded rollback range]
   - require confirmation for destructive rollback actions [done for direct thread rollback]

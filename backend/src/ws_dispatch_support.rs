@@ -529,6 +529,12 @@ pub(crate) async fn execute_ws_method(
             .await
             .map_err(anyhow::Error::from)
         }
+        "session/rollbackTargets/list" => {
+            let session_id = require_session_id(&params, "sessionId")?;
+            session_rollback_targets_payload(state, &auth.profile_id, &session_id)
+                .await
+                .map_err(anyhow::Error::from)
+        }
         "session/turn/get" => {
             let session_id = require_session_id(&params, "sessionId")?;
             let turn_id = require_string(&params, "turnId")?;

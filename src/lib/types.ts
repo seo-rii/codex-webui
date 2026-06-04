@@ -605,6 +605,23 @@ export type SessionRollbackPayload = {
   thread: CodexThread;
 };
 
+export type SessionRollbackTarget = {
+  turnId: string | null;
+  turnIndex: number;
+  numTurns: number;
+  preview: string;
+  startedAt: number | null;
+  completedAt: number | null;
+};
+
+export type SessionRollbackTargetsPayload = {
+  targets: SessionRollbackTarget[];
+  loadedStart: number;
+  loadedTurns: number;
+  totalTurns: number | null;
+  truncatedBefore: boolean;
+};
+
 export type SessionTurnSearchMatch = {
   turnId: string;
   turnIndex: number;

@@ -2037,6 +2037,29 @@ fn ws_session_cache_validation_returns_not_modified_for_matching_versions() {
     );
     assert!(list_not_modified.get("sessions").is_none());
 
+    let list_state_hash_not_modified = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "sessions/list",
+        json!({
+            "archived": false,
+            "limit": 20,
+            "knownVersion": "stale-client-payload-version",
+            "knownStateHash": list_state_hash
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        list_state_hash_not_modified
+            .get("notModified")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(list_state_hash_not_modified.get("sessions").is_none());
+
     let patched_session = create_session_payload(
         &state,
         "default",
@@ -2131,6 +2154,29 @@ fn ws_session_cache_validation_returns_not_modified_for_matching_versions() {
         Some(true)
     );
     assert!(detail_not_modified.get("thread").is_none());
+
+    let detail_state_hash_not_modified = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "session/get",
+        json!({
+            "sessionId": session_id,
+            "limit": 20,
+            "knownVersion": "stale-client-payload-version",
+            "knownStateHash": detail_state_hash
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        detail_state_hash_not_modified
+            .get("notModified")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(detail_state_hash_not_modified.get("thread").is_none());
 
     with_ui_state_write(&state, "default", |ui_state| {
         let Some(queues) = ui_state

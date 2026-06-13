@@ -511,6 +511,23 @@ pub(crate) fn cacheable_session_list_response(
         });
     }
 
+    if known_state_hash
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .zip(
+            payload
+                .get("stateHash")
+                .and_then(Value::as_str)
+                .map(str::trim),
+        )
+        .is_some_and(|(known, current)| known == current)
+    {
+        return json!({
+            "cacheVersion": version,
+            "notModified": true
+        });
+    }
+
     if known_version.is_some()
         && known_state_hash
             .map(str::trim)

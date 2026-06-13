@@ -134,6 +134,8 @@
   } from "$lib/types";
 
   const SESSION_LIST_BROWSER_CACHE_SCHEMA_VERSION = 2;
+  const SESSION_LIST_VERSION_HINT_LIMIT = 240;
+  const SESSION_DETAIL_VERSION_HINT_LIMIT = 320;
 
   type WorkspaceTabId =
     | "chat"
@@ -3993,6 +3995,14 @@
     return fnv1a32Hex(source);
   }
 
+  function boundedVersionHints(source: Record<string, string>, limit: number) {
+    const entries = Object.entries(source);
+    if (entries.length === 0 || entries.length > limit) {
+      return null;
+    }
+    return Object.fromEntries(entries);
+  }
+
   function clonePayloadForCache<T>(payload: T): T {
     return JSON.parse(JSON.stringify(payload)) as T;
   }
@@ -4736,7 +4746,9 @@
     const listCacheKey = buildSessionListBrowserCacheKey(null, refreshLimit);
     let knownVersion: string | null = sessionListCacheKey === listCacheKey ? sessionListCacheVersion : null;
     let knownSummaryVersions: Record<string, string> | null =
-      knownVersion && sessionListCacheKey === listCacheKey && sessionListStateHash ? { ...sessionSummaryVersionsById } : null;
+      knownVersion && sessionListCacheKey === listCacheKey && sessionListStateHash
+        ? boundedVersionHints(sessionSummaryVersionsById, SESSION_LIST_VERSION_HINT_LIMIT)
+        : null;
     let knownStateHash: string | null = knownVersion && sessionListCacheKey === listCacheKey ? sessionListStateHash : null;
     const shouldHydrateListFromBrowserCache =
       Boolean(listCacheKey) && (sessionListCacheKey !== listCacheKey || sessions.length === 0);
@@ -4752,7 +4764,9 @@
           sessionListCacheKey = listCacheKey;
           sessionListCacheVersion = cachedEntry.version;
           knownVersion = cachedEntry.version;
-          knownSummaryVersions = sessionListStateHash ? { ...sessionSummaryVersionsById } : null;
+          knownSummaryVersions = sessionListStateHash
+            ? boundedVersionHints(sessionSummaryVersionsById, SESSION_LIST_VERSION_HINT_LIMIT)
+            : null;
           knownStateHash = sessionListStateHash;
         }
       }
@@ -5555,7 +5569,7 @@
   ) {
     const knownTurnVersions =
       !replaceWithRecentWindow && knownVersion && sessionDetailStateHash && conversation?.thread.id === sessionId
-        ? { ...sessionTurnVersionsById }
+        ? boundedVersionHints(sessionTurnVersionsById, SESSION_DETAIL_VERSION_HINT_LIMIT)
         : null;
     const knownStateHash =
       !replaceWithRecentWindow && knownVersion && conversation?.thread.id === sessionId ? sessionDetailStateHash : null;

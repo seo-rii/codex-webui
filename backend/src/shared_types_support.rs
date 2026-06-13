@@ -38,6 +38,9 @@ pub(crate) struct AppState {
         Arc<Mutex<HashMap<String, CachedAttachmentStorageUsage>>>,
     pub(crate) relays: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
     pub(crate) terminals: Arc<Mutex<HashMap<String, Arc<TerminalSession>>>>,
+    pub(crate) session_summary_update_tasks:
+        Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    pub(crate) runtime_config_update_tasks: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(crate) ui_state_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub(crate) ui_state_cache: Arc<Mutex<HashMap<String, Value>>>,
     pub(crate) automation_timers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,

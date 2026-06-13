@@ -297,66 +297,78 @@ async fn send_notification_webhook_with_retries(
 }
 
 pub(crate) async fn emit_runtime_profile_config_updated(state: &AppState, profile_id: &str) {
-    let (shutdown_available, _) = system_shutdown_capability(&state.config).await;
-    let (shutdown_after_queue_completes, scheduled_shutdown, scheduled_shutdown_blocked_reason) =
-        match with_ui_state_read(state, profile_id, |ui_state| {
-            Ok((
-                ui_state
-                    .get("global")
-                    .and_then(|value| value.get("shutdownAfterQueueCompletes"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                ui_state
-                    .get("global")
-                    .and_then(|value| value.get("scheduledShutdown"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                ui_state
-                    .get("global")
-                    .and_then(|value| value.get("scheduledShutdownBlockedReason"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            ))
-        })
-        .await
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let state_for_task = state.clone();
+    let profile_id = profile_id.to_string();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        let (shutdown_available, _) = system_shutdown_capability(&state_for_task.config).await;
+        let (shutdown_after_queue_completes, scheduled_shutdown, scheduled_shutdown_blocked_reason) =
+            match with_ui_state_read(&state_for_task, &profile_id, |ui_state| {
+                Ok((
+                    ui_state
+                        .get("global")
+                        .and_then(|value| value.get("shutdownAfterQueueCompletes"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    ui_state
+                        .get("global")
+                        .and_then(|value| value.get("scheduledShutdown"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    ui_state
+                        .get("global")
+                        .and_then(|value| value.get("scheduledShutdownBlockedReason"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                ))
+            })
+            .await
+            {
+                Ok(values) => values,
+                Err(_) => return,
+            };
+
+        let next_scheduled_shutdown = if shutdown_available
+            && scheduled_shutdown
+                .get("scheduledFor")
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value > now_unix_ms())
         {
-            Ok(values) => values,
-            Err(_) => return,
+            scheduled_shutdown
+        } else {
+            Value::Null
         };
+        let paused_queues = list_resume_pending_queues_payload(&state_for_task, &profile_id)
+            .await
+            .unwrap_or_else(|_| json!([]));
 
-    let next_scheduled_shutdown = if shutdown_available
-        && scheduled_shutdown
-            .get("scheduledFor")
-            .and_then(Value::as_u64)
-            .is_some_and(|value| value > now_unix_ms())
-    {
-        scheduled_shutdown
-    } else {
-        Value::Null
-    };
-    let paused_queues = list_resume_pending_queues_payload(state, profile_id)
-        .await
-        .unwrap_or_else(|_| json!([]));
-
-    emit_profile_config_updated(
-        state,
-        profile_id,
-        json!({
-            "systemShutdown": {
-                "available": shutdown_available,
-                "delaySeconds": state.config.system_shutdown_delay_seconds,
-                "armed": shutdown_available
-                    && state.config.system_shutdown_enabled
-                    && shutdown_after_queue_completes
-            },
-            "startup": {
-                "pausedQueues": paused_queues,
-                "scheduledShutdown": next_scheduled_shutdown,
-                "scheduledShutdownBlockedReason": scheduled_shutdown_blocked_reason
-            }
-        }),
-    )
-    .await;
+        emit_profile_config_updated(
+            &state_for_task,
+            &profile_id,
+            json!({
+                "systemShutdown": {
+                    "available": shutdown_available,
+                    "delaySeconds": state_for_task.config.system_shutdown_delay_seconds,
+                    "armed": shutdown_available
+                        && state_for_task.config.system_shutdown_enabled
+                        && shutdown_after_queue_completes
+                },
+                "startup": {
+                    "pausedQueues": paused_queues,
+                    "scheduledShutdown": next_scheduled_shutdown,
+                    "scheduledShutdownBlockedReason": scheduled_shutdown_blocked_reason
+                }
+            }),
+        )
+        .await;
+    });
+    let mut tasks = state.runtime_config_update_tasks.lock().await;
+    if let Some(existing) = tasks.insert(resolved_profile_id, handle) {
+        existing.abort();
+    }
 }
 
 fn notification_thread_id(method: &str, params: &Value) -> Option<String> {

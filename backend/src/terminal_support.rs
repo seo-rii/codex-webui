@@ -232,16 +232,35 @@ pub(crate) async fn create_terminal(
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
         let mut buffer = [0_u8; 4096];
+        let mut pending_output = String::new();
         loop {
-            match reader.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(read) => {
-                    let text = String::from_utf8_lossy(&buffer[..read]).to_string();
-                    output_session.append_output(&text).await;
+            match tokio::time::timeout(Duration::from_millis(50), reader.read(&mut buffer)).await {
+                Ok(Ok(0)) => {
+                    if !pending_output.is_empty() {
+                        output_session.append_output(&pending_output).await;
+                    }
+                    break;
                 }
-                Err(error) => {
+                Ok(Ok(read)) => {
+                    let text = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    pending_output.push_str(&text);
+                    if pending_output.len() >= 16 * 1024 {
+                        output_session.append_output(&pending_output).await;
+                        pending_output.clear();
+                    }
+                }
+                Ok(Err(error)) => {
+                    if !pending_output.is_empty() {
+                        output_session.append_output(&pending_output).await;
+                    }
                     warn!("terminal output stream failed: {error:#}");
                     break;
+                }
+                Err(_) => {
+                    if !pending_output.is_empty() {
+                        output_session.append_output(&pending_output).await;
+                        pending_output.clear();
+                    }
                 }
             }
         }

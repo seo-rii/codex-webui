@@ -510,6 +510,9 @@ pub(crate) fn map_app_server_session_notification(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            if delta.is_empty() {
+                return None;
+            }
             mapped.insert("delta".to_string(), Value::String(delta.clone()));
             mapped.insert("deltaLength".to_string(), json!(delta.chars().count()));
         }

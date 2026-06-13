@@ -35,12 +35,157 @@ pub(crate) async fn subscribe_session(
     let cleanup_state = state.clone();
     let stream_out_tx = out_tx.clone();
     let handle = tokio::spawn(async move {
+        let mut pending_delta_event: Option<Value> = None;
+        let mut pending_delta_key = String::new();
         loop {
-            match receiver.recv().await {
-                Ok(event) => {
-                    let Some(event) = filter_session_event_for_role(role, event) else {
+            match tokio::time::timeout(Duration::from_millis(50), receiver.recv()).await {
+                Err(_) => {
+                    if let Some(event) = pending_delta_event.take() {
+                        if !send_relay_envelope(
+                            &stream_out_tx,
+                            ServerEnvelope::Event {
+                                session_id: session_key.clone(),
+                                event,
+                            },
+                            "session-subscription-output-delta",
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                    pending_delta_key.clear();
+                }
+                Ok(Ok(event)) => {
+                    let Some(mut event) = filter_session_event_for_role(role, event) else {
                         continue;
                     };
+
+                    if event.get("method").and_then(Value::as_str)
+                        == Some("item/commandExecution/outputDelta")
+                    {
+                        let params = event.get("params").and_then(Value::as_object);
+                        let turn_id = params
+                            .and_then(|params| params.get("turnId"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let item_id = params
+                            .and_then(|params| params.get("itemId"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let delta = params
+                            .and_then(|params| params.get("delta"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        if delta.is_empty() {
+                            continue;
+                        }
+                        if turn_id.is_empty() || item_id.is_empty() {
+                            if let Some(pending_event) = pending_delta_event.take() {
+                                if !send_relay_envelope(
+                                    &stream_out_tx,
+                                    ServerEnvelope::Event {
+                                        session_id: session_key.clone(),
+                                        event: pending_event,
+                                    },
+                                    "session-subscription-output-delta",
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                            }
+                            pending_delta_key.clear();
+                        } else {
+                            let next_key = format!("{turn_id}\u{0}{item_id}");
+                            if pending_delta_event.is_some() && pending_delta_key == next_key {
+                                if let Some(params) = pending_delta_event
+                                    .as_mut()
+                                    .and_then(|pending| pending.get_mut("params"))
+                                    .and_then(Value::as_object_mut)
+                                {
+                                    let mut next_delta = params
+                                        .get("delta")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    next_delta.push_str(&delta);
+                                    params.insert(
+                                        "deltaLength".to_string(),
+                                        json!(next_delta.chars().count()),
+                                    );
+                                    params.insert("delta".to_string(), Value::String(next_delta));
+                                }
+                            } else {
+                                if let Some(pending_event) = pending_delta_event.take() {
+                                    if !send_relay_envelope(
+                                        &stream_out_tx,
+                                        ServerEnvelope::Event {
+                                            session_id: session_key.clone(),
+                                            event: pending_event,
+                                        },
+                                        "session-subscription-output-delta",
+                                    )
+                                    .await
+                                    {
+                                        break;
+                                    }
+                                }
+                                pending_delta_key = next_key;
+                                event
+                                    .get_mut("params")
+                                    .and_then(Value::as_object_mut)
+                                    .map(|params| {
+                                        params.insert(
+                                            "deltaLength".to_string(),
+                                            json!(delta.chars().count()),
+                                        );
+                                    });
+                                pending_delta_event = Some(event);
+                            }
+                            if pending_delta_event
+                                .as_ref()
+                                .and_then(|pending| pending.get("params"))
+                                .and_then(|params| params.get("delta"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| value.len() >= 16 * 1024)
+                            {
+                                if let Some(pending_event) = pending_delta_event.take() {
+                                    if !send_relay_envelope(
+                                        &stream_out_tx,
+                                        ServerEnvelope::Event {
+                                            session_id: session_key.clone(),
+                                            event: pending_event,
+                                        },
+                                        "session-subscription-output-delta",
+                                    )
+                                    .await
+                                    {
+                                        break;
+                                    }
+                                }
+                                pending_delta_key.clear();
+                            }
+                            continue;
+                        }
+                    }
+
+                    if let Some(pending_event) = pending_delta_event.take() {
+                        if !send_relay_envelope(
+                            &stream_out_tx,
+                            ServerEnvelope::Event {
+                                session_id: session_key.clone(),
+                                event: pending_event,
+                            },
+                            "session-subscription-output-delta",
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                    pending_delta_key.clear();
                     if !send_relay_envelope(
                         &stream_out_tx,
                         ServerEnvelope::Event {
@@ -54,11 +199,22 @@ pub(crate) async fn subscribe_session(
                         break;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
                     warn!("websocket lagged on session {session_key}: skipped {skipped} messages");
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
             }
+        }
+        if let Some(event) = pending_delta_event.take() {
+            let _ = send_relay_envelope(
+                &stream_out_tx,
+                ServerEnvelope::Event {
+                    session_id: session_key.clone(),
+                    event,
+                },
+                "session-subscription-output-delta",
+            )
+            .await;
         }
         drop(receiver);
         prune_unused_session_relay(&cleanup_state, &profile_key, &session_key).await;

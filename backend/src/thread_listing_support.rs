@@ -920,27 +920,42 @@ pub(crate) async fn emit_session_summary_updated(
     status_override: Option<&str>,
 ) {
     invalidate_session_listing_cache(state, profile_id, Some(session_id)).await;
-    let summary = build_session_summary_payload(
-        state,
-        profile_id,
-        session_id,
-        preferences_override,
-        status_override,
-    )
-    .await;
-    if let Ok(summary) = summary {
-        emit_profile_global_notification(
-            state,
-            profile_id,
-            json!({
-                "kind": "notification",
-                "method": "codex-webui/sessionSummaryUpdated",
-                "params": {
-                    "session": summary
-                }
-            }),
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let task_key = format!("{resolved_profile_id}:{session_id}");
+    let state_for_task = state.clone();
+    let profile_id = profile_id.to_string();
+    let session_id = session_id.to_string();
+    let status_override = status_override.map(str::to_string);
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let summary = build_session_summary_payload(
+            &state_for_task,
+            &profile_id,
+            &session_id,
+            preferences_override,
+            status_override.as_deref(),
         )
         .await;
+        if let Ok(summary) = summary {
+            emit_profile_global_notification(
+                &state_for_task,
+                &profile_id,
+                json!({
+                    "kind": "notification",
+                    "method": "codex-webui/sessionSummaryUpdated",
+                    "params": {
+                        "session": summary
+                    }
+                }),
+            )
+            .await;
+        }
+    });
+    let mut tasks = state.session_summary_update_tasks.lock().await;
+    if let Some(existing) = tasks.insert(task_key, handle) {
+        existing.abort();
     }
 }
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { BellRing, Clock3, History, Info, Monitor, Palette, Pencil, Play, Plug, Power, RefreshCw, RotateCcw, Save, Server, Settings2, Sparkles, Square, Trash2, Wand2 } from "lucide-svelte";
+  import { ArrowRightLeft, BellRing, Clock3, History, Info, Monitor, Palette, Pencil, Play, Plug, Power, RefreshCw, RotateCcw, Save, Server, Settings2, Sparkles, Square, Trash2, Wand2 } from "lucide-svelte";
   import { fade } from "svelte/transition";
 
   import { api } from "$lib/api";
@@ -42,6 +42,7 @@
 
   type SettingsTabId =
     | "config"
+    | "defaults"
     | "startup"
     | "processes"
     | "audit"
@@ -60,6 +61,7 @@
     configFilePath,
     autostart = null,
     runtime = null,
+    defaults = null,
     notificationSettings = null,
     promptPresets = [],
     automations = [],
@@ -71,6 +73,7 @@
     readOnly = false,
     initialTab = null,
     onAutostartSaved = null,
+    onSaveDefaultLanguageBridge = null,
     onSaveThemeSettings = null,
     onNotificationSettingsSaved = null,
     onSavePromptPreset = null,
@@ -86,6 +89,7 @@
     configFilePath: string;
     autostart?: AppConfigPayload["autostart"] | null;
     runtime?: CodexRuntimeStatus | null;
+    defaults?: AppConfigPayload["defaults"] | null;
     notificationSettings?: NotificationSettings | null;
     promptPresets?: PromptPreset[];
     automations?: AutomationDefinition[];
@@ -97,6 +101,7 @@
     readOnly?: boolean;
     initialTab?: SettingsTabId | null;
     onAutostartSaved?: ((enabled: boolean) => void | Promise<void>) | null;
+    onSaveDefaultLanguageBridge?: ((enabled: boolean, outputLanguage: string) => void | Promise<void>) | null;
     onSaveThemeSettings?: ((settings: ThemeSettings) => void | Promise<void>) | null;
     onNotificationSettingsSaved?: ((settings: Partial<NotificationSettings>) => void | Promise<void>) | null;
     onSavePromptPreset?: ((preset: PromptPreset) => void | Promise<void>) | null;
@@ -141,11 +146,14 @@
   let auditEntries = $state<AuditLogEntry[]>([]);
   let themeDraft = $state<ThemeSettings>(cloneThemeSettings(DEFAULT_THEME_SETTINGS));
   let themeBaseFingerprint = $state(JSON.stringify(cloneThemeSettings(DEFAULT_THEME_SETTINGS)));
+  let defaultLanguageBridgeEnabled = $state(false);
+  let defaultLanguageBridgeOutputLanguage = $state("auto");
   let loading = $state(true);
   let saving = $state(false);
   let reloading = $state(false);
   let savingNotifications = $state(false);
   let savingAutostart = $state(false);
+  let savingDefaults = $state(false);
   let savingPreset = $state(false);
   let savingTheme = $state(false);
   let cleaningAutomationWorktrees = $state(false);
@@ -168,6 +176,10 @@
   const dirty = $derived(Boolean(configFile && editorValue !== configFile.content));
   const configModelContextWindow = $derived.by(() => parseTomlIntegerSetting(editorValue, "model_context_window"));
   const themeDirty = $derived(themeBaseFingerprint !== JSON.stringify(themeDraft));
+  const defaultsDirty = $derived(
+    defaultLanguageBridgeEnabled !== (defaults?.languageBridgeEnabled ?? false) ||
+      defaultLanguageBridgeOutputLanguage.trim() !== (defaults?.languageBridgeOutputLanguage ?? "auto")
+  );
   const webuiBuildTimestampLabel = $derived.by(() => {
     const _locale = $localeSignal;
     const value = runtime?.webuiBuildTimestamp;
@@ -279,6 +291,12 @@
       openSession: isKorean ? "세션 열기" : "Open session",
       notifications: m.notifications(),
       startup: m.startup(),
+      sessionDefaults: m.session_defaults(),
+      defaultLanguageBridge: m.default_language_bridge(),
+      defaultLanguageBridgeDescription: m.default_language_bridge_description(),
+      languageBridgeOutput: isKorean ? "출력 언어" : "Output language",
+      languageBridgeAuto: isKorean ? "자동 감지" : "Auto detect",
+      saveDefaults: isKorean ? "기본값 저장" : "Save defaults",
       autostartTitle: m.autostart_title(),
       autostartDescription: m.autostart_description(),
       autostartEnable: m.autostart_enable(),
@@ -418,6 +436,13 @@
         alert: false
       },
       {
+        id: "defaults",
+        label: ui.sessionDefaults,
+        icon: ArrowRightLeft,
+        meta: defaultsDirty ? ui.unsaved : null,
+        alert: defaultsDirty
+      },
+      {
         id: "theme",
         label: ui.themeEditor,
         icon: Palette,
@@ -517,6 +542,11 @@
     }
     activeTab = initialTab;
     appliedInitialTab = initialTab;
+  });
+
+  $effect(() => {
+    defaultLanguageBridgeEnabled = defaults?.languageBridgeEnabled ?? false;
+    defaultLanguageBridgeOutputLanguage = defaults?.languageBridgeOutputLanguage ?? "auto";
   });
 
   $effect(() => {
@@ -1307,6 +1337,25 @@
       cleaningAutomationWorktrees = false;
     }
   }
+
+  async function saveDefaultLanguageBridgeSettings() {
+    if (readOnly || savingDefaults || !defaultsDirty) {
+      return;
+    }
+
+    savingDefaults = true;
+    errorText = "";
+    try {
+      await onSaveDefaultLanguageBridge?.(
+        defaultLanguageBridgeEnabled,
+        defaultLanguageBridgeOutputLanguage.trim() || "auto"
+      );
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : ui.failedSave;
+    } finally {
+      savingDefaults = false;
+    }
+  }
 </script>
 
 <section class="settings-shell surface">
@@ -1472,6 +1521,64 @@
             <div class="field-note field-note--read-only">{ui.readOnlyMode}</div>
           {/if}
           <MonacoTextEditor bind:value={editorValue} height={460} path={configFile.path} readonly={readOnly} />
+        </section>
+      </div>
+    {:else if activeTab === "defaults"}
+      <div
+        aria-labelledby="settings-tab-defaults"
+        class="settings-tab-panel"
+        id="settings-panel-defaults"
+        role="tabpanel"
+        transition:fade={{ duration: 160 }}
+      >
+        <section class="panel">
+          <div class="panel__header">
+            <div class="panel-title">
+              <ArrowRightLeft size={16} />
+              <h3>{ui.sessionDefaults}</h3>
+            </div>
+            {#if defaultsDirty}
+              <span class="meta-pill subtle">{ui.unsaved}</span>
+            {/if}
+          </div>
+          <p class="field-note">{ui.defaultLanguageBridgeDescription}</p>
+          <div class="catalog-list">
+            <label class="checkbox-card checkbox-card--compact">
+              <input
+                class="checkbox-input"
+                checked={defaultLanguageBridgeEnabled}
+                disabled={readOnly || savingDefaults}
+                onchange={(event) => (defaultLanguageBridgeEnabled = (event.currentTarget as HTMLInputElement).checked)}
+                type="checkbox"
+              />
+              <span aria-hidden="true" class="checkbox-control"></span>
+              <span class="checkbox-copy">
+                <span class="checkbox-title">{ui.defaultLanguageBridge}</span>
+                <span class="checkbox-description">{ui.defaultLanguageBridgeDescription}</span>
+              </span>
+            </label>
+            <label class="field-block">
+              <span>{ui.languageBridgeOutput}</span>
+              <input
+                bind:value={defaultLanguageBridgeOutputLanguage}
+                class="field-input"
+                disabled={readOnly || savingDefaults}
+                placeholder={ui.languageBridgeAuto}
+                type="text"
+              />
+            </label>
+            <div class="settings-shell__actions">
+              <button
+                class="solid-button"
+                disabled={readOnly || !defaultsDirty || savingDefaults}
+                onclick={() => void saveDefaultLanguageBridgeSettings()}
+                type="button"
+              >
+                <Save size={14} />
+                <span>{savingDefaults ? ui.saving : ui.saveDefaults}</span>
+              </button>
+            </div>
+          </div>
         </section>
       </div>
     {:else if activeTab === "startup"}

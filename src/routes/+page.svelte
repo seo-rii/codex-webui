@@ -347,7 +347,7 @@
   let computerTabOpen = $state(false);
   let diagnosticsTabOpen = $state(false);
   let memoryTabOpen = $state(false);
-  let settingsInitialTab = $state<"config" | "startup" | "audit" | "theme" | "notifications" | "presets" | "automations" | "apps" | "plugins" | "skills" | "mcp" | null>(null);
+  let settingsInitialTab = $state<"config" | "defaults" | "startup" | "audit" | "theme" | "notifications" | "presets" | "automations" | "apps" | "plugins" | "skills" | "mcp" | null>(null);
   let gitDiffTabs = $state<GitDiffTab[]>([]);
   let codeDiffTabs = $state<CodeDiffTab[]>([]);
   let fileTabs = $state<FileTab[]>([]);
@@ -6576,7 +6576,7 @@
     }
   }
 
-  async function saveDefaultLanguageBridgeEnabled(enabled: boolean) {
+  async function saveDefaultLanguageBridgeDefaults(enabled: boolean, outputLanguage: string | null = null) {
     if (readOnlyRole) {
       errorText = m.error_forbidden_role();
       return;
@@ -6590,7 +6590,7 @@
       const nextConfig = applyLocalComposerPreferencesToConfig(
         await api.saveDefaultSessionPreferences({
           languageBridgeEnabled: enabled,
-          languageBridgeOutputLanguage: config.defaults.languageBridgeOutputLanguage ?? "auto"
+          languageBridgeOutputLanguage: outputLanguage?.trim() || config.defaults.languageBridgeOutputLanguage || "auto"
         })
       );
       config = nextConfig;
@@ -11860,7 +11860,7 @@
         void installApp();
       }}
       onDefaultLanguageBridgeChange={(enabled) => {
-        void saveDefaultLanguageBridgeEnabled(enabled);
+        void saveDefaultLanguageBridgeDefaults(enabled);
       }}
       onSystemShutdownArmedChange={(armed) => {
         void saveSystemShutdownAfterQueueCompletes(armed);
@@ -13400,6 +13400,7 @@
                 configFilePath={config?.paths.configFilePath ?? ""}
                 autostart={config?.autostart ?? null}
                 runtime={runtime}
+                defaults={config?.defaults ?? null}
                 notificationSettings={config?.notifications.settings ?? null}
                 promptPresets={config?.promptPresets ?? []}
                 automations={config?.automations.items ?? []}
@@ -13417,6 +13418,9 @@
                 }}
                 onAutostartSaved={async (enabled) => {
                   await saveAutostartEnabled(enabled);
+                }}
+                onSaveDefaultLanguageBridge={async (enabled, outputLanguage) => {
+                  await saveDefaultLanguageBridgeDefaults(enabled, outputLanguage);
                 }}
                 onSaveThemeSettings={async (theme) => {
                   await saveThemeSettings(theme);

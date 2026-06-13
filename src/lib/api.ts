@@ -19,6 +19,8 @@ import type {
   ComputerInputEvent,
   ComputerInputPayload,
   CodexQuotaStatus,
+  CodexResetTicketsPayload,
+  CodexResetTicketUsePayload,
   CodexRuntimeActionPayload,
   CodexRuntimeProcessKillPayload,
   CodexRuntimeProcessesPayload,
@@ -467,6 +469,17 @@ export const api = {
 
   getQuota(refresh = false) {
     return ws.request<CodexQuotaStatus>("runtime/quota", { refresh });
+  },
+
+  getResetTickets(refresh = false) {
+    return ws.request<CodexResetTicketsPayload>("runtime/resetTickets", { refresh });
+  },
+
+  useResetTicket(ticketId: string, limitId: string | null = null) {
+    return ws.request<CodexResetTicketUsePayload>("runtime/resetTicket/use", {
+      ticketId,
+      limitId
+    });
   },
 
   checkRuntimeUpdate() {

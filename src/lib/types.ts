@@ -979,6 +979,38 @@ export type CodexQuotaStatus = {
   error: string | null;
 };
 
+export type CodexResetTicket = {
+  id: string;
+  label: string | null;
+  limitId: string | null;
+  limitName: string | null;
+  expiresAt: string | null;
+  createdAt: string | null;
+  usedAt: string | null;
+  available: boolean;
+  raw?: unknown;
+};
+
+export type CodexResetTicketsPayload = {
+  available: boolean;
+  supported: boolean;
+  tickets: CodexResetTicket[];
+  rateLimits: unknown;
+  rateLimitsByLimitId: Record<string, unknown> | null;
+  fetchedAt: number | null;
+  refresh: boolean;
+  message: string | null;
+  error: string | null;
+};
+
+export type CodexResetTicketUsePayload = {
+  ok: true;
+  method: string;
+  ticketId: string;
+  limitId: string | null;
+  result: unknown;
+};
+
 export type GitRepository = {
   path: string;
   name: string;

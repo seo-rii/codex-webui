@@ -69,6 +69,7 @@
   import { describeUiError } from "$lib/ui-errors";
   import { activeLocale, localeOptions, localeSignal, updateLocale } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
+  import { getLocale } from "$lib/paraglide/runtime.js";
   import {
     applyThemeSettings,
     applyThemeMode,
@@ -90,6 +91,8 @@
     ComputerFramePayload,
     ComputerInputEvent,
     CodexQuotaStatus,
+    CodexResetTicket,
+    CodexResetTicketsPayload,
     CodexRuntimeStatus,
     CodexTurn,
     DirectoryPayload,
@@ -232,6 +235,7 @@
   let config = $state<AppConfigPayload | null>(null);
   let catalog = $state<CatalogPayload | null>(null);
   let quota = $state<CodexQuotaStatus | null>(null);
+  let resetTickets = $state<CodexResetTicketsPayload | null>(null);
   let runtime = $state<CodexRuntimeStatus | null>(null);
   let remoteControlStatus = $state<{ status: string; environmentId: string | null; updatedAt: number } | null>(null);
   let computerFramesBySessionId = $state<Record<string, ComputerFramePayload>>({});
@@ -282,6 +286,10 @@
   let quotaBusy = $state(false);
   let quotaRefreshPromise: Promise<void> | null = null;
   let quotaForceRefreshQueued = false;
+  let resetTicketsBusy = $state(false);
+  let resetTicketsRefreshPromise: Promise<void> | null = null;
+  let resetTicketsForceRefreshQueued = false;
+  let resetTicketUseBusyId = $state<string | null>(null);
   let notificationsBusy = $state(false);
   let directoryPayload = $state<DirectoryPayload | null>(null);
   let requestAnswers = $state<Record<string, Record<string, string>>>({});
@@ -4545,6 +4553,7 @@
 
     config = null;
     quota = null;
+    resetTickets = null;
     sessions = [];
     sessionsCursor = null;
     sessionsHasMore = false;
@@ -4690,6 +4699,7 @@
       syncConfiguredTheme(config);
       syncStartupAlertModal(config);
       void refreshQuota(false);
+      void refreshResetTickets(false);
       void refreshAccountState(false);
       void refreshNotifications();
       void refreshTerminals();
@@ -5681,6 +5691,7 @@
       await refreshSessions(shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null);
       await refreshTerminals();
       void refreshQuota(false);
+      void refreshResetTickets(false);
       void refreshAccountState(false);
 
       if (!selectedSessionId) {
@@ -5920,6 +5931,7 @@
       accountLoginFlow = null;
       void refreshAccountState(false);
       void refreshQuota(true);
+      void refreshResetTickets(true);
       return;
     }
 
@@ -5934,6 +5946,7 @@
           noticeText = m.account_updated_notice();
           void refreshAccountState(true);
           void refreshQuota(true);
+          void refreshResetTickets(true);
         } else {
           accountLoginFlow = {
             ...accountLoginFlow,
@@ -5947,6 +5960,7 @@
 
     if (event.method === "codex-webui/accountRateLimitsUpdated") {
       void refreshQuota(true);
+      void refreshResetTickets(true);
       return;
     }
 
@@ -8171,6 +8185,71 @@
       if (quotaForceRefreshQueued) {
         void refreshQuota(true);
       }
+    }
+  }
+
+  async function refreshResetTickets(force = false) {
+    if (resetTicketsRefreshPromise) {
+      resetTicketsForceRefreshQueued = resetTicketsForceRefreshQueued || force;
+      return resetTicketsRefreshPromise;
+    }
+
+    const runForce = force || resetTicketsForceRefreshQueued;
+    resetTicketsForceRefreshQueued = false;
+    resetTicketsBusy = true;
+    const resetTicketProfileId = activeProfileId;
+
+    resetTicketsRefreshPromise = (async () => {
+      try {
+        const nextResetTickets = await api.getResetTickets(runForce);
+        if (resetTicketProfileId === activeProfileId) {
+          resetTickets = nextResetTickets;
+        }
+      } catch (error) {
+        errorText = describeError(error);
+      } finally {
+        resetTicketsBusy = false;
+      }
+    })();
+
+    try {
+      await resetTicketsRefreshPromise;
+    } finally {
+      resetTicketsRefreshPromise = null;
+      if (resetTicketsForceRefreshQueued) {
+        void refreshResetTickets(true);
+      }
+    }
+  }
+
+  async function useResetTicket(ticket: CodexResetTicket) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    if (!ticket.available || resetTicketUseBusyId) {
+      return;
+    }
+
+    const label = ticket.label ?? ticket.limitName ?? ticket.limitId ?? ticket.id;
+    const confirmed = window.confirm(
+      getLocale().startsWith("ko")
+        ? `리셋 티켓 "${label}"을 사용합니다. 이 작업은 되돌릴 수 없습니다. 계속할까요?`
+        : `Use reset ticket "${label}"? This cannot be undone.`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    resetTicketUseBusyId = ticket.id;
+    try {
+      await api.useResetTicket(ticket.id, ticket.limitId);
+      noticeText = getLocale().startsWith("ko") ? "리셋 티켓을 사용했습니다." : "Reset ticket used.";
+      await Promise.all([refreshQuota(true), refreshResetTickets(true)]);
+    } catch (error) {
+      errorText = describeError(error);
+    } finally {
+      resetTicketUseBusyId = null;
     }
   }
 
@@ -11793,6 +11872,9 @@
       notificationsUnreadCount={config?.notifications.unreadCount ?? 0}
       {quota}
       {quotaBusy}
+      {resetTickets}
+      {resetTicketsBusy}
+      {resetTicketUseBusyId}
       {runtime}
       {runtimeBusyAction}
       gatewayRestartAvailable={config?.gateway.restartAvailable ?? false}
@@ -11843,6 +11925,12 @@
       }}
       onRefreshQuota={() => {
         void refreshQuota(true);
+      }}
+      onRefreshResetTickets={() => {
+        void refreshResetTickets(true);
+      }}
+      onUseResetTicket={(ticket) => {
+        void useResetTicket(ticket);
       }}
       onRefreshNotifications={() => {
         void refreshNotifications();

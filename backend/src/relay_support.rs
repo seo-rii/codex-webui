@@ -133,15 +133,14 @@ pub(crate) async fn subscribe_session(
                                     }
                                 }
                                 pending_delta_key = next_key;
-                                event
-                                    .get_mut("params")
-                                    .and_then(Value::as_object_mut)
-                                    .map(|params| {
+                                event.get_mut("params").and_then(Value::as_object_mut).map(
+                                    |params| {
                                         params.insert(
                                             "deltaLength".to_string(),
                                             json!(delta.chars().count()),
                                         );
-                                    });
+                                    },
+                                );
                                 pending_delta_event = Some(event);
                             }
                             if pending_delta_event

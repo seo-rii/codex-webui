@@ -14,6 +14,7 @@
     X,
     Cpu,
     Zap,
+    Ticket,
     History,
     RefreshCw,
     AlertCircle,
@@ -40,6 +41,8 @@
     AppNotification,
     CodexAccountLoginFlow,
     CodexQuotaStatus,
+    CodexResetTicket,
+    CodexResetTicketsPayload,
     CodexRuntimeStatus,
 	    SavedSessionFilter,
 	    SessionFolder,
@@ -93,6 +96,9 @@
     readOnly = false,
     quota,
     quotaBusy,
+    resetTickets = null,
+    resetTicketsBusy = false,
+    resetTicketUseBusyId = null,
     runtime,
     runtimeBusyAction,
     gatewayRestartAvailable = true,
@@ -109,6 +115,8 @@
     resolvedTheme,
     accountLoginFlow,
     onRefreshQuota,
+    onRefreshResetTickets,
+    onUseResetTicket,
     onRefreshNotifications,
     onMarkNotificationsRead,
     onClearNotifications,
@@ -183,6 +191,9 @@
     readOnly?: boolean;
     quota: CodexQuotaStatus | null;
     quotaBusy: boolean;
+    resetTickets?: CodexResetTicketsPayload | null;
+    resetTicketsBusy?: boolean;
+    resetTicketUseBusyId?: string | null;
     runtime: CodexRuntimeStatus | null;
     runtimeBusyAction: "install" | "update" | "check" | "status" | null;
     gatewayRestartAvailable?: boolean;
@@ -199,6 +210,8 @@
     resolvedTheme: ResolvedTheme;
     accountLoginFlow: CodexAccountLoginFlow | null;
     onRefreshQuota: () => void;
+    onRefreshResetTickets: () => void;
+    onUseResetTicket: (ticket: CodexResetTicket) => void;
     onRefreshNotifications: () => void;
     onMarkNotificationsRead: (ids: string[] | null) => void;
     onClearNotifications: () => void;
@@ -240,6 +253,7 @@
 
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
+    const isKorean = getLocale().startsWith("ko");
 
     return {
       appShortName: m.app_short_name(),
@@ -300,6 +314,14 @@
       quotaUsage: m.quota_usage(),
       quota5h: m.quota_5h(),
       quotaWeekly: m.quota_weekly(),
+      resetTickets: isKorean ? "리셋 티켓" : "Reset tickets",
+      refreshResetTickets: isKorean ? "리셋 티켓 새로고침" : "Refresh reset tickets",
+      useResetTicket: isKorean ? "사용" : "Use",
+      resetTicketUnsupported: isKorean
+        ? "현재 Codex가 리셋 티켓 정보를 노출하지 않습니다."
+        : "This Codex build does not expose reset-ticket records.",
+      resetTicketEmpty: isKorean ? "사용 가능한 리셋 티켓이 없습니다." : "No reset tickets available.",
+      resetTicketUnavailable: isKorean ? "사용 불가" : "Unavailable",
       runtime: m.runtime(),
       loading: m.loading(),
       version: m.version(),
@@ -1760,6 +1782,73 @@
                 </div>
                 <p class="text-[10px] text-gray-400 italic">Reset {formatQuotaReset(quota?.weekly?.resetAt)}</p>
               </div>
+            </div>
+          </div>
+
+          <div class="space-y-3">
+            <div class="flex items-center justify-between gap-2">
+              <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
+                <Ticket size={10} /> {ui.resetTickets}
+              </h4>
+              <button
+                aria-label={ui.refreshResetTickets}
+                class="rounded-md p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={resetTicketsBusy}
+                onclick={onRefreshResetTickets}
+                title={ui.refreshResetTickets}
+                type="button"
+              >
+                <RefreshCw size={12} class={resetTicketsBusy ? "animate-spin" : ""} />
+              </button>
+            </div>
+
+            <div class="sidebar-flyout-surface rounded-xl border border-gray-100 bg-gray-50 p-2 space-y-2">
+              {#if resetTicketsBusy && !resetTickets}
+                <div class="flex items-center gap-2 text-[11px] text-gray-500">
+                  <RefreshCw size={12} class="animate-spin" />
+                  {ui.loading}
+                </div>
+              {:else if resetTickets?.error}
+                <div class="flex items-start gap-2 text-[11px] text-red-500">
+                  <AlertCircle size={12} class="mt-0.5 shrink-0" />
+                  <span>{resetTickets.error}</span>
+                </div>
+              {:else if resetTickets && !resetTickets.supported}
+                <p class="text-[11px] leading-snug text-gray-500">{resetTickets.message ?? ui.resetTicketUnsupported}</p>
+              {:else if resetTickets?.tickets?.length}
+                <div class="space-y-1.5">
+                  {#each resetTickets.tickets as ticket (ticket.id)}
+                    <div class="rounded-lg border border-gray-200 bg-white p-2">
+                      <div class="flex items-start justify-between gap-2">
+                        <div class="min-w-0">
+                          <div class="truncate text-[11px] font-bold text-gray-800">
+                            {ticket.label ?? ticket.limitName ?? ticket.limitId ?? ticket.id}
+                          </div>
+                          <div class="truncate text-[10px] text-gray-400">
+                            {ticket.expiresAt ? `Expires ${ticket.expiresAt}` : ticket.id}
+                          </div>
+                        </div>
+                        <button
+                          class="shrink-0 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] font-bold text-amber-700 transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
+                          disabled={readOnly || !ticket.available || resetTicketUseBusyId === ticket.id}
+                          onclick={() => onUseResetTicket(ticket)}
+                          type="button"
+                        >
+                          {#if resetTicketUseBusyId === ticket.id}
+                            <RefreshCw size={10} class="animate-spin" />
+                          {:else if ticket.available}
+                            {ui.useResetTicket}
+                          {:else}
+                            {ui.resetTicketUnavailable}
+                          {/if}
+                        </button>
+                      </div>
+                    </div>
+                  {/each}
+                </div>
+              {:else}
+                <p class="text-[11px] leading-snug text-gray-500">{ui.resetTicketEmpty}</p>
+              {/if}
             </div>
           </div>
 

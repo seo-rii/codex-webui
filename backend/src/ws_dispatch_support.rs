@@ -114,6 +114,20 @@ pub(crate) async fn execute_ws_method(
             )
             .await
         }
+        "runtime/resetTickets" => {
+            codex_reset_tickets_payload(
+                state,
+                &auth.profile_id,
+                params
+                    .get("refresh")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            )
+            .await
+        }
+        "runtime/resetTicket/use" => {
+            use_codex_reset_ticket_payload(state, &auth.profile_id, params).await
+        }
         "codex/features/list" => {
             proxy_app_server_payload(state, &auth.profile_id, "experimentalFeature/list", params)
                 .await

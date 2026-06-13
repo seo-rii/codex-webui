@@ -517,6 +517,249 @@ pub(crate) async fn codex_quota_status(
     Ok(payload)
 }
 
+pub(crate) async fn codex_reset_tickets_payload(
+    state: &AppState,
+    profile_id: &str,
+    refresh: bool,
+) -> Result<Value> {
+    let client = app_server_client(state, profile_id).await?;
+    let response = match client
+        .request_with_timeout(
+            "account/rateLimits/read",
+            Value::Null,
+            ACCOUNT_APP_SERVER_RECOVERY_RETRY_TIMEOUT,
+            true,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(json!({
+                "available": false,
+                "supported": false,
+                "tickets": [],
+                "rateLimits": Value::Null,
+                "rateLimitsByLimitId": Value::Null,
+                "fetchedAt": now_unix_ms(),
+                "refresh": refresh,
+                "message": "This Codex build did not return reset-ticket information.",
+                "error": error.to_string(),
+            }));
+        }
+    };
+    let (tickets, saw_reset_ticket_field) = extract_codex_reset_tickets(&response);
+
+    Ok(json!({
+        "available": true,
+        "supported": saw_reset_ticket_field,
+        "tickets": tickets,
+        "rateLimits": response.get("rateLimits").cloned().unwrap_or(Value::Null),
+        "rateLimitsByLimitId": response
+            .get("rateLimitsByLimitId")
+            .or_else(|| response.get("rate_limits_by_limit_id"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "fetchedAt": now_unix_ms(),
+        "refresh": refresh,
+        "message": if !saw_reset_ticket_field {
+            Some("This Codex build did not expose reset-ticket records.")
+        } else {
+            None
+        },
+        "error": Value::Null,
+    }))
+}
+
+pub(crate) async fn use_codex_reset_ticket_payload(
+    state: &AppState,
+    profile_id: &str,
+    params: Value,
+) -> Result<Value> {
+    let ticket_id = require_string(&params, "ticketId")?;
+    let limit_id = params
+        .get("limitId")
+        .or_else(|| params.get("limit_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let client = app_server_client(state, profile_id).await?;
+    let mut payload = json!({ "ticketId": ticket_id });
+    if let Some(limit_id) = limit_id.as_deref() {
+        payload["limitId"] = json!(limit_id);
+    }
+
+    let mut failures = Vec::new();
+    for method in [
+        "account/rateLimits/resetTicket/use",
+        "account/resetTickets/use",
+        "account/resetTicket/use",
+        "account/rateLimitResetTicket/use",
+    ] {
+        match client
+            .request_with_timeout(
+                method,
+                payload.clone(),
+                ACCOUNT_APP_SERVER_RECOVERY_RETRY_TIMEOUT,
+                true,
+            )
+            .await
+        {
+            Ok(result) => {
+                let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+                    .0
+                    .to_string();
+                state.quota_cache.lock().await.remove(&resolved_profile_id);
+                return Ok(json!({
+                    "ok": true,
+                    "method": method,
+                    "ticketId": ticket_id,
+                    "limitId": limit_id,
+                    "result": result,
+                }));
+            }
+            Err(error) => failures.push(format!("{method}: {error}")),
+        }
+    }
+
+    anyhow::bail!(
+        "Codex reset-ticket use is not exposed by this Codex version. {}",
+        failures.join("; ")
+    );
+}
+
+fn extract_codex_reset_tickets(response: &Value) -> (Vec<Value>, bool) {
+    let mut entries = Vec::new();
+    let saw_reset_ticket_field = collect_reset_ticket_entries(response, &mut entries);
+    let tickets = entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, (value, fallback_id))| {
+            normalize_reset_ticket_entry(value, fallback_id, index)
+        })
+        .collect();
+    (tickets, saw_reset_ticket_field)
+}
+
+fn collect_reset_ticket_entries(value: &Value, entries: &mut Vec<(Value, Option<String>)>) -> bool {
+    match value {
+        Value::Array(items) => {
+            let mut found = false;
+            for item in items {
+                found |= collect_reset_ticket_entries(item, entries);
+            }
+            found
+        }
+        Value::Object(object) => {
+            let mut found = false;
+            for (key, child) in object {
+                let normalized_key = key
+                    .chars()
+                    .filter(|ch| ch.is_ascii_alphanumeric())
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                if normalized_key.contains("resetticket") {
+                    collect_reset_ticket_field(child, entries);
+                    found = true;
+                } else {
+                    found |= collect_reset_ticket_entries(child, entries);
+                }
+            }
+            found
+        }
+        _ => false,
+    }
+}
+
+fn collect_reset_ticket_field(value: &Value, entries: &mut Vec<(Value, Option<String>)>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                entries.push((item.clone(), None));
+            }
+        }
+        Value::Object(object) => {
+            if object
+                .keys()
+                .any(|key| matches!(key.as_str(), "id" | "ticketId" | "ticket_id"))
+            {
+                entries.push((value.clone(), None));
+            } else {
+                for (key, child) in object {
+                    entries.push((child.clone(), Some(key.clone())));
+                }
+            }
+        }
+        Value::String(_) => entries.push((value.clone(), None)),
+        _ => {}
+    }
+}
+
+fn normalize_reset_ticket_entry(
+    value: Value,
+    fallback_id: Option<String>,
+    index: usize,
+) -> Option<Value> {
+    match value {
+        Value::String(ticket_id) => {
+            let ticket_id = ticket_id.trim();
+            if ticket_id.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "id": ticket_id,
+                "label": Value::Null,
+                "limitId": Value::Null,
+                "limitName": Value::Null,
+                "expiresAt": Value::Null,
+                "createdAt": Value::Null,
+                "usedAt": Value::Null,
+                "available": true,
+                "raw": ticket_id,
+            }))
+        }
+        Value::Object(object) => {
+            let string_field = |names: &[&str]| {
+                names.iter().find_map(|name| {
+                    object
+                        .get(*name)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                })
+            };
+            let ticket_id = string_field(&[
+                "id",
+                "ticketId",
+                "ticket_id",
+                "resetTicketId",
+                "reset_ticket_id",
+            ])
+            .or(fallback_id)
+            .unwrap_or_else(|| format!("ticket-{}", index + 1));
+            let used_at = string_field(&["usedAt", "used_at"]);
+            let available = object
+                .get("available")
+                .or_else(|| object.get("active"))
+                .and_then(Value::as_bool)
+                .unwrap_or(used_at.is_none());
+            Some(json!({
+                "id": ticket_id,
+                "label": string_field(&["label", "name", "title", "description"]),
+                "limitId": string_field(&["limitId", "limit_id", "rateLimitId", "rate_limit_id"]),
+                "limitName": string_field(&["limitName", "limit_name", "rateLimitName", "rate_limit_name"]),
+                "expiresAt": string_field(&["expiresAt", "expires_at", "expiration", "expires"]),
+                "createdAt": string_field(&["createdAt", "created_at"]),
+                "usedAt": used_at,
+                "available": available,
+                "raw": Value::Object(object),
+            }))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) async fn get_account_state(state: &AppState, profile_id: &str) -> Result<Value> {
     let client = app_server_client(state, profile_id).await?;
     let response = match client

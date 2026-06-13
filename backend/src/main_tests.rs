@@ -191,6 +191,19 @@ turn_counter = 0
 request_counts = {}
 method_delays = {}
 method_errors = {}
+rate_limits_response = {
+    "rateLimits": {
+        "limitId": "codex",
+        "limitName": "Codex",
+        "primary": None,
+        "secondary": None,
+        "credits": None,
+        "individualLimit": None,
+        "planType": None,
+        "rateLimitReachedType": None
+    },
+    "rateLimitsByLimitId": {}
+}
 args = sys.argv[1:]
 goals_enabled = any(args[index:index + 2] == ["--enable", "goals"] for index in range(len(args)))
 
@@ -240,6 +253,15 @@ for raw_line in sys.stdin:
             "result": {
                 "ok": True,
                 "enabled": goals_enabled
+            }
+        })
+        continue
+    if method == "debug/setRateLimitsResponse":
+        rate_limits_response = params.get("response") or {}
+        write({
+            "id": request_id,
+            "result": {
+                "ok": True
             }
         })
         continue
@@ -1071,6 +1093,11 @@ for raw_line in sys.stdin:
                 },
                 "requiresOpenaiAuth": False
             }
+        })
+    elif method == "account/rateLimits/read":
+        write({
+            "id": request_id,
+            "result": rate_limits_response
         })
     elif method == "model/list":
         write({

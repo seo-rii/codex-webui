@@ -42,7 +42,7 @@ The project also optimizes for a case where native Codex surfaces can become exp
 - Attachments, Monaco-backed diff/file editing, aggregated live diff, live plan, subagent activity views, native `/review`, confirmed Codex history rollback, and rich transcript cards for generated images, image views, standalone web search, and review-mode markers
 - Git repository discovery, status, fetch/pull, staged/unstaged Source Control sections, dense tree-or-list change browsing, commit inspection, branch checkout, and worktree management in a VS Code-inspired Git workspace
 - Terminal tabs that survive page reloads as long as the server process stays up
-- Runtime install/update checks, quota display, plugin/marketplace/skill/MCP management, app catalog visibility, and `config.toml` editing
+- Runtime install/update checks, quota and reset-ticket display, plugin/marketplace/skill/MCP management, app catalog visibility, and `config.toml` editing
 - Memory workspace for inspecting profile memory settings/storage, resetting native Codex memory data, and toggling per-session memory eligibility
 - Computer-use groundwork through Codex app-server plugin/app proxies, dynamic tool-call responses, image/text tool output rendering, remote-control status events, and a documented WebSocket snapshot-stream path before any WebRTC dependency
 - Persistent notification center with unread sync, plus Slack and generic webhook delivery for completion, attention, queue-failure, and shutdown events
@@ -265,6 +265,7 @@ If you only want one account at a time, you can still keep a single profile and 
 - Changing session or composer preferences syncs the relevant defaults back into `config.toml`.
 - Existing sessions keep their own persisted preferences; changing defaults mainly affects new sessions and future default state.
 - Language bridge is an opt-in session/default preference. When enabled, Codex Web UI first creates an ephemeral translation thread, sends the translated English prompt to the real session, and adds a developer instruction that keeps the final answer in the selected output language. The default is stored under `[codex_webui]` in `config.toml`.
+- Reset tickets, when exposed by the active Codex app-server, appear in the account popover next to quota. Ticket use is confirmed in the browser before dispatch. If the installed Codex build only exposes rate-limit snapshots and not a reset-ticket use RPC, the UI reports that limitation instead of silently failing.
 - If a saved draft exists while a session is still hydrating, local input typed into the composer wins; draft restore will not clobber text or attachments the user entered during loading.
 - Queued follow-ups are stored server-side and can continue after the page closes as long as the server remains up.
 

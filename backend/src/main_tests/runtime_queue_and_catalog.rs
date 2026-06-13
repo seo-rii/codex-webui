@@ -880,6 +880,99 @@ async fn runtime_quota_status_returns_cached_payload_while_refresh_in_flight() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_reset_tickets_payload_normalizes_app_server_rate_limit_tickets() {
+    let sandbox = unique_test_dir("codex-reset-tickets");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "debug/setRateLimitsResponse",
+            json!({
+                "response": {
+                    "rateLimits": {
+                        "limitId": "codex",
+                        "limitName": "Codex"
+                    },
+                    "rateLimitsByLimitId": {
+                        "codex": {
+                            "limitName": "Codex",
+                            "resetTickets": [
+                                {
+                                    "ticketId": "ticket-1",
+                                    "label": "Reset five hour",
+                                    "limitId": "codex",
+                                    "expiresAt": "2026-06-14T00:00:00Z"
+                                }
+                            ]
+                        }
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let payload = codex_reset_tickets_payload(&state, "default", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        payload.get("available").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        payload.get("supported").and_then(Value::as_bool),
+        Some(true)
+    );
+    let ticket = payload
+        .get("tickets")
+        .and_then(Value::as_array)
+        .and_then(|tickets| tickets.first())
+        .expect("reset ticket should be normalized");
+    assert_eq!(ticket.get("id").and_then(Value::as_str), Some("ticket-1"));
+    assert_eq!(ticket.get("limitId").and_then(Value::as_str), Some("codex"));
+    assert_eq!(ticket.get("available").and_then(Value::as_bool), Some(true));
+    assert!(payload.get("rateLimitsByLimitId").is_some());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_reset_ticket_use_reports_unsupported_without_codex_rpc() {
+    let sandbox = unique_test_dir("codex-reset-ticket-use-unsupported");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let error = use_codex_reset_ticket_payload(
+        &state,
+        "default",
+        json!({
+            "ticketId": "ticket-1",
+            "limitId": "codex"
+        }),
+    )
+    .await
+    .expect_err("fake app-server does not expose reset-ticket use RPCs");
+    assert!(
+        error
+            .to_string()
+            .contains("reset-ticket use is not exposed"),
+        "{error}"
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_list_shows_running_when_active_turn_exists_but_thread_metadata_is_idle() {
     let sandbox = unique_test_dir("session-list-running-status-sync");
     let workspace = sandbox.join("workspace");

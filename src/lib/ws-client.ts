@@ -66,6 +66,51 @@ const PONG_TIMEOUT_MS = 10_000;
 const FOREGROUND_STALE_MS = HEARTBEAT_MS + PONG_TIMEOUT_MS;
 const REQUEST_TIMEOUT_MS = 720_000;
 const RECONNECT_DELAYS = [250, 500, 1000, 2000, 4000];
+const DEDUPED_READ_METHODS = new Set([
+  "arena/list",
+  "audit/list",
+  "catalog/get",
+  "codex/apps/list",
+  "codex/features/list",
+  "codex/hooks/list",
+  "codex/mcp/status/list",
+  "codex/plugins/list",
+  "codex/plugins/read",
+  "codex/realtime/listVoices",
+  "codex/skills/list",
+  "config/get",
+  "diagnostics/parser/compare",
+  "directories/browse",
+  "editor/file/get",
+  "files/search",
+  "git/commit/diff",
+  "git/file/get",
+  "git/file/resolve",
+  "git/github/pull",
+  "git/github/pulls",
+  "git/repositories/list",
+  "git/status",
+  "git/worktrees/list",
+  "memory/status",
+  "notifications/list",
+  "runtime/checkUpdate",
+  "runtime/processes/list",
+  "runtime/quota",
+  "runtime/status",
+  "session/draft/get",
+  "session/get",
+  "session/goal/get",
+  "session/itemDetail/get",
+  "session/olderTurns/get",
+  "session/queue/get",
+  "session/rollbackTargets/list",
+  "session/search",
+  "session/turn/get",
+  "sessions/list",
+  "sessions/search",
+  "terminal/list",
+  "terminal/read"
+]);
 
 function appPath(pathname: string) {
   const normalized = pathname.startsWith("/") ? pathname : `/${pathname}`;
@@ -84,6 +129,39 @@ function makeRequestId() {
   return `ws-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function normalizeJsonForKey(value: unknown): unknown {
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => (typeof item === "undefined" ? null : normalizeJsonForKey(item)));
+  }
+  if (typeof value === "object") {
+    const input = value as Record<string, unknown>;
+    const output: Record<string, unknown> = {};
+    for (const key of Object.keys(input).sort()) {
+      const item = input[key];
+      if (typeof item === "undefined" || typeof item === "function" || typeof item === "symbol") {
+        continue;
+      }
+      output[key] = normalizeJsonForKey(item);
+    }
+    return output;
+  }
+  return null;
+}
+
+function dedupeKeyForRequest(method: string, params: unknown) {
+  if (!DEDUPED_READ_METHODS.has(method)) {
+    return null;
+  }
+  try {
+    return `${method}:${JSON.stringify(normalizeJsonForKey(params))}`;
+  } catch {
+    return null;
+  }
+}
+
 export class WebSocketRpcClient {
   private socket: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -96,16 +174,26 @@ export class WebSocketRpcClient {
   private hasConnectedOnce = false;
   private lastActivityAt = 0;
   private pending = new Map<string, PendingRequest>();
+  private inflightReadRequests = new Map<string, Promise<unknown>>();
   private sessionHandlers = new Map<string, Set<SessionEventHandler>>();
   private terminalHandlers = new Map<string, Set<TerminalEventHandler>>();
   private globalHandlers = new Set<(event: GlobalStreamEvent) => void>();
   private reconnectListeners = new Set<() => void>();
+  private resyncRequiredListeners = new Set<(reason: string) => void>();
   private connectionState: WsConnectionState = "idle";
   private connectionStateListeners = new Set<(state: WsConnectionState) => void>();
 
   request<T>(method: string, params: unknown = {}): Promise<T> {
     if (typeof window === "undefined") {
       return Promise.reject(new Error("WebSocket requests are only available in the browser."));
+    }
+
+    const dedupeKey = dedupeKeyForRequest(method, params);
+    if (dedupeKey) {
+      const existing = this.inflightReadRequests.get(dedupeKey);
+      if (existing) {
+        return existing as Promise<T>;
+      }
     }
 
     const id = makeRequestId();
@@ -116,7 +204,7 @@ export class WebSocketRpcClient {
       params
     };
 
-    return new Promise<T>((resolve, reject) => {
+    const promise = new Promise<T>((resolve, reject) => {
       const timeoutTimer = setTimeout(() => {
         const pending = this.pending.get(id);
         if (!pending) {
@@ -138,14 +226,27 @@ export class WebSocketRpcClient {
       this.ensureConnected();
       this.flushPending();
     });
+    if (dedupeKey) {
+      this.inflightReadRequests.set(dedupeKey, promise);
+      const cleanup = () => {
+        if (this.inflightReadRequests.get(dedupeKey) === promise) {
+          this.inflightReadRequests.delete(dedupeKey);
+        }
+      };
+      void promise.then(cleanup, cleanup);
+    }
+    return promise;
   }
 
   subscribeSession(sessionId: string, handler: SessionEventHandler) {
     const current = this.sessionHandlers.get(sessionId) ?? new Set<SessionEventHandler>();
+    const shouldSubscribe = current.size === 0;
     current.add(handler);
     this.sessionHandlers.set(sessionId, current);
     this.ensureConnected();
-    this.sendTransient("session/subscribe", { sessionId });
+    if (shouldSubscribe) {
+      this.sendTransient("session/subscribe", { sessionId });
+    }
 
     return () => {
       const handlers = this.sessionHandlers.get(sessionId);
@@ -164,9 +265,12 @@ export class WebSocketRpcClient {
   }
 
   subscribeGlobal(handler: (event: GlobalStreamEvent) => void) {
+    const shouldSubscribe = this.globalHandlers.size === 0;
     this.globalHandlers.add(handler);
     this.ensureConnected();
-    this.sendTransient("events/subscribe", {});
+    if (shouldSubscribe) {
+      this.sendTransient("events/subscribe", {});
+    }
 
     return () => {
       this.globalHandlers.delete(handler);
@@ -178,10 +282,13 @@ export class WebSocketRpcClient {
 
   subscribeTerminal(terminalId: string, handler: TerminalEventHandler) {
     const current = this.terminalHandlers.get(terminalId) ?? new Set<TerminalEventHandler>();
+    const shouldSubscribe = current.size === 0;
     current.add(handler);
     this.terminalHandlers.set(terminalId, current);
     this.ensureConnected();
-    this.sendTransient("terminal/subscribe", { terminalId });
+    if (shouldSubscribe) {
+      this.sendTransient("terminal/subscribe", { terminalId });
+    }
 
     return () => {
       const handlers = this.terminalHandlers.get(terminalId);
@@ -203,6 +310,13 @@ export class WebSocketRpcClient {
     this.reconnectListeners.add(listener);
     return () => {
       this.reconnectListeners.delete(listener);
+    };
+  }
+
+  onResyncRequired(listener: (reason: string) => void) {
+    this.resyncRequiredListeners.add(listener);
+    return () => {
+      this.resyncRequiredListeners.delete(listener);
     };
   }
 
@@ -270,6 +384,7 @@ export class WebSocketRpcClient {
       pending.reject(new Error(message));
     }
     this.pending.clear();
+    this.inflightReadRequests.clear();
   }
 
   private ensureConnected() {
@@ -331,7 +446,13 @@ export class WebSocketRpcClient {
       }
 
       if (payload.kind === "resyncRequired") {
-        this.forceReconnect();
+        if (this.resyncRequiredListeners.size === 0) {
+          this.forceReconnect();
+          return;
+        }
+        for (const listener of this.resyncRequiredListeners) {
+          listener(payload.reason);
+        }
         return;
       }
 

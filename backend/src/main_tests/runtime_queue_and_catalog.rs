@@ -1786,6 +1786,231 @@ async fn runtime_notifications_emit_session_stream_events_from_rust_relay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_thread_status_overrides_stale_cached_runtime_activity() {
+    let sandbox = unique_test_dir("terminal-status-authoritative");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-terminal-authoritative";
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Terminal status authoritative",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 20,
+                    "status": "running",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": [
+                        {
+                            "id": "turn-stale",
+                            "status": "inProgress",
+                            "error": Value::Null,
+                            "startedAt": 10,
+                            "completedAt": Value::Null,
+                            "durationMs": Value::Null,
+                            "items": []
+                        }
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-stale".to_string());
+    state
+        .pending_turn_starts
+        .lock()
+        .await
+        .insert(runtime_key.clone());
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][session_id] = json!({
+            "status": "running",
+            "updatedAt": now_unix_ms()
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let relay = ensure_stream_relay(&state, "default", session_id)
+        .await
+        .expect("relay should initialize");
+    let mut receiver = relay.subscribe();
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "thread/status/changed".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "status": { "type": "completed" }
+            }),
+        },
+    )
+    .await;
+
+    let status_changed = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+        .await
+        .expect("status event should arrive")
+        .expect("status event should be readable");
+    assert_eq!(
+        status_changed
+            .get("params")
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str),
+        Some("completed")
+    );
+    assert!(state.active_turns.lock().await.get(&runtime_key).is_none());
+    assert!(
+        !state
+            .pending_turn_starts
+            .lock()
+            .await
+            .contains(&runtime_key)
+    );
+
+    let ui_state = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ui_state["runtimeStatusByThreadId"][session_id]["status"].as_str(),
+        Some("completed")
+    );
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let session = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
+        })
+        .expect("expected seeded session");
+    assert_eq!(
+        session.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_app_server_cleanup_is_scoped_to_requested_session() {
+    let sandbox = unique_test_dir("missing-app-server-session-scoped");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let session_a = "thread-missing-app-server-a";
+    let session_b = "thread-missing-app-server-b";
+    let runtime_key_a = runtime_session_key("default", session_a);
+    let runtime_key_b = runtime_session_key("default", session_b);
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key_a.clone(), "turn-a".to_string());
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key_b.clone(), "turn-b".to_string());
+    {
+        let mut assignments = state.session_app_server_assignments.lock().await;
+        assignments.insert(runtime_key_a.clone(), "default::session::a".to_string());
+        assignments.insert(runtime_key_b.clone(), "default::session::b".to_string());
+    }
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][session_a] = json!({
+            "status": "running",
+            "updatedAt": now_unix_ms().saturating_sub(60_000)
+        });
+        ui_state["runtimeStatusByThreadId"][session_b] = json!({
+            "status": "running",
+            "updatedAt": now_unix_ms().saturating_sub(60_000)
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let cleared = clear_stale_session_runtime_activity_if_app_server_missing(
+        &state,
+        "default",
+        session_a,
+        0,
+        "codex app-server is not running",
+    )
+    .await;
+
+    assert!(cleared);
+    assert!(
+        state
+            .active_turns
+            .lock()
+            .await
+            .get(&runtime_key_a)
+            .is_none()
+    );
+    assert_eq!(
+        state.active_turns.lock().await.get(&runtime_key_b).cloned(),
+        Some("turn-b".to_string())
+    );
+    let ui_state = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ui_state["runtimeStatusByThreadId"][session_a]["status"].as_str(),
+        Some("failed")
+    );
+    assert_eq!(
+        ui_state["runtimeStatusByThreadId"][session_b]["status"].as_str(),
+        Some("running")
+    );
+    let assignments = state.session_app_server_assignments.lock().await;
+    assert!(!assignments.contains_key(&runtime_key_a));
+    assert_eq!(
+        assignments.get(&runtime_key_b).map(String::as_str),
+        Some("default::session::b")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_server_start_enables_goals_by_default() {
     let sandbox = unique_test_dir("app-server-goals-default");
     let workspace = sandbox.join("workspace");
@@ -1918,6 +2143,90 @@ async fn active_goal_session_turn_uses_goal_app_server_after_restart_assignment_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_limited_goal_session_turn_uses_goal_app_server_after_restart_assignment_loss() {
+    let sandbox = unique_test_dir("goal-turn-usage-limited-dedicated-after-restart");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    cache_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-usage-limited-resume",
+        &json!({
+            "threadId": "thread-goal-usage-limited-resume",
+            "objective": "resume after usage reset",
+            "status": "usageLimited"
+        }),
+    )
+    .await;
+
+    let _turn_client =
+        app_server_client_for_session_turn(&state, "default", "thread-goal-usage-limited-resume")
+            .await
+            .unwrap();
+
+    assert_eq!(state.app_servers.client_count().await, 1);
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key(
+                "default",
+                "thread-goal-usage-limited-resume"
+            ))
+            .cloned(),
+        Some("default::goal::thread-goal-usage-limited-resume".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budget_limited_goal_session_turn_uses_goal_app_server_after_restart_assignment_loss() {
+    let sandbox = unique_test_dir("goal-turn-budget-limited-dedicated-after-restart");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    cache_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-budget-limited-resume",
+        &json!({
+            "threadId": "thread-goal-budget-limited-resume",
+            "objective": "wrap up after budget limit",
+            "status": "budgetLimited"
+        }),
+    )
+    .await;
+
+    let _turn_client =
+        app_server_client_for_session_turn(&state, "default", "thread-goal-budget-limited-resume")
+            .await
+            .unwrap();
+
+    assert_eq!(state.app_servers.client_count().await, 1);
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key(
+                "default",
+                "thread-goal-budget-limited-resume"
+            ))
+            .cloned(),
+        Some("default::goal::thread-goal-budget-limited-resume".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_goal_fetch_uses_goal_app_server_after_restart_assignment_loss() {
     let sandbox = unique_test_dir("goal-fetch-dedicated-after-restart");
     let workspace = sandbox.join("workspace");
@@ -1992,6 +2301,188 @@ async fn active_goal_fetch_uses_goal_app_server_after_restart_assignment_loss() 
             .get(&runtime_session_key("default", "thread-goal-fetch-resume"))
             .cloned(),
         Some("default::goal::thread-goal-fetch-resume".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_limited_goal_fetch_uses_goal_app_server_after_restart_assignment_loss() {
+    let sandbox = unique_test_dir("goal-fetch-usage-limited-dedicated-after-restart");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let goal_client = app_server_client_for_goal_session(
+        &state,
+        "default",
+        "thread-goal-fetch-usage-limited-resume",
+    )
+    .await
+    .unwrap();
+    goal_client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-goal-fetch-usage-limited-resume",
+                    "name": "Usage-limited goal thread",
+                    "preview": "resume usage-limited goal",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "turns": [],
+                    "goal": {
+                        "threadId": "thread-goal-fetch-usage-limited-resume",
+                        "objective": "resume after usage reset",
+                        "status": "usageLimited",
+                        "createdAt": 1,
+                        "updatedAt": 2
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    cache_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-fetch-usage-limited-resume",
+        &json!({
+            "threadId": "thread-goal-fetch-usage-limited-resume",
+            "objective": "resume after usage reset",
+            "status": "usageLimited"
+        }),
+    )
+    .await;
+    state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .remove(&runtime_session_key(
+            "default",
+            "thread-goal-fetch-usage-limited-resume",
+        ));
+
+    let _default_client = app_server_client(&state, "default").await.unwrap();
+    let goal =
+        fetch_session_goal_payload(&state, "default", "thread-goal-fetch-usage-limited-resume")
+            .await
+            .unwrap();
+
+    assert_eq!(
+        goal.get("objective").and_then(Value::as_str),
+        Some("resume after usage reset")
+    );
+    assert_eq!(
+        goal.get("status").and_then(Value::as_str),
+        Some("usageLimited")
+    );
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key(
+                "default",
+                "thread-goal-fetch-usage-limited-resume"
+            ))
+            .cloned(),
+        Some("default::goal::thread-goal-fetch-usage-limited-resume".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budget_limited_goal_fetch_uses_goal_app_server_after_restart_assignment_loss() {
+    let sandbox = unique_test_dir("goal-fetch-budget-limited-dedicated-after-restart");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let goal_client = app_server_client_for_goal_session(
+        &state,
+        "default",
+        "thread-goal-fetch-budget-limited-resume",
+    )
+    .await
+    .unwrap();
+    goal_client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-goal-fetch-budget-limited-resume",
+                    "name": "Budget-limited goal thread",
+                    "preview": "wrap up budget-limited goal",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "turns": [],
+                    "goal": {
+                        "threadId": "thread-goal-fetch-budget-limited-resume",
+                        "objective": "wrap up after budget limit",
+                        "status": "budgetLimited",
+                        "createdAt": 1,
+                        "updatedAt": 2
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    cache_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-fetch-budget-limited-resume",
+        &json!({
+            "threadId": "thread-goal-fetch-budget-limited-resume",
+            "objective": "wrap up after budget limit",
+            "status": "budgetLimited"
+        }),
+    )
+    .await;
+    state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .remove(&runtime_session_key(
+            "default",
+            "thread-goal-fetch-budget-limited-resume",
+        ));
+
+    let _default_client = app_server_client(&state, "default").await.unwrap();
+    let goal =
+        fetch_session_goal_payload(&state, "default", "thread-goal-fetch-budget-limited-resume")
+            .await
+            .unwrap();
+
+    assert_eq!(
+        goal.get("objective").and_then(Value::as_str),
+        Some("wrap up after budget limit")
+    );
+    assert_eq!(
+        goal.get("status").and_then(Value::as_str),
+        Some("budgetLimited")
+    );
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key(
+                "default",
+                "thread-goal-fetch-budget-limited-resume"
+            ))
+            .cloned(),
+        Some("default::goal::thread-goal-fetch-budget-limited-resume".to_string())
     );
 }
 

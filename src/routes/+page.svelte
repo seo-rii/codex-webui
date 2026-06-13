@@ -1509,6 +1509,7 @@
   let releaseSessionStream: (() => void) | null = null;
   let releaseGlobalStream: (() => void) | null = null;
   let releaseReconnectListener: (() => void) | null = null;
+  let releaseResyncRequiredListener: (() => void) | null = null;
   let releaseConnectionStateListener: (() => void) | null = null;
   let releaseThemeListener: (() => void) | null = null;
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1516,6 +1517,7 @@
   const pendingPreferencePatchesBySessionId = new Map<string, Partial<SessionPreferences>>();
   let hydrationRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let websocketResyncTimer: ReturnType<typeof setTimeout> | null = null;
   let selectedSessionDetailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let selectedSessionCompletionRefreshTimers: ReturnType<typeof setTimeout>[] = [];
   let sessionListCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2622,6 +2624,9 @@
         void recoverFromReconnect();
       }
     });
+    releaseResyncRequiredListener = api.onResyncRequired(() => {
+      recoverFromWebSocketResync();
+    });
     releaseConnectionStateListener = api.onConnectionState((state) => {
       connectionState = state;
     });
@@ -2808,6 +2813,8 @@
       releaseGlobalStream = null;
       releaseReconnectListener?.();
       releaseReconnectListener = null;
+      releaseResyncRequiredListener?.();
+      releaseResyncRequiredListener = null;
       releaseConnectionStateListener?.();
       releaseConnectionStateListener = null;
       releaseThemeListener?.();
@@ -4531,6 +4538,10 @@
       clearTimeout(timer);
     }
     itemDetailRefreshTimers.clear();
+    if (websocketResyncTimer) {
+      clearTimeout(websocketResyncTimer);
+      websocketResyncTimer = null;
+    }
 
     config = null;
     quota = null;
@@ -5686,6 +5697,35 @@
     }
   }
 
+  function recoverFromWebSocketResync() {
+    if (authenticated !== true) {
+      return;
+    }
+
+    if (websocketResyncTimer) {
+      clearTimeout(websocketResyncTimer);
+    }
+    websocketResyncTimer = setTimeout(() => {
+      websocketResyncTimer = null;
+      if (authenticated !== true) {
+        return;
+      }
+
+      void refreshSessions(shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null);
+      if (selectedSessionId) {
+        void refreshSelectedSessionState(
+          selectedSessionId,
+          Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize),
+          true,
+          sessionDetailCacheVersion,
+          false
+        ).catch((error) => {
+          errorText = describeError(error);
+        });
+      }
+    }, 320);
+  }
+
   function handleGlobalEvent(event: GlobalStreamEvent) {
     if (event.kind !== "notification") {
       return;
@@ -6676,6 +6716,28 @@
       tokensUsed: String(goal.tokensUsed ?? 0),
       tokenBudget: goal.tokenBudget === null ? "∞" : String(goal.tokenBudget)
     });
+  }
+
+  function goalPrimaryAction(status: string | null | undefined): "pause" | "resume" | null {
+    if (status === "active") {
+      return "pause";
+    }
+    if (status === "paused" || status === "blocked" || status === "usageLimited") {
+      return "resume";
+    }
+    return null;
+  }
+
+  function goalPrimaryActionLabel(status: string | null | undefined) {
+    return goalPrimaryAction(status) === "resume" ? ui.resume : "Pause";
+  }
+
+  async function handleGoalPrimaryAction(status: string | null | undefined) {
+    const action = goalPrimaryAction(status);
+    if (!action) {
+      return;
+    }
+    await handleGoalSlashCommand(action);
   }
 
   async function handleGoalSlashCommand(args: string) {
@@ -11998,14 +12060,16 @@
                       </div>
                     </div>
                     <div class="flex shrink-0 items-center gap-1">
-                      <button
-                        class="ui-animated-button ui-animated-button--soft rounded-lg border border-gray-200 bg-white px-2 py-1 text-[10px] font-bold text-gray-600 hover:bg-gray-50 disabled:opacity-50"
-                        disabled={readOnlyRole}
-                        onclick={() => void handleGoalSlashCommand(conversation?.goal?.status === "paused" ? "resume" : "pause")}
-                        type="button"
-                      >
-                        {conversation.goal.status === "paused" ? "Resume" : "Pause"}
-                      </button>
+                      {#if goalPrimaryAction(conversation.goal.status)}
+                        <button
+                          class="ui-animated-button ui-animated-button--soft rounded-lg border border-gray-200 bg-white px-2 py-1 text-[10px] font-bold text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+                          disabled={readOnlyRole}
+                          onclick={() => void handleGoalPrimaryAction(conversation?.goal?.status)}
+                          type="button"
+                        >
+                          {goalPrimaryActionLabel(conversation.goal.status)}
+                        </button>
+                      {/if}
                       <button
                         class="ui-animated-button ui-animated-button--soft rounded-lg border border-red-100 bg-red-50 px-2 py-1 text-[10px] font-bold text-red-600 hover:bg-red-100 disabled:opacity-50"
                         disabled={readOnlyRole}

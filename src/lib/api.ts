@@ -195,6 +195,10 @@ export const api = {
     return ws.onReconnect(listener);
   },
 
+  onResyncRequired(listener: (reason: string) => void) {
+    return ws.onResyncRequired(listener);
+  },
+
   onConnectionState(listener: (state: WsConnectionState) => void) {
     return ws.onConnectionState(listener);
   },

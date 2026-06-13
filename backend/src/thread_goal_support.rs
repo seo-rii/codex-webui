@@ -1,6 +1,6 @@
 use super::*;
 
-fn canonical_goal_status(value: &str) -> Option<&'static str> {
+pub(crate) fn canonical_goal_status(value: &str) -> Option<&'static str> {
     match value {
         "active" => Some("active"),
         "paused" | "pause" => Some("paused"),
@@ -69,10 +69,17 @@ fn goal_from_response(response: &Value, session_id: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn goal_status_is_active(goal: &Value) -> bool {
+pub(crate) fn goal_status_uses_goal_app_server(status: &str) -> bool {
+    matches!(
+        canonical_goal_status(status),
+        Some("active" | "usageLimited" | "budgetLimited")
+    )
+}
+
+fn goal_should_use_goal_app_server(goal: &Value) -> bool {
     goal.get("status")
         .and_then(Value::as_str)
-        .is_some_and(|status| canonical_goal_status(status) == Some("active"))
+        .is_some_and(goal_status_uses_goal_app_server)
 }
 
 pub(crate) async fn cache_session_goal_payload(
@@ -206,7 +213,7 @@ pub(crate) async fn fetch_session_goal_payload(
         session_id,
         "thread/goal/get",
         json!({ "threadId": session_id }),
-        goal_status_is_active(&cached_goal),
+        goal_should_use_goal_app_server(&cached_goal),
     )
     .await?;
     let goal = goal_from_response(&response, session_id);

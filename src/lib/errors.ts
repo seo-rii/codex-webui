@@ -11,7 +11,8 @@ export type AppErrorCode =
   | "SESSION_NOT_ARCHIVED"
   | "SESSION_NOT_FOUND"
   | "SESSION_ROLLOUT_NOT_FOUND"
-  | "SESSION_ROLLOUT_NOT_RECOVERABLE";
+  | "SESSION_ROLLOUT_NOT_RECOVERABLE"
+  | "SESSION_ROLLOUT_RECOVERY_REQUIRED";
 
 export type AppErrorPayload = {
   code: AppErrorCode | string;
@@ -20,6 +21,14 @@ export type AppErrorPayload = {
   retryAt?: number | string | null;
   retryAfterSeconds?: number | null;
   appServerError?: unknown;
+  sessionId?: string;
+  recovery?: {
+    available?: boolean;
+    issue?: string | null;
+    totalLines?: number | null;
+    recoverableLines?: number | null;
+    skippedLines?: number | null;
+  };
 };
 
 function asRecord(value: unknown) {
@@ -231,7 +240,9 @@ export function parseAppError(value: unknown): AppErrorPayload | null {
       typeof record.retryAfterSeconds === "number" && Number.isFinite(record.retryAfterSeconds)
         ? record.retryAfterSeconds
         : null,
-    appServerError: record.appServerError
+    appServerError: record.appServerError,
+    sessionId: typeof record.sessionId === "string" ? record.sessionId : undefined,
+    recovery: asRecord(record.recovery) as AppErrorPayload["recovery"]
   };
 }
 

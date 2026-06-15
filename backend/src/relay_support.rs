@@ -27,6 +27,7 @@ pub(crate) async fn subscribe_session(
     profile_id: String,
     session_id: String,
     role: UserRole,
+    include_initial_queue: bool,
 ) -> Result<()> {
     let relay = ensure_stream_relay(&state, &profile_id, &session_id).await?;
     let mut receiver = relay.subscribe();
@@ -61,9 +62,20 @@ pub(crate) async fn subscribe_session(
                         continue;
                     };
 
-                    if event.get("method").and_then(Value::as_str)
-                        == Some("item/commandExecution/outputDelta")
-                    {
+                    let event_method = event
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if matches!(
+                        event_method.as_str(),
+                        "item/commandExecution/outputDelta"
+                            | "item/agentMessage/delta"
+                            | "item/plan/delta"
+                            | "item/reasoning/textDelta"
+                            | "item/reasoning/summaryTextDelta"
+                            | "thread/realtime/transcript/delta"
+                    ) {
                         let params = event.get("params").and_then(Value::as_object);
                         let turn_id = params
                             .and_then(|params| params.get("turnId"))
@@ -73,6 +85,15 @@ pub(crate) async fn subscribe_session(
                             .and_then(|params| params.get("itemId"))
                             .and_then(Value::as_str)
                             .unwrap_or_default();
+                        let role = params
+                            .and_then(|params| params.get("role"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let summary_index = params
+                            .and_then(|params| params.get("summaryIndex"))
+                            .and_then(Value::as_i64)
+                            .map(|value| value.to_string())
+                            .unwrap_or_default();
                         let delta = params
                             .and_then(|params| params.get("delta"))
                             .and_then(Value::as_str)
@@ -81,7 +102,13 @@ pub(crate) async fn subscribe_session(
                         if delta.is_empty() {
                             continue;
                         }
-                        if turn_id.is_empty() || item_id.is_empty() {
+                        let missing_required_key =
+                            if event_method == "thread/realtime/transcript/delta" {
+                                role.is_empty()
+                            } else {
+                                turn_id.is_empty() || item_id.is_empty()
+                            };
+                        if missing_required_key {
                             if let Some(pending_event) = pending_delta_event.take() {
                                 if !send_relay_envelope(
                                     &stream_out_tx,
@@ -98,7 +125,9 @@ pub(crate) async fn subscribe_session(
                             }
                             pending_delta_key.clear();
                         } else {
-                            let next_key = format!("{turn_id}\u{0}{item_id}");
+                            let next_key = format!(
+                                "{event_method}\u{0}{turn_id}\u{0}{item_id}\u{0}{role}\u{0}{summary_index}"
+                            );
                             if pending_delta_event.is_some() && pending_delta_key == next_key {
                                 if let Some(params) = pending_delta_event
                                     .as_mut()
@@ -224,7 +253,9 @@ pub(crate) async fn subscribe_session(
         existing.abort();
     }
 
-    if let Ok(queue) = get_session_queue_payload(&state, &profile_id, &session_id).await {
+    if include_initial_queue
+        && let Ok(queue) = get_session_queue_payload(&state, &profile_id, &session_id).await
+    {
         let queue = if role_has_admin_access(role) {
             queue
         } else {

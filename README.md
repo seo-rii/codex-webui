@@ -265,7 +265,7 @@ If you only want one account at a time, you can still keep a single profile and 
 - Changing session or composer preferences syncs the relevant defaults back into `config.toml`.
 - Existing sessions keep their own persisted preferences; changing defaults mainly affects new sessions and future default state.
 - Language bridge is an opt-in session/default preference. When enabled, Codex Web UI first creates an ephemeral translation thread, sends the translated English prompt to the real session, and adds a developer instruction that keeps the final answer in the selected output language. The default is stored under `[codex_webui]` in `config.toml`.
-- Reset tickets, when exposed by the active Codex app-server, appear in the account popover next to quota. Ticket use is confirmed in the browser before dispatch. If the installed Codex build only exposes rate-limit snapshots and not a reset-ticket use RPC, the UI reports that limitation instead of silently failing.
+- Reset tickets, when exposed by the active Codex app-server, appear in the account popover next to quota. Ticket use is confirmed in the browser before dispatch. Builds that only expose rate-limit snapshots simply hide the reset-ticket section.
 - If a saved draft exists while a session is still hydrating, local input typed into the composer wins; draft restore will not clobber text or attachments the user entered during loading.
 - Queued follow-ups are stored server-side and can continue after the page closes as long as the server remains up.
 

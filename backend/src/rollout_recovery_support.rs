@@ -44,6 +44,13 @@ impl RolloutRecoveryActionError {
     }
 }
 
+pub(crate) fn is_rollout_history_corruption_error(message: &str) -> bool {
+    let lowered = message.to_lowercase();
+    lowered.contains("stream did not contain valid utf-8")
+        || lowered.contains("failed to load thread history")
+        || lowered.contains("failed to load rollout")
+}
+
 fn normalize_rollout_line(raw_line: &str) -> Option<String> {
     let trimmed = raw_line
         .trim_start_matches('\u{feff}')
@@ -71,6 +78,118 @@ fn normalize_rollout_line(raw_line: &str) -> Option<String> {
     }
 
     None
+}
+
+fn expand_rollout_path_from_error_message(
+    state: &AppState,
+    profile_id: &str,
+    message: &str,
+) -> Option<PathBuf> {
+    let jsonl_end = message.find(".jsonl")?.saturating_add(".jsonl".len());
+    let before = &message[..jsonl_end];
+    let start = before
+        .rfind(['`', '\'', '"'])
+        .map(|index| index.saturating_add(1))
+        .or_else(|| {
+            before
+                .rfind(char::is_whitespace)
+                .map(|index| index.saturating_add(1))
+        })
+        .unwrap_or(0);
+    let raw_path = before[start..jsonl_end].trim();
+    if raw_path.is_empty() {
+        return None;
+    }
+
+    let profile = resolve_runtime_profile(&state.config, profile_id);
+    let expanded = if let Some(suffix) = raw_path.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(suffix))
+            .unwrap_or_else(|| PathBuf::from(raw_path))
+    } else {
+        PathBuf::from(raw_path)
+    };
+    let normalized = normalize_path(expanded);
+    let normalized_codex_home = normalize_path(profile.codex_home.clone());
+    if normalized
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("jsonl")
+        || !path_is_within(&normalized_codex_home, &normalized)
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+async fn resolve_session_rollout_path_for_recovery(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    error_message: Option<&str>,
+) -> Option<PathBuf> {
+    if let Ok(Some(thread)) =
+        read_local_thread_metadata_payload(state, profile_id, session_id).await
+    {
+        if let Some(path) = resolve_rollout_path(state, profile_id, session_id, &thread) {
+            return Some(path);
+        }
+    }
+
+    for archived in [false, true] {
+        if let Ok(candidates) = list_rollout_candidates_payload(state, profile_id, archived).await {
+            if let Some(path) = candidates
+                .iter()
+                .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(session_id))
+                .and_then(|candidate| candidate.get("path").and_then(Value::as_str))
+                .map(PathBuf::from)
+            {
+                return Some(path);
+            }
+        }
+    }
+
+    if let Some(path) = error_message
+        .and_then(|message| expand_rollout_path_from_error_message(state, profile_id, message))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&format!("{session_id}.jsonl")))
+        })
+    {
+        return Some(path);
+    }
+
+    if error_message.is_none() {
+        if let Ok(thread) = read_thread_metadata_payload(state, profile_id, session_id).await {
+            if let Some(path) = resolve_rollout_path(state, profile_id, session_id, &thread) {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
+pub(crate) async fn inspect_session_rollout_recovery_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    error_message: Option<&str>,
+) -> Option<Value> {
+    let rollout_path =
+        resolve_session_rollout_path_for_recovery(state, profile_id, session_id, error_message)
+            .await?;
+    let rollout_buffer = tokio_fs::read(rollout_path).await.ok()?;
+    let plan = inspect_rollout_recovery_content(&rollout_buffer);
+    if !plan.info.available
+        || plan.info.recoverable_lines == 0
+        || plan.recovered_content.trim().is_empty()
+    {
+        return None;
+    }
+    Some(json!(plan.info))
 }
 
 pub(crate) fn inspect_rollout_recovery_content(buffer: &[u8]) -> RolloutRecoveryPlanPayload {
@@ -133,21 +252,9 @@ pub(crate) async fn recover_session_rollout_payload(
         ));
     }
 
-    let thread = read_thread_metadata_payload(state, profile_id, session_id)
-        .await
-        .map_err(|error| {
-            RolloutRecoveryActionError::new(
-                error.status,
-                if error.status == StatusCode::NOT_FOUND {
-                    "SESSION_NOT_FOUND"
-                } else {
-                    "SESSION_METADATA_READ_FAILED"
-                },
-                error.message,
-            )
-        })?;
-
-    let Some(rollout_path) = resolve_rollout_path(state, profile_id, session_id, &thread) else {
+    let Some(rollout_path) =
+        resolve_session_rollout_path_for_recovery(state, profile_id, session_id, None).await
+    else {
         return Err(RolloutRecoveryActionError::new(
             StatusCode::NOT_FOUND,
             "SESSION_ROLLOUT_NOT_FOUND",

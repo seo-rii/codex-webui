@@ -68,6 +68,8 @@ export function describeUiError(value: unknown) {
         return m.error_session_rollout_not_found();
       case "SESSION_ROLLOUT_NOT_RECOVERABLE":
         return m.error_session_rollout_not_recoverable();
+      case "SESSION_ROLLOUT_RECOVERY_REQUIRED":
+        return m.session_history_recovery_generic_message();
       default:
         if (parsed.message?.trim()) {
           return parsed.message.trim();

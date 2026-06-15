@@ -12,6 +12,7 @@ type CacheEnvelope<T> = {
 const DB_NAME = "codex-webui-browser-cache";
 const DB_VERSION = 1;
 const BROWSER_CACHE_OPERATION_TIMEOUT_MS = 1_500;
+const PERSISTENT_PRUNE_INTERVAL_MS = 30_000;
 const STORE_LIMITS: Record<CacheStoreName, { maxEntries: number; ttlMs: number }> = {
   "session-details": {
     maxEntries: 80,
@@ -25,6 +26,14 @@ const STORE_LIMITS: Record<CacheStoreName, { maxEntries: number; ttlMs: number }
 const memoryStores: Record<CacheStoreName, Map<string, CacheEnvelope<unknown>>> = {
   "session-details": new Map(),
   "session-lists": new Map()
+};
+const persistentPruneTimers: Record<CacheStoreName, ReturnType<typeof setTimeout> | null> = {
+  "session-details": null,
+  "session-lists": null
+};
+const lastPersistentPruneAt: Record<CacheStoreName, number> = {
+  "session-details": 0,
+  "session-lists": 0
 };
 
 let databasePromise: Promise<IDBDatabase> | null = null;
@@ -139,6 +148,12 @@ async function runStoreRequest<T>(
 async function readEnvelope<T>(storeName: CacheStoreName, key: string) {
   pruneMemoryStore(storeName);
   const memory = memoryStores[storeName].get(key) as CacheEnvelope<T> | undefined;
+  if (memory && !isExpiredEnvelope(storeName, memory as CacheEnvelope<unknown>)) {
+    return memory;
+  }
+  if (memory) {
+    memoryStores[storeName].delete(key);
+  }
 
   try {
     const value = await withBrowserCacheTimeout(
@@ -190,6 +205,7 @@ async function deleteEnvelope(storeName: CacheStoreName, key: string) {
 }
 
 async function prunePersistentStore(storeName: CacheStoreName) {
+  lastPersistentPruneAt[storeName] = Date.now();
   pruneMemoryStore(storeName);
   if (!browserSupportsIndexedDb()) {
     return;
@@ -226,6 +242,19 @@ async function prunePersistentStore(storeName: CacheStoreName) {
   }
 }
 
+function schedulePersistentPrune(storeName: CacheStoreName) {
+  if (persistentPruneTimers[storeName]) {
+    return;
+  }
+
+  const elapsed = Date.now() - lastPersistentPruneAt[storeName];
+  const delay = Math.max(0, PERSISTENT_PRUNE_INTERVAL_MS - elapsed);
+  persistentPruneTimers[storeName] = setTimeout(() => {
+    persistentPruneTimers[storeName] = null;
+    void prunePersistentStore(storeName);
+  }, delay);
+}
+
 async function writeEnvelope<T>(storeName: CacheStoreName, envelope: CacheEnvelope<T>) {
   memoryStores[storeName].set(envelope.key, envelope as CacheEnvelope<unknown>);
   pruneMemoryStore(storeName);
@@ -245,7 +274,7 @@ async function writeEnvelope<T>(storeName: CacheStoreName, envelope: CacheEnvelo
   } catch {
     // Memory fallback already contains the latest value.
   }
-  void prunePersistentStore(storeName);
+  schedulePersistentPrune(storeName);
 }
 
 export async function readSessionListCache(key: string) {

@@ -943,6 +943,36 @@ async fn codex_reset_tickets_payload_normalizes_app_server_rate_limit_tickets() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_reset_tickets_payload_is_quiet_when_protocol_is_unsupported() {
+    let sandbox = unique_test_dir("codex-reset-tickets-unsupported-quiet");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let payload = codex_reset_tickets_payload(&state, "default", false)
+        .await
+        .unwrap();
+    assert_eq!(
+        payload.get("available").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        payload.get("supported").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        payload.get("message"),
+        Some(&Value::Null),
+        "unsupported protocol should not produce a user-facing warning"
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_reset_ticket_use_reports_unsupported_without_codex_rpc() {
     let sandbox = unique_test_dir("codex-reset-ticket-use-unsupported");
     let workspace = sandbox.join("workspace");

@@ -561,11 +561,7 @@ pub(crate) async fn codex_reset_tickets_payload(
             .unwrap_or(Value::Null),
         "fetchedAt": now_unix_ms(),
         "refresh": refresh,
-        "message": if !saw_reset_ticket_field {
-            Some("This Codex build did not expose reset-ticket records.")
-        } else {
-            None
-        },
+        "message": Value::Null,
         "error": Value::Null,
     }))
 }

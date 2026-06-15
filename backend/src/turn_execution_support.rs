@@ -893,6 +893,32 @@ async fn turn_app_server_error(
     )
 }
 
+async fn session_rollout_recovery_required_error(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    message: &str,
+) -> Option<ApiError> {
+    if !is_rollout_history_corruption_error(message) {
+        return None;
+    }
+
+    let recovery =
+        inspect_session_rollout_recovery_payload(state, profile_id, session_id, Some(message))
+            .await?;
+    Some(api_error(
+        StatusCode::CONFLICT,
+        json!({
+            "code": "SESSION_ROLLOUT_RECOVERY_REQUIRED",
+            "message": message,
+            "status": StatusCode::CONFLICT.as_u16(),
+            "sessionId": session_id,
+            "recovery": recovery
+        })
+        .to_string(),
+    ))
+}
+
 pub(crate) async fn resolve_active_turn_id_payload(
     state: &AppState,
     profile_id: &str,
@@ -1109,7 +1135,7 @@ pub(crate) async fn send_turn_payload(
             )
         })?;
     if thread.get("status").and_then(Value::as_str) == Some("notLoaded") {
-        client
+        if let Err(error) = client
             .request(
                 "thread/resume",
                 json!({
@@ -1119,12 +1145,16 @@ pub(crate) async fn send_turn_payload(
                 }),
             )
             .await
-            .map_err(|error| {
-                api_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("Failed to resume the session before sending: {error}"),
-                )
-            })?;
+        {
+            let message = format!("Failed to resume the session before sending: {error}");
+            if let Some(recovery_error) =
+                session_rollout_recovery_required_error(state, profile_id, session_id, &message)
+                    .await
+            {
+                return Err(recovery_error);
+            }
+            return Err(api_error(StatusCode::BAD_GATEWAY, message));
+        }
     }
 
     let mut effective_prompt = trimmed_prompt.to_string();
@@ -1226,6 +1256,13 @@ pub(crate) async fn send_turn_payload(
     {
         Ok(response) => response,
         Err(error) => {
+            let message = format!("Failed to start the turn: {error}");
+            if let Some(recovery_error) =
+                session_rollout_recovery_required_error(state, profile_id, session_id, &message)
+                    .await
+            {
+                return Err(recovery_error);
+            }
             return Err(
                 turn_app_server_error(state, profile_id, &client, "Failed to start the turn", error)
                     .await,

@@ -232,8 +232,12 @@ export const api = {
     return ws.subscribeGlobal(listener);
   },
 
-  subscribeSession(sessionId: string, listener: (event: StreamEvent) => void) {
-    return ws.subscribeSession(sessionId, listener);
+  subscribeSession(
+    sessionId: string,
+    listener: (event: StreamEvent) => void,
+    options: { includeInitialQueue?: boolean } = {}
+  ) {
+    return ws.subscribeSession(sessionId, listener, options);
   },
 
   subscribeTerminal(terminalId: string, listener: (event: TerminalEvent) => void) {

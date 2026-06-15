@@ -441,6 +441,15 @@
     return m.quota_left_compact({ percent: String(Math.round(Math.min(...candidates))) });
   }
 
+  function shouldShowResetTickets() {
+    return (
+      Boolean(resetTicketsBusy && !resetTickets) ||
+      Boolean(resetTickets?.supported) ||
+      Boolean(resetTickets?.tickets?.length) ||
+      Boolean(resetTickets?.error)
+    );
+  }
+
   function accountLabel() {
     if (account?.email) {
       return account.email;
@@ -1785,72 +1794,74 @@
             </div>
           </div>
 
-          <div class="space-y-3">
-            <div class="flex items-center justify-between gap-2">
-              <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
-                <Ticket size={10} /> {ui.resetTickets}
-              </h4>
-              <button
-                aria-label={ui.refreshResetTickets}
-                class="rounded-md p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={resetTicketsBusy}
-                onclick={onRefreshResetTickets}
-                title={ui.refreshResetTickets}
-                type="button"
-              >
-                <RefreshCw size={12} class={resetTicketsBusy ? "animate-spin" : ""} />
-              </button>
-            </div>
+          {#if shouldShowResetTickets()}
+            <div class="space-y-3">
+              <div class="flex items-center justify-between gap-2">
+                <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
+                  <Ticket size={10} /> {ui.resetTickets}
+                </h4>
+                <button
+                  aria-label={ui.refreshResetTickets}
+                  class="rounded-md p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={resetTicketsBusy}
+                  onclick={onRefreshResetTickets}
+                  title={ui.refreshResetTickets}
+                  type="button"
+                >
+                  <RefreshCw size={12} class={resetTicketsBusy ? "animate-spin" : ""} />
+                </button>
+              </div>
 
-            <div class="sidebar-flyout-surface rounded-xl border border-gray-100 bg-gray-50 p-2 space-y-2">
-              {#if resetTicketsBusy && !resetTickets}
-                <div class="flex items-center gap-2 text-[11px] text-gray-500">
-                  <RefreshCw size={12} class="animate-spin" />
-                  {ui.loading}
-                </div>
-              {:else if resetTickets?.error}
-                <div class="flex items-start gap-2 text-[11px] text-red-500">
-                  <AlertCircle size={12} class="mt-0.5 shrink-0" />
-                  <span>{resetTickets.error}</span>
-                </div>
-              {:else if resetTickets && !resetTickets.supported}
-                <p class="text-[11px] leading-snug text-gray-500">{resetTickets.message ?? ui.resetTicketUnsupported}</p>
-              {:else if resetTickets?.tickets?.length}
-                <div class="space-y-1.5">
-                  {#each resetTickets.tickets as ticket (ticket.id)}
-                    <div class="rounded-lg border border-gray-200 bg-white p-2">
-                      <div class="flex items-start justify-between gap-2">
-                        <div class="min-w-0">
-                          <div class="truncate text-[11px] font-bold text-gray-800">
-                            {ticket.label ?? ticket.limitName ?? ticket.limitId ?? ticket.id}
+              <div class="sidebar-flyout-surface rounded-xl border border-gray-100 bg-gray-50 p-2 space-y-2">
+                {#if resetTicketsBusy && !resetTickets}
+                  <div class="flex items-center gap-2 text-[11px] text-gray-500">
+                    <RefreshCw size={12} class="animate-spin" />
+                    {ui.loading}
+                  </div>
+                {:else if resetTickets?.error}
+                  <div class="flex items-start gap-2 text-[11px] text-red-500">
+                    <AlertCircle size={12} class="mt-0.5 shrink-0" />
+                    <span>{resetTickets.error}</span>
+                  </div>
+                {:else if resetTickets && !resetTickets.supported}
+                  <p class="text-[11px] leading-snug text-gray-500">{resetTickets.message ?? ui.resetTicketUnsupported}</p>
+                {:else if resetTickets?.tickets?.length}
+                  <div class="space-y-1.5">
+                    {#each resetTickets.tickets as ticket (ticket.id)}
+                      <div class="rounded-lg border border-gray-200 bg-white p-2">
+                        <div class="flex items-start justify-between gap-2">
+                          <div class="min-w-0">
+                            <div class="truncate text-[11px] font-bold text-gray-800">
+                              {ticket.label ?? ticket.limitName ?? ticket.limitId ?? ticket.id}
+                            </div>
+                            <div class="truncate text-[10px] text-gray-400">
+                              {ticket.expiresAt ? `Expires ${ticket.expiresAt}` : ticket.id}
+                            </div>
                           </div>
-                          <div class="truncate text-[10px] text-gray-400">
-                            {ticket.expiresAt ? `Expires ${ticket.expiresAt}` : ticket.id}
-                          </div>
+                          <button
+                            class="shrink-0 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] font-bold text-amber-700 transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
+                            disabled={readOnly || !ticket.available || resetTicketUseBusyId === ticket.id}
+                            onclick={() => onUseResetTicket(ticket)}
+                            type="button"
+                          >
+                            {#if resetTicketUseBusyId === ticket.id}
+                              <RefreshCw size={10} class="animate-spin" />
+                            {:else if ticket.available}
+                              {ui.useResetTicket}
+                            {:else}
+                              {ui.resetTicketUnavailable}
+                            {/if}
+                          </button>
                         </div>
-                        <button
-                          class="shrink-0 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] font-bold text-amber-700 transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
-                          disabled={readOnly || !ticket.available || resetTicketUseBusyId === ticket.id}
-                          onclick={() => onUseResetTicket(ticket)}
-                          type="button"
-                        >
-                          {#if resetTicketUseBusyId === ticket.id}
-                            <RefreshCw size={10} class="animate-spin" />
-                          {:else if ticket.available}
-                            {ui.useResetTicket}
-                          {:else}
-                            {ui.resetTicketUnavailable}
-                          {/if}
-                        </button>
                       </div>
-                    </div>
-                  {/each}
-                </div>
-              {:else}
-                <p class="text-[11px] leading-snug text-gray-500">{ui.resetTicketEmpty}</p>
-              {/if}
+                    {/each}
+                  </div>
+                {:else}
+                  <p class="text-[11px] leading-snug text-gray-500">{ui.resetTicketEmpty}</p>
+                {/if}
+              </div>
             </div>
-          </div>
+          {/if}
 
           <div class="space-y-4">
             <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">

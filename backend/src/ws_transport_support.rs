@@ -17,6 +17,60 @@ struct SlowWebSocketLogState {
 static SLOW_WS_LOG_STATE: std::sync::OnceLock<std::sync::Mutex<SlowWebSocketLogState>> =
     std::sync::OnceLock::new();
 
+fn rough_json_value_size(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(number) => number.to_string().len(),
+        Value::String(text) => text.len().saturating_add(2),
+        Value::Array(items) => items
+            .iter()
+            .map(rough_json_value_size)
+            .sum::<usize>()
+            .saturating_add(items.len().saturating_add(1)),
+        Value::Object(entries) => entries
+            .iter()
+            .map(|(key, item)| {
+                key.len()
+                    .saturating_add(rough_json_value_size(item))
+                    .saturating_add(4)
+            })
+            .sum::<usize>()
+            .saturating_add(entries.len().saturating_add(1)),
+    }
+}
+
+fn rough_ws_response_size(message: &ServerEnvelope) -> usize {
+    match message {
+        ServerEnvelope::Response {
+            id, result, error, ..
+        } => 48usize
+            .saturating_add(id.len())
+            .saturating_add(
+                result
+                    .as_ref()
+                    .map(rough_json_value_size)
+                    .unwrap_or_default(),
+            )
+            .saturating_add(error.as_ref().map(String::len).unwrap_or_default()),
+        ServerEnvelope::Event { session_id, event } => 48usize
+            .saturating_add(session_id.len())
+            .saturating_add(rough_json_value_size(event)),
+        ServerEnvelope::TerminalEvent { terminal_id, event } => 56usize
+            .saturating_add(terminal_id.len())
+            .saturating_add(rough_json_value_size(event)),
+        ServerEnvelope::GlobalEvent { event } => {
+            32usize.saturating_add(rough_json_value_size(event))
+        }
+        ServerEnvelope::Ready { connection_id } => 40usize.saturating_add(connection_id.len()),
+        ServerEnvelope::ResyncRequired { reason } => 40usize.saturating_add(reason.len()),
+        ServerEnvelope::Pong { nonce } => {
+            24usize.saturating_add(nonce.as_ref().map(String::len).unwrap_or_default())
+        }
+    }
+}
+
 pub(crate) async fn handle_ws(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -366,9 +420,7 @@ async fn handle_ws_message(
                 },
             };
             let elapsed = started_at.elapsed();
-            let response_size = serde_json::to_vec(&message)
-                .map(|bytes| bytes.len())
-                .unwrap_or_default();
+            let response_size = rough_ws_response_size(&message);
             if elapsed > Duration::from_millis(250) || response_size > 256 * 1024 {
                 let now = Instant::now();
                 let state = SLOW_WS_LOG_STATE.get_or_init(|| {

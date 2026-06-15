@@ -844,6 +844,7 @@ async fn session_subscription_drops_slow_outbound_client() {
         "default".to_string(),
         "thread-1".to_string(),
         UserRole::Admin,
+        true,
     )
     .await
     .expect("subscription should start");
@@ -930,6 +931,7 @@ async fn viewer_session_subscription_redacts_queue_payloads() {
         "default".to_string(),
         "thread-queue".to_string(),
         UserRole::Viewer,
+        true,
     )
     .await
     .expect("viewer subscription should start");
@@ -949,6 +951,95 @@ async fn viewer_session_subscription_redacts_queue_payloads() {
     assert!(queue.get("items").is_none());
     assert!(queue.to_string().contains("secret queued prompt") == false);
     assert!(queue.to_string().contains("secret-skill") == false);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_subscription_coalesces_text_delta_events() {
+    let sandbox = unique_test_dir("session-delta-coalesce");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let (out_tx, mut out_rx) = mpsc::channel(8);
+    let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    subscribe_session(
+        state.clone(),
+        out_tx,
+        subscriptions,
+        "default".to_string(),
+        "thread-delta".to_string(),
+        UserRole::Admin,
+        true,
+    )
+    .await
+    .expect("subscription should start");
+
+    let _initial_queue = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+        .await
+        .expect("initial queue event should arrive")
+        .expect("initial queue event should be readable");
+    let relay = state
+        .relays
+        .lock()
+        .await
+        .get(&session_relay_key("default", "thread-delta"))
+        .cloned()
+        .expect("session relay should exist");
+
+    relay
+        .send(json!({
+            "kind": "notification",
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread-delta",
+                "turnId": "turn-1",
+                "itemId": "agent-1",
+                "delta": "hello "
+            }
+        }))
+        .expect("first delta should publish");
+    relay
+        .send(json!({
+            "kind": "notification",
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread-delta",
+                "turnId": "turn-1",
+                "itemId": "agent-1",
+                "delta": "world"
+            }
+        }))
+        .expect("second delta should publish");
+
+    let envelope = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+        .await
+        .expect("coalesced delta event should arrive")
+        .expect("coalesced delta event should be readable");
+    let ServerEnvelope::Event { event, .. } = envelope else {
+        panic!("expected session event");
+    };
+    assert_eq!(
+        event.get("method").and_then(Value::as_str),
+        Some("item/agentMessage/delta")
+    );
+    assert_eq!(
+        event
+            .get("params")
+            .and_then(|params| params.get("delta"))
+            .and_then(Value::as_str),
+        Some("hello world")
+    );
+    assert_eq!(
+        event
+            .get("params")
+            .and_then(|params| params.get("deltaLength"))
+            .and_then(Value::as_u64),
+        Some(11)
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }

@@ -65,7 +65,7 @@
   import StartupAlertModal from "$lib/components/StartupAlertModal.svelte";
   import WorkspaceHeader from "$lib/components/WorkspaceHeader.svelte";
   import WorkspaceTabStrip from "$lib/components/WorkspaceTabStrip.svelte";
-  import { isUsageLimitErrorPayload } from "$lib/errors";
+  import { isUsageLimitErrorPayload, parseAppError } from "$lib/errors";
   import { describeUiError } from "$lib/ui-errors";
   import { activeLocale, localeOptions, localeSignal, updateLocale } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
@@ -1528,6 +1528,8 @@
   let hydrationRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let websocketResyncTimer: ReturnType<typeof setTimeout> | null = null;
+  let websocketResyncInFlight = false;
+  let websocketResyncQueued = false;
   let selectedSessionDetailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let selectedSessionCompletionRefreshTimers: ReturnType<typeof setTimeout>[] = [];
   let sessionListCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -5037,7 +5039,6 @@
     activeWorkspaceTabId = "chat";
     disconnectStream();
     connectStream(sessionId);
-    void refreshSessionQueueSnapshot(sessionId);
 
     try {
       const detailCacheKey = buildSessionDetailBrowserCacheKey(sessionId);
@@ -5109,6 +5110,9 @@
       }
 
       if (payload.kind === "notification" && payload.method === "codex-webui/queueDispatchFailed") {
+        if (showSessionRecoveryPromptFromError(payload.params, sessionId)) {
+          return;
+        }
         errorText = m.queue_dispatch_failed({ message: describeUiError(payload.params) });
       }
 
@@ -5244,18 +5248,7 @@
       } else if (selectedSessionId === sessionId) {
         queuePendingSessionEvent(sessionId, payload);
       }
-    });
-  }
-
-  async function refreshSessionQueueSnapshot(sessionId: string) {
-    try {
-      const queue = await api.getSessionQueue(sessionId);
-      if (selectedSessionId === sessionId) {
-        applyQueuePayloadToSession(sessionId, queue);
-      }
-    } catch {
-      // The full session load path will still hydrate the queue.
-    }
+    }, { includeInitialQueue: false });
   }
 
   function disconnectStream() {
@@ -5504,6 +5497,31 @@
     };
   }
 
+  function showSessionRecoveryPromptFromError(error: unknown, fallbackSessionId: string | null = null) {
+    const parsed = parseAppError(error);
+    if (parsed?.code !== "SESSION_ROLLOUT_RECOVERY_REQUIRED") {
+      return false;
+    }
+
+    const sessionId = parsed.sessionId ?? fallbackSessionId;
+    const recovery = parsed.recovery;
+    if (!sessionId || !recovery?.available) {
+      return false;
+    }
+
+    dismissedSessionRecoveryPromptForSessionId = null;
+    sessionRecoveryPrompt = {
+      sessionId,
+      message: parsed.message ?? m.session_history_recovery_generic_message(),
+      issue: typeof recovery.issue === "string" ? recovery.issue : null,
+      totalLines: typeof recovery.totalLines === "number" ? recovery.totalLines : null,
+      recoverableLines: typeof recovery.recoverableLines === "number" ? recovery.recoverableLines : null,
+      skippedLines: typeof recovery.skippedLines === "number" ? recovery.skippedLines : null,
+      busy: false
+    };
+    return true;
+  }
+
   function dismissSessionRecoveryPrompt() {
     if (sessionRecoveryPrompt?.sessionId) {
       dismissedSessionRecoveryPromptForSessionId = sessionRecoveryPrompt.sessionId;
@@ -5687,39 +5705,12 @@
       return;
     }
 
-    try {
-      const authSession = await api.getAuthSession();
-      activeProfileId = authSession.activeProfileId ?? activeProfileId ?? "default";
-      loginHcaptcha = authSession.hcaptcha ?? { enabled: false, siteKey: null };
-      if (!authSession.authenticated) {
-        clearWorkspaceForLoggedOut();
-        return;
-      }
-
-      ensureGlobalStreamSubscription();
-      void refreshRuntimeStatus(false, { silent: true });
-
-      config = applyLocalComposerPreferencesToConfig(await api.getConfig());
-      syncConfiguredTheme(config);
-      syncStartupAlertModal(config);
-      await refreshSessions(shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null);
-      await refreshTerminals();
-      void refreshQuota(false);
-      void refreshResetTickets(false);
-      void refreshAccountState(false);
-
-      if (!selectedSessionId) {
-        return;
-      }
-
-      await refreshSelectedSessionState(
-        selectedSessionId,
-        Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize),
-        true
-      );
-    } catch (error) {
-      errorText = describeError(error);
+    ensureGlobalStreamSubscription();
+    void refreshRuntimeStatus(false, { silent: true });
+    if (activeWorkspaceTabId.startsWith("terminal:")) {
+      void refreshTerminals();
     }
+    recoverFromWebSocketResync();
   }
 
   function recoverFromWebSocketResync() {
@@ -5736,18 +5727,34 @@
         return;
       }
 
-      void refreshSessions(shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null);
-      if (selectedSessionId) {
-        void refreshSelectedSessionState(
-          selectedSessionId,
-          Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize),
-          true,
-          sessionDetailCacheVersion,
-          false
-        ).catch((error) => {
-          errorText = describeError(error);
-        });
+      if (websocketResyncInFlight) {
+        websocketResyncQueued = true;
+        return;
       }
+
+      websocketResyncInFlight = true;
+      void (async () => {
+        try {
+          await refreshSessions(shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null);
+          if (selectedSessionId) {
+            await refreshSelectedSessionState(
+              selectedSessionId,
+              Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize),
+              true,
+              sessionDetailCacheVersion,
+              false
+            );
+          }
+        } catch (error) {
+          errorText = describeError(error);
+        } finally {
+          websocketResyncInFlight = false;
+          if (websocketResyncQueued) {
+            websocketResyncQueued = false;
+            recoverFromWebSocketResync();
+          }
+        }
+      })();
     }, 320);
   }
 
@@ -6362,18 +6369,23 @@
         if (saveVersion !== preferenceSaveVersion) {
           return;
         }
-        const nextConfig = applyLocalComposerPreferencesToConfig(await api.getConfig());
+        const nextPreferences = applyLocalSendOnEnterPreference(saved);
         if (conversation?.thread.id === sessionId) {
           conversation = {
             ...conversation,
-            preferences: applyLocalSendOnEnterPreference(saved)
+            preferences: nextPreferences
           };
           markConversationCacheDirty();
+          applySessionSummaryUpdate(buildSessionSummaryFromConversation(conversation));
         }
         pendingPreferencePatchesBySessionId.delete(sessionId);
-        config = nextConfig;
-        syncConfiguredTheme(config);
-        await refreshSessions(shouldPinSession(selectedSessionSummary) ? selectedSessionSummary : null);
+        if (config) {
+          config = applyLocalComposerPreferencesToConfig({
+            ...config,
+            defaults: nextPreferences
+          });
+          syncConfiguredTheme(config);
+        }
       } catch (error) {
         errorText = describeError(error);
       }
@@ -7261,6 +7273,10 @@
             draftAttachments = attachmentSnapshot;
             scheduleComposerTextareaResize();
           }
+          if (showSessionRecoveryPromptFromError(error, sessionId)) {
+            errorText = "";
+            return;
+          }
           errorText = describeError(error);
         })
         .finally(() => {
@@ -7269,6 +7285,11 @@
         });
     } catch (error) {
       finishComposerMutation(mutationSignature);
+      if (showSessionRecoveryPromptFromError(error, selectedSessionId)) {
+        errorText = "";
+        startingMessage = false;
+        return;
+      }
       errorText = describeError(error);
       startingMessage = false;
     }

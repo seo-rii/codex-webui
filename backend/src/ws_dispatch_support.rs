@@ -1176,6 +1176,10 @@ pub(crate) async fn execute_ws_method(
         }
         "session/subscribe" => {
             let session_id = require_session_id(&params, "sessionId")?;
+            let include_initial_queue = params
+                .get("includeInitialQueue")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
             subscribe_session(
                 state.clone(),
                 out_tx.clone(),
@@ -1183,6 +1187,7 @@ pub(crate) async fn execute_ws_method(
                 auth.profile_id.clone(),
                 session_id.clone(),
                 auth.role,
+                include_initial_queue,
             )
             .await?;
             Ok(json!({ "subscribed": true, "sessionId": session_id }))

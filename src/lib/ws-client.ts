@@ -59,6 +59,9 @@ type PendingRequest = {
 
 type SessionEventHandler = (event: StreamEvent) => void;
 type TerminalEventHandler = (event: TerminalEvent) => void;
+type SessionSubscriptionOptions = {
+  includeInitialQueue?: boolean;
+};
 
 const HEARTBEAT_MS = 20_000;
 const CONNECT_TIMEOUT_MS = 12_000;
@@ -176,6 +179,7 @@ export class WebSocketRpcClient {
   private pending = new Map<string, PendingRequest>();
   private inflightReadRequests = new Map<string, Promise<unknown>>();
   private sessionHandlers = new Map<string, Set<SessionEventHandler>>();
+  private sessionSubscriptionOptions = new Map<string, Required<SessionSubscriptionOptions>>();
   private terminalHandlers = new Map<string, Set<TerminalEventHandler>>();
   private globalHandlers = new Set<(event: GlobalStreamEvent) => void>();
   private reconnectListeners = new Set<() => void>();
@@ -238,14 +242,19 @@ export class WebSocketRpcClient {
     return promise;
   }
 
-  subscribeSession(sessionId: string, handler: SessionEventHandler) {
+  subscribeSession(sessionId: string, handler: SessionEventHandler, options: SessionSubscriptionOptions = {}) {
     const current = this.sessionHandlers.get(sessionId) ?? new Set<SessionEventHandler>();
     const shouldSubscribe = current.size === 0;
     current.add(handler);
     this.sessionHandlers.set(sessionId, current);
+    if (shouldSubscribe) {
+      this.sessionSubscriptionOptions.set(sessionId, {
+        includeInitialQueue: options.includeInitialQueue ?? true
+      });
+    }
     this.ensureConnected();
     if (shouldSubscribe) {
-      this.sendTransient("session/subscribe", { sessionId });
+      this.sendSessionSubscribe(sessionId);
     }
 
     return () => {
@@ -260,6 +269,7 @@ export class WebSocketRpcClient {
       }
 
       this.sessionHandlers.delete(sessionId);
+      this.sessionSubscriptionOptions.delete(sessionId);
       this.sendTransient("session/unsubscribe", { sessionId });
     };
   }
@@ -561,7 +571,7 @@ export class WebSocketRpcClient {
     }
 
     for (const sessionId of this.sessionHandlers.keys()) {
-      this.sendTransient("session/subscribe", { sessionId });
+      this.sendSessionSubscribe(sessionId);
     }
 
     for (const terminalId of this.terminalHandlers.keys()) {
@@ -581,6 +591,14 @@ export class WebSocketRpcClient {
       params
     };
     this.socket.send(JSON.stringify(payload));
+  }
+
+  private sendSessionSubscribe(sessionId: string) {
+    const options = this.sessionSubscriptionOptions.get(sessionId) ?? { includeInitialQueue: true };
+    this.sendTransient("session/subscribe", {
+      sessionId,
+      includeInitialQueue: options.includeInitialQueue
+    });
   }
 
   private startHeartbeat() {

@@ -4886,6 +4886,114 @@ async fn send_turn_payload_clears_runtime_state_when_turn_start_fails() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_turn_payload_surfaces_rollout_recovery_when_resume_fails() {
+    let sandbox = unique_test_dir("turn-send-resume-rollout-recovery");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let session_id = "019ebc8b-141e-71e0-93e5-bba09962d880";
+    let created_at = time::OffsetDateTime::now_utc().unix_timestamp();
+    let created_date = time::OffsetDateTime::from_unix_timestamp(created_at)
+        .unwrap()
+        .date();
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join(created_date.year().to_string())
+        .join(format!("{:02}", u8::from(created_date.month())))
+        .join(format!("{:02}", created_date.day()));
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join(format!("rollout-2026-06-13T00-54-51-{session_id}.jsonl"));
+    fs::write(&rollout_path, b"{\"step\":1}\n\xff\n{\"step\":2}\n").unwrap();
+
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Corrupted rollout",
+                    "preview": "Corrupted rollout",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": created_at,
+                    "updatedAt": created_at,
+                    "status": "notLoaded",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    client
+        .request(
+            "debug/setError",
+            json!({
+                "method": "thread/resume",
+                "message": format!(
+                    "failed to read thread: thread-store internal error: failed to load thread history `{}`: stream did not contain valid UTF-8",
+                    rollout_path.display()
+                )
+            }),
+        )
+        .await
+        .unwrap();
+
+    let error = send_turn_payload(
+        &state,
+        "default",
+        session_id,
+        "Continue after recovery.",
+        None,
+        None,
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        Some("client-corrupt-resume"),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    let payload: Value = serde_json::from_str(&error.message).unwrap();
+    assert_eq!(
+        payload.get("code").and_then(Value::as_str),
+        Some("SESSION_ROLLOUT_RECOVERY_REQUIRED")
+    );
+    assert_eq!(
+        payload.get("sessionId").and_then(Value::as_str),
+        Some(session_id)
+    );
+    assert_eq!(
+        payload
+            .get("recovery")
+            .and_then(|recovery| recovery.get("issue"))
+            .and_then(Value::as_str),
+        Some("invalidUtf8")
+    );
+    assert_eq!(
+        payload
+            .get("recovery")
+            .and_then(|recovery| recovery.get("recoverableLines"))
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test]
 async fn send_turn_payload_translates_language_bridge_prompt_with_temp_session() {
     let sandbox = unique_test_dir("turn-language-bridge");

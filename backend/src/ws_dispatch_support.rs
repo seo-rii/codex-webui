@@ -800,6 +800,12 @@ pub(crate) async fn execute_ws_method(
                 .await
                 .map_err(anyhow::Error::from)
         }
+        "session/compact/start" => {
+            let session_id = require_session_id(&params, "sessionId")?;
+            start_session_compaction_payload(state, &auth.profile_id, &session_id)
+                .await
+                .map_err(anyhow::Error::from)
+        }
         "computer/input" => {
             let session_id = require_session_id(&params, "sessionId")?;
             send_computer_input_payload(

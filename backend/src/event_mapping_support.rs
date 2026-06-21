@@ -404,7 +404,11 @@ pub(crate) fn map_app_server_session_notification(
                     "items": []
                 })
             });
-            mapped.insert("turn".to_string(), normalize_session_turn_payload(&turn, 0));
+            let mut normalized_turn = normalize_session_turn_payload(&turn, 0);
+            if notification.method == "turn/completed" {
+                mark_turn_without_agent_output_failed(&mut normalized_turn, "live");
+            }
+            mapped.insert("turn".to_string(), normalized_turn);
         }
         "item/started" | "item/completed" => {
             let turn_id = mapped

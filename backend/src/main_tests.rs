@@ -980,6 +980,30 @@ for raw_line in sys.stdin:
             }
         })
     elif method == "turn/start":
+        sandbox_policy = params.get("sandboxPolicy")
+        if isinstance(sandbox_policy, dict):
+            if sandbox_policy.get("type") == "readOnly":
+                access = sandbox_policy.get("access")
+                if isinstance(access, dict) and access.get("type") == "restricted":
+                    write({
+                        "id": request_id,
+                        "error": {
+                            "code": -32602,
+                            "message": "Invalid request: readOnly.access is no longer supported; use permissionProfile for restricted reads"
+                        }
+                    })
+                    continue
+            if sandbox_policy.get("type") == "workspaceWrite":
+                read_only_access = sandbox_policy.get("readOnlyAccess")
+                if isinstance(read_only_access, dict) and read_only_access.get("type") == "restricted":
+                    write({
+                        "id": request_id,
+                        "error": {
+                            "code": -32602,
+                            "message": "Invalid request: workspaceWrite.readOnlyAccess is no longer supported; use permissionProfile for restricted reads"
+                        }
+                    })
+                    continue
         thread_id = params.get("threadId", "")
         turn_counter += 1
         timestamp_counter += 1
@@ -1063,6 +1087,49 @@ for raw_line in sys.stdin:
                     "id": turn_id
                 }
             }
+        })
+    elif method == "thread/compact/start":
+        thread_id = params.get("threadId", "")
+        turn_counter += 1
+        timestamp_counter += 1
+        turn_id = f"turn-{turn_counter}"
+        thread = threads.get(thread_id) or {
+            "id": thread_id,
+            "name": "New thread",
+            "preview": "",
+            "cwd": "",
+            "archived": False,
+            "createdAt": timestamp_counter,
+            "updatedAt": timestamp_counter,
+            "status": "idle",
+            "isSubagent": False,
+            "agentNickname": None,
+            "agentRole": None,
+            "turns": []
+        }
+        turn = {
+            "id": turn_id,
+            "status": "inProgress",
+            "error": None,
+            "startedAt": timestamp_counter,
+            "completedAt": None,
+            "durationMs": None,
+            "items": [
+                {
+                    "id": f"{turn_id}:compact:0",
+                    "type": "contextCompression",
+                    "status": "inProgress"
+                }
+            ]
+        }
+        thread["turns"] = list(thread.get("turns") or []) + [turn]
+        thread["status"] = "running"
+        thread["updatedAt"] = timestamp_counter
+        thread["lastCompactStart"] = params
+        threads[thread_id] = thread
+        write({
+            "id": request_id,
+            "result": {}
         })
     elif method == "turn/steer":
         thread_id = params.get("threadId", "")

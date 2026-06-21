@@ -7,6 +7,17 @@ use crate::thread_read_support::{
 const DUPLICATE_TURN_START_ACTIVE_GRACE_MS: u64 = 30_000;
 const LANGUAGE_BRIDGE_TRANSLATION_TIMEOUT: Duration = Duration::from_secs(180);
 const LANGUAGE_BRIDGE_TRANSLATION_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const CODEX_PERMISSION_PROFILE_READ_ONLY: &str = ":read-only";
+const CODEX_PERMISSION_PROFILE_WORKSPACE: &str = ":workspace";
+const CODEX_PERMISSION_PROFILE_DANGER_FULL_ACCESS: &str = ":danger-full-access";
+
+fn permission_profile_for_sandbox_mode(sandbox_mode: &str) -> &'static str {
+    match sandbox_mode {
+        "danger-full-access" => CODEX_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
+        "read-only" => CODEX_PERMISSION_PROFILE_READ_ONLY,
+        _ => CODEX_PERMISSION_PROFILE_WORKSPACE,
+    }
+}
 
 pub(crate) fn normalize_client_user_message_id(value: Option<&str>) -> Option<String> {
     value
@@ -443,6 +454,7 @@ async fn translate_prompt_with_language_bridge(
             json!({
                 "cwd": cwd,
                 "model": preferences.get("model").cloned().unwrap_or(Value::Null),
+                "permissions": CODEX_PERMISSION_PROFILE_READ_ONLY,
                 "developerInstructions": "You are a private translation preprocessor for Codex Web UI. Return only the requested JSON. Do not call tools and do not solve the user's task.",
                 "ephemeral": true,
                 "threadSource": "subagent",
@@ -477,15 +489,8 @@ async fn translate_prompt_with_language_bridge(
                 "cwd": cwd,
                 "model": preferences.get("model").cloned().unwrap_or(Value::Null),
                 "approvalPolicy": "never",
-                "sandboxPolicy": {
-                    "type": "readOnly",
-                    "access": {
-                        "type": "restricted",
-                        "includePlatformDefaults": true,
-                        "readableRoots": [cwd]
-                    },
-                    "networkAccess": false
-                }
+                "permissions": CODEX_PERMISSION_PROFILE_READ_ONLY,
+                "runtimeWorkspaceRoots": [cwd]
             }),
         )
         .await
@@ -731,15 +736,8 @@ pub(crate) async fn spawn_language_bridge_response_translation_for_completed_tur
                     "cwd": cwd,
                     "model": preferences.get("model").cloned().unwrap_or(Value::Null),
                     "approvalPolicy": "never",
-                    "sandboxPolicy": {
-                        "type": "readOnly",
-                        "access": {
-                            "type": "restricted",
-                            "includePlatformDefaults": true,
-                            "readableRoots": [cwd]
-                        },
-                        "networkAccess": false
-                    }
+                    "permissions": CODEX_PERMISSION_PROFILE_READ_ONLY,
+                    "runtimeWorkspaceRoots": [cwd]
                 }),
             )
             .await
@@ -1191,28 +1189,31 @@ pub(crate) async fn send_turn_payload(
         .get("networkAccess")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let read_only_access = json!({
-        "type": "restricted",
-        "includePlatformDefaults": true,
-        "readableRoots": readable_roots
-    });
-    let sandbox_policy = match sandbox_mode {
-        "danger-full-access" => json!({
-            "type": "dangerFullAccess"
-        }),
-        "read-only" => json!({
-            "type": "readOnly",
-            "access": read_only_access.clone(),
-            "networkAccess": network_access
-        }),
-        _ => json!({
-            "type": "workspaceWrite",
-            "writableRoots": [cwd],
-            "readOnlyAccess": read_only_access.clone(),
-            "networkAccess": network_access,
-            "excludeTmpdirEnvVar": false,
-            "excludeSlashTmp": false
-        }),
+    let runtime_workspace_roots = if sandbox_mode == "read-only" {
+        readable_roots.clone()
+    } else {
+        vec![cwd.clone()]
+    };
+    let permission_profile = permission_profile_for_sandbox_mode(sandbox_mode);
+    let sandbox_policy = if network_access {
+        match sandbox_mode {
+            "danger-full-access" => json!({
+                "type": "dangerFullAccess"
+            }),
+            "read-only" => json!({
+                "type": "readOnly",
+                "networkAccess": true
+            }),
+            _ => json!({
+                "type": "workspaceWrite",
+                "writableRoots": [cwd],
+                "networkAccess": true,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }),
+        }
+    } else {
+        Value::Null
     };
     let model = next_preferences
         .get("model")
@@ -1237,6 +1238,8 @@ pub(crate) async fn send_turn_payload(
                 "cwd": next_preferences.get("cwd").cloned().unwrap_or(Value::Null),
                 "approvalPolicy": next_preferences.get("approvalPolicy").cloned().unwrap_or_else(|| json!("on-request")),
                 "sandboxPolicy": sandbox_policy,
+                "permissions": if network_access { Value::Null } else { Value::String(permission_profile.to_string()) },
+                "runtimeWorkspaceRoots": runtime_workspace_roots,
                 "model": model.clone(),
                 "personality": next_preferences.get("personality").cloned().unwrap_or(Value::Null),
                 "serviceTier": match next_preferences.get("speed").and_then(Value::as_str) {
@@ -1322,6 +1325,226 @@ pub(crate) async fn send_turn_payload(
             .cloned()
             .unwrap_or(Value::Null)
     }))
+    }
+    .await;
+
+    if result.is_err() {
+        let was_pending = state.pending_turn_starts.lock().await.remove(&runtime_key);
+        if was_pending {
+            let was_starting = with_ui_state_read(state, profile_id, |ui_state| {
+                Ok(ui_state
+                    .get("runtimeStatusByThreadId")
+                    .and_then(Value::as_object)
+                    .and_then(|entries| entries.get(session_id))
+                    .and_then(|status| normalized_thread_status(Some(status)))
+                    .as_deref()
+                    == Some("starting"))
+            })
+            .await
+            .unwrap_or(false);
+            if was_starting {
+                set_runtime_session_status(state, profile_id, session_id, "failed").await;
+                emit_session_notification(
+                    state,
+                    profile_id,
+                    session_id,
+                    json!({
+                        "kind": "notification",
+                        "method": "thread/status/changed",
+                        "params": {
+                            "threadId": session_id,
+                            "status": "failed"
+                        }
+                    }),
+                )
+                .await;
+                emit_session_summary_updated(state, profile_id, session_id, None, Some("failed"))
+                    .await;
+            } else {
+                emit_session_summary_updated(state, profile_id, session_id, None, None).await;
+            }
+        }
+    }
+    result
+}
+
+pub(crate) async fn start_session_compaction_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<Value> {
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        session_id,
+    );
+    clear_stale_session_runtime_activity_if_app_server_missing(
+        state,
+        profile_id,
+        session_id,
+        DUPLICATE_TURN_START_ACTIVE_GRACE_MS,
+        "codex app-server is not running",
+    )
+    .await;
+    {
+        let mut pending_turn_starts = state.pending_turn_starts.lock().await;
+        if !pending_turn_starts.insert(runtime_key.clone()) {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                json!({
+                    "code": "TURN_ALREADY_STARTING",
+                    "message": "A response is already starting for this session."
+                })
+                .to_string(),
+            ));
+        }
+    }
+
+    let result = async {
+        if let Some(cached_active_turn_id) =
+            state.active_turns.lock().await.get(&runtime_key).cloned()
+        {
+            let runtime_status_updated_at = with_ui_state_read(state, profile_id, |ui_state| {
+                Ok(ui_state
+                    .get("runtimeStatusByThreadId")
+                    .and_then(Value::as_object)
+                    .and_then(|entries| entries.get(session_id))
+                    .and_then(|entry| entry.get("updatedAt"))
+                    .and_then(Value::as_u64))
+            })
+            .await
+            .ok()
+            .flatten();
+            if runtime_status_updated_at.is_some_and(|updated_at| {
+                now_unix_ms().saturating_sub(updated_at) < DUPLICATE_TURN_START_ACTIVE_GRACE_MS
+            }) {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "code": "TURN_ALREADY_RUNNING",
+                        "message": "A response is already running for this session.",
+                        "turnId": cached_active_turn_id
+                    })
+                    .to_string(),
+                ));
+            }
+
+            let thread = read_thread_payload(state, profile_id, session_id, true).await?;
+            let active_turn_id = thread
+                .get("turns")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .and_then(active_turn_id_from_turns);
+            if let Some(active_turn_id) = active_turn_id {
+                state
+                    .active_turns
+                    .lock()
+                    .await
+                    .insert(runtime_key.clone(), active_turn_id.clone());
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "code": "TURN_ALREADY_RUNNING",
+                        "message": "A response is already running for this session.",
+                        "turnId": active_turn_id
+                    })
+                    .to_string(),
+                ));
+            }
+            state.active_turns.lock().await.remove(&runtime_key);
+        }
+
+        set_runtime_session_status(state, profile_id, session_id, "starting").await;
+        emit_session_summary_updated(state, profile_id, session_id, None, Some("starting")).await;
+        emit_session_notification(
+            state,
+            profile_id,
+            session_id,
+            json!({
+                "kind": "notification",
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": session_id,
+                    "status": "starting"
+                }
+            }),
+        )
+        .await;
+
+        cancel_scheduled_shutdown_for_activity(state, profile_id).await;
+
+        let client = app_server_client_for_session_turn(state, profile_id, session_id)
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to connect to codex app-server: {error}"),
+                )
+            })?;
+        let response = match client
+            .request("thread/compact/start", json!({ "threadId": session_id }))
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(turn_app_server_error(
+                    state,
+                    profile_id,
+                    &client,
+                    "Failed to start context compression",
+                    error,
+                )
+                .await);
+            }
+        };
+
+        let mut turn_id = response
+            .get("turn")
+            .and_then(|value| value.get("id"))
+            .and_then(Value::as_str)
+            .or_else(|| response.get("turnId").and_then(Value::as_str))
+            .map(str::to_string);
+        if turn_id.is_none() {
+            turn_id = read_thread_payload(state, profile_id, session_id, true)
+                .await
+                .ok()
+                .and_then(|thread| {
+                    thread
+                        .get("turns")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .and_then(active_turn_id_from_turns)
+                });
+        }
+        if let Some(turn_id) = turn_id.as_deref() {
+            state
+                .active_turns
+                .lock()
+                .await
+                .insert(runtime_key.clone(), turn_id.to_string());
+        }
+        state.pending_turn_starts.lock().await.remove(&runtime_key);
+        set_runtime_session_status(state, profile_id, session_id, "running").await;
+        set_session_highlight(state, profile_id, session_id, None).await;
+        emit_session_notification(
+            state,
+            profile_id,
+            session_id,
+            json!({
+                "kind": "notification",
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": session_id,
+                    "status": "running"
+                }
+            }),
+        )
+        .await;
+        emit_session_summary_updated(state, profile_id, session_id, None, Some("running")).await;
+
+        Ok(json!({
+            "ok": true,
+            "turnId": turn_id
+        }))
     }
     .await;
 

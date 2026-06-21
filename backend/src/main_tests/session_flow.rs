@@ -3569,6 +3569,97 @@ async fn local_session_detail_marks_failed_context_compaction_tail_terminal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_session_detail_marks_silent_empty_completion_failed() {
+    let sandbox = unique_test_dir("session-detail-empty-completion-failed");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000116";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    fs::write(
+        rollout_dir.join(format!("rollout-2026-04-24T01-09-00-{session_id}.jsonl")),
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:09:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:09:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-silent"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "continue the previous work"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:09:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-silent",
+                    "last_agent_message": null
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+    let turn = detail
+        .get("thread")
+        .and_then(|thread| thread.get("turns"))
+        .and_then(Value::as_array)
+        .and_then(|turns| turns.first())
+        .expect("silent turn should remain visible");
+
+    assert_eq!(turn.get("status").and_then(Value::as_str), Some("failed"));
+    assert_eq!(
+        turn.get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        Some(EMPTY_ASSISTANT_RESPONSE_CODE)
+    );
+    assert!(
+        turn.get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                    && item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains("without an assistant response"))
+            }))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_session_detail_does_not_resurrect_active_tail_behind_terminal_cache() {
     let sandbox = unique_test_dir("session-detail-active-terminal-cache");
     let workspace = sandbox.join("workspace");
@@ -4546,6 +4637,20 @@ async fn send_turn_payload_uses_app_server_and_updates_session_state() {
         last_turn_start.get("serviceTier").and_then(Value::as_str),
         Some("fast")
     );
+    let sandbox_policy = last_turn_start
+        .get("sandboxPolicy")
+        .and_then(Value::as_object)
+        .expect("network-enabled turn should preserve legacy sandbox policy");
+    assert_eq!(
+        sandbox_policy.get("type").and_then(Value::as_str),
+        Some("workspaceWrite")
+    );
+    assert!(sandbox_policy.get("readOnlyAccess").is_none());
+    assert!(
+        last_turn_start
+            .get("permissions")
+            .is_none_or(Value::is_null)
+    );
     assert_eq!(
         last_turn_start
             .get("clientUserMessageId")
@@ -4887,6 +4992,98 @@ async fn send_turn_payload_clears_runtime_state_when_turn_start_fails() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_session_compaction_payload_proxies_native_compact_start() {
+    let sandbox = unique_test_dir("manual-compact-start");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        None,
+        Some("Manual compact"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let client = app_server_client(&state, "default").await.unwrap();
+
+    let payload = start_session_compaction_payload(&state, "default", &session_id)
+        .await
+        .unwrap();
+    assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+
+    let request_count = client
+        .request(
+            "debug/requestCount",
+            json!({ "target": "thread/compact/start" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(1));
+
+    let runtime_status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][&session_id].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime_status.get("status").and_then(Value::as_str),
+        Some("running")
+    );
+
+    let runtime_key = runtime_session_key(
+        resolve_runtime_profile_entry(&state.config, "default").0,
+        &session_id,
+    );
+    assert!(
+        state
+            .pending_turn_starts
+            .lock()
+            .await
+            .get(&runtime_key)
+            .is_none()
+    );
+
+    let thread = read_thread_payload(&state, "default", &session_id, true)
+        .await
+        .unwrap();
+    let turns = thread.get("turns").and_then(Value::as_array).unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(
+        turns[0]
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str),
+        Some("contextCompression")
+    );
+
+    let summary = build_session_summary_payload(&state, "default", &session_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.get("status").and_then(Value::as_str),
+        Some("running")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_turn_payload_surfaces_rollout_recovery_when_resume_fails() {
     let sandbox = unique_test_dir("turn-send-resume-rollout-recovery");
     let workspace = sandbox.join("workspace");
@@ -5065,6 +5262,23 @@ async fn send_turn_payload_translates_language_bridge_prompt_with_temp_session()
             .and_then(|item| item.get("text"))
             .and_then(Value::as_str),
         Some("Summarize it.")
+    );
+    assert_eq!(
+        last_turn_start.get("permissions").and_then(Value::as_str),
+        Some(":workspace")
+    );
+    assert!(
+        last_turn_start
+            .get("sandboxPolicy")
+            .is_none_or(Value::is_null)
+    );
+    assert_eq!(
+        last_turn_start
+            .get("runtimeWorkspaceRoots")
+            .and_then(Value::as_array)
+            .and_then(|roots| roots.first())
+            .and_then(Value::as_str),
+        Some(workspace.to_str().unwrap())
     );
     let instructions = last_turn_start
         .get("collaborationMode")

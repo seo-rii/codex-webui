@@ -142,6 +142,93 @@ pub(crate) fn is_internal_session_item_type(item_type: &str) -> bool {
     )
 }
 
+pub(crate) const EMPTY_ASSISTANT_RESPONSE_CODE: &str = "EMPTY_ASSISTANT_RESPONSE";
+pub(crate) const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "Codex completed this turn without an assistant response. Send the message again or check the Codex app-server logs.";
+
+pub(crate) fn session_turn_has_visible_agent_output(turn: &Value) -> bool {
+    turn.get("items")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                let item_type = item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(normalize_session_item_type_name)
+                    .unwrap_or("unknown");
+                item_type != "userMessage" && !is_internal_session_item_type(item_type)
+            })
+        })
+}
+
+fn turn_error_message(turn: &Value) -> Option<String> {
+    turn.get("error")
+        .and_then(|error| {
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+pub(crate) fn mark_turn_without_agent_output_failed(
+    turn: &mut Value,
+    item_id_suffix: impl AsRef<str>,
+) -> bool {
+    if session_turn_has_visible_agent_output(turn) {
+        return false;
+    }
+    let status = turn.get("status").and_then(Value::as_str);
+    let existing_error_message = turn_error_message(turn);
+    if !matches!(
+        status,
+        Some("completed" | "done" | "success" | "failed" | "error" | "systemError")
+    ) || (existing_error_message.is_none()
+        && !matches!(status, Some("completed" | "done" | "success")))
+    {
+        return false;
+    }
+    let message =
+        existing_error_message.unwrap_or_else(|| EMPTY_ASSISTANT_RESPONSE_MESSAGE.to_string());
+
+    let turn_id = turn
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("turn")
+        .to_string();
+    let error_payload = turn
+        .get("error")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "code": EMPTY_ASSISTANT_RESPONSE_CODE,
+                "message": message
+            })
+        });
+    if let Some(turn_object) = turn.as_object_mut() {
+        turn_object.insert("status".to_string(), Value::String("failed".to_string()));
+        turn_object.insert("error".to_string(), error_payload);
+        let items = turn_object
+            .entry("items".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(items) = items.as_array_mut() {
+            items.push(json!({
+                "id": format!("{}:empty-assistant-response:{}", turn_id, item_id_suffix.as_ref()),
+                "type": "agentMessage",
+                "text": message,
+                "phase": "final_answer",
+                "status": "failed"
+            }));
+        }
+        return true;
+    }
+
+    false
+}
+
 pub(crate) fn normalize_session_item_payload(
     item: &Value,
     turn_id: &str,

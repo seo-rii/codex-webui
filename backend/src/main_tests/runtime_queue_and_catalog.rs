@@ -3031,6 +3031,100 @@ fn thread_goal_notifications_are_mapped_for_session_streams() {
     );
 }
 
+#[test]
+fn silent_turn_completion_notifications_are_mapped_as_failed() {
+    let event = map_app_server_session_notification(&AppServerNotification {
+        method: "turn/completed".to_string(),
+        params: json!({
+            "turnId": "turn-silent",
+            "turn": {
+                "id": "turn-silent",
+                "status": "completed",
+                "items": [
+                    {
+                        "id": "turn-silent:user",
+                        "type": "userMessage",
+                        "text": "continue the previous work"
+                    }
+                ]
+            }
+        }),
+    })
+    .unwrap();
+    let turn = event
+        .get("params")
+        .and_then(|params| params.get("turn"))
+        .expect("mapped turn");
+
+    assert_eq!(turn.get("status").and_then(Value::as_str), Some("failed"));
+    assert_eq!(
+        turn.get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        Some(EMPTY_ASSISTANT_RESPONSE_CODE)
+    );
+    assert!(
+        turn.get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                    && item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains("without an assistant response"))
+            }))
+    );
+}
+
+#[test]
+fn error_only_turn_completion_notifications_keep_visible_error_message() {
+    let event = map_app_server_session_notification(&AppServerNotification {
+        method: "turn/completed".to_string(),
+        params: json!({
+            "turnId": "turn-context-full",
+            "turn": {
+                "id": "turn-context-full",
+                "status": "failed",
+                "error": {
+                    "codexErrorInfo": "contextWindowExceeded",
+                    "message": "Codex ran out of room in the model's context window."
+                },
+                "items": [
+                    {
+                        "id": "turn-context-full:user",
+                        "type": "userMessage",
+                        "text": "계속 작업해"
+                    }
+                ]
+            }
+        }),
+    })
+    .unwrap();
+    let turn = event
+        .get("params")
+        .and_then(|params| params.get("turn"))
+        .expect("mapped turn");
+
+    assert_eq!(turn.get("status").and_then(Value::as_str), Some("failed"));
+    assert_eq!(
+        turn.get("error")
+            .and_then(|error| error.get("codexErrorInfo"))
+            .and_then(Value::as_str),
+        Some("contextWindowExceeded")
+    );
+    assert!(
+        turn.get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                    && item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains("context window"))
+            }))
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_goal_notifications_update_cached_goal_snapshot() {
     let sandbox = unique_test_dir("thread-goal-notification-cache");

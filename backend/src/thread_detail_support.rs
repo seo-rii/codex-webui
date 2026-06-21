@@ -726,6 +726,10 @@ fn build_turn_window_from_rollout_records(
                             }
                         }
                     }
+                    mark_turn_without_agent_output_failed(
+                        &mut turns[index],
+                        record_index.to_string(),
+                    );
                 }
             }
             ("event_msg", "error") => {

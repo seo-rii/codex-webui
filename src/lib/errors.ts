@@ -1,4 +1,5 @@
 export type AppErrorCode =
+  | "CONTEXT_WINDOW_EXCEEDED"
   | "EMPTY_MESSAGE"
   | "FORBIDDEN_ROLE"
   | "USAGE_LIMIT_EXCEEDED"
@@ -115,6 +116,54 @@ export function isUsageLimitErrorPayload(value: unknown) {
   return false;
 }
 
+export function isContextWindowExceededPayload(value: unknown) {
+  const parsed = maybeParseJson(value);
+  const stack: unknown[] = [parsed];
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (typeof current === "string") {
+      const lowered = current.toLowerCase();
+      const compact = current.replace(/[^a-z0-9]/giu, "").toLowerCase();
+      if (
+        compact.includes("contextwindowexceeded") ||
+        compact.includes("contextwindowlimitexceeded") ||
+        (lowered.includes("context window") &&
+          (lowered.includes("exceeded") || lowered.includes("full") || lowered.includes("limit")))
+      ) {
+        return true;
+      }
+      const maybeJson = maybeParseJson(current);
+      if (maybeJson !== current) {
+        stack.push(maybeJson);
+      }
+      continue;
+    }
+
+    if (Array.isArray(current)) {
+      stack.push(...current);
+      continue;
+    }
+
+    const record = asRecord(current);
+    if (!record) {
+      continue;
+    }
+
+    if (
+      normalizedErrorInfo(record.code) === "contextwindowexceeded" ||
+      normalizedErrorInfo(record.codexErrorInfo) === "contextwindowexceeded" ||
+      normalizedErrorInfo(record.errorInfo) === "contextwindowexceeded"
+    ) {
+      return true;
+    }
+
+    stack.push(...Object.values(record).map(maybeParseJson));
+  }
+
+  return false;
+}
+
 export function appErrorRetryAtMs(value: unknown): number | undefined {
   const now = Date.now();
   const candidates: number[] = [];
@@ -182,6 +231,12 @@ export function parseAppError(value: unknown): AppErrorPayload | null {
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (!trimmed.startsWith("{")) {
+      if (isContextWindowExceededPayload(trimmed)) {
+        return {
+          code: "CONTEXT_WINDOW_EXCEEDED",
+          message: trimmed
+        };
+      }
       if (isUsageLimitErrorPayload(trimmed)) {
         return {
           code: "USAGE_LIMIT_EXCEEDED",
@@ -214,7 +269,12 @@ export function parseAppError(value: unknown): AppErrorPayload | null {
     normalizedErrorInfo(record.code) === "usagelimitexceeded" ||
     normalizedErrorInfo(record.codexErrorInfo) === "usagelimitexceeded" ||
     normalizedErrorInfo(record.errorInfo) === "usagelimitexceeded";
-  if (!directUsageLimit) {
+  const directContextWindow =
+    normalizedErrorInfo(record.code) === "contextwindowexceeded" ||
+    normalizedErrorInfo(record.codexErrorInfo) === "contextwindowexceeded" ||
+    normalizedErrorInfo(record.errorInfo) === "contextwindowexceeded" ||
+    isContextWindowExceededPayload(record);
+  if (!directUsageLimit && !directContextWindow) {
     const nestedMessage = parseAppError(record.message);
     if (nestedMessage) {
       return nestedMessage;
@@ -224,6 +284,8 @@ export function parseAppError(value: unknown): AppErrorPayload | null {
   const code =
     typeof record.code === "string"
       ? record.code
+      : directContextWindow
+        ? "CONTEXT_WINDOW_EXCEEDED"
       : directUsageLimit || isUsageLimitErrorPayload(record)
         ? "USAGE_LIMIT_EXCEEDED"
         : null;

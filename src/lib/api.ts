@@ -876,6 +876,12 @@ export const api = {
     });
   },
 
+  startSessionCompact(sessionId: string) {
+    return ws.request<{ ok: true; turnId?: string | null }>("session/compact/start", {
+      sessionId
+    });
+  },
+
   browseDirectories(currentPath: string | null) {
     return ws.request<DirectoryPayload>("directories/browse", { currentPath });
   },

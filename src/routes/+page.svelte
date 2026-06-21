@@ -65,7 +65,7 @@
   import StartupAlertModal from "$lib/components/StartupAlertModal.svelte";
   import WorkspaceHeader from "$lib/components/WorkspaceHeader.svelte";
   import WorkspaceTabStrip from "$lib/components/WorkspaceTabStrip.svelte";
-  import { isUsageLimitErrorPayload, parseAppError } from "$lib/errors";
+  import { isContextWindowExceededPayload, isUsageLimitErrorPayload, parseAppError } from "$lib/errors";
   import { describeUiError } from "$lib/ui-errors";
   import { activeLocale, localeOptions, localeSignal, updateLocale } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
@@ -198,6 +198,11 @@
     totalLines: number | null;
     recoverableLines: number | null;
     skippedLines: number | null;
+    busy: boolean;
+  };
+  type ManualCompactPromptState = {
+    sessionId: string;
+    message: string;
     busy: boolean;
   };
   type ArenaWorkspaceComponent = typeof import("$lib/components/ArenaWorkspace.svelte").default;
@@ -406,6 +411,8 @@
   let startupAlertDismissed = $state(false);
   let sessionRecoveryPrompt = $state<SessionRecoveryPromptState | null>(null);
   let dismissedSessionRecoveryPromptForSessionId = $state<string | null>(null);
+  let manualCompactPrompt = $state<ManualCompactPromptState | null>(null);
+  let dismissedManualCompactPromptForSessionId = $state<string | null>(null);
   let startupAlertNow = $state(Date.now());
   let deferredInstallPrompt = $state<BeforeInstallPromptEvent | null>(null);
   let pwaInstalled = $state(false);
@@ -494,6 +501,7 @@
   const toolOutputInitialChars = 24_000;
   const composerTextareaMinHeight = 52;
   const sessionQueryParamKey = "session";
+  const sessionNewParamKey = "sessionNew";
   const sessionSearchQueryParamKey = "sessionSearch";
   const sessionSearchScopeParamKey = "sessionSearchScope";
   const sessionArchivedParamKey = "sessionArchived";
@@ -886,6 +894,38 @@
       contextCompression: m.context_compression(),
       contextCompressionInProgress: m.context_compression_in_progress(),
       contextCompressionCompleted: m.context_compression_completed(),
+      manualCompactTitle:
+        locale === "ko"
+          ? "컨텍스트가 가득 찼습니다"
+          : locale === "ja"
+            ? "Context window is full"
+            : locale === "zh-Hans"
+              ? "上下文窗口已满"
+              : locale === "zh-Hant"
+                ? "上下文視窗已滿"
+                : locale === "fr"
+                  ? "Fenêtre de contexte pleine"
+                  : locale === "es"
+                    ? "La ventana de contexto está llena"
+                    : "Context window is full",
+      manualCompactDescription:
+        locale === "ko"
+          ? "자동 압축이 멈춘 경우 수동으로 컨텍스트 압축을 다시 시작할 수 있습니다."
+          : "If automatic compaction stopped, start context compression manually.",
+      manualCompactAction:
+        locale === "ko"
+          ? "수동 압축 시작"
+          : locale === "ja"
+            ? "Start manual compact"
+            : locale === "zh-Hans"
+              ? "Start manual compact"
+              : locale === "zh-Hant"
+                ? "Start manual compact"
+                : "Start manual compact",
+      manualCompactStarting:
+        locale === "ko" ? "압축 시작 중" : "Starting compact",
+      manualCompactStarted:
+        locale === "ko" ? "컨텍스트 압축을 시작했습니다." : "Context compression started.",
       showOlderWorkItems: (count: number) =>
         locale === "ko" ? `이전 작업 과정 ${count}개 더 보기` : `Show ${count} older work items`,
       showFullMessage: locale === "ko" ? "전체 메시지 보기" : "Show full message",
@@ -1215,7 +1255,7 @@
     mobileSidebarOpen = false;
     composerSettingsOpen = false;
     activeWorkspaceTabId = "chat";
-    syncSelectedSessionInUrl(null);
+    syncSelectedSessionInUrl(null, { draft: true });
     queueMicrotask(() => {
       scheduleComposerTextareaResize();
     });
@@ -1543,6 +1583,7 @@
   let transcriptDockElement = $state<HTMLDivElement | undefined>(undefined);
   let stickTranscriptToBottom = $state(true);
   let forceTranscriptScroll = $state(false);
+  let pendingTranscriptBottomScroll = $state(false);
   let transcriptAutoScrollSuspendedByUser = $state(false);
   let composerSettingsTriggerElement = $state<HTMLButtonElement | undefined>(undefined);
   let composerSettingsPopoverElement = $state<HTMLDivElement | undefined>(undefined);
@@ -2032,6 +2073,8 @@
         return m.slash_plan_description();
       case "goal":
         return m.slash_goal_description();
+      case "compact":
+        return ui.manualCompactDescription;
       case "fast":
         return m.slash_fast_description();
       default:
@@ -3003,7 +3046,11 @@
   });
 
   $effect(() => {
-    if (!conversation || !transcriptElement || (!stickTranscriptToBottom && !forceTranscriptScroll)) {
+    if (
+      !conversation ||
+      !transcriptElement ||
+      (!stickTranscriptToBottom && !forceTranscriptScroll && !pendingTranscriptBottomScroll)
+    ) {
       return;
     }
     scheduleTranscriptScrollToBottom();
@@ -3013,10 +3060,23 @@
     if (!transcriptElement || !conversation) {
       return;
     }
-    if (!inlineGenerationState && !loadingDetail && !sending) {
+    if (!inlineGenerationState && !loadingDetail && !sending && !pendingTranscriptBottomScroll) {
       return;
     }
-    if (!stickTranscriptToBottom && !forceTranscriptScroll) {
+    if (!stickTranscriptToBottom && !forceTranscriptScroll && !pendingTranscriptBottomScroll) {
+      return;
+    }
+    scheduleTranscriptScrollToBottom();
+  });
+
+  $effect(() => {
+    if (
+      !transcriptElement ||
+      !conversation ||
+      loadingDetail ||
+      loadingOlderTurns ||
+      (!pendingTranscriptBottomScroll && !forceTranscriptScroll)
+    ) {
       return;
     }
     scheduleTranscriptScrollToBottom();
@@ -3752,6 +3812,7 @@
     transcriptAutoScrollSuspendedByUser = true;
     stickTranscriptToBottom = false;
     forceTranscriptScroll = false;
+    pendingTranscriptBottomScroll = false;
     if (transcriptScrollFrame !== null && typeof window !== "undefined") {
       cancelAnimationFrame(transcriptScrollFrame);
     }
@@ -3762,10 +3823,12 @@
   function requestTranscriptBottomScroll(force = false) {
     if (force) {
       transcriptAutoScrollSuspendedByUser = false;
+      pendingTranscriptBottomScroll = true;
       noteTranscriptProgrammaticScroll(700);
     } else if (transcriptAutoScrollSuspendedByUser && !isTranscriptAtBottom()) {
       stickTranscriptToBottom = false;
       forceTranscriptScroll = false;
+      pendingTranscriptBottomScroll = false;
       return;
     }
 
@@ -3794,7 +3857,7 @@
     if (!transcriptElement) {
       return;
     }
-    if (transcriptAutoScrollSuspendedByUser && !forceTranscriptScroll) {
+    if (transcriptAutoScrollSuspendedByUser && !forceTranscriptScroll && !pendingTranscriptBottomScroll) {
       return;
     }
 
@@ -3841,12 +3904,19 @@
           return;
         }
         if (
+          loadingDetail ||
           loadingOlderTurns ||
-          (transcriptAutoScrollSuspendedByUser && !forceTranscriptScroll) ||
-          (!stickTranscriptToBottom && !forceTranscriptScroll)
+          (transcriptAutoScrollSuspendedByUser && !forceTranscriptScroll && !pendingTranscriptBottomScroll) ||
+          (!stickTranscriptToBottom && !forceTranscriptScroll && !pendingTranscriptBottomScroll)
         ) {
           transcriptScrollFrame = null;
-          forceTranscriptScroll = false;
+          if (loadingDetail || loadingOlderTurns) {
+            stickTranscriptToBottom = true;
+            forceTranscriptScroll = true;
+          } else {
+            forceTranscriptScroll = false;
+            pendingTranscriptBottomScroll = false;
+          }
           return;
         }
 
@@ -3862,6 +3932,7 @@
 
         if (stableFrames >= 2 || window.performance.now() - startedAt >= 700) {
           transcriptScrollFrame = null;
+          pendingTranscriptBottomScroll = false;
           forceTranscriptScroll = false;
           return;
         }
@@ -4508,7 +4579,15 @@
     return value || null;
   }
 
-  function syncSelectedSessionInUrl(sessionId: string | null) {
+  function getDraftSessionRequestedFromUrl() {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    const params = new URL(window.location.href).searchParams;
+    return !params.get(sessionQueryParamKey)?.trim() && isEnabledQueryParam(params.get(sessionNewParamKey));
+  }
+
+  function syncSelectedSessionInUrl(sessionId: string | null, options: { draft?: boolean } = {}) {
     if (typeof window === "undefined") {
       return;
     }
@@ -4516,8 +4595,13 @@
     const url = new URL(window.location.href);
     if (sessionId) {
       url.searchParams.set(sessionQueryParamKey, sessionId);
+      url.searchParams.delete(sessionNewParamKey);
+    } else if (options.draft) {
+      url.searchParams.delete(sessionQueryParamKey);
+      url.searchParams.set(sessionNewParamKey, "1");
     } else {
       url.searchParams.delete(sessionQueryParamKey);
+      url.searchParams.delete(sessionNewParamKey);
     }
 
     const nextUrl = `${url.pathname}${url.search}${url.hash}`;
@@ -4706,6 +4790,7 @@
 
       readSessionListStateFromUrl();
       const requestedSessionId = getRequestedSessionIdFromUrl();
+      const draftSessionRequested = getDraftSessionRequestedFromUrl();
       const [nextConfig] = await Promise.all([api.getConfig(), refreshSessions()]);
       config = applyLocalComposerPreferencesToConfig(nextConfig);
       syncConfiguredTheme(config);
@@ -4723,6 +4808,11 @@
           return;
         }
         syncSelectedSessionInUrl(null);
+      }
+
+      if (draftSessionRequested) {
+        activateDraftSession(config.defaults);
+        return;
       }
 
       const firstSession = sessions[0] ?? null;
@@ -5033,6 +5123,8 @@
     sendIntent = null;
     sessionRecoveryPrompt = null;
     dismissedSessionRecoveryPromptForSessionId = null;
+    manualCompactPrompt = null;
+    dismissedManualCompactPromptForSessionId = null;
     clearStaleSessionCatchup();
     mobileSidebarOpen = false;
     composerSettingsOpen = false;
@@ -5125,6 +5217,9 @@
         const params = payload.params as Record<string, unknown>;
         const turn = params.turn && typeof params.turn === "object" ? (params.turn as Record<string, unknown>) : null;
         const appServerError = payload.method === "error" ? (params.error ?? params) : (turn?.error ?? params.error);
+        if (appServerError && showManualCompactPromptFromError(appServerError, sessionId)) {
+          errorText = describeUiError(appServerError);
+        }
         if (appServerError && isUsageLimitErrorPayload(appServerError)) {
           errorText = describeUiError(appServerError);
         }
@@ -5212,6 +5307,7 @@
         }
 
         if (payload.kind === "notification" && payload.method === "turn/completed") {
+          updateManualCompactPrompt(sessionId, conversation);
           scheduleSelectedSessionStateRefresh(sessionId, 450);
           scheduleSelectedSessionCompletionRefresh(sessionId);
         }
@@ -5470,6 +5566,7 @@
     clearHydrationRefresh();
     clearStaleSessionCatchup();
     updateSessionRecoveryPrompt(sessionId, nextConversation);
+    updateManualCompactPrompt(sessionId, nextConversation);
     return nextConversation;
   }
 
@@ -5520,6 +5617,91 @@
       busy: false
     };
     return true;
+  }
+
+  function getConversationContextWindowMessage(nextConversation: ConversationState) {
+    for (const turn of [...nextConversation.thread.turns].reverse()) {
+      if (!turn.error) {
+        continue;
+      }
+      if (isContextWindowExceededPayload(turn.error)) {
+        return describeUiError(turn.error);
+      }
+      if (isContextWindowExceededPayload(turn.error.message)) {
+        return turn.error.message ?? ui.manualCompactDescription;
+      }
+    }
+    return null;
+  }
+
+  function updateManualCompactPrompt(sessionId: string, nextConversation: ConversationState) {
+    const message = getConversationContextWindowMessage(nextConversation);
+    if (!message || dismissedManualCompactPromptForSessionId === sessionId) {
+      if (manualCompactPrompt?.sessionId === sessionId && !manualCompactPrompt.busy) {
+        manualCompactPrompt = null;
+      }
+      return;
+    }
+
+    manualCompactPrompt = {
+      sessionId,
+      message,
+      busy: manualCompactPrompt?.sessionId === sessionId ? manualCompactPrompt.busy : false
+    };
+  }
+
+  function showManualCompactPromptFromError(error: unknown, fallbackSessionId: string | null = null) {
+    if (!isContextWindowExceededPayload(error)) {
+      return false;
+    }
+    const parsed = parseAppError(error);
+    const sessionId = parsed?.sessionId ?? fallbackSessionId;
+    if (!sessionId || dismissedManualCompactPromptForSessionId === sessionId) {
+      return false;
+    }
+    manualCompactPrompt = {
+      sessionId,
+      message: parsed?.message ?? describeUiError(error) ?? ui.manualCompactDescription,
+      busy: manualCompactPrompt?.sessionId === sessionId ? manualCompactPrompt.busy : false
+    };
+    return true;
+  }
+
+  function dismissManualCompactPrompt() {
+    if (manualCompactPrompt?.sessionId) {
+      dismissedManualCompactPromptForSessionId = manualCompactPrompt.sessionId;
+    }
+    manualCompactPrompt = null;
+  }
+
+  async function startManualCompactFromPrompt() {
+    const prompt = manualCompactPrompt;
+    if (!prompt || prompt.busy || readOnlyRole) {
+      return;
+    }
+
+    manualCompactPrompt = {
+      ...prompt,
+      busy: true
+    };
+
+    try {
+      await api.startSessionCompact(prompt.sessionId);
+      noticeText = ui.manualCompactStarted;
+      dismissedManualCompactPromptForSessionId = null;
+      manualCompactPrompt = null;
+      if (selectedSessionId === prompt.sessionId) {
+        scheduleSelectedSessionStateRefresh(prompt.sessionId, 450);
+      }
+    } catch (error) {
+      errorText = describeError(error);
+      if (manualCompactPrompt?.sessionId === prompt.sessionId) {
+        manualCompactPrompt = {
+          ...manualCompactPrompt,
+          busy: false
+        };
+      }
+    }
   }
 
   function dismissSessionRecoveryPrompt() {
@@ -6182,6 +6364,7 @@
     showArchivedSessions = false;
     sessionSearchQuery = "";
     sessionSearchScope = "summary";
+    syncSessionListStateInUrl();
     mobileSidebarOpen = false;
     draftSelectedSkills = [];
     composerSkillQuery = "";
@@ -6938,6 +7121,32 @@
         await startReviewFromSlash(args);
       } catch (error) {
         errorText = describeError(error);
+      }
+      return true;
+    }
+
+    if (command === "compact") {
+      if (readOnlyRole) {
+        errorText = m.error_forbidden_role();
+        return true;
+      }
+      const selectedBinding = ensureSelectedSessionBinding();
+      if (!selectedBinding) {
+        return true;
+      }
+      try {
+        await api.startSessionCompact(selectedBinding.sessionId);
+        noticeText = ui.manualCompactStarted;
+        dismissedManualCompactPromptForSessionId = null;
+        if (manualCompactPrompt?.sessionId === selectedBinding.sessionId) {
+          manualCompactPrompt = null;
+        }
+        scheduleSelectedSessionStateRefresh(selectedBinding.sessionId, 450);
+      } catch (error) {
+        errorText = describeError(error);
+      } finally {
+        draft = "";
+        scheduleComposerTextareaResize();
       }
       return true;
     }
@@ -10130,6 +10339,7 @@
       if (typeof window !== "undefined") {
         const nextUrl = new URL(window.location.href);
         nextUrl.searchParams.set(sessionQueryParamKey, threadId);
+        nextUrl.searchParams.delete(sessionNewParamKey);
         window.open(nextUrl.toString(), "_blank", "noopener,noreferrer");
         return;
       }
@@ -10680,14 +10890,18 @@
     if (isTranscriptAtBottom()) {
       transcriptAutoScrollSuspendedByUser = false;
       stickTranscriptToBottom = true;
+      if (!loadingDetail && !loadingOlderTurns) {
+        pendingTranscriptBottomScroll = false;
+      }
     } else if (
       hasTranscriptUserScrollIntent() ||
-      transcriptAutoScrollSuspendedByUser ||
-      getTranscriptNow() > transcriptProgrammaticScrollUntil
+      transcriptAutoScrollSuspendedByUser
     ) {
       suspendTranscriptAutoScrollForUser();
-    } else if (forceTranscriptScroll) {
+    } else if (forceTranscriptScroll || pendingTranscriptBottomScroll) {
       stickTranscriptToBottom = true;
+    } else if (getTranscriptNow() > transcriptProgrammaticScrollUntil) {
+      suspendTranscriptAutoScrollForUser();
     } else if (stickTranscriptToBottom) {
       scheduleTranscriptScrollToBottom();
       return;
@@ -12201,6 +12415,46 @@
                       >
                         {m.clear_all()}
                       </button>
+                    </div>
+                  </div>
+                {/if}
+
+                {#if manualCompactPrompt && manualCompactPrompt.sessionId === conversation.thread.id}
+                  <div
+                    class="rounded-2xl border px-3 py-3 shadow-sm"
+                    style="border-color: rgba(245, 158, 11, 0.38); background: color-mix(in srgb, var(--panel-strong) 88%, rgba(245, 158, 11, 0.12)); color: var(--ink-strong);"
+                  >
+                    <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div class="min-w-0 flex items-start gap-3">
+                        <span class="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-amber-200 bg-amber-50 text-amber-700">
+                          <AlertCircle size={15} />
+                        </span>
+                        <div class="min-w-0">
+                          <p class="text-sm font-bold">{ui.manualCompactTitle}</p>
+                          <p class="mt-1 line-clamp-2 text-xs leading-5" style="color: var(--muted);">
+                            {manualCompactPrompt.message || ui.manualCompactDescription}
+                          </p>
+                        </div>
+                      </div>
+                      <div class="flex shrink-0 items-center gap-2">
+                        <button
+                          class="ui-animated-button ui-animated-button--soft inline-flex h-8 items-center gap-2 rounded-xl border border-amber-200 bg-amber-600 px-3 text-xs font-bold text-white shadow-sm hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-55"
+                          disabled={manualCompactPrompt.busy || readOnlyRole}
+                          onclick={() => void startManualCompactFromPrompt()}
+                          type="button"
+                        >
+                          <RefreshCw size={13} class={manualCompactPrompt.busy ? "animate-spin" : ""} />
+                          {manualCompactPrompt.busy ? ui.manualCompactStarting : ui.manualCompactAction}
+                        </button>
+                        <button
+                          aria-label={ui.close}
+                          class="ui-animated-button ui-animated-button--icon inline-flex h-8 w-8 items-center justify-center rounded-xl text-gray-400 hover:bg-black/5 hover:text-gray-700"
+                          onclick={dismissManualCompactPrompt}
+                          type="button"
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
                     </div>
                   </div>
                 {/if}

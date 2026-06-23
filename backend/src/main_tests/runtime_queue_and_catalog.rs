@@ -943,6 +943,67 @@ async fn codex_reset_tickets_payload_normalizes_app_server_rate_limit_tickets() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_reset_tickets_payload_supports_latest_reset_credit_summary() {
+    let sandbox = unique_test_dir("codex-reset-credit-summary");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "debug/setRateLimitsResponse",
+            json!({
+                "response": {
+                    "rateLimits": {
+                        "limitId": "codex",
+                        "limitName": "Codex"
+                    },
+                    "rateLimitsByLimitId": {
+                        "codex": {
+                            "limitName": "Codex"
+                        }
+                    },
+                    "rateLimitResetCredits": {
+                        "availableCount": 2
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let payload = codex_reset_tickets_payload(&state, "default", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        payload.get("supported").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        payload.get("availableCount").and_then(Value::as_i64),
+        Some(2)
+    );
+    let tickets = payload
+        .get("tickets")
+        .and_then(Value::as_array)
+        .expect("latest reset credits should materialize usable entries");
+    assert_eq!(tickets.len(), 2);
+    assert_eq!(
+        tickets
+            .first()
+            .and_then(|ticket| ticket.get("id"))
+            .and_then(Value::as_str),
+        Some("rate-limit-reset-credit-1")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_reset_tickets_payload_is_quiet_when_protocol_is_unsupported() {
     let sandbox = unique_test_dir("codex-reset-tickets-unsupported-quiet");
     let workspace = sandbox.join("workspace");
@@ -982,6 +1043,25 @@ async fn codex_reset_ticket_use_reports_unsupported_without_codex_rpc() {
 
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let client = app_server_client(&state, "default").await.unwrap();
+    for method in [
+        "account/rateLimitResetCredit/consume",
+        "account/rateLimits/resetTicket/use",
+        "account/resetTickets/use",
+        "account/resetTicket/use",
+        "account/rateLimitResetTicket/use",
+    ] {
+        client
+            .request(
+                "debug/setError",
+                json!({
+                    "method": method,
+                    "message": "unknown method"
+                }),
+            )
+            .await
+            .unwrap();
+    }
     let error = use_codex_reset_ticket_payload(
         &state,
         "default",
@@ -997,6 +1077,43 @@ async fn codex_reset_ticket_use_reports_unsupported_without_codex_rpc() {
             .to_string()
             .contains("reset-ticket use is not exposed"),
         "{error}"
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_reset_ticket_use_consumes_latest_reset_credit() {
+    let sandbox = unique_test_dir("codex-reset-credit-use");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let payload = use_codex_reset_ticket_payload(
+        &state,
+        "default",
+        json!({
+            "ticketId": "rate-limit-reset-credit-1",
+            "idempotencyKey": "reset-attempt-1"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        payload.get("method").and_then(Value::as_str),
+        Some("account/rateLimitResetCredit/consume")
+    );
+    assert_eq!(
+        payload.get("outcome").and_then(Value::as_str),
+        Some("reset")
+    );
+    assert_eq!(
+        payload.get("idempotencyKey").and_then(Value::as_str),
+        Some("reset-attempt-1")
     );
 
     let _ = fs::remove_dir_all(sandbox);

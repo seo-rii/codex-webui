@@ -537,6 +537,7 @@ pub(crate) async fn codex_reset_tickets_payload(
             return Ok(json!({
                 "available": false,
                 "supported": false,
+                "availableCount": 0,
                 "tickets": [],
                 "rateLimits": Value::Null,
                 "rateLimitsByLimitId": Value::Null,
@@ -547,11 +548,41 @@ pub(crate) async fn codex_reset_tickets_payload(
             }));
         }
     };
-    let (tickets, saw_reset_ticket_field) = extract_codex_reset_tickets(&response);
+    let (mut tickets, saw_reset_ticket_field) = extract_codex_reset_tickets(&response);
+    let reset_credit_count = extract_rate_limit_reset_credit_count(&response);
+    if tickets.is_empty() {
+        if let Some(count) = reset_credit_count.filter(|count| *count > 0) {
+            let visible_count = count.min(20);
+            tickets.extend((0..visible_count).map(|index| {
+                json!({
+                    "id": format!("rate-limit-reset-credit-{}", index + 1),
+                    "label": if count == 1 {
+                        "Earned reset credit".to_string()
+                    } else {
+                        format!("Earned reset credit {} of {}", index + 1, count)
+                    },
+                    "limitId": Value::Null,
+                    "limitName": "Codex",
+                    "expiresAt": Value::Null,
+                    "createdAt": Value::Null,
+                    "usedAt": Value::Null,
+                    "available": true,
+                    "raw": {
+                        "rateLimitResetCredits": {
+                            "availableCount": count
+                        }
+                    },
+                })
+            }));
+        }
+    }
 
     Ok(json!({
         "available": true,
-        "supported": saw_reset_ticket_field,
+        "supported": saw_reset_ticket_field || reset_credit_count.is_some(),
+        "availableCount": reset_credit_count.unwrap_or(tickets.iter().filter(|ticket| {
+            ticket.get("available").and_then(Value::as_bool).unwrap_or(false)
+        }).count() as i64),
         "tickets": tickets,
         "rateLimits": response.get("rateLimits").cloned().unwrap_or(Value::Null),
         "rateLimitsByLimitId": response
@@ -580,6 +611,43 @@ pub(crate) async fn use_codex_reset_ticket_payload(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let client = app_server_client(state, profile_id).await?;
+    let idempotency_key = params
+        .get("idempotencyKey")
+        .or_else(|| params.get("idempotency_key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let consume_payload = json!({ "idempotencyKey": idempotency_key });
+    match client
+        .request_with_timeout(
+            "account/rateLimitResetCredit/consume",
+            consume_payload,
+            ACCOUNT_APP_SERVER_RECOVERY_RETRY_TIMEOUT,
+            true,
+        )
+        .await
+    {
+        Ok(result) => {
+            let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+                .0
+                .to_string();
+            state.quota_cache.lock().await.remove(&resolved_profile_id);
+            return Ok(json!({
+                "ok": true,
+                "method": "account/rateLimitResetCredit/consume",
+                "ticketId": ticket_id,
+                "limitId": limit_id,
+                "idempotencyKey": idempotency_key,
+                "outcome": result.get("outcome").cloned().unwrap_or(Value::Null),
+                "result": result,
+            }));
+        }
+        Err(error) if !app_server_method_unsupported_error(&error) => return Err(error),
+        Err(_) => {}
+    }
+
     let mut payload = json!({ "ticketId": ticket_id });
     if let Some(limit_id) = limit_id.as_deref() {
         payload["limitId"] = json!(limit_id);
@@ -624,6 +692,14 @@ pub(crate) async fn use_codex_reset_ticket_payload(
     );
 }
 
+fn app_server_method_unsupported_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("unknown method")
+        || message.contains("method not found")
+        || message.contains("not implemented")
+        || message.contains("unsupported method")
+}
+
 fn extract_codex_reset_tickets(response: &Value) -> (Vec<Value>, bool) {
     let mut entries = Vec::new();
     let saw_reset_ticket_field = collect_reset_ticket_entries(response, &mut entries);
@@ -635,6 +711,18 @@ fn extract_codex_reset_tickets(response: &Value) -> (Vec<Value>, bool) {
         })
         .collect();
     (tickets, saw_reset_ticket_field)
+}
+
+fn extract_rate_limit_reset_credit_count(response: &Value) -> Option<i64> {
+    response
+        .get("rateLimitResetCredits")
+        .or_else(|| response.get("rate_limit_reset_credits"))
+        .and_then(|value| {
+            value
+                .get("availableCount")
+                .or_else(|| value.get("available_count"))
+                .and_then(Value::as_i64)
+        })
 }
 
 fn collect_reset_ticket_entries(value: &Value, entries: &mut Vec<(Value, Option<String>)>) -> bool {

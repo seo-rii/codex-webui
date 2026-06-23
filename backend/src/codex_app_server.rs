@@ -1366,31 +1366,30 @@ async fn terminate_managed_process_group(
         return;
     }
     let process_group = format!("-{pid}");
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg("--")
-        .arg(&process_group)
-        .status()
-        .await;
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg("--")
-        .arg(pid.to_string())
-        .status()
-        .await;
+    let pid_target = pid.to_string();
+    let _ = signal_managed_process_target("-TERM", &process_group).await;
+    let _ = signal_managed_process_target("-TERM", &pid_target).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let _ = Command::new("kill")
-        .arg("-KILL")
+    if signal_managed_process_target("-0", &process_group).await {
+        let _ = signal_managed_process_target("-KILL", &process_group).await;
+    }
+    if signal_managed_process_target("-0", &pid_target).await {
+        let _ = signal_managed_process_target("-KILL", &pid_target).await;
+    }
+}
+
+#[cfg(unix)]
+async fn signal_managed_process_target(signal: &str, target: &str) -> bool {
+    Command::new("kill")
+        .arg(signal)
         .arg("--")
-        .arg(&process_group)
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
-        .await;
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg("--")
-        .arg(pid.to_string())
-        .status()
-        .await;
+        .await
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(not(unix))]
@@ -1984,6 +1983,13 @@ mod tests {
             current_pid,
             Some(changed_identity)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_process_signal_treats_missing_target_as_inactive() {
+        assert!(!super::signal_managed_process_target("-0", "999999999").await);
+        assert!(!super::signal_managed_process_target("-0", "-999999999").await);
     }
 
     #[test]

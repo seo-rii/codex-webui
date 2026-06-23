@@ -10,6 +10,7 @@ const LANGUAGE_BRIDGE_TRANSLATION_POLL_INTERVAL: Duration = Duration::from_milli
 const CODEX_PERMISSION_PROFILE_READ_ONLY: &str = ":read-only";
 const CODEX_PERMISSION_PROFILE_WORKSPACE: &str = ":workspace";
 const CODEX_PERMISSION_PROFILE_DANGER_FULL_ACCESS: &str = ":danger-full-access";
+const CODEX_DEPRECATED_RESTRICTED_READ_ERROR: &str = "readOnly.access is no longer supported";
 
 fn permission_profile_for_sandbox_mode(sandbox_mode: &str) -> &'static str {
     match sandbox_mode {
@@ -17,6 +18,20 @@ fn permission_profile_for_sandbox_mode(sandbox_mode: &str) -> &'static str {
         "read-only" => CODEX_PERMISSION_PROFILE_READ_ONLY,
         _ => CODEX_PERMISSION_PROFILE_WORKSPACE,
     }
+}
+
+fn language_bridge_start_error(context: &str, error: impl std::fmt::Display) -> ApiError {
+    let message = error.to_string();
+    let details = if message.contains(CODEX_DEPRECATED_RESTRICTED_READ_ERROR)
+        || message.contains("workspaceWrite.readOnlyAccess is no longer supported")
+    {
+        format!(
+            "{context}: Codex rejected a deprecated sandboxPolicy payload. This WebUI build sends language bridge requests with permissions={CODEX_PERMISSION_PROFILE_READ_ONLY} and no sandboxPolicy; rebuild or safe-restart the gateway if an older backend process is still serving requests. Original error: {message}"
+        )
+    } else {
+        format!("{context}: {message}")
+    };
+    api_error(StatusCode::BAD_GATEWAY, details)
 }
 
 pub(crate) fn normalize_client_user_message_id(value: Option<&str>) -> Option<String> {
@@ -462,12 +477,7 @@ async fn translate_prompt_with_language_bridge(
             }),
         )
         .await
-        .map_err(|error| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to start language bridge session: {error}"),
-            )
-        })?;
+        .map_err(|error| language_bridge_start_error("Failed to start language bridge session", error))?;
     let temp_thread_id = start_response
         .get("thread")
         .and_then(|thread| thread.get("id"))
@@ -495,10 +505,7 @@ async fn translate_prompt_with_language_bridge(
         )
         .await
         .map_err(|error| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to start language bridge translation: {error}"),
-            )
+            language_bridge_start_error("Failed to start language bridge translation", error)
         })?;
 
     let deadline = tokio::time::Instant::now() + LANGUAGE_BRIDGE_TRANSLATION_TIMEOUT;

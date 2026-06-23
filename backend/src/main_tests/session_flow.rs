@@ -5368,6 +5368,58 @@ async fn completed_turn_uses_language_bridge_response_translation_subagent() {
     }
     assert_eq!(translated.as_deref(), Some("번역된 응답입니다."));
 
+    let client = app_server_client(&state, "default").await.unwrap();
+    let threads_payload = client
+        .request(
+            "thread/list",
+            json!({
+                "limit": 20
+            }),
+        )
+        .await
+        .unwrap();
+    let translation_turn_start = threads_payload
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|threads| {
+            threads
+                .iter()
+                .filter(|thread| {
+                    thread.get("id").and_then(Value::as_str) != Some(session_id.as_str())
+                })
+                .filter(|thread| thread.get("isSubagent").and_then(Value::as_bool) == Some(true))
+                .filter_map(|thread| thread.get("lastTurnStart"))
+                .find(|turn_start| {
+                    turn_start
+                        .get("input")
+                        .and_then(Value::as_array)
+                        .and_then(|items| items.first())
+                        .and_then(|item| item.get("text"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains("Translate the following Codex answer"))
+                })
+        })
+        .expect("response translation subagent should start a turn");
+    assert_eq!(
+        translation_turn_start
+            .get("permissions")
+            .and_then(Value::as_str),
+        Some(":read-only")
+    );
+    assert!(
+        translation_turn_start
+            .get("sandboxPolicy")
+            .is_none_or(Value::is_null)
+    );
+    assert_eq!(
+        translation_turn_start
+            .get("runtimeWorkspaceRoots")
+            .and_then(Value::as_array)
+            .and_then(|roots| roots.first())
+            .and_then(Value::as_str),
+        Some(workspace.to_str().unwrap())
+    );
+
     let _ = fs::remove_dir_all(sandbox);
 }
 

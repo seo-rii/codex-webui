@@ -1166,6 +1166,22 @@ for raw_line in sys.stdin:
             "id": request_id,
             "result": rate_limits_response
         })
+    elif method == "account/rateLimitResetCredit/consume":
+        if not params.get("idempotencyKey"):
+            write({
+                "id": request_id,
+                "error": {
+                    "code": -32602,
+                    "message": "idempotencyKey must not be empty"
+                }
+            })
+            continue
+        write({
+            "id": request_id,
+            "result": {
+                "outcome": "reset"
+            }
+        })
     elif method == "model/list":
         write({
             "id": request_id,

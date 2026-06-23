@@ -317,6 +317,8 @@
       resetTickets: isKorean ? "리셋 티켓" : "Reset tickets",
       refreshResetTickets: isKorean ? "리셋 티켓 새로고침" : "Refresh reset tickets",
       useResetTicket: isKorean ? "사용" : "Use",
+      resetTicketsAvailable: (count: number) =>
+        isKorean ? `${count}개 사용 가능` : `${count} available`,
       resetTicketUnsupported: isKorean
         ? "현재 Codex가 리셋 티켓 정보를 노출하지 않습니다."
         : "This Codex build does not expose reset-ticket records.",
@@ -1797,9 +1799,16 @@
           {#if shouldShowResetTickets()}
             <div class="space-y-3">
               <div class="flex items-center justify-between gap-2">
-                <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
-                  <Ticket size={10} /> {ui.resetTickets}
-                </h4>
+                <div class="flex min-w-0 items-center gap-2">
+                  <h4 class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-gray-400">
+                    <Ticket size={10} /> {ui.resetTickets}
+                  </h4>
+                  {#if resetTickets?.supported}
+                    <span class="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700">
+                      {ui.resetTicketsAvailable(resetTickets.availableCount ?? resetTickets.tickets.length)}
+                    </span>
+                  {/if}
+                </div>
                 <button
                   aria-label={ui.refreshResetTickets}
                   class="rounded-md p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:cursor-not-allowed disabled:opacity-50"

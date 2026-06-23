@@ -994,6 +994,7 @@ export type CodexResetTicket = {
 export type CodexResetTicketsPayload = {
   available: boolean;
   supported: boolean;
+  availableCount: number;
   tickets: CodexResetTicket[];
   rateLimits: unknown;
   rateLimitsByLimitId: Record<string, unknown> | null;
@@ -1008,6 +1009,8 @@ export type CodexResetTicketUsePayload = {
   method: string;
   ticketId: string;
   limitId: string | null;
+  idempotencyKey?: string;
+  outcome?: "reset" | "alreadyRedeemed" | "nothingToReset" | "noCredit" | string | null;
   result: unknown;
 };
 

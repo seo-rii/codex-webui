@@ -237,6 +237,7 @@
   };
   const HUNDRED_M_CONTEXT_WINDOW = 100_000_000;
   const LOCAL_QUEUE_MODE_GRACE_MS = 120_000;
+  const sessionPageSize = 20;
   const SESSION_DETAIL_CACHE_INLINE_IMAGE_RESULT_MAX_CHARS = 256 * 1024;
 
   let config = $state<AppConfigPayload | null>(null);
@@ -421,6 +422,8 @@
   let sessionListCacheKey = $state<string | null>(null);
   let sessionListCacheVersion = $state<string | null>(null);
   let sessionListStateHash = $state<string | null>(null);
+  let sessionListWindowKey = $state<string | null>(null);
+  let sessionListRequestedLimit = $state(sessionPageSize);
   let sessionSummaryVersionsById = $state<Record<string, string>>({});
   let sessionDetailCacheVersion = $state<string | null>(null);
   let sessionDetailStateHash = $state<string | null>(null);
@@ -486,7 +489,6 @@
   const readOnlyParsedCommandTypes = new Set(["read", "list_files", "search"]);
   const scrollBottomThreshold = 48;
   const transcriptTopLoadThreshold = 96;
-  const sessionPageSize = 20;
   const olderTurnPageSize = 20;
   const olderTurnAutoLoadWindowMs = 1500;
   const olderTurnAutoLoadBurstLimit = 3;
@@ -1241,6 +1243,8 @@
     expandedLargeOutputs = {};
     loadingTurns = {};
     turnLoadErrors = {};
+    pendingInitialTranscriptScrollSessionId = null;
+    pendingTranscriptBottomScroll = false;
     draft = options.draftText ?? "";
     draftAttachments = [...(options.draftAttachments ?? [])];
     titleDraft = options.title ?? "";
@@ -1613,6 +1617,7 @@
   let transcriptScrollGeneration = 0;
   let transcriptUserScrollIntentUntil = 0;
   let transcriptProgrammaticScrollUntil = 0;
+  let pendingInitialTranscriptScrollSessionId = $state<string | null>(null);
   let composerHistory = $state<string[]>([]);
   let composerHistoryIndex = $state(-1);
   let composerHistoryDraft = $state("");
@@ -3808,11 +3813,26 @@
     return transcriptElement.scrollHeight - transcriptElement.scrollTop - transcriptElement.clientHeight <= threshold;
   }
 
+  function isInitialTranscriptScrollPending(sessionId: string | null = selectedSessionId) {
+    return Boolean(sessionId && pendingInitialTranscriptScrollSessionId === sessionId);
+  }
+
+  function clearInitialTranscriptScrollPending(sessionId: string | null = selectedSessionId) {
+    if (!sessionId || pendingInitialTranscriptScrollSessionId !== sessionId) {
+      return;
+    }
+    pendingInitialTranscriptScrollSessionId = null;
+    if (!olderTurnsAutoLoadPaused) {
+      olderTurnsAutoLoadEnabled = true;
+    }
+  }
+
   function suspendTranscriptAutoScrollForUser() {
     transcriptAutoScrollSuspendedByUser = true;
     stickTranscriptToBottom = false;
     forceTranscriptScroll = false;
     pendingTranscriptBottomScroll = false;
+    clearInitialTranscriptScrollPending();
     if (transcriptScrollFrame !== null && typeof window !== "undefined") {
       cancelAnimationFrame(transcriptScrollFrame);
     }
@@ -3857,7 +3877,12 @@
     if (!transcriptElement) {
       return;
     }
-    if (transcriptAutoScrollSuspendedByUser && !forceTranscriptScroll && !pendingTranscriptBottomScroll) {
+    if (
+      transcriptAutoScrollSuspendedByUser &&
+      !forceTranscriptScroll &&
+      !pendingTranscriptBottomScroll &&
+      !isInitialTranscriptScrollPending()
+    ) {
       return;
     }
 
@@ -3903,20 +3928,18 @@
           transcriptScrollFrame = null;
           return;
         }
+        if (loadingDetail || loadingOlderTurns) {
+          transcriptScrollFrame = null;
+          return;
+        }
+        const initialScrollPending = isInitialTranscriptScrollPending();
         if (
-          loadingDetail ||
-          loadingOlderTurns ||
-          (transcriptAutoScrollSuspendedByUser && !forceTranscriptScroll && !pendingTranscriptBottomScroll) ||
-          (!stickTranscriptToBottom && !forceTranscriptScroll && !pendingTranscriptBottomScroll)
+          (transcriptAutoScrollSuspendedByUser && !forceTranscriptScroll && !pendingTranscriptBottomScroll && !initialScrollPending) ||
+          (!stickTranscriptToBottom && !forceTranscriptScroll && !pendingTranscriptBottomScroll && !initialScrollPending)
         ) {
           transcriptScrollFrame = null;
-          if (loadingDetail || loadingOlderTurns) {
-            stickTranscriptToBottom = true;
-            forceTranscriptScroll = true;
-          } else {
-            forceTranscriptScroll = false;
-            pendingTranscriptBottomScroll = false;
-          }
+          forceTranscriptScroll = false;
+          pendingTranscriptBottomScroll = false;
           return;
         }
 
@@ -3930,10 +3953,13 @@
           stableFrames = 0;
         }
 
-        if (stableFrames >= 2 || window.performance.now() - startedAt >= 700) {
+        if (stableFrames >= 2 || window.performance.now() - startedAt >= 900) {
           transcriptScrollFrame = null;
           pendingTranscriptBottomScroll = false;
           forceTranscriptScroll = false;
+          if (initialScrollPending) {
+            clearInitialTranscriptScrollPending();
+          }
           return;
         }
 
@@ -4179,6 +4205,18 @@
     });
   }
 
+  function buildSessionListWindowKey() {
+    return buildSessionListBrowserCacheKey(null, 0);
+  }
+
+  function ensureSessionListWindowKey(windowKey: string | null) {
+    if (sessionListWindowKey === windowKey) {
+      return;
+    }
+    sessionListWindowKey = windowKey;
+    sessionListRequestedLimit = sessionPageSize;
+  }
+
   function buildSessionDetailBrowserCacheKey(sessionId: string) {
     if (!activeProfileId) {
       return null;
@@ -4313,17 +4351,21 @@
     }
 
     setSessionsStable(deduped);
+    sessionListRequestedLimit = payload.nextCursor
+      ? Math.max(sessionPageSize, sessionListRequestedLimit, sessions.length)
+      : Math.max(sessionPageSize, sessions.length);
     sessionsCursor = payload.nextCursor;
     sessionsHasMore = Boolean(payload.nextCursor);
     if (!append) {
       sessionListCacheVersion = payload.cacheVersion ?? null;
       sessionListStateHash = payload.stateHash ?? null;
       sessionSummaryVersionsById = payload.summaryVersions ? { ...payload.summaryVersions } : {};
-      sessionListCacheKey = buildSessionListBrowserCacheKey(null, Math.max(sessionPageSize, sessions.length));
+      sessionListCacheKey = buildSessionListBrowserCacheKey(null, sessionListRequestedLimit);
     } else {
       sessionListCacheVersion = null;
       sessionListStateHash = null;
       sessionSummaryVersionsById = {};
+      sessionListCacheKey = buildSessionListBrowserCacheKey(null, sessionListRequestedLimit);
     }
   }
 
@@ -4359,12 +4401,15 @@
     }
 
     setSessionsStable(deduped);
+    sessionListRequestedLimit = patch.nextCursor
+      ? Math.max(sessionPageSize, sessionListRequestedLimit, sessions.length)
+      : Math.max(sessionPageSize, sessions.length);
     sessionsCursor = patch.nextCursor;
     sessionsHasMore = Boolean(patch.nextCursor);
     sessionListCacheVersion = payload.cacheVersion;
     sessionListStateHash = patch.finalStateHash;
     sessionSummaryVersionsById = { ...patch.summaryVersions };
-    sessionListCacheKey = buildSessionListBrowserCacheKey(null, Math.max(sessionPageSize, sessions.length));
+    sessionListCacheKey = buildSessionListBrowserCacheKey(null, sessionListRequestedLimit);
     return true;
   }
 
@@ -4657,6 +4702,8 @@
     sessionListCacheKey = null;
     sessionListCacheVersion = null;
     sessionListStateHash = null;
+    sessionListWindowKey = null;
+    sessionListRequestedLimit = sessionPageSize;
     sessionSummaryVersionsById = {};
     conversation = null;
     selectedSessionId = null;
@@ -4834,7 +4881,8 @@
     sessionsBusy = true;
     sessionsLoadingMore = false;
     const query = sessionSearchQuery.trim();
-    const refreshLimit = Math.max(sessionPageSize, sessions.length);
+    ensureSessionListWindowKey(buildSessionListWindowKey());
+    const refreshLimit = Math.max(sessionPageSize, sessions.length, sessionListRequestedLimit);
     const listCacheKey = buildSessionListBrowserCacheKey(null, refreshLimit);
     let knownVersion: string | null = sessionListCacheKey === listCacheKey ? sessionListCacheVersion : null;
     let knownSummaryVersions: Record<string, string> | null =
@@ -5007,6 +5055,8 @@
     if (!cursor) {
       return;
     }
+    ensureSessionListWindowKey(buildSessionListWindowKey());
+    sessionListRequestedLimit = Math.max(sessionListRequestedLimit, sessions.length + sessionPageSize);
 
     sessionsLoadingMore = true;
     try {
@@ -5109,8 +5159,9 @@
     draft = "";
     draftAttachments = [];
     titleDraft = "";
+    pendingInitialTranscriptScrollSessionId = sessionId;
     requestTranscriptBottomScroll(true);
-    olderTurnsAutoLoadEnabled = true;
+    olderTurnsAutoLoadEnabled = false;
     olderTurnsAutoLoadPaused = false;
     olderTurnsAutoTriggerTimestamps = [];
     loadingOlderTurns = false;
@@ -5189,6 +5240,11 @@
     } finally {
       if (selectedSessionId === sessionId && sessionSelectionVersion === selectionVersion) {
         loadingDetail = false;
+        const currentConversation = conversation as unknown as ConversationState | null;
+        if (currentConversation?.thread.id === sessionId && isInitialTranscriptScrollPending(sessionId)) {
+          requestTranscriptBottomScroll(true);
+          scheduleTranscriptScrollToBottom();
+        }
       }
     }
   }
@@ -5546,6 +5602,9 @@
       };
     }
     conversation = nextConversation;
+    if (isInitialTranscriptScrollPending(sessionId)) {
+      requestTranscriptBottomScroll(true);
+    }
     updateSessionDetailSyncState(detail);
     sessionQueueSnapshotsBySessionId = {
       ...sessionQueueSnapshotsBySessionId,
@@ -5806,7 +5865,7 @@
       clearHydrationRefresh();
       clearStaleSessionCatchup();
       updateSessionRecoveryPrompt(sessionId, nextConversation);
-      preserveTranscriptScrollAfterDataUpdate(loadDraft || replaceWithRecentWindow);
+      preserveTranscriptScrollAfterDataUpdate(isInitialTranscriptScrollPending(sessionId) || replaceWithRecentWindow);
       return nextConversation;
     }
 
@@ -5850,7 +5909,7 @@
       if (loadDraft) {
         await loadSavedDraft(nextDetail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
       }
-      preserveTranscriptScrollAfterDataUpdate(loadDraft || replaceWithRecentWindow);
+      preserveTranscriptScrollAfterDataUpdate(isInitialTranscriptScrollPending(nextDetail.thread.id) || replaceWithRecentWindow);
       return nextConversation;
     }
 
@@ -5878,7 +5937,7 @@
     if (replaceWithRecentWindow && skippedEventCount > 0) {
       scheduleSelectedSessionStateRefresh(detail.thread.id, 160, true);
     }
-    preserveTranscriptScrollAfterDataUpdate(loadDraft || replaceWithRecentWindow);
+    preserveTranscriptScrollAfterDataUpdate(isInitialTranscriptScrollPending(detail.thread.id) || replaceWithRecentWindow);
     return nextConversation;
   }
 
@@ -8487,8 +8546,22 @@
 
     resetTicketUseBusyId = ticket.id;
     try {
-      await api.useResetTicket(ticket.id, ticket.limitId);
-      noticeText = getLocale().startsWith("ko") ? "리셋 티켓을 사용했습니다." : "Reset ticket used.";
+      const idempotencyKey =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `reset-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const result = await api.useResetTicket(ticket.id, ticket.limitId, idempotencyKey);
+      if (result.outcome === "nothingToReset") {
+        noticeText = getLocale().startsWith("ko")
+          ? "현재 리셋할 사용량 창이 없습니다."
+          : "There is no eligible usage window to reset.";
+      } else if (result.outcome === "noCredit") {
+        noticeText = getLocale().startsWith("ko")
+          ? "사용 가능한 리셋 티켓이 없습니다."
+          : "No reset credits are available.";
+      } else {
+        noticeText = getLocale().startsWith("ko") ? "리셋 티켓을 사용했습니다." : "Reset ticket used.";
+      }
       await Promise.all([refreshQuota(true), refreshResetTickets(true)]);
     } catch (error) {
       errorText = describeError(error);
@@ -10887,28 +10960,31 @@
       return;
     }
 
+    const userScrollIntent = hasTranscriptUserScrollIntent();
+    const initialScrollPending = isInitialTranscriptScrollPending();
     if (isTranscriptAtBottom()) {
       transcriptAutoScrollSuspendedByUser = false;
       stickTranscriptToBottom = true;
+      clearInitialTranscriptScrollPending();
       if (!loadingDetail && !loadingOlderTurns) {
         pendingTranscriptBottomScroll = false;
       }
-    } else if (
-      hasTranscriptUserScrollIntent() ||
-      transcriptAutoScrollSuspendedByUser
-    ) {
+    } else if (userScrollIntent || transcriptAutoScrollSuspendedByUser) {
       suspendTranscriptAutoScrollForUser();
-    } else if (forceTranscriptScroll || pendingTranscriptBottomScroll) {
+    } else if (initialScrollPending || forceTranscriptScroll || pendingTranscriptBottomScroll) {
       stickTranscriptToBottom = true;
-    } else if (getTranscriptNow() > transcriptProgrammaticScrollUntil) {
-      suspendTranscriptAutoScrollForUser();
     } else if (stickTranscriptToBottom) {
       scheduleTranscriptScrollToBottom();
       return;
+    } else if (getTranscriptNow() > transcriptProgrammaticScrollUntil) {
+      suspendTranscriptAutoScrollForUser();
     }
 
     if (
       !forceTranscriptScroll &&
+      !pendingTranscriptBottomScroll &&
+      !initialScrollPending &&
+      !loadingDetail &&
       transcriptElement.scrollTop <= transcriptTopLoadThreshold &&
       sessionHydrationRemainingTurns > 0 &&
       olderTurnsAutoLoadEnabled &&
@@ -14302,6 +14378,10 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .chat-transcript {
+    overflow-anchor: none;
   }
 
   .transcript-dock {

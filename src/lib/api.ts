@@ -479,10 +479,11 @@ export const api = {
     return ws.request<CodexResetTicketsPayload>("runtime/resetTickets", { refresh });
   },
 
-  useResetTicket(ticketId: string, limitId: string | null = null) {
+  useResetTicket(ticketId: string, limitId: string | null = null, idempotencyKey: string | null = null) {
     return ws.request<CodexResetTicketUsePayload>("runtime/resetTicket/use", {
       ticketId,
-      limitId
+      limitId,
+      idempotencyKey
     });
   },
 

@@ -26,6 +26,15 @@ pub(crate) async fn resume_session_queue_payload(
         };
         queue_object.insert("resumePending".to_string(), json!(false));
         queue_object.insert("updatedAt".to_string(), json!(now_unix_ms()));
+        if let Some(items) = queue_object.get_mut("items").and_then(Value::as_array_mut) {
+            for item in items {
+                if let Some(item_object) = item.as_object_mut() {
+                    item_object.remove("status");
+                    item_object.remove("failedAt");
+                    item_object.remove("error");
+                }
+            }
+        }
         Ok(())
     })
     .await?;
@@ -74,6 +83,17 @@ pub(crate) async fn dispatch_session_queue_item_payload(
         let next_queue =
             remove_session_queue_item_after_dispatch(state, profile_id, session_id, queue_id)
                 .await?;
+        let should_continue = next_queue
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+            && !next_queue
+                .get("resumeRequired")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        if should_continue {
+            spawn_queue_drain(state, profile_id, session_id);
+        }
         Ok(next_queue)
     })
     .await;

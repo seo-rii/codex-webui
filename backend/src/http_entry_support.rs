@@ -145,11 +145,9 @@ async fn handle_http_inner(
                 } else {
                     false
                 };
-                let has_profile = !state.config.profiles.is_empty()
-                    && state
-                        .config
-                        .profiles
-                        .contains_key(&state.config.default_profile_id);
+                let (default_profile_id, profiles) = runtime_profiles_snapshot(&state.config);
+                let has_profile =
+                    !profiles.is_empty() && profiles.contains_key(&default_profile_id);
                 let has_allowed_roots = !state.config.allowed_roots.is_empty();
                 let ready =
                     data_dir_exists && data_dir_writable && has_profile && has_allowed_roots;
@@ -274,7 +272,7 @@ codex_webui_host_memory_current_bytes {host_memory_current_bytes}\n\
 codex_webui_host_memory_max_bytes {host_memory_max_bytes}\n\
 # TYPE codex_webui_host_oom_kill_count counter\n\
 codex_webui_host_oom_kill_count {host_oom_kill_count}\n",
-                    state.config.profiles.len(),
+                    runtime_profiles_snapshot(&state.config).1.len(),
                     state.config.allowed_roots.len()
                 );
                 let mut response = Response::new(Body::from(metrics));

@@ -18,6 +18,9 @@ import type {
   CodexMemoryStatusPayload,
   ComputerInputEvent,
   ComputerInputPayload,
+  CodexProfileAccountsPayload,
+  CodexProfileMutationPayload,
+  CodexProfileSelectPayload,
   CodexQuotaStatus,
   CodexResetTicketsPayload,
   CodexResetTicketUsePayload,
@@ -107,6 +110,23 @@ function readCookie(name: string) {
   );
 }
 
+function writeProfileCookie(payload: CodexProfileSelectPayload) {
+  if (typeof document === "undefined" || !payload.profileCookie) {
+    return;
+  }
+  const cookie = payload.profileCookie;
+  const parts = [
+    `${encodeURIComponent(cookie.name)}=${encodeURIComponent(payload.activeProfileId)}`,
+    `Path=${cookie.path || "/"}`,
+    `Max-Age=${Math.max(0, Math.floor(cookie.maxAgeSeconds))}`,
+    `SameSite=${cookie.sameSite}`
+  ];
+  if (cookie.sameSite === "None" || window.location.protocol === "https:") {
+    parts.push("Secure");
+  }
+  document.cookie = parts.join("; ");
+}
+
 async function request<T>(input: string, init?: RequestInit) {
   const headers = new Headers(init?.headers ?? {});
   if (!(init?.body instanceof FormData) && !headers.has("content-type")) {
@@ -182,11 +202,10 @@ export const api = {
     return response;
   },
 
-  selectAuthProfile(profileId: string) {
-    return request<{ ok: true; activeProfileId: string }>(apiPath("/auth/profile"), {
-      method: "POST",
-      body: JSON.stringify({ profileId })
-    });
+  async selectAuthProfile(profileId: string) {
+    const response = await ws.request<CodexProfileSelectPayload>("account/profile/select", { profileId });
+    writeProfileCookie(response);
+    return response;
   },
 
   disconnect() {
@@ -235,7 +254,7 @@ export const api = {
   subscribeSession(
     sessionId: string,
     listener: (event: StreamEvent) => void,
-    options: { includeInitialQueue?: boolean } = {}
+    options: { includeInitialQueue?: boolean; profileId?: string | null } = {}
   ) {
     return ws.subscribeSession(sessionId, listener, options);
   },
@@ -475,6 +494,18 @@ export const api = {
     return ws.request<CodexQuotaStatus>("runtime/quota", { refresh });
   },
 
+  getProfileAccounts(refresh = false) {
+    return ws.request<CodexProfileAccountsPayload>("account/profiles/list", { refresh });
+  },
+
+  updateAccountProfile(profileId: string, label: string) {
+    return ws.request<CodexProfileMutationPayload>("account/profile/update", { profileId, label });
+  },
+
+  deleteAccountProfile(profileId: string, deleteData = false) {
+    return ws.request<CodexProfileMutationPayload>("account/profile/delete", { profileId, deleteData });
+  },
+
   getResetTickets(refresh = false) {
     return ws.request<CodexResetTicketsPayload>("runtime/resetTickets", { refresh });
   },
@@ -556,14 +587,16 @@ export const api = {
     limit = 20,
     knownVersion: string | null = null,
     knownTurnVersions: Record<string, string> | null = null,
-    knownStateHash: string | null = null
+    knownStateHash: string | null = null,
+    profileId: string | null = null
   ) {
     return ws.request<SessionDetailResponse>("session/get", {
       sessionId,
       limit,
       knownVersion,
       knownTurnVersions,
-      knownStateHash
+      knownStateHash,
+      profileId
     });
   },
 
@@ -606,26 +639,27 @@ export const api = {
     });
   },
 
-  listRollbackTargets(sessionId: string) {
+  listRollbackTargets(sessionId: string, profileId: string | null = null) {
     return ws.request<SessionRollbackTargetsPayload>("session/rollbackTargets/list", {
-      sessionId
+      sessionId,
+      profileId
     });
   },
 
-  searchSessionTurns(sessionId: string, query: string, cursor: string | null = null, limit = 20) {
-    return ws.request<SessionTurnSearchPayload>("session/search", { sessionId, query, cursor, limit });
+  searchSessionTurns(sessionId: string, query: string, cursor: string | null = null, limit = 20, profileId: string | null = null) {
+    return ws.request<SessionTurnSearchPayload>("session/search", { sessionId, query, cursor, limit, profileId });
   },
 
-  getSessionDraft(sessionId: string) {
-    return ws.request<SessionDraftPayload>("session/draft/get", { sessionId });
+  getSessionDraft(sessionId: string, profileId: string | null = null) {
+    return ws.request<SessionDraftPayload>("session/draft/get", { sessionId, profileId });
   },
 
-  saveSessionDraft(sessionId: string, draft: string, intent: "message" | "steer" | "queue") {
-    return ws.request<SessionDraftPayload>("session/draft/save", { sessionId, draft, intent });
+  saveSessionDraft(sessionId: string, draft: string, intent: "message" | "steer" | "queue", profileId: string | null = null) {
+    return ws.request<SessionDraftPayload>("session/draft/save", { sessionId, draft, intent, profileId });
   },
 
-  getSessionQueue(sessionId: string) {
-    return ws.request<SessionDetailPayload["queue"]>("session/queue/get", { sessionId });
+  getSessionQueue(sessionId: string, profileId: string | null = null) {
+    return ws.request<SessionDetailPayload["queue"]>("session/queue/get", { sessionId, profileId });
   },
 
   enqueueSessionMessage(
@@ -636,6 +670,7 @@ export const api = {
       attachmentIds: string[];
       clientRequestId?: string;
       clientUserMessageId?: string;
+      profileId?: string | null;
     }
   ) {
     return ws.request<SessionDetailPayload["queue"]>("session/queue/enqueue", {
@@ -644,62 +679,76 @@ export const api = {
       clientRequestId: payload.clientRequestId ?? null,
       clientUserMessageId: payload.clientUserMessageId ?? null,
       skills: payload.skills ?? [],
-      attachmentIds: payload.attachmentIds
+      attachmentIds: payload.attachmentIds,
+      profileId: payload.profileId ?? null
     });
   },
 
-  resumeSessionQueue(sessionId: string) {
-    return ws.request<SessionDetailPayload["queue"]>("session/queue/resume", { sessionId });
+  resumeSessionQueue(sessionId: string, profileId: string | null = null) {
+    return ws.request<SessionDetailPayload["queue"]>("session/queue/resume", { sessionId, profileId });
   },
 
-  removeQueuedMessage(sessionId: string, queueId: string) {
-    return ws.request<SessionDetailPayload["queue"]>("session/queue/remove", { sessionId, queueId });
+  removeQueuedMessage(sessionId: string, queueId: string, profileId: string | null = null) {
+    return ws.request<SessionDetailPayload["queue"]>("session/queue/remove", { sessionId, queueId, profileId });
   },
 
-  updateQueuedMessage(sessionId: string, queueId: string, payload: { prompt: string; skills?: SelectedSkill[]; attachmentIds?: string[] }) {
+  updateQueuedMessage(
+    sessionId: string,
+    queueId: string,
+    payload: { prompt: string; skills?: SelectedSkill[]; attachmentIds?: string[]; profileId?: string | null }
+  ) {
     return ws.request<SessionDetailPayload["queue"]>("session/queue/update", {
       sessionId,
       queueId,
       prompt: payload.prompt,
       skills: payload.skills ?? [],
-      attachmentIds: payload.attachmentIds
+      attachmentIds: payload.attachmentIds,
+      profileId: payload.profileId ?? null
     });
   },
 
-  reorderQueuedMessages(sessionId: string, queueIds: string[]) {
+  reorderQueuedMessages(sessionId: string, queueIds: string[], profileId: string | null = null) {
     return ws.request<SessionDetailPayload["queue"]>("session/queue/reorder", {
       sessionId,
-      queueIds
+      queueIds,
+      profileId
     });
   },
 
-  dispatchQueuedMessage(sessionId: string, queueId: string, mode: "message" | "steer", activeTurnId: string | null = null) {
+  dispatchQueuedMessage(
+    sessionId: string,
+    queueId: string,
+    mode: "message" | "steer",
+    activeTurnId: string | null = null,
+    profileId: string | null = null
+  ) {
     return ws.request<SessionDetailPayload["queue"]>("session/queue/dispatch", {
       sessionId,
       queueId,
       mode,
-      activeTurnId
+      activeTurnId,
+      profileId
     });
   },
 
-  clearSessionDraft(sessionId: string) {
-    return ws.request<SessionDraftPayload>("session/draft/clear", { sessionId });
+  clearSessionDraft(sessionId: string, profileId: string | null = null) {
+    return ws.request<SessionDraftPayload>("session/draft/clear", { sessionId, profileId });
   },
 
-  getSessionOlderTurns(sessionId: string, beforeTurnId: string, limit = 20) {
-    return ws.request<SessionTurnsPagePayload>("session/olderTurns/get", { sessionId, beforeTurnId, limit });
+  getSessionOlderTurns(sessionId: string, beforeTurnId: string, limit = 20, profileId: string | null = null) {
+    return ws.request<SessionTurnsPagePayload>("session/olderTurns/get", { sessionId, beforeTurnId, limit, profileId });
   },
 
-  getSessionTurn(sessionId: string, turnId: string) {
-    return ws.request<SessionTurnPayload>("session/turn/get", { sessionId, turnId });
+  getSessionTurn(sessionId: string, turnId: string, profileId: string | null = null) {
+    return ws.request<SessionTurnPayload>("session/turn/get", { sessionId, turnId, profileId });
   },
 
-  getSessionItemDetail(sessionId: string, turnId: string, itemId: string) {
-    return ws.request<SessionItemDetailPayload>("session/itemDetail/get", { sessionId, turnId, itemId });
+  getSessionItemDetail(sessionId: string, turnId: string, itemId: string, profileId: string | null = null) {
+    return ws.request<SessionItemDetailPayload>("session/itemDetail/get", { sessionId, turnId, itemId, profileId });
   },
 
-  getSessionGoal(sessionId: string) {
-    return ws.request<{ goal: ThreadGoal | null }>("session/goal/get", { sessionId });
+  getSessionGoal(sessionId: string, profileId: string | null = null) {
+    return ws.request<{ goal: ThreadGoal | null }>("session/goal/get", { sessionId, profileId });
   },
 
   setSessionGoal(
@@ -708,16 +757,18 @@ export const api = {
       objective?: string | null;
       status?: ThreadGoal["status"] | null;
       tokenBudget?: number | null;
-    }
+    },
+    profileId: string | null = null
   ) {
     return ws.request<{ goal: ThreadGoal | null }>("session/goal/set", {
       sessionId,
+      profileId,
       ...payload
     });
   },
 
-  clearSessionGoal(sessionId: string) {
-    return ws.request<{ goal: null; cleared: boolean }>("session/goal/clear", { sessionId });
+  clearSessionGoal(sessionId: string, profileId: string | null = null) {
+    return ws.request<{ goal: null; cleared: boolean }>("session/goal/clear", { sessionId, profileId });
   },
 
   savePreferences(sessionId: string, preferences: Partial<SessionPreferences>) {
@@ -730,6 +781,23 @@ export const api = {
 
   renameSession(sessionId: string, name: string) {
     return ws.request<{ ok: true }>("session/rename", { sessionId, name });
+  },
+
+  moveSessionProfile(sessionId: string, targetProfileId: string, sourceProfileId: string | null = null) {
+    const params: Record<string, string> = { sessionId, targetProfileId };
+    if (sourceProfileId?.trim()) {
+      params.profileId = sourceProfileId.trim();
+      params.sourceProfileId = sourceProfileId.trim();
+    }
+    return ws.request<{
+      ok: true;
+      sessionId: string;
+      sourceProfileId: string;
+      targetProfileId: string;
+      targetProfileLabel: string;
+      archived: boolean;
+      session: SessionSummary | null;
+    }>("session/profile/move", params);
   },
 
   updateSessionOrganization(sessionId: string, patch: Partial<{ pinned: boolean; tags: string[] }>) {
@@ -790,10 +858,23 @@ export const api = {
     }>("account/get");
   },
 
-  startAccountLogin(type: "chatgpt" | "chatgptDeviceCode" | "apiKey", apiKey?: string | null) {
+  startAccountLogin(
+    type: "chatgpt" | "chatgptDeviceCode" | "apiKey" | "authJsonFile",
+    apiKey?: string | null,
+    authJsonPath?: string | null,
+    options?: {
+      createProfile?: boolean;
+      profileLabel?: string | null;
+      profileId?: string | null;
+    }
+  ) {
     return ws.request<CodexAccountLoginResponse>("account/login/start", {
       type,
       apiKey: apiKey ?? null,
+      authJsonPath: authJsonPath ?? null,
+      createProfile: options?.createProfile ?? false,
+      profileLabel: options?.profileLabel ?? null,
+      profileId: options?.profileId ?? null,
       browserBaseUrl: type === "chatgpt" ? browserBaseUrl() : null
     });
   },
@@ -814,6 +895,7 @@ export const api = {
       attachmentIds: string[];
       preferences: Partial<SessionPreferences>;
       clientUserMessageId?: string;
+      profileId?: string | null;
     }
   ) {
     return ws.request<{ ok: true }>("turn/send", {
@@ -822,7 +904,8 @@ export const api = {
       skills: payload.skills ?? [],
       attachmentIds: payload.attachmentIds,
       preferences: payload.preferences,
-      clientUserMessageId: payload.clientUserMessageId ?? null
+      clientUserMessageId: payload.clientUserMessageId ?? null,
+      profileId: payload.profileId ?? null
     });
   },
 
@@ -832,7 +915,8 @@ export const api = {
     attachmentIds: string[] = [],
     skills: SelectedSkill[] = [],
     activeTurnId: string | null = null,
-    clientUserMessageId: string | null = null
+    clientUserMessageId: string | null = null,
+    profileId: string | null = null
   ) {
     return ws.request<{ ok: true }>("turn/steer", {
       sessionId,
@@ -840,7 +924,8 @@ export const api = {
       skills,
       attachmentIds,
       activeTurnId,
-      clientUserMessageId
+      clientUserMessageId,
+      profileId
     });
   },
 

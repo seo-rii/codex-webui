@@ -7,8 +7,8 @@ pub(crate) async fn app_server_client(
     let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
     app_server_client_with_key(
         state,
-        resolved_profile_id,
-        profile,
+        &resolved_profile_id,
+        &profile,
         resolved_profile_id.to_string(),
     )
     .await
@@ -20,7 +20,7 @@ pub(crate) async fn app_server_client_for_session(
     session_id: &str,
 ) -> Result<AppServerClient> {
     let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
-    let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+    let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
     let client_key = state
         .session_app_server_assignments
         .lock()
@@ -28,7 +28,7 @@ pub(crate) async fn app_server_client_for_session(
         .get(&runtime_key)
         .cloned()
         .unwrap_or_else(|| resolved_profile_id.to_string());
-    app_server_client_with_key(state, resolved_profile_id, profile, client_key).await
+    app_server_client_with_key(state, &resolved_profile_id, &profile, client_key).await
 }
 
 pub(crate) async fn app_server_client_for_session_turn(
@@ -37,7 +37,7 @@ pub(crate) async fn app_server_client_for_session_turn(
     session_id: &str,
 ) -> Result<AppServerClient> {
     let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
-    let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+    let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
     let cached_goal_uses_goal_app_server = with_ui_state_read(state, profile_id, |ui_state| {
         Ok(ui_state
             .get("goalsByThreadId")
@@ -50,20 +50,49 @@ pub(crate) async fn app_server_client_for_session_turn(
     .await
     .unwrap_or(false);
     let client_key = {
-        let mut assignments = state.session_app_server_assignments.lock().await;
+        let assignments_snapshot = state.session_app_server_assignments.lock().await.clone();
+        let runtime_key_prefix = format!("profile::{resolved_profile_id}::session-runtime::");
+        let default_client_key = resolved_profile_id.to_string();
+        let active_runtime_keys = state
+            .active_turns
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let pending_runtime_keys = state
+            .pending_turn_starts
+            .lock()
+            .await
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let another_default_client_session_is_active = active_runtime_keys
+            .iter()
+            .chain(pending_runtime_keys.iter())
+            .any(|other_runtime_key| {
+                other_runtime_key != &runtime_key
+                    && other_runtime_key.starts_with(&runtime_key_prefix)
+                    && assignments_snapshot.get(other_runtime_key).is_none_or(
+                        |assigned_client_key| assigned_client_key == &default_client_key,
+                    )
+            });
         let desired_client_key = if state.config.per_session_app_servers {
             format!("{resolved_profile_id}::session::{session_id}")
         } else if cached_goal_uses_goal_app_server {
             format!("{resolved_profile_id}::goal::{session_id}")
+        } else if another_default_client_session_is_active {
+            format!("{resolved_profile_id}::session::{session_id}")
         } else {
             resolved_profile_id.to_string()
         };
+        let mut assignments = state.session_app_server_assignments.lock().await;
         assignments
             .entry(runtime_key)
             .or_insert(desired_client_key)
             .clone()
     };
-    app_server_client_with_key(state, resolved_profile_id, profile, client_key).await
+    app_server_client_with_key(state, &resolved_profile_id, &profile, client_key).await
 }
 
 pub(crate) async fn app_server_client_for_goal_session(
@@ -72,7 +101,7 @@ pub(crate) async fn app_server_client_for_goal_session(
     session_id: &str,
 ) -> Result<AppServerClient> {
     let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
-    let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+    let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
     let existing_assignment = state
         .session_app_server_assignments
         .lock()
@@ -100,7 +129,7 @@ pub(crate) async fn app_server_client_for_goal_session(
             .or_insert(desired_client_key)
             .clone()
     };
-    app_server_client_with_key(state, resolved_profile_id, profile, client_key).await
+    app_server_client_with_key(state, &resolved_profile_id, &profile, client_key).await
 }
 
 pub(crate) async fn app_server_client_by_key(
@@ -109,7 +138,13 @@ pub(crate) async fn app_server_client_by_key(
     client_key: &str,
 ) -> Result<AppServerClient> {
     let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
-    app_server_client_with_key(state, resolved_profile_id, profile, client_key.to_string()).await
+    app_server_client_with_key(
+        state,
+        &resolved_profile_id,
+        &profile,
+        client_key.to_string(),
+    )
+    .await
 }
 
 pub(crate) async fn app_server_client_key_for_session(
@@ -118,7 +153,7 @@ pub(crate) async fn app_server_client_key_for_session(
     session_id: &str,
 ) -> String {
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
-    let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+    let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
     state
         .session_app_server_assignments
         .lock()
@@ -214,7 +249,7 @@ pub(crate) async fn session_ids_for_app_server_client(
                     entries
                         .iter()
                         .filter_map(|(session_id, status)| {
-                            let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+                            let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
                             if assignments.contains_key(&runtime_key) {
                                 return None;
                             }
@@ -244,34 +279,31 @@ pub(crate) async fn clear_app_server_assignments_for_sessions(
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
     let mut assignments = state.session_app_server_assignments.lock().await;
     for session_id in session_ids {
-        assignments.remove(&runtime_session_key(resolved_profile_id, session_id));
+        assignments.remove(&runtime_session_key(&resolved_profile_id, session_id));
     }
 }
 
-pub(crate) fn resolve_runtime_profile_entry<'a>(
-    config: &'a Config,
-    profile_id: &'a str,
-) -> (&'a str, &'a RuntimeProfile) {
-    if let Some(profile) = config.profiles.get(profile_id) {
-        return (profile_id, profile);
+pub(crate) fn resolve_runtime_profile_entry(
+    config: &Config,
+    profile_id: &str,
+) -> (String, RuntimeProfile) {
+    let (default_profile_id, profiles) = runtime_profiles_snapshot(config);
+    if let Some(profile) = profiles.get(profile_id) {
+        return (profile_id.to_string(), profile.clone());
     }
 
-    if let Some(profile) = config.profiles.get(&config.default_profile_id) {
-        return (config.default_profile_id.as_str(), profile);
+    if let Some(profile) = profiles.get(&default_profile_id) {
+        return (default_profile_id, profile.clone());
     }
 
-    config
-        .profiles
+    profiles
         .iter()
         .next()
-        .map(|(resolved_profile_id, profile)| (resolved_profile_id.as_str(), profile))
+        .map(|(resolved_profile_id, profile)| (resolved_profile_id.clone(), profile.clone()))
         .expect("at least one runtime profile must exist")
 }
 
-pub(crate) fn resolve_runtime_profile<'a>(
-    config: &'a Config,
-    profile_id: &'a str,
-) -> &'a RuntimeProfile {
+pub(crate) fn resolve_runtime_profile(config: &Config, profile_id: &str) -> RuntimeProfile {
     resolve_runtime_profile_entry(config, profile_id).1
 }
 

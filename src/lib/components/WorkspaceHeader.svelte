@@ -16,7 +16,9 @@
     RotateCcw,
     Search,
     Settings,
-    Terminal
+    Terminal,
+    User,
+    UserCog
   } from "lucide-svelte";
 
   import { m } from "$lib/paraglide/messages.js";
@@ -29,6 +31,7 @@
     restoreThread: string;
     archiveThread: string;
     open: string;
+    moveSessionToAccount: string;
     newThread: string;
     tasks: string;
     gitWorkspace: string;
@@ -45,6 +48,7 @@
     titleInputElement = $bindable(),
     running,
     selectedSessionSummary,
+    profiles = [],
     readOnly,
     tokenCountLabel,
     contextUsage,
@@ -60,6 +64,7 @@
     onSaveTitle,
     onEditTags,
     onToggleSearch,
+    onRequestMoveSessionProfile,
     onForkHandoff,
     onTogglePinned,
     onToggleArchive,
@@ -77,6 +82,12 @@
     titleInputElement?: HTMLInputElement | undefined;
     running: boolean;
     selectedSessionSummary: SessionSummary | null;
+    profiles?: Array<{
+      id: string;
+      label: string;
+      codexHome: string;
+      active: boolean;
+    }>;
     readOnly: boolean;
     tokenCountLabel: string | null;
     contextUsage: {
@@ -96,6 +107,7 @@
     onSaveTitle: () => void | Promise<void>;
     onEditTags: () => void | Promise<void>;
     onToggleSearch: () => void;
+    onRequestMoveSessionProfile: (session: SessionSummary) => void;
     onForkHandoff: () => void | Promise<void>;
     onTogglePinned: () => void | Promise<void>;
     onToggleArchive: () => void | Promise<void>;
@@ -108,6 +120,22 @@
     onOpenSettingsTab: () => void;
     onCreateTerminalTab: () => void | Promise<void>;
   } = $props();
+
+  function selectedSessionAccountLabel() {
+    const profileLabel = (selectedSessionSummary?.profileLabel ?? "").trim();
+    if (profileLabel) {
+      return profileLabel;
+    }
+    return (selectedSessionSummary?.accountEmail ?? "").trim();
+  }
+
+  function selectedSessionCanMoveProfile() {
+    if (!selectedSessionSummary || readOnly || profiles.length <= 1) {
+      return false;
+    }
+    const currentProfileId = selectedSessionSummary.profileId ?? profiles.find((profile) => profile.active)?.id ?? null;
+    return profiles.some((profile) => profile.id !== currentProfileId);
+  }
 </script>
 
 <header class="sticky top-0 z-40 flex items-center justify-between border-b border-gray-100 bg-white/80 px-6 py-3 backdrop-blur-md">
@@ -150,6 +178,31 @@
               <Pin size={10} />
               {m.pinned_only()}
             </span>
+          {/if}
+          {#if selectedSessionAccountLabel()}
+            {#if selectedSessionCanMoveProfile()}
+              <button
+                class="session-title-account-badge ui-animated-button ui-animated-button--soft inline-flex max-w-[14rem] items-center gap-1 rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[10px] font-semibold text-gray-500 transition-colors hover:border-amber-200 hover:bg-amber-50 hover:text-amber-700"
+                title={`${ui.moveSessionToAccount}: ${selectedSessionSummary.profileCodexHome ?? selectedSessionAccountLabel()}`}
+                type="button"
+                onclick={() => {
+                  if (selectedSessionSummary) {
+                    onRequestMoveSessionProfile(selectedSessionSummary);
+                  }
+                }}
+              >
+                <UserCog size={10} class="shrink-0" />
+                <span class="truncate">{selectedSessionAccountLabel()}</span>
+              </button>
+            {:else}
+              <span
+                class="session-title-account-badge inline-flex max-w-[14rem] items-center gap-1 rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[10px] font-semibold text-gray-500"
+                title={selectedSessionSummary.profileCodexHome ?? selectedSessionAccountLabel()}
+              >
+                <User size={10} class="shrink-0" />
+                <span class="truncate">{selectedSessionAccountLabel()}</span>
+              </span>
+            {/if}
           {/if}
           {#each selectedSessionSummary.tags as tag (tag)}
             <span class="inline-flex items-center rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[10px] font-semibold text-gray-500">
@@ -371,5 +424,17 @@
 
   :global(:root[data-theme="dark"]) .workspace-open-trigger:hover {
     background: linear-gradient(180deg, rgba(71, 85, 105, 0.98), rgba(51, 65, 85, 1));
+  }
+
+  :global(:root[data-theme="dark"]) .session-title-account-badge {
+    border-color: rgba(71, 85, 105, 0.42);
+    background: rgba(15, 23, 42, 0.74);
+    color: #94a3b8;
+  }
+
+  :global(:root[data-theme="dark"]) button.session-title-account-badge:hover {
+    border-color: rgba(245, 158, 11, 0.34);
+    background: rgba(69, 39, 10, 0.36);
+    color: #fbbf24;
   }
 </style>

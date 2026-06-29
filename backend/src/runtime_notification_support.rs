@@ -780,7 +780,7 @@ pub(crate) async fn clear_stale_session_runtime_activity_if_app_server_missing(
     let client_key = app_server_client_key_for_session(state, profile_id, session_id).await;
     if state
         .app_servers
-        .client_key_has_active_process(resolved_profile_id, &client_key)
+        .client_key_has_active_process(&resolved_profile_id, &client_key)
         .await
     {
         return false;
@@ -883,7 +883,7 @@ async fn mark_runtime_session_terminal_after_reconcile(
     reason: &str,
 ) {
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        &resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
     state.active_turns.lock().await.remove(&runtime_key);

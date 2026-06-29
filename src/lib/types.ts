@@ -49,6 +49,11 @@ export type SessionPreferences = {
 
 export type SessionSummary = {
   id: string;
+  profileId?: string | null;
+  profileLabel?: string | null;
+  profileCodexHome?: string | null;
+  accountEmail?: string | null;
+  accountType?: "apiKey" | "chatgpt" | string | null;
   name: string | null;
   preview: string;
   queueCount: number;
@@ -73,6 +78,7 @@ export type SessionSummaryFilter = {
   untaggedOnly: boolean;
   highlight: "all" | "attention" | "completed";
   tags: string[];
+  profileIds?: string[];
 };
 
 export type SavedSessionFilter = SessionSummaryFilter & {
@@ -472,6 +478,19 @@ export type CodexAccountLoginResponse =
     }
   | {
       type: "chatgptAuthTokens";
+    }
+  | {
+      type: "authJsonFile";
+      imported: true;
+      profile?: {
+        id: string;
+        label: string;
+        codexHome: string;
+        dataDir?: string;
+        active?: boolean;
+      } | null;
+      restartRequired?: boolean;
+      configPath?: string | null;
     };
 
 export type CodexAccountLoginFlow =
@@ -977,6 +996,48 @@ export type CodexQuotaStatus = {
   fiveHour: CodexQuotaWindow | null;
   weekly: CodexQuotaWindow | null;
   error: string | null;
+};
+
+export type CodexProfileAccountSummary = {
+  profileId: string;
+  label: string;
+  codexHome: string;
+  active: boolean;
+  account: {
+    type: "apiKey" | "chatgpt" | null;
+    email: string | null;
+    planType: string | null;
+    requiresOpenaiAuth: boolean;
+  };
+  quota: CodexQuotaStatus;
+};
+
+export type CodexProfileAccountsPayload = {
+  profiles: CodexProfileAccountSummary[];
+  fetchedAt: number;
+};
+
+export type CodexProfileSelectPayload = {
+  ok: true;
+  activeProfileId: string;
+  profileCookie?: {
+    name: string;
+    path: string;
+    maxAgeSeconds: number;
+    sameSite: "Strict" | "Lax" | "None";
+  };
+};
+
+export type CodexProfileMutationPayload = {
+  ok: true;
+  profileId?: string;
+  profile?: {
+    id: string;
+    label: string;
+  };
+  deleteData?: boolean;
+  deletedData?: boolean;
+  restartRequired?: boolean;
 };
 
 export type CodexResetTicket = {

@@ -113,6 +113,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
             app_server_handoff_enabled: false,
             per_session_app_servers: false,
             restart_command: None,
+            config_file_path: None,
         }),
         app_servers: AppServerManager::new(AppServerClientConfig::default()),
         http: reqwest::Client::new(),

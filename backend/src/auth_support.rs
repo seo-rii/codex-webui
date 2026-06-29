@@ -40,7 +40,6 @@ pub(crate) fn issue_profile_cookie(
     let secure = resolve_cookie_secure(config, secure_request)?;
     let mut cookie = Cookie::new(PROFILE_COOKIE, profile_id.to_string());
     cookie.set_path(auth_cookie_path(config));
-    cookie.set_http_only(true);
     cookie.set_same_site(match config.cookie_same_site {
         SameSiteMode::Strict => SameSite::Strict,
         SameSiteMode::Lax => SameSite::Lax,
@@ -435,7 +434,8 @@ pub(crate) async fn select_profile(
         .map(sanitize_profile_id)
         .unwrap_or_else(|| config.default_profile_id.clone());
 
-    if !config.profiles.contains_key(&requested_profile_id) {
+    let (_, profiles) = runtime_profiles_snapshot(&config);
+    if !profiles.contains_key(&requested_profile_id) {
         return Ok(json_error(StatusCode::BAD_REQUEST, "Unknown profile."));
     }
 
@@ -483,10 +483,11 @@ pub(crate) fn auth_context_from_headers(
         return None;
     };
 
+    let (_, profiles) = runtime_profiles_snapshot(config);
     let profile_id = jar
         .get(PROFILE_COOKIE)
         .map(|cookie| sanitize_profile_id(cookie.value()))
-        .filter(|value| config.profiles.contains_key(value))
+        .filter(|value| profiles.contains_key(value))
         .unwrap_or_else(|| config.default_profile_id.clone());
 
     Some(AuthContext { role, profile_id })

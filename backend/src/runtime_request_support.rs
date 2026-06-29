@@ -45,7 +45,7 @@ pub(crate) async fn clear_session_pending_requests(
     session_id: &str,
 ) {
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        &resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
     let removed = state
@@ -178,7 +178,7 @@ pub(crate) async fn handle_profile_server_request(
     };
 
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        &resolve_runtime_profile_entry(&state.config, profile_id).0,
         &session_id,
     );
     if !session_accepts_server_request(state, &runtime_key).await {
@@ -375,7 +375,7 @@ pub(crate) async fn resolve_server_request_payload(
     result: Value,
 ) -> ApiResult<Value> {
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        &resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
     let pending = state
@@ -478,7 +478,7 @@ pub(crate) async fn send_computer_input_payload(
         serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
     );
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        &resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
     let pending_request_id = {

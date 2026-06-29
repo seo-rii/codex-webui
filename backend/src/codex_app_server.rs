@@ -2,11 +2,12 @@ use std::{
     collections::HashMap,
     env,
     error::Error as StdError,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Command as StdCommand, Stdio},
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc as std_mpsc,
     },
@@ -56,6 +57,7 @@ pub struct AppServerClientConfig {
     pub request_timeout: Duration,
     pub startup_timeout: Duration,
     pub handoff_dir: Option<PathBuf>,
+    pub drop_inherited_capabilities: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -95,6 +97,7 @@ impl Default for AppServerClientConfig {
             request_timeout: default_request_timeout(),
             startup_timeout: default_startup_timeout(),
             handoff_dir: None,
+            drop_inherited_capabilities: default_drop_inherited_capabilities(),
         }
     }
 }
@@ -228,6 +231,88 @@ pub fn app_server_request_interrupted(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message.contains("codex app-server exited")
         || message.contains("codex app-server request channel closed")
+}
+
+fn codex_app_server_command_spec(
+    codex_bin: &str,
+    args: Vec<OsString>,
+    drop_inherited_capabilities: bool,
+    setpriv_available: bool,
+) -> (OsString, Vec<OsString>) {
+    #[cfg(target_os = "linux")]
+    {
+        if drop_inherited_capabilities && setpriv_available {
+            let mut wrapped_args = vec![
+                OsString::from("--inh-caps=-all"),
+                OsString::from("--ambient-caps=-all"),
+                OsString::from("--"),
+                OsString::from(codex_bin),
+            ];
+            wrapped_args.extend(args);
+            return (OsString::from("setpriv"), wrapped_args);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = drop_inherited_capabilities;
+        let _ = setpriv_available;
+    }
+
+    (OsString::from(codex_bin), args)
+}
+
+fn codex_capability_wrapper_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static SETPRIV_CAP_WRAPPER_AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *SETPRIV_CAP_WRAPPER_AVAILABLE.get_or_init(|| {
+            StdCommand::new("setpriv")
+                .arg("--inh-caps=-all")
+                .arg("--ambient-caps=-all")
+                .arg("--")
+                .arg("true")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+static SETPRIV_CAP_WRAPPER_UNAVAILABLE_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn codex_command_from_app_server_args(
+    config: &AppServerClientConfig,
+    args: Vec<OsString>,
+) -> Command {
+    let setpriv_available = codex_capability_wrapper_available();
+    #[cfg(target_os = "linux")]
+    if config.drop_inherited_capabilities
+        && !setpriv_available
+        && !SETPRIV_CAP_WRAPPER_UNAVAILABLE_WARNED.swap(true, Ordering::SeqCst)
+    {
+        warn!(
+            "setpriv capability wrapper is unavailable; starting codex app-server without dropping inherited capabilities"
+        );
+    }
+
+    let (program, args) = codex_app_server_command_spec(
+        &config.codex_bin,
+        args,
+        config.drop_inherited_capabilities,
+        setpriv_available,
+    );
+    let mut command = Command::new(program);
+    command.args(args);
+    command
 }
 
 impl AppServerClient {
@@ -688,23 +773,25 @@ impl AppServerClient {
                 self.inner.config.max_processes.max(1)
             ),
         };
-        let mut command = Command::new(&self.inner.config.codex_bin);
         let handoff_paths = self.ensure_handoff_server_running().await?;
         let handoff_proxy = handoff_paths.is_some();
-        if let Some(handoff_paths) = handoff_paths {
-            command
-                .arg("app-server")
-                .arg("proxy")
-                .arg("--sock")
-                .arg(&handoff_paths.socket_path);
+        let args = if let Some(handoff_paths) = handoff_paths {
+            vec![
+                OsString::from("app-server"),
+                OsString::from("proxy"),
+                OsString::from("--sock"),
+                handoff_paths.socket_path.as_os_str().to_os_string(),
+            ]
         } else {
-            command
-                .arg("app-server")
-                .arg("--enable")
-                .arg("goals")
-                .arg("--listen")
-                .arg("stdio://");
-        }
+            vec![
+                OsString::from("app-server"),
+                OsString::from("--enable"),
+                OsString::from("goals"),
+                OsString::from("--listen"),
+                OsString::from("stdio://"),
+            ]
+        };
+        let mut command = codex_command_from_app_server_args(&self.inner.config, args);
 
         command
             .env("CODEX_HOME", &self.inner.profile.codex_home)
@@ -831,13 +918,17 @@ impl AppServerClient {
                 .try_clone()
                 .with_context(|| format!("failed to clone {}", paths.log_path.display()))?;
 
-            let mut command = Command::new(&self.inner.config.codex_bin);
+            let mut command = codex_command_from_app_server_args(
+                &self.inner.config,
+                vec![
+                    OsString::from("app-server"),
+                    OsString::from("--enable"),
+                    OsString::from("goals"),
+                    OsString::from("--listen"),
+                    OsString::from(format!("unix://{}", paths.socket_path.display())),
+                ],
+            );
             command
-                .arg("app-server")
-                .arg("--enable")
-                .arg("goals")
-                .arg("--listen")
-                .arg(format!("unix://{}", paths.socket_path.display()))
                 .env("CODEX_HOME", &self.inner.profile.codex_home)
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log))
@@ -1686,6 +1777,22 @@ fn default_startup_timeout() -> Duration {
     Duration::from_secs(seconds)
 }
 
+fn default_drop_inherited_capabilities() -> bool {
+    std::env::var("CODEX_WEBUI_DROP_CODEX_CAPS")
+        .ok()
+        .as_deref()
+        .and_then(parse_env_bool)
+        .unwrap_or(cfg!(target_os = "linux"))
+}
+
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 async fn supervise_process(
     inner: Arc<AppServerClientInner>,
     mut child: Child,
@@ -1952,6 +2059,7 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::path::PathBuf;
 
     #[cfg(target_os = "linux")]
@@ -2089,6 +2197,55 @@ mod tests {
             super::app_server_request_timeout_seconds_from_env_value(Some("999999")),
             7_200
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codex_app_server_command_wraps_with_setpriv_when_cap_drop_is_enabled() {
+        let (program, args) = super::codex_app_server_command_spec(
+            "/usr/bin/codex",
+            vec![OsString::from("app-server"), OsString::from("--listen")],
+            true,
+            true,
+        );
+        let args = args
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(program.to_string_lossy(), "setpriv");
+        assert_eq!(
+            args,
+            vec![
+                "--inh-caps=-all",
+                "--ambient-caps=-all",
+                "--",
+                "/usr/bin/codex",
+                "app-server",
+                "--listen"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_app_server_command_keeps_direct_command_when_cap_drop_is_disabled_or_unavailable() {
+        let (program, args) = super::codex_app_server_command_spec(
+            "/usr/bin/codex",
+            vec![OsString::from("app-server")],
+            false,
+            true,
+        );
+        assert_eq!(program.to_string_lossy(), "/usr/bin/codex");
+        assert_eq!(args, vec![OsString::from("app-server")]);
+
+        let (program, args) = super::codex_app_server_command_spec(
+            "/usr/bin/codex",
+            vec![OsString::from("app-server")],
+            true,
+            false,
+        );
+        assert_eq!(program.to_string_lossy(), "/usr/bin/codex");
+        assert_eq!(args, vec![OsString::from("app-server")]);
     }
 
     #[test]

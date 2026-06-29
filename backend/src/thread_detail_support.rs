@@ -43,7 +43,7 @@ async fn session_pending_requests_payload(
     session_id: &str,
 ) -> Vec<Value> {
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        &resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
     let mut requests = state
@@ -1541,7 +1541,7 @@ pub(crate) async fn session_detail_payload(
     };
     let turns = visible_turns.clone();
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        &resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
     let raw_active_turn_id_from_payload = active_turn_id_from_turns(&turns);
@@ -1553,12 +1553,24 @@ pub(crate) async fn session_detail_payload(
             .cloned())
     })
     .await?;
-    let mut terminal_runtime_status = runtime_status_entry
+    let runtime_status_text = runtime_status_entry
         .as_ref()
-        .and_then(|status| normalized_thread_status(Some(status)))
-        .filter(|status| !is_live_thread_status(status));
+        .and_then(|status| normalized_thread_status(Some(status)));
+    let runtime_status_updated_at = runtime_status_entry
+        .as_ref()
+        .and_then(|status| status.get("updatedAt"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let stale_starting_runtime_status = runtime_status_text.as_deref() == Some("starting")
+        && now_unix_ms().saturating_sub(runtime_status_updated_at)
+            >= SESSION_DETAIL_ACTIVE_RECONCILE_TIMEOUT_MS;
+    let mut terminal_runtime_status = runtime_status_text
+        .clone()
+        .filter(|status| !is_live_thread_status(status) && status != "starting");
 
-    if raw_active_turn_id_from_payload.is_some() && terminal_runtime_status.is_none() {
+    if (raw_active_turn_id_from_payload.is_some() || stale_starting_runtime_status)
+        && terminal_runtime_status.is_none()
+    {
         let app_server_thread =
             match app_server_client_for_session(state, profile_id, session_id).await {
                 Ok(client) => client
@@ -1707,14 +1719,18 @@ pub(crate) async fn session_detail_payload(
     })
     .await?;
     let cached_goal = cached_session_goal_or_null_payload(state, profile_id, session_id).await;
-    let goal = tokio::time::timeout(
-        Duration::from_millis(SESSION_DETAIL_GOAL_TIMEOUT_MS),
-        fetch_session_goal_payload(state, profile_id, session_id),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .unwrap_or(cached_goal);
+    let goal = if cached_goal.is_null() {
+        tokio::time::timeout(
+            Duration::from_millis(SESSION_DETAIL_GOAL_TIMEOUT_MS),
+            fetch_session_goal_payload(state, profile_id, session_id),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(Value::Null)
+    } else {
+        cached_goal
+    };
     clear_completed_session_highlight_on_open(state, profile_id, session_id).await;
 
     let payload = json!({
@@ -1856,16 +1872,6 @@ pub(crate) fn cacheable_session_detail_response(
     known_state_hash: Option<&str>,
 ) -> Value {
     let version = payload_cache_version(&payload);
-    if known_version
-        .map(str::trim)
-        .is_some_and(|candidate| !candidate.is_empty() && candidate == version)
-    {
-        return json!({
-            "cacheVersion": version,
-            "notModified": true
-        });
-    }
-
     if known_state_hash
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1952,6 +1958,16 @@ pub(crate) fn cacheable_session_detail_response(
                 "tokenUsage": payload.get("tokenUsage").cloned().unwrap_or(Value::Null),
                 "hydration": payload.get("hydration").cloned().unwrap_or(Value::Null)
             }
+        });
+    }
+
+    if known_version
+        .map(str::trim)
+        .is_some_and(|candidate| !candidate.is_empty() && candidate == version)
+    {
+        return json!({
+            "cacheVersion": version,
+            "notModified": true
         });
     }
 

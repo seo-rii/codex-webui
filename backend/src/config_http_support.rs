@@ -445,9 +445,8 @@ pub(crate) async fn get_config_payload(state: &AppState, profile_id: &str) -> Ap
     } else {
         Value::Null
     };
-    let mut profiles = state
-        .config
-        .profiles
+    let (_, profiles_snapshot) = runtime_profiles_snapshot(&state.config);
+    let mut profiles = profiles_snapshot
         .iter()
         .map(|(id, profile)| {
             json!({

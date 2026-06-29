@@ -455,7 +455,7 @@ pub(crate) async fn session_stream_has_subscribers(
         .relays
         .lock()
         .await
-        .get(&session_relay_key(resolved_profile_id, session_id))
+        .get(&session_relay_key(&resolved_profile_id, session_id))
         .is_some_and(|relay| relay.receiver_count() > 0)
 }
 
@@ -482,7 +482,7 @@ async fn prune_session_relay_with_receiver_limit(
     max_receivers: usize,
 ) {
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
-    let relay_key = session_relay_key(resolved_profile_id, session_id);
+    let relay_key = session_relay_key(&resolved_profile_id, session_id);
     let mut relays = state.relays.lock().await;
     if relays
         .get(&relay_key)
@@ -581,7 +581,7 @@ pub(crate) async fn emit_profile_global_notification(
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
     let relay = {
         let relays = state.relays.lock().await;
-        relays.get(&global_relay_key(resolved_profile_id)).cloned()
+        relays.get(&global_relay_key(&resolved_profile_id)).cloned()
     };
 
     if let Some(relay) = relay {

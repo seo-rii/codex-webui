@@ -100,6 +100,7 @@ pub(crate) struct Config {
     pub(crate) app_server_handoff_enabled: bool,
     pub(crate) per_session_app_servers: bool,
     pub(crate) restart_command: Option<String>,
+    pub(crate) config_file_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -239,6 +240,7 @@ impl Config {
             ),
             per_session_app_servers: parse_bool_env("CODEX_WEBUI_PER_SESSION_APP_SERVERS"),
             restart_command: optional_env("CODEX_WEBUI_RESTART_COMMAND"),
+            config_file_path: optional_env("CODEX_WEBUI_CONFIG_PATH").map(PathBuf::from),
         };
         validate_plaintext_password_policy(&config)?;
         Ok(config)
@@ -267,7 +269,8 @@ fn parse_app_server_handoff_enabled(value: Option<String>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_app_server_handoff_enabled;
+    use super::{parse_app_server_handoff_enabled, read_runtime_profiles_from_config_path};
+    use std::{fs, path::PathBuf};
 
     #[test]
     fn app_server_handoff_defaults_to_platform_support() {
@@ -276,6 +279,56 @@ mod tests {
         assert!(!parse_app_server_handoff_enabled(Some("0".to_string())));
         assert!(parse_app_server_handoff_enabled(Some("true".to_string())));
         assert!(parse_app_server_handoff_enabled(Some("on".to_string())));
+    }
+
+    #[test]
+    fn runtime_profiles_can_load_from_webui_yaml() {
+        let sandbox = std::env::temp_dir().join(format!(
+            "codex-webui-config-support-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&sandbox);
+        fs::create_dir_all(&sandbox).unwrap();
+        let config_path = sandbox.join("codex-webui.yml");
+        fs::write(
+            &config_path,
+            r#"
+defaultProfileId: work
+profiles:
+  - id: default
+    label: Default
+    codexHome: /home/example/.codex
+    dataDir: /tmp/codex-webui/default
+  - id: work
+    label: Work Account
+    codexHome: /tmp/codex-webui/accounts/work/codex-home
+    dataDir: /tmp/codex-webui/profiles/work
+"#,
+        )
+        .unwrap();
+
+        let (default_profile_id, profiles) =
+            read_runtime_profiles_from_config_path(Some(config_path))
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(default_profile_id.as_deref(), Some("work"));
+        assert_eq!(profiles.len(), 2);
+        let work = profiles
+            .iter()
+            .find(|profile| profile.id.as_deref() == Some("work"))
+            .unwrap();
+        assert_eq!(work.label.as_deref(), Some("Work Account"));
+        assert_eq!(
+            work.codex_home.as_deref().map(PathBuf::from),
+            Some(PathBuf::from("/tmp/codex-webui/accounts/work/codex-home"))
+        );
+        assert_eq!(
+            work.data_dir.as_deref().map(PathBuf::from),
+            Some(PathBuf::from("/tmp/codex-webui/profiles/work"))
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
     }
 }
 
@@ -414,26 +467,56 @@ pub(crate) fn parse_runtime_profiles(
     default_codex_home: &PathBuf,
     root_data_dir: &PathBuf,
 ) -> Result<(String, HashMap<String, RuntimeProfile>)> {
-    let default_profile_id = sanitize_profile_id(
+    let env_default_profile_id = sanitize_profile_id(
         &env::var("CODEX_WEBUI_DEFAULT_PROFILE_ID").unwrap_or_else(|_| "default".to_string()),
     );
     let raw_profiles = env::var("CODEX_WEBUI_PROFILES_JSON").ok();
-
-    let Some(raw_profiles) = raw_profiles.filter(|value| !value.trim().is_empty()) else {
-        let mut profiles = HashMap::new();
-        profiles.insert(
-            default_profile_id.clone(),
-            RuntimeProfile {
-                label: "Default".to_string(),
-                codex_home: default_codex_home.clone(),
-                data_dir: root_data_dir.join("profiles").join(&default_profile_id),
-            },
-        );
-        return Ok((default_profile_id, profiles));
+    let yaml_profiles = if raw_profiles
+        .as_ref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        read_runtime_profiles_from_config_file()?
+    } else {
+        None
     };
 
-    let parsed: Vec<RuntimeProfileShape> =
-        serde_json::from_str(&raw_profiles).context("invalid CODEX_WEBUI_PROFILES_JSON")?;
+    let (default_profile_id, parsed) =
+        if let Some((yaml_default_profile_id, profiles)) = yaml_profiles {
+            (
+                yaml_default_profile_id.unwrap_or(env_default_profile_id),
+                profiles,
+            )
+        } else if let Some(raw_profiles) = raw_profiles.filter(|value| !value.trim().is_empty()) {
+            (
+                env_default_profile_id,
+                serde_json::from_str(&raw_profiles).context("invalid CODEX_WEBUI_PROFILES_JSON")?,
+            )
+        } else {
+            let mut profiles = HashMap::new();
+            profiles.insert(
+                env_default_profile_id.clone(),
+                RuntimeProfile {
+                    label: "Default".to_string(),
+                    codex_home: default_codex_home.clone(),
+                    data_dir: root_data_dir.join("profiles").join(&env_default_profile_id),
+                },
+            );
+            return Ok((env_default_profile_id, profiles));
+        };
+    Ok(runtime_profiles_from_shapes(
+        default_profile_id,
+        default_codex_home,
+        root_data_dir,
+        parsed,
+    ))
+}
+
+fn runtime_profiles_from_shapes(
+    default_profile_id: String,
+    default_codex_home: &PathBuf,
+    root_data_dir: &PathBuf,
+    parsed: Vec<RuntimeProfileShape>,
+) -> (String, HashMap<String, RuntimeProfile>) {
     let mut profiles = HashMap::new();
 
     for entry in parsed {
@@ -489,7 +572,115 @@ pub(crate) fn parse_runtime_profiles(
             .unwrap_or_else(|| "default".to_string())
     };
 
-    Ok((resolved_default_profile_id, profiles))
+    (resolved_default_profile_id, profiles)
+}
+
+pub(crate) fn runtime_profiles_snapshot(
+    config: &Config,
+) -> (String, HashMap<String, RuntimeProfile>) {
+    if env::var("CODEX_WEBUI_PROFILES_JSON")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return (config.default_profile_id.clone(), config.profiles.clone());
+    }
+
+    let default_codex_home = config
+        .profiles
+        .get(&config.default_profile_id)
+        .or_else(|| config.profiles.values().next())
+        .map(|profile| profile.codex_home.clone())
+        .unwrap_or_else(|| config.data_dir.join("codex-home"));
+    let config_path = config
+        .config_file_path
+        .clone()
+        .or_else(webui_config_path_from_env_or_home);
+    match read_runtime_profiles_from_config_path(config_path) {
+        Ok(Some((yaml_default_profile_id, profiles))) => runtime_profiles_from_shapes(
+            yaml_default_profile_id.unwrap_or_else(|| config.default_profile_id.clone()),
+            &default_codex_home,
+            &config.data_dir,
+            profiles,
+        ),
+        Ok(None) | Err(_) => (config.default_profile_id.clone(), config.profiles.clone()),
+    }
+}
+
+fn read_runtime_profiles_from_config_file()
+-> Result<Option<(Option<String>, Vec<RuntimeProfileShape>)>> {
+    read_runtime_profiles_from_config_path(webui_config_path_from_env_or_home())
+}
+
+fn read_runtime_profiles_from_config_path(
+    path: Option<PathBuf>,
+) -> Result<Option<(Option<String>, Vec<RuntimeProfileShape>)>> {
+    use yaml_rust2::{Yaml, YamlLoader};
+
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if !path.is_file() {
+        return Ok(None);
+    }
+
+    let raw_config =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let documents = YamlLoader::load_from_str(&raw_config)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let Some(document) = documents.first() else {
+        return Ok(None);
+    };
+    let default_profile_id = yaml_string(document, "defaultProfileId")
+        .or_else(|| yaml_string(document, "default_profile_id"))
+        .map(|value| sanitize_profile_id(&value));
+    let Some(profiles_yaml) = document["profiles"].as_vec() else {
+        return Ok(None);
+    };
+
+    let profiles = profiles_yaml
+        .iter()
+        .filter_map(|profile| match profile {
+            Yaml::Hash(_) => {
+                let id = yaml_string(profile, "id");
+                if id.as_deref().is_none_or(|value| value.trim().is_empty()) {
+                    return None;
+                }
+                Some(RuntimeProfileShape {
+                    id,
+                    label: yaml_string(profile, "label"),
+                    codex_home: yaml_string(profile, "codexHome")
+                        .or_else(|| yaml_string(profile, "codex_home")),
+                    data_dir: yaml_string(profile, "dataDir")
+                        .or_else(|| yaml_string(profile, "data_dir")),
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if profiles.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some((default_profile_id, profiles)))
+    }
+}
+
+fn webui_config_path_from_env_or_home() -> Option<PathBuf> {
+    if let Some(path) = optional_env("CODEX_WEBUI_CONFIG_PATH") {
+        return Some(PathBuf::from(path));
+    }
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|home| home.join(".codex").join("codex-webui.yml"))
+}
+
+fn yaml_string(document: &yaml_rust2::Yaml, key: &str) -> Option<String> {
+    document[key]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 pub(crate) fn parse_allowed_roots(project_root: &Path) -> Result<Vec<PathBuf>> {

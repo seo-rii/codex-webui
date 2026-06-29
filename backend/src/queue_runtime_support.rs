@@ -38,7 +38,7 @@ where
 
 async fn cancel_queue_drain_retry(state: &AppState, profile_id: &str, session_id: &str) {
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
-    let key = runtime_session_key(resolved_profile_id, session_id);
+    let key = runtime_session_key(&resolved_profile_id, session_id);
     if let Some(handle) = state.queue_drain_retries.lock().await.remove(&key) {
         handle.abort();
     }
@@ -204,12 +204,12 @@ async fn session_turn_activity(
     session_id: &str,
 ) -> SessionTurnActivity {
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
-    let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+    let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
     let cached_active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
     let client_key = app_server_client_key_for_session(state, profile_id, session_id).await;
     let has_session_process = state
         .app_servers
-        .client_key_has_active_process(resolved_profile_id, &client_key)
+        .client_key_has_active_process(&resolved_profile_id, &client_key)
         .await;
 
     if !has_session_process
@@ -335,7 +335,7 @@ async fn maybe_drain_queue_with_attempt(
 ) {
     let guarded = with_queue_dispatch_guard(state, profile_id, session_id, async {
         let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
-        let runtime_key = runtime_session_key(resolved_profile_id, session_id);
+        let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
         if state
             .pending_turn_starts
             .lock()
@@ -383,8 +383,67 @@ async fn maybe_drain_queue_with_attempt(
                 return;
             }
             SessionTurnActivity::Unknown => {
-                schedule_queue_drain_retry(state, profile_id, session_id, attempt);
-                return;
+                let status_is_stale = with_ui_state_read(state, profile_id, |ui_state| {
+                    Ok(ui_state
+                        .get("runtimeStatusByThreadId")
+                        .and_then(Value::as_object)
+                        .and_then(|entries| entries.get(session_id))
+                        .is_some_and(|status| {
+                            normalized_thread_status(Some(status))
+                                .as_deref()
+                                .is_some_and(is_live_thread_status)
+                                && status.get("updatedAt").and_then(Value::as_u64).is_some_and(
+                                    |updated_at| {
+                                        now_unix_ms().saturating_sub(updated_at)
+                                            >= QUEUE_ACTIVE_STATUS_FRESH_MS
+                                    },
+                                )
+                        }))
+                })
+                .await
+                .unwrap_or(false);
+                let local_still_active = match local_session_has_active_turn_payload(
+                    state, profile_id, session_id,
+                )
+                .await
+                {
+                    Ok(Some(value)) => value,
+                    Ok(None) | Err(_) => false,
+                };
+                if !status_is_stale || local_still_active {
+                    schedule_queue_drain_retry(state, profile_id, session_id, attempt);
+                    return;
+                }
+
+                state.active_turns.lock().await.remove(&runtime_key);
+                state.pending_turn_starts.lock().await.remove(&runtime_key);
+                clear_app_server_assignments_for_sessions(
+                    state,
+                    profile_id,
+                    &[session_id.to_string()],
+                )
+                .await;
+                let _ = with_ui_state_write(state, profile_id, |ui_state| {
+                    let Some(runtime_status_by_thread_id) = ui_state
+                        .get_mut("runtimeStatusByThreadId")
+                        .and_then(Value::as_object_mut)
+                    else {
+                        return Err(api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "runtime status state is missing",
+                        ));
+                    };
+                    runtime_status_by_thread_id.insert(
+                        session_id.to_string(),
+                        json!({
+                            "status": "completed",
+                            "updatedAt": now_unix_ms(),
+                            "reason": "stale queued turn activity probe timed out"
+                        }),
+                    );
+                    Ok(())
+                })
+                .await;
             }
             SessionTurnActivity::Idle => {}
         }

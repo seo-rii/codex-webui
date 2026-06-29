@@ -217,6 +217,9 @@ pub(crate) async fn fetch_session_goal_payload(
     )
     .await?;
     let goal = goal_from_response(&response, session_id);
+    if goal.is_null() && !cached_goal.is_null() {
+        return Ok(cached_goal);
+    }
     cache_session_goal_payload(state, profile_id, session_id, &goal).await;
     Ok(goal)
 }

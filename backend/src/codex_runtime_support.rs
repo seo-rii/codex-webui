@@ -5,6 +5,7 @@ const CODEX_OAUTH_DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const ACCOUNT_LOGIN_FLOW_TTL: Duration = Duration::from_secs(15 * 60);
 const ACCOUNT_APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
 const ACCOUNT_APP_SERVER_RECOVERY_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_AUTH_JSON_IMPORT_BYTES: u64 = 512 * 1024;
 
 pub(crate) async fn codex_runtime_status(state: &AppState, check_latest: bool) -> Result<Value> {
     let configured_bin = state.config.codex_bin.clone();
@@ -137,9 +138,8 @@ pub(crate) async fn codex_runtime_processes_payload(
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
         .0
         .to_string();
-    let configured_profiles = state
-        .config
-        .profiles
+    let (_, profiles_snapshot) = runtime_profiles_snapshot(&state.config);
+    let configured_profiles = profiles_snapshot
         .iter()
         .map(|(profile_id, profile)| AppServerProfile {
             id: profile_id.clone(),
@@ -351,7 +351,7 @@ pub(crate) async fn force_kill_codex_process_payload(
     let reason = format!("Codex process {pid} was force killed from settings.");
     let affected_session_ids = clear_runtime_activity_after_app_server_client_exit(
         state,
-        resolved_profile_id,
+        &resolved_profile_id,
         &snapshot.client_key,
         Some(&reason),
     )
@@ -515,6 +515,139 @@ pub(crate) async fn codex_quota_status(
     );
 
     Ok(payload)
+}
+
+pub(crate) async fn codex_profile_accounts_payload(
+    state: &AppState,
+    active_profile_id: &str,
+    refresh: bool,
+) -> Result<Value> {
+    let resolved_active_profile_id =
+        resolve_runtime_profile_entry(&state.config, active_profile_id)
+            .0
+            .to_string();
+    let (_, profiles_snapshot) = runtime_profiles_snapshot(&state.config);
+    let profiles = profiles_snapshot
+        .iter()
+        .map(|(profile_id, profile)| {
+            (
+                profile_id.clone(),
+                profile.label.clone(),
+                profile.codex_home.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut account_profiles = futures_util::stream::iter(profiles)
+        .map(|(profile_id, label, codex_home)| {
+            let state = state.clone();
+            let resolved_active_profile_id = resolved_active_profile_id.clone();
+            async move {
+                let auth_path = codex_home.join("auth.json");
+                let auth_payload = tokio_fs::read(&auth_path)
+                    .await
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                let auth_mode = auth_payload
+                    .as_ref()
+                    .and_then(|value| value.get("auth_mode").or_else(|| value.get("authMode")))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let has_api_key = auth_payload
+                    .as_ref()
+                    .and_then(|value| value.get("OPENAI_API_KEY"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty());
+                let has_chatgpt_tokens = auth_payload
+                    .as_ref()
+                    .and_then(|value| value.get("tokens"))
+                    .and_then(Value::as_object)
+                    .is_some_and(|tokens| {
+                        tokens
+                            .get("access_token")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| !value.trim().is_empty())
+                            && tokens
+                                .get("account_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| !value.trim().is_empty())
+                    });
+                let account_type = if has_api_key
+                    || auth_mode
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case("apikey"))
+                {
+                    Some("apiKey")
+                } else if has_chatgpt_tokens
+                    || auth_mode
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case("chatgpt"))
+                {
+                    Some("chatgpt")
+                } else {
+                    None
+                };
+                let quota = codex_quota_status(&state, refresh, &profile_id)
+                    .await
+                    .unwrap_or_else(|error| {
+                        json!({
+                            "available": false,
+                            "source": Value::Null,
+                            "fetchedAt": now_unix_ms(),
+                            "account": Value::Null,
+                            "plan": Value::Null,
+                            "fiveHour": Value::Null,
+                            "weekly": Value::Null,
+                            "error": error.to_string(),
+                        })
+                    });
+                let active = profile_id == resolved_active_profile_id;
+                let requires_openai_auth = account_type.is_none();
+
+                json!({
+                    "profileId": profile_id,
+                    "label": label,
+                    "codexHome": codex_home.display().to_string(),
+                    "active": active,
+                    "account": {
+                        "type": account_type,
+                        "email": quota.get("account").cloned().unwrap_or(Value::Null),
+                        "planType": quota.get("plan").cloned().unwrap_or(Value::Null),
+                        "requiresOpenaiAuth": requires_openai_auth
+                    },
+                    "quota": quota
+                })
+            }
+        })
+        .buffer_unordered(3)
+        .collect::<Vec<_>>()
+        .await;
+
+    account_profiles.sort_by(|left, right| {
+        right
+            .get("active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            .cmp(&left.get("active").and_then(Value::as_bool).unwrap_or(false))
+            .then_with(|| {
+                left.get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(
+                        right
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+            })
+    });
+
+    Ok(json!({
+        "profiles": account_profiles,
+        "fetchedAt": now_unix_ms()
+    }))
 }
 
 pub(crate) async fn codex_reset_tickets_payload(
@@ -945,6 +1078,62 @@ pub(crate) async fn start_account_login(
                 )
                 .await;
         }
+        "authJsonFile" => {
+            let auth_json_path = params
+                .get("authJsonPath")
+                .or_else(|| params.get("credentialsJsonPath"))
+                .or_else(|| params.get("path"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("Credentials JSON file path is required."))?;
+            let create_profile = params
+                .get("createProfile")
+                .or_else(|| params.get("create_profile"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let profile_label = params
+                .get("profileLabel")
+                .or_else(|| params.get("profile_label"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let profile_id_hint = params
+                .get("profileId")
+                .or_else(|| params.get("profile_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let import_result = import_account_auth_json_file(
+                state,
+                profile_id,
+                auth_json_path,
+                create_profile,
+                profile_label,
+                profile_id_hint,
+            )
+            .await?;
+            emit_profile_global_notification(
+                state,
+                &resolved_profile_id,
+                json!({
+                    "kind": "notification",
+                    "method": "codex-webui/accountUpdated",
+                    "params": {}
+                }),
+            )
+            .await;
+            return Ok(json!({
+                "type": "authJsonFile",
+                "imported": true,
+                "profile": import_result.get("profile").cloned().unwrap_or(Value::Null),
+                "restartRequired": import_result
+                    .get("restartRequired")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                "configPath": import_result.get("configPath").cloned().unwrap_or(Value::Null)
+            }));
+        }
         _ => anyhow::bail!("Invalid account login type."),
     }
 
@@ -965,6 +1154,486 @@ pub(crate) async fn start_account_login(
     client
         .request("account/login/start", json!({ "type": login_type }))
         .await
+}
+
+async fn import_account_auth_json_file(
+    state: &AppState,
+    profile_id: &str,
+    raw_path: &str,
+    create_profile: bool,
+    profile_label: Option<&str>,
+    profile_id_hint: Option<&str>,
+) -> Result<Value> {
+    let input_path = expand_server_auth_json_path(raw_path);
+    let metadata = tokio_fs::metadata(&input_path).await.with_context(|| {
+        format!(
+            "failed to read credentials file metadata at {}",
+            input_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!("Credentials JSON path must point to a file.");
+    }
+    if metadata.len() > MAX_AUTH_JSON_IMPORT_BYTES {
+        anyhow::bail!(
+            "Credentials JSON file is too large. Limit is {} KiB.",
+            MAX_AUTH_JSON_IMPORT_BYTES / 1024
+        );
+    }
+    let bytes = tokio_fs::read(&input_path).await.with_context(|| {
+        format!(
+            "failed to read credentials file at {}",
+            input_path.display()
+        )
+    })?;
+    let parsed: Value =
+        serde_json::from_slice(&bytes).context("credentials file must be valid JSON")?;
+    if !parsed.is_object() {
+        anyhow::bail!("Credentials JSON file must contain a JSON object.");
+    }
+    let pretty = serde_json::to_vec_pretty(&parsed)?;
+    if create_profile {
+        let profile_payload = create_profile_from_auth_json_import(
+            state,
+            &input_path,
+            &pretty,
+            profile_label,
+            profile_id_hint,
+            &parsed,
+        )
+        .await?;
+        return Ok(json!({
+            "profile": profile_payload,
+            "restartRequired": false,
+            "configPath": codex_webui_config_path(state).display().to_string()
+        }));
+    }
+
+    let profile = resolve_runtime_profile(&state.config, profile_id);
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    write_file_atomically(&profile.codex_home.join("auth.json"), pretty).await?;
+    state.quota_cache.lock().await.remove(&resolved_profile_id);
+    state
+        .app_servers
+        .close_profile(&resolved_profile_id)
+        .await?;
+    Ok(json!({
+        "profile": {
+            "id": resolved_profile_id,
+            "label": profile.label,
+            "codexHome": profile.codex_home.display().to_string(),
+            "active": true
+        },
+        "restartRequired": false,
+        "configPath": Value::Null
+    }))
+}
+
+fn expand_server_auth_json_path(raw_path: &str) -> PathBuf {
+    let trimmed = raw_path.trim();
+    let expanded = if trimmed == "~" {
+        home_dir_path().unwrap_or_else(|| PathBuf::from(trimmed))
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        home_dir_path()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(trimmed))
+    } else {
+        PathBuf::from(trimmed)
+    };
+    normalize_path(expanded)
+}
+
+fn codex_webui_config_path(state: &AppState) -> PathBuf {
+    state.config.config_file_path.clone().unwrap_or_else(|| {
+        home_dir_path()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".codex")
+            .join("codex-webui.yml")
+    })
+}
+
+async fn read_codex_webui_config_yaml(state: &AppState) -> Result<(PathBuf, yaml_rust2::Yaml)> {
+    use yaml_rust2::YamlLoader;
+    use yaml_rust2::yaml::{Hash as YamlHash, Yaml};
+
+    let config_path = codex_webui_config_path(state);
+    let raw_config = tokio_fs::read_to_string(&config_path)
+        .await
+        .unwrap_or_default();
+    let config_value = if raw_config.trim().is_empty() {
+        Yaml::Hash(YamlHash::new())
+    } else {
+        YamlLoader::load_from_str(&raw_config)
+            .with_context(|| format!("failed to parse {}", config_path.display()))?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Yaml::Hash(YamlHash::new()))
+    };
+    if !config_value.is_hash() {
+        anyhow::bail!("codex-webui.yml must contain a YAML object to edit profiles.");
+    }
+    Ok((config_path, config_value))
+}
+
+fn profile_yaml_entries_from_state(state: &AppState) -> Vec<yaml_rust2::Yaml> {
+    use yaml_rust2::yaml::{Hash as YamlHash, Yaml};
+
+    state
+        .config
+        .profiles
+        .iter()
+        .map(|(profile_id, profile)| {
+            let mut entry = YamlHash::new();
+            entry.insert(
+                Yaml::String("id".to_string()),
+                Yaml::String(profile_id.clone()),
+            );
+            entry.insert(
+                Yaml::String("label".to_string()),
+                Yaml::String(profile.label.clone()),
+            );
+            entry.insert(
+                Yaml::String("codexHome".to_string()),
+                Yaml::String(profile.codex_home.display().to_string()),
+            );
+            entry.insert(
+                Yaml::String("dataDir".to_string()),
+                Yaml::String(profile.data_dir.display().to_string()),
+            );
+            Yaml::Hash(entry)
+        })
+        .collect()
+}
+
+fn ensure_profile_yaml_array(config_value: &mut yaml_rust2::Yaml, state: &AppState) -> Result<()> {
+    use yaml_rust2::Yaml;
+
+    let root = config_value
+        .as_mut_hash()
+        .ok_or_else(|| anyhow!("codex-webui.yml must contain a YAML object to edit profiles."))?;
+    let profiles_key = Yaml::String("profiles".to_string());
+    if !root.get(&profiles_key).is_some_and(Yaml::is_array) {
+        root.insert(
+            profiles_key,
+            Yaml::Array(profile_yaml_entries_from_state(state)),
+        );
+    }
+    Ok(())
+}
+
+fn profile_yaml_array_mut(
+    config_value: &mut yaml_rust2::Yaml,
+) -> Result<&mut Vec<yaml_rust2::Yaml>> {
+    config_value["profiles"]
+        .as_mut_vec()
+        .ok_or_else(|| anyhow!("codex-webui.yml profiles must be a YAML array."))
+}
+
+fn profile_id_from_yaml(profile: &yaml_rust2::Yaml) -> Option<String> {
+    profile["id"].as_str().map(sanitize_profile_id)
+}
+
+async fn write_codex_webui_config_yaml(
+    config_path: &Path,
+    config_value: &yaml_rust2::Yaml,
+) -> Result<()> {
+    use yaml_rust2::YamlEmitter;
+
+    let mut encoded = String::new();
+    YamlEmitter::new(&mut encoded)
+        .dump(config_value)
+        .map_err(|error| anyhow!("failed to encode codex-webui.yml: {error}"))?;
+    encoded.push('\n');
+    write_file_atomically(config_path, encoded.into_bytes()).await
+}
+
+fn default_import_profile_label(parsed: &Value, input_path: &Path) -> String {
+    parsed
+        .get("account")
+        .and_then(Value::as_object)
+        .and_then(|account| account.get("email"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            parsed
+                .get("tokens")
+                .and_then(Value::as_object)
+                .and_then(|tokens| tokens.get("email"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| input_path.file_stem().and_then(|value| value.to_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "Imported account".to_string())
+}
+
+async fn create_profile_from_auth_json_import(
+    state: &AppState,
+    input_path: &Path,
+    auth_json_bytes: &[u8],
+    profile_label: Option<&str>,
+    profile_id_hint: Option<&str>,
+    parsed: &Value,
+) -> Result<Value> {
+    let label = profile_label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| default_import_profile_label(parsed, input_path));
+    let requested_id = profile_id_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| label.clone());
+    let base_id = sanitize_profile_id(&requested_id);
+    use yaml_rust2::yaml::{Hash as YamlHash, Yaml};
+    let (config_path, mut config_value) = read_codex_webui_config_yaml(state).await?;
+
+    let root_data_dir = config_value["dataDir"]
+        .as_str()
+        .map(expand_server_auth_json_path)
+        .unwrap_or_else(|| state.config.data_dir.clone());
+    let (_, profiles_snapshot) = runtime_profiles_snapshot(&state.config);
+    let mut existing_ids = profiles_snapshot.keys().cloned().collect::<HashSet<_>>();
+    if let Some(profiles) = config_value["profiles"].as_vec() {
+        for profile in profiles {
+            if let Some(id) = profile["id"].as_str().map(sanitize_profile_id) {
+                existing_ids.insert(id);
+            }
+        }
+    }
+
+    let mut id = base_id.clone();
+    let mut suffix = 2u64;
+    while existing_ids.contains(&id) {
+        id = format!("{base_id}-{suffix}");
+        suffix = suffix.saturating_add(1);
+    }
+
+    let codex_home = root_data_dir.join("accounts").join(&id).join("codex-home");
+    let data_dir = root_data_dir.join("profiles").join(&id);
+    write_file_atomically(&codex_home.join("auth.json"), auth_json_bytes.to_vec()).await?;
+    tokio_fs::create_dir_all(&data_dir).await?;
+
+    ensure_profile_yaml_array(&mut config_value, state)?;
+    let profiles = profile_yaml_array_mut(&mut config_value)?;
+    let mut entry = YamlHash::new();
+    entry.insert(Yaml::String("id".to_string()), Yaml::String(id.clone()));
+    entry.insert(
+        Yaml::String("label".to_string()),
+        Yaml::String(label.clone()),
+    );
+    entry.insert(
+        Yaml::String("codexHome".to_string()),
+        Yaml::String(codex_home.display().to_string()),
+    );
+    entry.insert(
+        Yaml::String("dataDir".to_string()),
+        Yaml::String(data_dir.display().to_string()),
+    );
+    profiles.push(Yaml::Hash(entry));
+
+    write_codex_webui_config_yaml(&config_path, &config_value).await?;
+
+    Ok(json!({
+        "id": id,
+        "label": label,
+        "codexHome": codex_home.display().to_string(),
+        "dataDir": data_dir.display().to_string(),
+        "active": false
+    }))
+}
+
+pub(crate) async fn select_account_profile_payload(
+    state: &AppState,
+    role: UserRole,
+    params: &Value,
+) -> Result<Value> {
+    let requested_profile_id = params
+        .get("profileId")
+        .and_then(Value::as_str)
+        .map(sanitize_profile_id)
+        .unwrap_or_else(|| state.config.default_profile_id.clone());
+
+    let (_, profiles_snapshot) = runtime_profiles_snapshot(&state.config);
+    if !profiles_snapshot.contains_key(&requested_profile_id) {
+        anyhow::bail!("Unknown profile.");
+    }
+
+    let _ = append_audit_log(
+        &state.config,
+        AuditLogEntry {
+            id: Uuid::new_v4().to_string(),
+            at: now_unix_ms(),
+            role: user_role_label(role).to_string(),
+            method: "account/profile/select".to_string(),
+            target: Some(requested_profile_id.clone()),
+            ok: true,
+            error: None,
+        },
+    )
+    .await;
+
+    Ok(json!({
+        "ok": true,
+        "activeProfileId": requested_profile_id,
+        "profileCookie": {
+            "name": PROFILE_COOKIE,
+            "path": auth_cookie_path(&state.config),
+            "maxAgeSeconds": 30 * 24 * 60 * 60,
+            "sameSite": match state.config.cookie_same_site {
+                SameSiteMode::Strict => "Strict",
+                SameSiteMode::Lax => "Lax",
+                SameSiteMode::None => "None",
+            }
+        }
+    }))
+}
+
+pub(crate) async fn update_account_profile_payload(
+    state: &AppState,
+    active_profile_id: &str,
+    params: &Value,
+) -> Result<Value> {
+    let profile_id = params
+        .get("profileId")
+        .and_then(Value::as_str)
+        .map(sanitize_profile_id)
+        .ok_or_else(|| anyhow!("profileId is required."))?;
+    let label = params
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("Profile label is required."))?;
+    if label.chars().count() > 80 {
+        anyhow::bail!("Profile label is too long.");
+    }
+    let (_, profiles_snapshot) = runtime_profiles_snapshot(&state.config);
+    if !profiles_snapshot.contains_key(&profile_id) {
+        anyhow::bail!("Unknown profile.");
+    }
+
+    let (config_path, mut config_value) = read_codex_webui_config_yaml(state).await?;
+    ensure_profile_yaml_array(&mut config_value, state)?;
+    let profiles = profile_yaml_array_mut(&mut config_value)?;
+    let Some(profile) = profiles
+        .iter_mut()
+        .find(|profile| profile_id_from_yaml(profile).as_deref() == Some(profile_id.as_str()))
+    else {
+        anyhow::bail!("Profile is not present in codex-webui.yml.");
+    };
+    let Some(entry) = profile.as_mut_hash() else {
+        anyhow::bail!("Profile entry must be a YAML object.");
+    };
+    entry.insert(
+        yaml_rust2::Yaml::String("label".to_string()),
+        yaml_rust2::Yaml::String(label.to_string()),
+    );
+    write_codex_webui_config_yaml(&config_path, &config_value).await?;
+
+    let _ = emit_profile_global_notification(
+        state,
+        active_profile_id,
+        json!({
+            "method": "codex-webui/profileUpdated",
+            "profileId": profile_id,
+            "label": label,
+            "restartRequired": false
+        }),
+    )
+    .await;
+
+    Ok(json!({
+        "ok": true,
+        "profile": {
+            "id": profile_id,
+            "label": label
+        },
+        "restartRequired": false
+    }))
+}
+
+pub(crate) async fn delete_account_profile_payload(
+    state: &AppState,
+    active_profile_id: &str,
+    params: &Value,
+) -> Result<Value> {
+    let profile_id = params
+        .get("profileId")
+        .and_then(Value::as_str)
+        .map(sanitize_profile_id)
+        .ok_or_else(|| anyhow!("profileId is required."))?;
+    let delete_data = params
+        .get("deleteData")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let resolved_active_profile_id =
+        resolve_runtime_profile_entry(&state.config, active_profile_id)
+            .0
+            .to_string();
+    let (default_profile_id, profiles_snapshot) = runtime_profiles_snapshot(&state.config);
+    if profile_id == default_profile_id {
+        anyhow::bail!("Default profile cannot be deleted.");
+    }
+    if profile_id == resolved_active_profile_id {
+        anyhow::bail!("Switch to another profile before deleting this profile.");
+    }
+    if profiles_snapshot.len() <= 1 {
+        anyhow::bail!("The last profile cannot be deleted.");
+    }
+    let Some(profile) = profiles_snapshot.get(&profile_id).cloned() else {
+        anyhow::bail!("Unknown profile.");
+    };
+
+    let (config_path, mut config_value) = read_codex_webui_config_yaml(state).await?;
+    ensure_profile_yaml_array(&mut config_value, state)?;
+    let profiles = profile_yaml_array_mut(&mut config_value)?;
+    let before_len = profiles.len();
+    profiles
+        .retain(|profile| profile_id_from_yaml(profile).as_deref() != Some(profile_id.as_str()));
+    if profiles.len() == before_len {
+        anyhow::bail!("Profile is not present in codex-webui.yml.");
+    }
+    write_codex_webui_config_yaml(&config_path, &config_value).await?;
+
+    state.app_servers.close_profile(&profile_id).await?;
+    state.quota_cache.lock().await.remove(&profile_id);
+
+    let mut deleted_data = false;
+    if delete_data {
+        let data_root = normalize_path(state.config.data_dir.clone());
+        for path in [profile.codex_home, profile.data_dir] {
+            let normalized = normalize_path(path);
+            if normalized.starts_with(&data_root) && normalized.exists() {
+                tokio_fs::remove_dir_all(&normalized).await?;
+                deleted_data = true;
+            }
+        }
+    }
+
+    let _ = emit_profile_global_notification(
+        state,
+        active_profile_id,
+        json!({
+            "method": "codex-webui/profileDeleted",
+            "profileId": profile_id,
+            "deleteData": delete_data,
+            "deletedData": deleted_data,
+            "restartRequired": false
+        }),
+    )
+    .await;
+
+    Ok(json!({
+        "ok": true,
+        "profileId": profile_id,
+        "deleteData": delete_data,
+        "deletedData": deleted_data,
+        "restartRequired": false
+    }))
 }
 
 pub(crate) async fn cancel_account_login(

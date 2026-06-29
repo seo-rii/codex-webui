@@ -74,10 +74,14 @@ pub(crate) struct SessionFilterCriteria {
     pub(crate) untagged_only: bool,
     pub(crate) highlight: Option<String>,
     pub(crate) tags: Vec<String>,
+    pub(crate) profile_ids: Vec<String>,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct SessionSummaryUiSnapshot {
+    pub(crate) profile_id: String,
+    pub(crate) profile_label: String,
+    pub(crate) profile_codex_home: String,
     pub(crate) session_meta_by_thread_id: serde_json::Map<String, Value>,
     pub(crate) preferences_by_thread_id: serde_json::Map<String, Value>,
     pub(crate) highlights_by_thread_id: serde_json::Map<String, Value>,
@@ -114,6 +118,31 @@ pub(crate) fn session_filter_from_value(filter: Option<&Value>) -> SessionFilter
     tags.sort();
     tags.dedup();
 
+    let mut profile_ids = filter
+        .and_then(|value| value.get("profileIds").or_else(|| value.get("profile_ids")))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(sanitize_profile_id)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if profile_ids.is_empty() {
+        if let Some(profile_id) = filter
+            .and_then(|value| value.get("profileId").or_else(|| value.get("profile_id")))
+            .and_then(Value::as_str)
+            .map(sanitize_profile_id)
+            .filter(|value| !value.is_empty())
+        {
+            profile_ids.push(profile_id);
+        }
+    }
+    profile_ids.sort();
+    profile_ids.dedup();
+
     SessionFilterCriteria {
         pinned_only: filter
             .and_then(|value| value.get("pinnedOnly"))
@@ -138,6 +167,7 @@ pub(crate) fn session_filter_from_value(filter: Option<&Value>) -> SessionFilter
             .filter(|value| *value == "attention" || *value == "completed")
             .map(str::to_string),
         tags,
+        profile_ids,
     }
 }
 
@@ -149,6 +179,13 @@ pub(crate) fn session_filter_from_query(query: Option<&str>) -> SessionFilterCri
         .collect::<Vec<_>>();
     tags.sort();
     tags.dedup();
+    let mut profile_ids = query_param_values(query, "filterProfile")
+        .into_iter()
+        .map(|value| sanitize_profile_id(&value))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    profile_ids.sort();
+    profile_ids.dedup();
 
     SessionFilterCriteria {
         pinned_only: query_param_value(query, "filterPinned").as_deref() == Some("true"),
@@ -159,6 +196,7 @@ pub(crate) fn session_filter_from_query(query: Option<&str>) -> SessionFilterCri
             .map(|value| value.trim().to_string())
             .filter(|value| value == "attention" || value == "completed"),
         tags,
+        profile_ids,
     }
 }
 
@@ -169,7 +207,7 @@ async fn loaded_thread_ids_from_app_server(
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
     if !state
         .app_servers
-        .profile_has_active_process(resolved_profile_id)
+        .profile_has_active_process(&resolved_profile_id)
         .await
     {
         return Some(HashSet::new());
@@ -597,9 +635,11 @@ pub(crate) async fn read_session_summary_ui_snapshot(
     state: &AppState,
     profile_id: &str,
 ) -> ApiResult<SessionSummaryUiSnapshot> {
-    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
-        .0
-        .to_string();
+    let (resolved_profile_id_ref, resolved_profile) =
+        resolve_runtime_profile_entry(&state.config, profile_id);
+    let resolved_profile_id = resolved_profile_id_ref.to_string();
+    let profile_label = resolved_profile.label.clone();
+    let profile_codex_home = resolved_profile.codex_home.display().to_string();
     let mut runtime_status_by_thread_id = with_ui_state_read(state, profile_id, |ui_state| {
         Ok(ui_state
             .get("runtimeStatusByThreadId")
@@ -705,7 +745,9 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                 break;
             }
             let status = normalized_thread_status(Some(status_value));
-            if !status.as_deref().is_some_and(is_live_thread_status) {
+            let status_text = status.as_deref();
+            if !(status_text.is_some_and(is_live_thread_status) || status_text == Some("starting"))
+            {
                 continue;
             }
             let status_updated_at = status_value
@@ -841,6 +883,9 @@ pub(crate) async fn read_session_summary_ui_snapshot(
             .unwrap_or_default();
 
         Ok(SessionSummaryUiSnapshot {
+            profile_id: resolved_profile_id.clone(),
+            profile_label,
+            profile_codex_home,
             session_meta_by_thread_id: ui_state
                 .get("sessionMetaByThreadId")
                 .and_then(Value::as_object)

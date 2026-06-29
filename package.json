@@ -36,7 +36,7 @@
     "verify:security-regressions": "node ./scripts/verify-security-regressions.mjs",
     "verify:low-memory-smoke": "node ./scripts/verify-low-memory-smoke.mjs",
     "verify:tunnel-safety": "node ./scripts/verify-tunnel-safety.mjs",
-    "gateway:dev": "cargo run --manifest-path backend/Cargo.toml",
+    "gateway:dev": "setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all cargo run --manifest-path backend/Cargo.toml",
     "gateway:check": "cargo check --manifest-path backend/Cargo.toml",
     "gateway:build": "cargo build --manifest-path backend/Cargo.toml",
     "preview": "vite preview",

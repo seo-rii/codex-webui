@@ -85,6 +85,231 @@ async fn account_login_uses_browser_base_url_for_oauth_callback() {
     assert_eq!(flow.return_url, "https://dev.seorii.io/absproxy/4173");
 }
 
+#[tokio::test]
+async fn account_login_imports_server_auth_json_file() {
+    let sandbox = unique_test_dir("account-login-import-auth-json");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home.clone());
+    let source_auth = sandbox.join("server-auth.json");
+    fs::write(
+        &source_auth,
+        r#"{"auth_mode":"chatgpt","tokens":{"refresh_token":"refresh","access_token":"access"}}"#,
+    )
+    .unwrap();
+
+    let response = start_account_login(
+        &state,
+        "default",
+        &json!({
+            "type": "authJsonFile",
+            "authJsonPath": source_auth.display().to_string()
+        }),
+    )
+    .await
+    .expect("server auth json import should succeed");
+
+    assert_eq!(
+        response.get("type").and_then(Value::as_str),
+        Some("authJsonFile")
+    );
+    assert_eq!(
+        response.get("imported").and_then(Value::as_bool),
+        Some(true)
+    );
+    let imported: Value =
+        serde_json::from_str(&fs::read_to_string(codex_home.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(
+        imported.get("auth_mode").and_then(Value::as_str),
+        Some("chatgpt")
+    );
+    assert_eq!(
+        imported
+            .get("tokens")
+            .and_then(|tokens| tokens.get("refresh_token"))
+            .and_then(Value::as_str),
+        Some("refresh")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn account_login_import_auth_json_can_create_profile_config_entry() {
+    let sandbox = unique_test_dir("account-login-import-auth-json-profile");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let config_path = sandbox.join("codex-webui.yml");
+    let mut config = (*state.config).clone();
+    config.config_file_path = Some(config_path.clone());
+    config.data_dir = sandbox.join("data");
+    state.config = Arc::new(config);
+    let source_auth = sandbox.join("server-auth.json");
+    fs::write(
+        &source_auth,
+        r#"{"auth_mode":"chatgpt","account":{"email":"work@example.com"},"tokens":{"refresh_token":"refresh","access_token":"access"}}"#,
+    )
+    .unwrap();
+
+    let response = start_account_login(
+        &state,
+        "default",
+        &json!({
+            "type": "authJsonFile",
+            "authJsonPath": source_auth.display().to_string(),
+            "createProfile": true,
+            "profileLabel": "Work Account"
+        }),
+    )
+    .await
+    .expect("server auth json profile import should succeed");
+
+    assert_eq!(
+        response.get("restartRequired").and_then(Value::as_bool),
+        Some(false)
+    );
+    let profile = response.get("profile").expect("profile should be returned");
+    assert_eq!(
+        profile.get("id").and_then(Value::as_str),
+        Some("work-account")
+    );
+    let imported_auth_path = sandbox
+        .join("data")
+        .join("accounts")
+        .join("work-account")
+        .join("codex-home")
+        .join("auth.json");
+    assert!(imported_auth_path.exists());
+    let saved_config =
+        yaml_rust2::YamlLoader::load_from_str(&fs::read_to_string(config_path).unwrap())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+    let profiles = saved_config["profiles"]
+        .as_vec()
+        .expect("profiles should be written");
+    assert!(profiles.iter().any(|entry| {
+        entry["id"].as_str() == Some("work-account")
+            && entry["label"].as_str() == Some("Work Account")
+    }));
+
+    let selected = select_account_profile_payload(
+        &state,
+        UserRole::Admin,
+        &json!({ "profileId": "work-account" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        selected.get("activeProfileId").and_then(Value::as_str),
+        Some("work-account")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn account_profile_update_and_delete_write_webui_config() {
+    let sandbox = unique_test_dir("account-profile-update-delete");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let data_dir = sandbox.join("data");
+    let work_codex_home = data_dir.join("accounts").join("work").join("codex-home");
+    let work_data_dir = data_dir.join("profiles").join("work");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::create_dir_all(&work_codex_home).unwrap();
+    fs::create_dir_all(&work_data_dir).unwrap();
+
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home.clone());
+    let config_path = sandbox.join("codex-webui.yml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+profiles:
+  - id: default
+    label: Default
+    codexHome: {}
+    dataDir: {}
+  - id: work
+    label: Work
+    codexHome: {}
+    dataDir: {}
+"#,
+            codex_home.display(),
+            data_dir.join("profiles").join("default").display(),
+            work_codex_home.display(),
+            work_data_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let mut config = (*state.config).clone();
+    config.config_file_path = Some(config_path.clone());
+    config.data_dir = data_dir;
+    state.config = Arc::new(config);
+
+    let update = update_account_profile_payload(
+        &state,
+        "default",
+        &json!({
+            "profileId": "work",
+            "label": "Renamed Work"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        update.get("restartRequired").and_then(Value::as_bool),
+        Some(false)
+    );
+    let saved_config =
+        yaml_rust2::YamlLoader::load_from_str(&fs::read_to_string(&config_path).unwrap())
+            .unwrap()
+            .remove(0);
+    let work_profile = saved_config["profiles"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .find(|profile| profile["id"].as_str() == Some("work"))
+        .unwrap();
+    assert_eq!(work_profile["label"].as_str(), Some("Renamed Work"));
+
+    let delete = delete_account_profile_payload(
+        &state,
+        "default",
+        &json!({
+            "profileId": "work"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        delete.get("restartRequired").and_then(Value::as_bool),
+        Some(false)
+    );
+    let saved_config =
+        yaml_rust2::YamlLoader::load_from_str(&fs::read_to_string(&config_path).unwrap())
+            .unwrap()
+            .remove(0);
+    assert!(
+        saved_config["profiles"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .all(|profile| profile["id"].as_str() != Some("work"))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminate_process_hard_kills_term_ignoring_process_group() {

@@ -880,6 +880,112 @@ async fn runtime_quota_status_returns_cached_payload_while_refresh_in_flight() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_account_list_returns_quota_for_each_configured_profile() {
+    let sandbox = unique_test_dir("profile-account-list");
+    let workspace = sandbox.join("workspace");
+    let default_codex_home = sandbox.join("codex-default");
+    let work_codex_home = sandbox.join("codex-work");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&default_codex_home).unwrap();
+    fs::create_dir_all(&work_codex_home).unwrap();
+    fs::write(
+        default_codex_home.join("auth.json"),
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"default-token","account_id":"default-account"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        work_codex_home.join("auth.json"),
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"work-token","account_id":"work-account"}}"#,
+    )
+    .unwrap();
+
+    let mut state = test_state(
+        workspace.clone(),
+        vec![workspace.clone()],
+        default_codex_home,
+    );
+    let mut config = (*state.config).clone();
+    config.profiles.insert(
+        "work".to_string(),
+        RuntimeProfile {
+            label: "Work".to_string(),
+            codex_home: work_codex_home,
+            data_dir: sandbox.join("data-work"),
+        },
+    );
+    state.config = Arc::new(config);
+    state.quota_cache.lock().await.insert(
+        "default".to_string(),
+        CachedQuota {
+            created_at: Instant::now(),
+            payload: json!({
+                "available": true,
+                "source": "backend-api",
+                "fetchedAt": now_unix_ms(),
+                "account": "default@example.com",
+                "plan": "plus",
+                "fiveHour": { "remainingPercent": 75 },
+                "weekly": { "remainingPercent": 60 },
+                "error": Value::Null
+            }),
+        },
+    );
+    state.quota_cache.lock().await.insert(
+        "work".to_string(),
+        CachedQuota {
+            created_at: Instant::now(),
+            payload: json!({
+                "available": true,
+                "source": "backend-api",
+                "fetchedAt": now_unix_ms(),
+                "account": "work@example.com",
+                "plan": "team",
+                "fiveHour": { "remainingPercent": 90 },
+                "weekly": { "remainingPercent": 80 },
+                "error": Value::Null
+            }),
+        },
+    );
+
+    let payload = codex_profile_accounts_payload(&state, "work", false)
+        .await
+        .unwrap();
+    let profiles = payload
+        .get("profiles")
+        .and_then(Value::as_array)
+        .expect("profile summaries should be returned");
+    assert_eq!(profiles.len(), 2);
+    assert_eq!(
+        profiles[0].get("profileId").and_then(Value::as_str),
+        Some("work")
+    );
+    assert_eq!(
+        profiles[0]
+            .get("account")
+            .and_then(|account| account.get("email"))
+            .and_then(Value::as_str),
+        Some("work@example.com")
+    );
+    assert_eq!(
+        profiles[0]
+            .get("quota")
+            .and_then(|quota| quota.get("weekly"))
+            .and_then(|weekly| weekly.get("remainingPercent"))
+            .and_then(Value::as_u64),
+        Some(80)
+    );
+    assert_eq!(
+        profiles[1]
+            .get("account")
+            .and_then(|account| account.get("type"))
+            .and_then(Value::as_str),
+        Some("chatgpt")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_reset_tickets_payload_normalizes_app_server_rate_limit_tickets() {
     let sandbox = unique_test_dir("codex-reset-tickets");
     let workspace = sandbox.join("workspace");
@@ -2545,6 +2651,141 @@ async fn active_goal_fetch_uses_goal_app_server_after_restart_assignment_loss() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_detail_uses_cached_goal_without_allocating_goal_app_server() {
+    let sandbox = unique_test_dir("goal-detail-cache-without-dedicated-client");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-goal-detail-cache",
+                    "name": "Cached goal detail",
+                    "preview": "inspect cached goal",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    cache_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-detail-cache",
+        &json!({
+            "threadId": "thread-goal-detail-cache",
+            "objective": "keep detail reads lightweight",
+            "status": "active",
+            "tokenBudget": 5000
+        }),
+    )
+    .await;
+
+    let detail = session_detail_payload(&state, "default", "thread-goal-detail-cache", 20)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail
+            .get("goal")
+            .and_then(|goal| goal.get("objective"))
+            .and_then(Value::as_str),
+        Some("keep detail reads lightweight")
+    );
+    assert!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-goal-detail-cache"))
+            .is_none(),
+        "session detail should not allocate a dedicated goal app-server"
+    );
+    assert_eq!(state.app_servers.client_count().await, 1);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn goal_fetch_preserves_cached_goal_when_native_goal_is_missing() {
+    let sandbox = unique_test_dir("goal-fetch-preserve-cache");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let goal_client = app_server_client_for_goal_session(&state, "default", "thread-goal-moved")
+        .await
+        .unwrap();
+    goal_client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": "thread-goal-moved",
+                    "name": "Moved goal thread",
+                    "preview": "resume moved goal",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    cache_session_goal_payload(
+        &state,
+        "default",
+        "thread-goal-moved",
+        &json!({
+            "threadId": "thread-goal-moved",
+            "objective": "continue moved goal",
+            "status": "active",
+            "tokenBudget": 5000,
+            "tokensUsed": 120
+        }),
+    )
+    .await;
+
+    let goal = fetch_session_goal_payload(&state, "default", "thread-goal-moved")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        goal.get("objective").and_then(Value::as_str),
+        Some("continue moved goal")
+    );
+    assert_eq!(goal.get("status").and_then(Value::as_str), Some("active"));
+    assert_eq!(
+        cached_session_goal_or_null_payload(&state, "default", "thread-goal-moved")
+            .await
+            .get("objective")
+            .and_then(Value::as_str),
+        Some("continue moved goal")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn usage_limited_goal_fetch_uses_goal_app_server_after_restart_assignment_loss() {
     let sandbox = unique_test_dir("goal-fetch-usage-limited-dedicated-after-restart");
     let workspace = sandbox.join("workspace");
@@ -2816,6 +3057,45 @@ async fn regular_session_turns_share_profile_app_server_by_default() {
             .get(&runtime_session_key("default", "thread-b"))
             .cloned(),
         Some("default".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_regular_session_turns_use_dedicated_app_servers() {
+    let sandbox = unique_test_dir("session-app-server-concurrent");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let _first = app_server_client_for_session_turn(&state, "default", "thread-a")
+        .await
+        .unwrap();
+    mark_test_session_active(&state, "thread-a").await;
+    let _second = app_server_client_for_session_turn(&state, "default", "thread-b")
+        .await
+        .unwrap();
+
+    assert_eq!(state.app_servers.client_count().await, 2);
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-a"))
+            .cloned(),
+        Some("default".to_string())
+    );
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-b"))
+            .cloned(),
+        Some("default::session::thread-b".to_string())
     );
 }
 
@@ -3861,6 +4141,258 @@ async fn dispatch_queue_item_returns_current_queue_when_dispatch_is_busy() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_queue_dispatch_resumes_remaining_items_after_turn_completion() {
+    let sandbox = unique_test_dir("queue-manual-dispatch-resumes");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5.4"
+        }),
+        None,
+        Some("Queue manual dispatch"),
+    )
+    .await
+    .unwrap();
+    let session_id = created.get("id").and_then(Value::as_str).unwrap();
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["queuesByThreadId"][session_id] = json!({
+            "items": [
+                {
+                    "id": "queue-1",
+                    "prompt": "first manual follow-up",
+                    "attachmentIds": [],
+                    "attachmentNames": [],
+                    "createdAt": 15
+                },
+                {
+                    "id": "queue-2",
+                    "prompt": "second automatic follow-up",
+                    "attachmentIds": [],
+                    "attachmentNames": [],
+                    "createdAt": 16
+                }
+            ],
+            "resumePending": false,
+            "updatedAt": 20
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let queue = dispatch_session_queue_item_payload(
+        &state, "default", session_id, "queue-1", "message", None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        queue.get("items").and_then(Value::as_array).map(Vec::len),
+        Some(1)
+    );
+    let active_turn_id = state
+        .active_turns
+        .lock()
+        .await
+        .get(&runtime_session_key("default", session_id))
+        .cloned()
+        .expect("manual dispatch should mark the first turn active");
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Queue manual dispatch",
+                    "preview": "first manual follow-up",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "completed",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": [
+                        {
+                            "id": active_turn_id,
+                            "status": "completed",
+                            "items": []
+                        }
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "turn/completed".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "turnId": active_turn_id,
+                "turn": {
+                    "id": active_turn_id,
+                    "status": "completed",
+                    "items": []
+                }
+            }),
+        },
+    )
+    .await;
+
+    for _ in 0..20 {
+        let queue = get_session_queue_payload(&state, "default", session_id)
+            .await
+            .unwrap();
+        if queue
+            .get("items")
+            .and_then(Value::as_array)
+            .is_none_or(|items| items.is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let queue = get_session_queue_payload(&state, "default", session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.get("items").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_queue_dispatch_uses_requested_session_profile() {
+    let sandbox = unique_test_dir("queue-dispatch-profile-routing");
+    let workspace = sandbox.join("workspace");
+    let default_codex_home = sandbox.join("codex-default");
+    let second_codex_home = sandbox.join("codex-second");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&default_codex_home).unwrap();
+    fs::create_dir_all(&second_codex_home).unwrap();
+
+    let mut state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        default_codex_home,
+    );
+    let mut config = (*state.config).clone();
+    config.config_file_path = Some(sandbox.join("isolated-codex-webui.yml"));
+    config.profiles.insert(
+        "second".to_string(),
+        RuntimeProfile {
+            label: "Second".to_string(),
+            codex_home: second_codex_home,
+            data_dir: sandbox.join(".data").join("profiles").join("second"),
+        },
+    );
+    state.config = Arc::new(config);
+
+    let session_id = "thread-second-profile-queue";
+    app_server_client(&state, "second")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Second profile queue",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    with_ui_state_write(&state, "second", |ui_state| {
+        ui_state["queuesByThreadId"][session_id] = json!({
+            "items": [
+                {
+                    "id": "queue-second",
+                    "prompt": "Dispatch in the second profile",
+                    "attachmentIds": [],
+                    "attachmentNames": [],
+                    "createdAt": 15
+                }
+            ],
+            "resumePending": false,
+            "updatedAt": 20
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let auth = AuthContext {
+        profile_id: "default".to_string(),
+        role: UserRole::Admin,
+    };
+    let queue = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "session/queue/dispatch",
+        json!({
+            "sessionId": session_id,
+            "profileId": "second",
+            "queueId": "queue-second",
+            "mode": "message"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        queue.get("items").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+    let thread = read_thread_payload(&state, "second", session_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        thread
+            .get("lastTurnStart")
+            .and_then(|value| value.get("input"))
+            .and_then(Value::as_array)
+            .and_then(|input| input.first())
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str),
+        Some("Dispatch in the second profile")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enqueue_session_queue_payload_auto_dispatches_when_session_is_idle() {
     let sandbox = unique_test_dir("queue-auto-dispatch");
     let workspace = sandbox.join("workspace");
@@ -4020,6 +4552,97 @@ async fn enqueue_session_queue_payload_returns_before_queue_drain_reads_thread()
     assert_eq!(
         queue.get("items").and_then(Value::as_array).map(Vec::len),
         Some(1)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_drain_recovers_after_repeated_activity_probe_timeouts() {
+    let sandbox = unique_test_dir("queue-recovers-after-activity-timeouts");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-activity-probe-timeout";
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Activity probe timeout",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "running",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "readDelayMs": 900,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["queuesByThreadId"][session_id] = json!({
+            "items": [
+                {
+                    "id": "queue-1",
+                    "prompt": "recover after repeated activity probe timeouts",
+                    "attachmentIds": [],
+                    "attachmentNames": [],
+                    "createdAt": 15
+                }
+            ],
+            "resumePending": false,
+            "updatedAt": 20
+        });
+        ui_state["runtimeStatusByThreadId"][session_id] = json!({
+            "status": "running",
+            "updatedAt": now_unix_ms().saturating_sub(120_000)
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+    state.active_turns.lock().await.insert(
+        runtime_session_key("default", session_id),
+        "stale-turn".to_string(),
+    );
+
+    maybe_drain_queue(&state, "default", session_id).await;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+
+    let queue = get_session_queue_payload(&state, "default", session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.get("items").and_then(Value::as_array).map(Vec::len),
+        Some(0),
+        "queue did not drain: {queue}"
+    );
+    let thread = read_thread_payload(&state, "default", session_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        thread
+            .get("lastTurnStart")
+            .and_then(|value| value.get("input"))
+            .and_then(Value::as_array)
+            .and_then(|input| input.first())
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str),
+        Some("recover after repeated activity probe timeouts")
     );
 
     let _ = fs::remove_dir_all(sandbox);

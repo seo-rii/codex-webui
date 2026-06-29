@@ -946,7 +946,7 @@ async fn resolve_active_turn_id_payload_with_hint(
     }
 
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        &resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
     if let Some(turn_id) = state.active_turns.lock().await.get(&runtime_key).cloned() {
@@ -978,7 +978,7 @@ pub(crate) async fn send_turn_payload(
     let trimmed_prompt = prompt.trim();
     let client_user_message_id = normalize_client_user_message_id(client_user_message_id);
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        &resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
     clear_stale_session_runtime_activity_if_app_server_missing(
@@ -1381,7 +1381,7 @@ pub(crate) async fn start_session_compaction_payload(
     session_id: &str,
 ) -> ApiResult<Value> {
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        &resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
     clear_stale_session_runtime_activity_if_app_server_missing(
@@ -1695,7 +1695,7 @@ pub(crate) async fn steer_turn_payload(
             .await?;
     }
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, profile_id).0,
+        &resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
     state

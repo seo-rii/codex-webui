@@ -53,6 +53,7 @@ type PendingRequest = {
   message: Extract<ClientEnvelope, { kind: "request" }>;
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
+  replayable: boolean;
   sentGeneration: number | null;
   timeoutTimer: ReturnType<typeof setTimeout>;
 };
@@ -61,6 +62,7 @@ type SessionEventHandler = (event: StreamEvent) => void;
 type TerminalEventHandler = (event: TerminalEvent) => void;
 type SessionSubscriptionOptions = {
   includeInitialQueue?: boolean;
+  profileId?: string | null;
 };
 
 const HEARTBEAT_MS = 20_000;
@@ -165,6 +167,10 @@ function dedupeKeyForRequest(method: string, params: unknown) {
   }
 }
 
+function requestCanReplayAfterReconnect(method: string) {
+  return DEDUPED_READ_METHODS.has(method);
+}
+
 export class WebSocketRpcClient {
   private socket: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -224,6 +230,7 @@ export class WebSocketRpcClient {
         message,
         resolve: resolve as (value: unknown) => void,
         reject,
+        replayable: requestCanReplayAfterReconnect(method),
         sentGeneration: null,
         timeoutTimer
       });
@@ -249,7 +256,8 @@ export class WebSocketRpcClient {
     this.sessionHandlers.set(sessionId, current);
     if (shouldSubscribe) {
       this.sessionSubscriptionOptions.set(sessionId, {
-        includeInitialQueue: options.includeInitialQueue ?? true
+        includeInitialQueue: options.includeInitialQueue ?? true,
+        profileId: options.profileId ?? null
       });
     }
     this.ensureConnected();
@@ -268,9 +276,13 @@ export class WebSocketRpcClient {
         return;
       }
 
+      const options = this.sessionSubscriptionOptions.get(sessionId);
       this.sessionHandlers.delete(sessionId);
       this.sessionSubscriptionOptions.delete(sessionId);
-      this.sendTransient("session/unsubscribe", { sessionId });
+      this.sendTransient("session/unsubscribe", {
+        sessionId,
+        profileId: options?.profileId ?? null
+      });
     };
   }
 
@@ -555,8 +567,17 @@ export class WebSocketRpcClient {
       return;
     }
 
-    for (const pending of this.pending.values()) {
+    for (const [id, pending] of [...this.pending.entries()]) {
       if (pending.sentGeneration === this.connectionGeneration) {
+        continue;
+      }
+      if (pending.sentGeneration !== null && !pending.replayable) {
+        this.pending.delete(id);
+        clearTimeout(pending.timeoutTimer);
+        pending.reject(new Error("WebSocket reconnected before the mutation completed. Refreshing session state."));
+        for (const listener of this.resyncRequiredListeners) {
+          listener("mutationReplaySkipped");
+        }
         continue;
       }
 
@@ -594,10 +615,11 @@ export class WebSocketRpcClient {
   }
 
   private sendSessionSubscribe(sessionId: string) {
-    const options = this.sessionSubscriptionOptions.get(sessionId) ?? { includeInitialQueue: true };
+    const options = this.sessionSubscriptionOptions.get(sessionId) ?? { includeInitialQueue: true, profileId: null };
     this.sendTransient("session/subscribe", {
       sessionId,
-      includeInitialQueue: options.includeInitialQueue
+      includeInitialQueue: options.includeInitialQueue,
+      profileId: options.profileId ?? null
     });
   }
 

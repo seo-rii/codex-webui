@@ -29,7 +29,9 @@
     Sun,
     Power,
     Download,
-    ArrowRightLeft
+    UserCog,
+    Pencil,
+    Trash2
   } from "lucide-svelte";
 
   import { describeUiError } from "$lib/ui-errors";
@@ -40,6 +42,7 @@
   import type {
     AppNotification,
     CodexAccountLoginFlow,
+    CodexProfileAccountSummary,
     CodexQuotaStatus,
     CodexResetTicket,
     CodexResetTicketsPayload,
@@ -90,7 +93,10 @@
     onArchivedChange,
     onTogglePin,
     onToggleArchive,
+    onRequestMoveSessionProfile,
     profiles = [],
+    profileAccounts = [],
+    profileAccountsBusy = false,
     account,
     webRole = "admin",
     readOnly = false,
@@ -115,6 +121,7 @@
     resolvedTheme,
     accountLoginFlow,
     onRefreshQuota,
+    onRefreshProfileAccounts,
     onRefreshResetTickets,
     onUseResetTicket,
     onRefreshNotifications,
@@ -129,7 +136,10 @@
     onRestartGateway,
     onThemeModeChange,
     onStartAccountLogin,
+    onImportAccountCredentials,
     onSelectProfile,
+    onRenameProfile,
+    onDeleteProfile,
     onCancelAccountLogin,
     onLogoutAccount,
     onLogoutWeb,
@@ -173,12 +183,15 @@
     onArchivedChange: (nextValue: boolean) => void;
     onTogglePin: (session: SessionSummary) => void;
     onToggleArchive: (session: SessionSummary) => void;
+    onRequestMoveSessionProfile: (session: SessionSummary) => void;
     profiles?: Array<{
       id: string;
       label: string;
       codexHome: string;
       active: boolean;
     }>;
+    profileAccounts?: CodexProfileAccountSummary[];
+    profileAccountsBusy?: boolean;
     account:
       | {
           type: "apiKey" | "chatgpt" | null;
@@ -210,6 +223,7 @@
     resolvedTheme: ResolvedTheme;
     accountLoginFlow: CodexAccountLoginFlow | null;
     onRefreshQuota: () => void;
+    onRefreshProfileAccounts: (force?: boolean) => void;
     onRefreshResetTickets: () => void;
     onUseResetTicket: (ticket: CodexResetTicket) => void;
     onRefreshNotifications: () => void;
@@ -224,7 +238,13 @@
     onRestartGateway: () => void;
     onThemeModeChange: (mode: ThemeMode) => void;
     onStartAccountLogin: (type: "chatgpt" | "chatgptDeviceCode") => void;
+    onImportAccountCredentials: (
+      path: string,
+      options?: { createProfile?: boolean; profileLabel?: string | null; profileId?: string | null }
+    ) => void | Promise<void>;
     onSelectProfile: (profileId: string) => void;
+    onRenameProfile: (profileId: string, label: string) => void;
+    onDeleteProfile: (profileId: string, label: string) => void;
     onCancelAccountLogin: (loginId: string) => void;
     onLogoutAccount: () => void;
     onLogoutWeb: () => void;
@@ -250,6 +270,10 @@
   let loadMoreOrigin = $state<"manual" | "auto" | null>(null);
   let lastSessionListSignature = "";
   let pendingSessionListScrollAnchor: { sessionId: string; offset: number } | null = null;
+  let serverAuthJsonPath = $state("");
+  let serverAuthJsonCreateProfile = $state(false);
+  let serverAuthJsonProfileLabel = $state("");
+  let serverAuthJsonImportBusy = $state(false);
 
   const ui = $derived.by(() => {
     const _locale = $localeSignal;
@@ -343,10 +367,24 @@
       close: m.close(),
       refreshQuota: m.refresh_quota(),
       switchAccount: m.switch_account(),
+      renameAccount: isKorean ? "계정 라벨 변경" : "Rename account",
+      deleteAccount: isKorean ? "계정 삭제" : "Delete account",
       signInAction: m.sign_in_action(),
       signOut: m.sign_out(),
       connected: m.connected(),
       signInRequired: m.sign_in_required(),
+      serverCredentialsJson: isKorean ? "서버 credentials JSON" : "Server credentials JSON",
+      serverCredentialsJsonPlaceholder: isKorean ? "~/.codex/auth.json 또는 /path/to/auth.json" : "~/.codex/auth.json or /path/to/auth.json",
+      serverCredentialsJsonDescription: isKorean
+        ? "브라우저 파일이 아니라 서버 파일시스템의 Codex auth.json을 현재 프로필로 가져옵니다."
+        : "Imports a Codex auth.json from the server filesystem into the active profile.",
+      createProfileFromCredentials: isKorean ? "새 프로필로 가져오기" : "Import as new profile",
+      createProfileFromCredentialsDescription: isKorean
+        ? "설정 파일에 프로필을 추가합니다. 새 프로필은 WebUI 재시작 후 선택할 수 있습니다."
+        : "Adds a profile to the config file. The new profile is selectable after restarting WebUI.",
+      newProfileLabelPlaceholder: isKorean ? "프로필 이름(선택)" : "Profile label (optional)",
+      importCredentials: isKorean ? "가져오기" : "Import",
+      moveSessionToAccount: isKorean ? "세션 계정 이동" : "Move session to account",
       localRuntime: m.local_runtime(),
       currentDarkMode: m.current_dark_mode(),
       currentLightMode: m.current_light_mode(),
@@ -411,6 +449,62 @@
     return candidate.length > 60 ? `${candidate.slice(0, 60).trimEnd()}...` : candidate;
   }
 
+  function sessionAccountBadgeLabel(session: SessionSummary) {
+    const profileLabel = (session.profileLabel ?? "").trim();
+    if (profileLabel) {
+      return profileLabel;
+    }
+    const email = (session.accountEmail ?? "").trim();
+    if (email) {
+      return email;
+    }
+    if (profiles.length <= 1) {
+      return "";
+    }
+    return profiles.find((profile) => profile.id === session.profileId)?.label ?? "";
+  }
+
+  function shouldShowSessionAccountBadge(session: SessionSummary) {
+    return profiles.length > 1 || Boolean(session.accountEmail || session.profileLabel);
+  }
+
+  function moveSessionProfileOptions(session: SessionSummary) {
+    const currentProfileId = session.profileId ?? profiles.find((profile) => profile.active)?.id ?? null;
+    return profiles.filter((profile) => profile.id !== currentProfileId);
+  }
+
+  function requestMoveSessionProfile(session: SessionSummary) {
+    if (readOnly) {
+      return;
+    }
+    const options = moveSessionProfileOptions(session);
+    if (options.length === 0) {
+      return;
+    }
+    onRequestMoveSessionProfile(session);
+  }
+
+  async function importServerAuthJson() {
+    if (serverAuthJsonImportBusy || readOnly) {
+      return;
+    }
+    const trimmedPath = serverAuthJsonPath.trim();
+    if (!trimmedPath) {
+      return;
+    }
+    serverAuthJsonImportBusy = true;
+    try {
+      await onImportAccountCredentials(trimmedPath, {
+        createProfile: serverAuthJsonCreateProfile,
+        profileLabel: serverAuthJsonProfileLabel.trim() || null
+      });
+      serverAuthJsonPath = "";
+      serverAuthJsonProfileLabel = "";
+    } finally {
+      serverAuthJsonImportBusy = false;
+    }
+  }
+
   function formatQuotaPercent(value: number | null | undefined) {
     if (typeof value !== "number" || !Number.isFinite(value)) {
       return "—";
@@ -441,6 +535,10 @@
       return null;
     }
     return m.quota_left_compact({ percent: String(Math.round(Math.min(...candidates))) });
+  }
+
+  function profileAccount(profileId: string) {
+    return profileAccounts.find((profile) => profile.profileId === profileId) ?? null;
   }
 
   function shouldShowResetTickets() {
@@ -896,7 +994,7 @@
   });
 </script>
 
-<aside class="sidebar flex flex-col h-full bg-gray-50/80 border-r border-gray-200/50 w-72 min-w-[18rem] transition-all">
+<aside class="sidebar flex h-full w-full min-w-0 flex-col border-r border-gray-200/50 bg-gray-50/80 transition-all">
   <div class="p-4 flex flex-col gap-4">
     <div class="relative flex items-center justify-between">
       <div class="flex items-center gap-2 px-1">
@@ -1462,23 +1560,33 @@
       {#each sessions as session (session.id)}
         <div class="group relative" data-session-id={session.id}>
           <button
-            class="w-full text-left p-3 pr-11 rounded-xl transition-all relative { session.id === selectedId ? 'bg-white shadow-sm border border-gray-200 ring-1 ring-gray-200/50' : sessionCardHighlightClass(session.id) }"
+            class={`w-full rounded-xl p-3 text-left transition-all relative ${
+              session.id === selectedId ? "bg-white shadow-sm border border-gray-200 ring-1 ring-gray-200/50" : sessionCardHighlightClass(session.id)
+            }`}
             onclick={() => onSelect(session.id)}
             type="button"
           >
             <div class="flex flex-col gap-1.5">
-              <div class="flex items-start justify-between gap-2">
-                <div class="min-w-0 flex flex-1 items-center gap-1.5">
-                  {#if session.pinned}
-                    <span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-amber-50 text-amber-600">
-                      <Pin size={10} />
-                    </span>
-                  {/if}
-                  <span class="min-w-0 flex-1 truncate text-sm font-medium text-gray-900 transition-colors group-hover:text-amber-700">
-                    {displaySessionTitle(session)}
+              <div class="flex min-w-0 items-center gap-1.5">
+                {#if session.pinned}
+                  <span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-amber-50 text-amber-600">
+                    <Pin size={10} />
                   </span>
-                </div>
-                <div class="flex shrink-0 flex-nowrap items-center gap-1.5 whitespace-nowrap">
+                {/if}
+                {#if isSessionRunning(session)}
+                  <span class="h-2 w-2 shrink-0 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.5)] animate-pulse"></span>
+                {/if}
+                <span class="min-w-0 flex-1 truncate text-sm font-medium text-gray-900 transition-colors group-hover:text-amber-700">
+                  {displaySessionTitle(session)}
+                </span>
+              </div>
+              
+              <p class="text-xs text-gray-500 line-clamp-1 break-all">
+                {session.preview || ui.newCodexSession}
+              </p>
+
+              {#if session.queueCount > 0 || sessionHighlights[session.id]}
+                <div class="flex min-w-0 flex-wrap items-center gap-1.5">
                   {#if session.queueCount > 0}
                     <span class="inline-flex items-center gap-1 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-slate-600">
                       <History size={10} />
@@ -1490,15 +1598,8 @@
                   {:else if sessionHighlights[session.id]?.kind === "completed"}
                     <span class="text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 font-bold uppercase tracking-widest">{ui.done}</span>
                   {/if}
-                  {#if isSessionRunning(session)}
-                    <span class="flex-shrink-0 w-2 h-2 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.5)] animate-pulse mt-1.5"></span>
-                  {/if}
                 </div>
-              </div>
-              
-              <p class="text-xs text-gray-500 line-clamp-1 break-all">
-                {session.preview || ui.newCodexSession}
-              </p>
+              {/if}
 
               {#if session.tags.length > 0}
                 <div class="flex flex-wrap gap-1">
@@ -1516,9 +1617,45 @@
               {/if}
               
               <div class="flex items-center justify-between gap-2 mt-1">
-                <span class="text-[10px] text-gray-400 font-medium tracking-tight">
-                  {formatUpdated(session.updatedAt)}
-                </span>
+                <div class="flex min-w-0 items-center gap-1.5">
+                  <span class="shrink-0 text-[10px] font-medium tracking-tight text-gray-400">
+                    {formatUpdated(session.updatedAt)}
+                  </span>
+                  {#if shouldShowSessionAccountBadge(session) && sessionAccountBadgeLabel(session)}
+                    {#if moveSessionProfileOptions(session).length > 0 && !readOnly}
+                      <span
+                        aria-label={ui.moveSessionToAccount}
+                        class="session-account-badge session-account-badge--button inline-flex min-w-0 max-w-[8.5rem] items-center gap-1 rounded-full border border-gray-200 bg-white px-1.5 py-0.5 text-[9px] font-semibold text-gray-500"
+                        role="button"
+                        tabindex="0"
+                        title={`${ui.moveSessionToAccount}: ${session.profileCodexHome ?? sessionAccountBadgeLabel(session)}`}
+                        onclick={(event) => {
+                          event.stopPropagation();
+                          requestMoveSessionProfile(session);
+                        }}
+                        onkeydown={(event) => {
+                          if (event.key !== "Enter" && event.key !== " ") {
+                            return;
+                          }
+                          event.preventDefault();
+                          event.stopPropagation();
+                          requestMoveSessionProfile(session);
+                        }}
+                      >
+                        <User size={9} class="shrink-0" />
+                        <span class="truncate">{sessionAccountBadgeLabel(session)}</span>
+                      </span>
+                    {:else}
+                      <span
+                        class="session-account-badge inline-flex min-w-0 max-w-[8.5rem] items-center gap-1 rounded-full border border-gray-200 bg-white px-1.5 py-0.5 text-[9px] font-semibold text-gray-500"
+                        title={session.profileCodexHome ?? sessionAccountBadgeLabel(session)}
+                      >
+                        <User size={9} class="shrink-0" />
+                        <span class="truncate">{sessionAccountBadgeLabel(session)}</span>
+                      </span>
+                    {/if}
+                  {/if}
+                </div>
                 {#if session.agentNickname}
                   <span class="text-[10px] px-1.5 py-0.5 bg-gray-100 text-gray-500 rounded font-semibold uppercase tracking-wider">
                     {session.agentNickname}
@@ -1544,6 +1681,25 @@
           >
             <Pin size={14} />
           </button>
+          {#if moveSessionProfileOptions(session).length > 0}
+            <button
+              aria-label={ui.moveSessionToAccount}
+              class={`absolute right-16 top-2 z-10 rounded-lg border border-gray-200 bg-white/95 p-1.5 text-gray-400 shadow-sm transition-all ${
+                readOnly
+                  ? "cursor-not-allowed opacity-45"
+                  : "opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 hover:border-amber-200 hover:bg-amber-50 hover:text-amber-700"
+              }`}
+              disabled={readOnly}
+              onclick={(event) => {
+                event.stopPropagation();
+                requestMoveSessionProfile(session);
+              }}
+              title={ui.moveSessionToAccount}
+              type="button"
+            >
+              <UserCog size={14} />
+            </button>
+          {/if}
           <button
             aria-label={showArchived ? ui.restoreThread : ui.archiveThread}
             class={`absolute right-2 top-2 z-10 rounded-lg border border-gray-200 bg-white/95 p-1.5 text-gray-400 shadow-sm transition-all ${
@@ -1609,7 +1765,13 @@
       aria-expanded={accountMenuOpen}
       bind:this={accountButtonElement}
       class="flex items-center gap-3 w-full p-2 rounded-xl hover:bg-gray-200/50 transition-all text-left group"
-      onclick={() => (accountMenuOpen = !accountMenuOpen)}
+      onclick={() => {
+        const opening = !accountMenuOpen;
+        accountMenuOpen = opening;
+        if (opening && !readOnly) {
+          onRefreshProfileAccounts(false);
+        }
+      }}
     >
       <div class="w-10 h-10 rounded-full bg-white border border-gray-200 flex items-center justify-center text-gray-500 group-hover:border-amber-500/30 group-hover:text-amber-600 transition-all shadow-sm">
         <User size={20} />
@@ -1660,37 +1822,150 @@
         </div>
 
         <div class="min-h-0 overflow-y-auto px-4 py-4 space-y-6 pr-3 scrollbar-thin">
-          {#if profiles.length > 1}
+          {#if profiles.length > 0}
             <div class="space-y-3">
-              <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
-                <User size={10} /> {ui.switchAccount}
-              </h4>
+              <div class="flex items-center justify-between gap-2">
+                <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
+                  <User size={10} /> {ui.switchAccount}
+                </h4>
+                <button
+                  aria-label={ui.refreshQuota}
+                  class="rounded-md p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={profileAccountsBusy || readOnly}
+                  onclick={() => onRefreshProfileAccounts(true)}
+                  title={ui.refreshQuota}
+                  type="button"
+                >
+                  <RefreshCw size={12} class={profileAccountsBusy ? "animate-spin" : ""} />
+                </button>
+              </div>
 
               <div class="space-y-2">
                 {#each profiles as profile (profile.id)}
-                  <button
-                    class={`sidebar-account-switcher flex w-full items-start justify-between gap-3 rounded-xl border px-3 py-2.5 text-left transition-all ${
+                  {@const profileAccountState = profileAccount(profile.id)}
+                  <div
+                    class={`sidebar-account-switcher flex w-full items-start justify-between gap-2 rounded-xl border px-3 py-2 text-left transition-all ${
                       profile.active
                         ? "border-amber-300 bg-amber-50 text-amber-800 shadow-sm"
                         : "border-gray-200 bg-gray-50 text-gray-600 hover:border-gray-300 hover:bg-white hover:text-gray-800"
                     }`}
-                    onclick={() => onSelectProfile(profile.id)}
-                    type="button"
                   >
-                    <div class="min-w-0">
-                      <p class="truncate text-sm font-semibold">{profile.label}</p>
-                      <p class="mt-1 truncate text-[10px] text-gray-400">{profile.codexHome}</p>
+                    <button class="min-w-0 flex-1 text-left" onclick={() => onSelectProfile(profile.id)} type="button">
+                      <div class="flex min-w-0 items-center gap-2">
+                        <p class="truncate text-sm font-semibold">{profile.label}</p>
+                        {#if profileAccountState?.account.planType}
+                          <span class="sidebar-flyout-badge shrink-0 rounded-full border border-gray-200 bg-white/80 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-gray-500">
+                            {profileAccountState.account.planType}
+                          </span>
+                        {/if}
+                      </div>
+                      <p class="mt-0.5 truncate text-[10px] text-gray-400">
+                        {profileAccountState?.account.email || profile.codexHome}
+                      </p>
+                      {#if profileAccountState}
+                        <div class="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[9px] font-semibold text-gray-500">
+                          <span>{ui.quota5h} {formatQuotaPercent(profileAccountState.quota.fiveHour?.remainingPercent)}</span>
+                          <span>{ui.quotaWeekly} {formatQuotaPercent(profileAccountState.quota.weekly?.remainingPercent)}</span>
+                        </div>
+                      {/if}
+                    </button>
+                    <div class="flex shrink-0 items-center gap-1">
+                      {#if profile.active}
+                        <span class="sidebar-flyout-badge rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-700">
+                          {ui.connected}
+                        </span>
+                      {/if}
+                      <button
+                        aria-label={ui.renameAccount}
+                        class="rounded-md p-1 text-gray-400 transition-colors hover:bg-white hover:text-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
+                        disabled={readOnly}
+                        onclick={() => onRenameProfile(profile.id, profile.label)}
+                        title={ui.renameAccount}
+                        type="button"
+                      >
+                        <Pencil size={12} />
+                      </button>
+                      <button
+                        aria-label={ui.deleteAccount}
+                        class="rounded-md p-1 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-40"
+                        disabled={readOnly || profile.active || profiles.length <= 1}
+                        onclick={() => onDeleteProfile(profile.id, profile.label)}
+                        title={ui.deleteAccount}
+                        type="button"
+                      >
+                        <Trash2 size={12} />
+                      </button>
                     </div>
-                    {#if profile.active}
-                      <span class="sidebar-flyout-badge rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-700">
-                        {ui.connected}
-                      </span>
-                    {/if}
-                  </button>
+                  </div>
                 {/each}
               </div>
             </div>
           {/if}
+
+          <div class="space-y-3">
+            <h4 class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-gray-400">
+              <Download size={10} /> {ui.serverCredentialsJson}
+            </h4>
+            <div class="sidebar-flyout-surface rounded-xl border border-gray-100 bg-gray-50 p-3">
+              <p class="mb-2 text-[11px] leading-snug text-gray-500">{ui.serverCredentialsJsonDescription}</p>
+              <label
+                class:checkbox-card--disabled={readOnly || serverAuthJsonImportBusy}
+                class="checkbox-card checkbox-card--compact mb-2 w-full max-w-full"
+                for="server-auth-json-create-profile"
+              >
+                <input
+                  bind:checked={serverAuthJsonCreateProfile}
+                  class="checkbox-input"
+                  disabled={readOnly || serverAuthJsonImportBusy}
+                  id="server-auth-json-create-profile"
+                  type="checkbox"
+                />
+                <span aria-hidden="true" class="checkbox-control"></span>
+                <span class="checkbox-copy min-w-0">
+                  <span class="checkbox-title">{ui.createProfileFromCredentials}</span>
+                  <span class="checkbox-description">{ui.createProfileFromCredentialsDescription}</span>
+                </span>
+              </label>
+              {#if serverAuthJsonCreateProfile}
+                <input
+                  bind:value={serverAuthJsonProfileLabel}
+                  class="mb-2 w-full rounded-lg border border-gray-200 bg-white px-2.5 py-2 text-xs font-medium text-gray-700 outline-none transition focus:border-amber-400 focus:ring-4 focus:ring-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
+                  disabled={readOnly || serverAuthJsonImportBusy}
+                  placeholder={ui.newProfileLabelPlaceholder}
+                  type="text"
+                />
+              {/if}
+              <div class="flex gap-2">
+                <input
+                  bind:value={serverAuthJsonPath}
+                  class="min-w-0 flex-1 rounded-lg border border-gray-200 bg-white px-2.5 py-2 text-xs font-medium text-gray-700 outline-none transition focus:border-amber-400 focus:ring-4 focus:ring-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
+                  disabled={readOnly || serverAuthJsonImportBusy}
+                  onkeydown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void importServerAuthJson();
+                    }
+                  }}
+                  placeholder={ui.serverCredentialsJsonPlaceholder}
+                  type="text"
+                />
+                <button
+                  class="shrink-0 rounded-lg bg-gray-900 px-3 py-2 text-[11px] font-bold text-white shadow-sm transition-all hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={readOnly || serverAuthJsonImportBusy || !serverAuthJsonPath.trim()}
+                  onclick={() => {
+                    void importServerAuthJson();
+                  }}
+                  type="button"
+                >
+                  {#if serverAuthJsonImportBusy}
+                    <RefreshCw size={12} class="animate-spin" />
+                  {:else}
+                    {ui.importCredentials}
+                  {/if}
+                </button>
+              </div>
+            </div>
+          </div>
 
           <div class="space-y-4">
             <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
@@ -1742,7 +2017,7 @@
 
           <div class="space-y-4">
             <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
-              <ArrowRightLeft size={10} /> {ui.sessionDefaults}
+              <Settings size={10} /> {ui.sessionDefaults}
             </h4>
 
             <label
@@ -2226,6 +2501,22 @@
   :global(:root[data-theme="dark"]) .sidebar-flyout-surface {
     border-color: rgba(71, 85, 105, 0.32) !important;
     background: rgba(15, 23, 42, 0.78) !important;
+  }
+
+  :global(:root[data-theme="dark"]) .session-account-badge {
+    border-color: rgba(71, 85, 105, 0.34) !important;
+    background: rgba(15, 23, 42, 0.8) !important;
+    color: #94a3b8 !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-flyout input {
+    border-color: rgba(71, 85, 105, 0.42) !important;
+    background: rgba(15, 23, 42, 0.86) !important;
+    color: #f8fafc !important;
+  }
+
+  :global(:root[data-theme="dark"]) .sidebar-flyout input::placeholder {
+    color: #64748b !important;
   }
 
   :global(:root[data-theme="dark"]) .sidebar-notification-item {

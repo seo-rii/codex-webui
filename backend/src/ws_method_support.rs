@@ -106,6 +106,7 @@ pub(crate) fn should_audit_ws_method(method: &str) -> bool {
             | "runtime/processes/list"
             | "runtime/quota"
             | "runtime/resetTickets"
+            | "account/profiles/list"
             | "memory/status"
             | "codex/features/list"
             | "codex/plugins/list"

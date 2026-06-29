@@ -1,5 +1,11 @@
 use super::*;
 
+fn clear_queue_item_dispatch_error(item_object: &mut serde_json::Map<String, Value>) {
+    item_object.remove("status");
+    item_object.remove("failedAt");
+    item_object.remove("error");
+}
+
 pub(crate) async fn enqueue_session_queue_payload(
     state: &AppState,
     profile_id: &str,
@@ -59,16 +65,20 @@ pub(crate) async fn enqueue_session_queue_payload(
             ));
         };
         if let Some(client_request_id) = client_request_id.as_deref() {
-            if let Some(existing_item_id) = items.iter().rev().find_map(|item| {
-                (item
-                    .get("clientRequestId")
+            if let Some(existing_item) = items.iter_mut().rev().find(|item| {
+                item.get("clientRequestId")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    == client_request_id)
-                    .then(|| item.get("id").and_then(Value::as_str).map(str::to_string))
-                    .flatten()
+                    == client_request_id
             }) {
-                accepted_queue_item_id = existing_item_id;
+                accepted_queue_item_id = existing_item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&accepted_queue_item_id)
+                    .to_string();
+                if let Some(existing_item_object) = existing_item.as_object_mut() {
+                    clear_queue_item_dispatch_error(existing_item_object);
+                }
                 queue.insert("resumePending".to_string(), json!(false));
                 queue.insert("updatedAt".to_string(), json!(updated_at));
                 return Ok(());
@@ -261,6 +271,7 @@ pub(crate) async fn update_session_queue_item_payload(
         );
         item_object.insert("attachmentIds".to_string(), json!(resolved_attachment_ids));
         item_object.insert("attachmentNames".to_string(), json!(attachment_names));
+        clear_queue_item_dispatch_error(item_object);
         if let Some(existing_object) = existing.as_object_mut() {
             existing_object.insert("updatedAt".to_string(), json!(now_unix_ms()));
         }

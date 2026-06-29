@@ -1123,6 +1123,7 @@ async function startServer(config) {
       CODEX_WEBUI_CODEX_BIN: String(config.codexBin),
       CODEX_HOME: String(defaultProfile.codexHome),
       CODEX_WEBUI_DATA_DIR: String(config.dataDir),
+      CODEX_WEBUI_CONFIG_PATH: String(configPath),
       CODEX_WEBUI_DEFAULT_PROFILE_ID: String(config.defaultProfileId),
       CODEX_WEBUI_PROFILES_JSON: JSON.stringify(
         config.profiles.map((profile) => ({

@@ -602,7 +602,7 @@ pub(crate) async fn emit_session_notification(
     let relay = {
         let relays = state.relays.lock().await;
         relays
-            .get(&session_relay_key(resolved_profile_id, session_id))
+            .get(&session_relay_key(&resolved_profile_id, session_id))
             .cloned()
     };
     if let Some(relay) = relay {

@@ -40,7 +40,8 @@
     GripVertical,
     Keyboard,
     Monitor,
-    Download
+    Download,
+    UserCog
   } from "lucide-svelte";
   import { onMount, tick } from "svelte";
   import { fly, slide } from "svelte/transition";
@@ -90,6 +91,7 @@
     CodexItem,
     ComputerFramePayload,
     ComputerInputEvent,
+    CodexProfileAccountSummary,
     CodexQuotaStatus,
     CodexResetTicket,
     CodexResetTicketsPayload,
@@ -243,6 +245,8 @@
   let config = $state<AppConfigPayload | null>(null);
   let catalog = $state<CatalogPayload | null>(null);
   let quota = $state<CodexQuotaStatus | null>(null);
+  let profileAccounts = $state<CodexProfileAccountSummary[]>([]);
+  let profileAccountsBusy = $state(false);
   let resetTickets = $state<CodexResetTicketsPayload | null>(null);
   let runtime = $state<CodexRuntimeStatus | null>(null);
   let remoteControlStatus = $state<{ status: string; environmentId: string | null; updatedAt: number } | null>(null);
@@ -259,6 +263,8 @@
   let sessionsLoadingMore = $state(false);
   let conversation = $state<ConversationState | null>(null);
   let selectedSessionId = $state<string | null>(null);
+  let profileMoveDialogSession = $state<SessionSummary | null>(null);
+  let profileMoveDialogTargetId = $state("");
   let activeProfileId = $state<string | null>(null);
   let authenticated = $state<boolean | null>(null);
   let webRole = $state<UserRole | null>(null);
@@ -294,6 +300,8 @@
   let quotaBusy = $state(false);
   let quotaRefreshPromise: Promise<void> | null = null;
   let quotaForceRefreshQueued = false;
+  let profileAccountsRefreshPromise: Promise<void> | null = null;
+  let profileAccountsForceRefreshQueued = false;
   let resetTicketsBusy = $state(false);
   let resetTicketsRefreshPromise: Promise<void> | null = null;
   let resetTicketsForceRefreshQueued = false;
@@ -355,6 +363,7 @@
   let MemoryWorkspaceView = $state<MemoryWorkspaceComponent | null>(null);
   let SettingsWorkspaceView = $state<SettingsWorkspaceComponent | null>(null);
   let TerminalWorkspaceView = $state<TerminalWorkspaceComponent | null>(null);
+  let lazyWorkspaceLoadErrors = $state<Partial<Record<LazyWorkspaceKind, string>>>({});
   let workspaceMenuOpen = $state(false);
   let tasksTabOpen = $state(false);
   let gitTabOpen = $state(false);
@@ -594,6 +603,14 @@
       restoreThread: m.restore_thread(),
       archiveThread: m.archive_thread(),
       open: m.open(),
+      moveSessionToAccount: locale === "ko" ? "세션 계정 이동" : "Move session to account",
+      moveSessionToAccountDescription:
+        locale === "ko"
+          ? "이 세션을 처리할 Codex 계정을 선택하세요. 세션 파일은 대상 프로필로 이동됩니다."
+          : "Choose the Codex account that should own this session. The session files will be moved to the selected profile.",
+      currentAccount: locale === "ko" ? "현재 계정" : "Current account",
+      targetAccount: locale === "ko" ? "대상 계정" : "Target account",
+      moveSession: locale === "ko" ? "이동" : "Move",
       refresh: locale === "ko" ? "새로고침" : "Refresh",
       loadingHistory: m.loading_history(),
       historyAvailable: m.history_available(),
@@ -1376,7 +1393,7 @@
     sessionTurnSearchError = "";
 
     try {
-      const response = await api.searchSessionTurns(sessionId, query, reset ? null : sessionTurnSearchCursor, 20);
+      const response = await api.searchSessionTurns(sessionId, query, reset ? null : sessionTurnSearchCursor, 20, profileIdForSession(sessionId));
       if (
         requestVersion !== sessionTurnSearchRequestVersion ||
         selectedSessionId !== sessionId ||
@@ -1803,13 +1820,22 @@
       return queueItems;
     }
 
+    const realIds = new Set<string>();
     const realCounts = new Map<string, number>();
     for (const item of queueItems) {
+      for (const value of [item.id, item.clientRequestId, item.clientUserMessageId]) {
+        if (value) {
+          realIds.add(value);
+        }
+      }
       const signature = buildQueueItemSignature(item.prompt, item.skills, item.attachmentIds);
       realCounts.set(signature, (realCounts.get(signature) ?? 0) + 1);
     }
 
     const visibleOptimisticItems = optimisticItems.filter((item) => {
+      if ([item.id, item.clientRequestId, item.clientUserMessageId].some((value) => value && realIds.has(value))) {
+        return false;
+      }
       const signature = buildQueueItemSignature(item.prompt, item.skills, item.attachmentIds);
       const remaining = realCounts.get(signature) ?? 0;
       if (remaining <= 0) {
@@ -2515,6 +2541,12 @@
       await existing;
       return;
     }
+    if (lazyWorkspaceLoadErrors[kind]) {
+      lazyWorkspaceLoadErrors = {
+        ...lazyWorkspaceLoadErrors,
+        [kind]: undefined
+      };
+    }
 
     const pending = (async () => {
       if (kind === "arena") {
@@ -2548,7 +2580,20 @@
         return;
       }
       if (kind === "settings") {
-        const module = await import("$lib/components/SettingsWorkspace.svelte");
+        let timeout: ReturnType<typeof setTimeout> | null = null;
+        const module = await Promise.race([
+          import("$lib/components/SettingsWorkspace.svelte"),
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error(getLocale().startsWith("ko") ? "설정 워크스페이스 로딩 시간이 초과됐습니다." : "Timed out loading the settings workspace.")),
+              15_000
+            );
+          })
+        ]).finally(() => {
+          if (timeout) {
+            clearTimeout(timeout);
+          }
+        });
         SettingsWorkspaceView = module.default;
         return;
       }
@@ -2557,7 +2602,12 @@
       TerminalWorkspaceView = module.default;
     })()
       .catch((error) => {
-        errorText = describeError(error);
+        const message = describeError(error);
+        lazyWorkspaceLoadErrors = {
+          ...lazyWorkspaceLoadErrors,
+          [kind]: message
+        };
+        errorText = message;
       })
       .finally(() => {
         lazyWorkspaceLoads.delete(kind);
@@ -3058,6 +3108,19 @@
     ) {
       return;
     }
+    scheduleTranscriptScrollToBottom();
+  });
+
+  $effect(() => {
+    if (
+      !transcriptElement ||
+      !loadingDetail ||
+      conversation ||
+      !isInitialTranscriptScrollPending()
+    ) {
+      return;
+    }
+    requestTranscriptBottomScroll(true);
     scheduleTranscriptScrollToBottom();
   });
 
@@ -3928,11 +3991,11 @@
           transcriptScrollFrame = null;
           return;
         }
-        if (loadingDetail || loadingOlderTurns) {
+        const initialScrollPending = isInitialTranscriptScrollPending();
+        if (loadingOlderTurns || (loadingDetail && !initialScrollPending)) {
           transcriptScrollFrame = null;
           return;
         }
-        const initialScrollPending = isInitialTranscriptScrollPending();
         if (
           (transcriptAutoScrollSuspendedByUser && !forceTranscriptScroll && !pendingTranscriptBottomScroll && !initialScrollPending) ||
           (!stickTranscriptToBottom && !forceTranscriptScroll && !pendingTranscriptBottomScroll && !initialScrollPending)
@@ -3954,11 +4017,14 @@
         }
 
         if (stableFrames >= 2 || window.performance.now() - startedAt >= 900) {
+          const keepInitialScrollPendingForDetailLoad = loadingDetail && initialScrollPending;
           transcriptScrollFrame = null;
-          pendingTranscriptBottomScroll = false;
-          forceTranscriptScroll = false;
-          if (initialScrollPending) {
-            clearInitialTranscriptScrollPending();
+          if (!keepInitialScrollPendingForDetailLoad) {
+            pendingTranscriptBottomScroll = false;
+            forceTranscriptScroll = false;
+            if (initialScrollPending) {
+              clearInitialTranscriptScrollPending();
+            }
           }
           return;
         }
@@ -4217,13 +4283,13 @@
     sessionListRequestedLimit = sessionPageSize;
   }
 
-  function buildSessionDetailBrowserCacheKey(sessionId: string) {
-    if (!activeProfileId) {
+  function buildSessionDetailBrowserCacheKey(sessionId: string, profileId = profileIdForSession(sessionId)) {
+    if (!profileId) {
       return null;
     }
 
     return JSON.stringify({
-      profileId: activeProfileId,
+      profileId,
       sessionId
     });
   }
@@ -4322,18 +4388,49 @@
   }
 
   function reuseUnchangedSessionSummaries(nextSessions: SessionSummary[], nextSummaryVersions: Record<string, string> | null | undefined) {
+    const enrichedNextSessions = nextSessions.map(enrichSessionSummaryContext);
     if (!nextSummaryVersions || Object.keys(sessionSummaryVersionsById).length === 0) {
-      return nextSessions;
+      return enrichedNextSessions;
     }
     const currentById = new Map(sessions.map((session) => [session.id, session]));
-    return nextSessions.map((session) => {
+    return enrichedNextSessions.map((session) => {
       const existing = currentById.get(session.id);
       const nextVersion = nextSummaryVersions[session.id];
       if (existing && nextVersion && sessionSummaryVersionsById[session.id] === nextVersion) {
-        return existing;
+        return enrichSessionSummaryContext(existing);
       }
       return session;
     });
+  }
+
+  function activeProfileConfig() {
+    return config?.profiles.find((profile) => profile.active) ?? config?.profiles.find((profile) => profile.id === activeProfileId) ?? null;
+  }
+
+  function profileIdForSession(sessionId: string | null | undefined) {
+    if (!sessionId) {
+      return activeProfileId;
+    }
+    const summary =
+      sessions.find((session) => session.id === sessionId) ??
+      (selectedSessionSummary?.id === sessionId ? selectedSessionSummary : null);
+    return summary?.profileId ?? activeProfileId;
+  }
+
+  function enrichSessionSummaryContext(summary: SessionSummary): SessionSummary {
+    const activeProfile = activeProfileConfig();
+    const profile =
+      (summary.profileId ? config?.profiles.find((entry) => entry.id === summary.profileId) : null) ?? activeProfile;
+    const summaryProfileId = summary.profileId ?? profile?.id ?? activeProfileId ?? null;
+    const isActiveProfile = !summaryProfileId || summaryProfileId === activeProfile?.id || summaryProfileId === activeProfileId;
+    return {
+      ...summary,
+      profileId: summaryProfileId,
+      profileLabel: summary.profileLabel ?? profile?.label ?? null,
+      profileCodexHome: summary.profileCodexHome ?? profile?.codexHome ?? null,
+      accountEmail: summary.accountEmail ?? (isActiveProfile ? (config?.account.email ?? null) : null),
+      accountType: summary.accountType ?? (isActiveProfile ? (config?.account.type ?? null) : null)
+    };
   }
 
   function mergeSessionPage(payload: SessionListPayload, pinnedSession: SessionSummary | null, append = false) {
@@ -4424,8 +4521,9 @@
   }
 
   function upsertSessionSummary(summary: SessionSummary, cacheDirty = true) {
-    if (isSubagentSessionSummary(summary)) {
-      setSessionsStable(sessions.filter((session) => session.id !== summary.id));
+    const enrichedSummary = enrichSessionSummaryContext(summary);
+    if (isSubagentSessionSummary(enrichedSummary)) {
+      setSessionsStable(sessions.filter((session) => session.id !== enrichedSummary.id));
       if (cacheDirty) {
         sessionListCacheVersion = null;
         sessionListStateHash = null;
@@ -4434,7 +4532,7 @@
       }
       return;
     }
-    setSessionsStable([summary, ...sessions.filter((session) => session.id !== summary.id)]);
+    setSessionsStable([enrichedSummary, ...sessions.filter((session) => session.id !== enrichedSummary.id)]);
     if (cacheDirty) {
       sessionListCacheVersion = null;
       sessionListStateHash = null;
@@ -4444,8 +4542,9 @@
   }
 
   function applySessionSummaryUpdate(summary: SessionSummary) {
-    if (isSubagentSessionSummary(summary)) {
-      const nextSessions = sessions.filter((session) => session.id !== summary.id);
+    const enrichedSummary = enrichSessionSummaryContext(summary);
+    if (isSubagentSessionSummary(enrichedSummary)) {
+      const nextSessions = sessions.filter((session) => session.id !== enrichedSummary.id);
       if (nextSessions.length !== sessions.length) {
         setSessionsStable(nextSessions);
         sessionListCacheVersion = null;
@@ -4461,8 +4560,8 @@
       return;
     }
 
-    if (summary.archived !== showArchivedSessions) {
-      const nextSessions = sessions.filter((session) => session.id !== summary.id);
+    if (enrichedSummary.archived !== showArchivedSessions) {
+      const nextSessions = sessions.filter((session) => session.id !== enrichedSummary.id);
       if (nextSessions.length !== sessions.length) {
         setSessionsStable(nextSessions);
         sessionListCacheVersion = null;
@@ -4473,8 +4572,8 @@
       return;
     }
 
-    if (!matchesSessionSummaryFilter(summary, sessionFilter)) {
-      const nextSessions = sessions.filter((session) => session.id !== summary.id);
+    if (!matchesSessionSummaryFilter(enrichedSummary, sessionFilter)) {
+      const nextSessions = sessions.filter((session) => session.id !== enrichedSummary.id);
       if (nextSessions.length !== sessions.length) {
         setSessionsStable(nextSessions);
         sessionListCacheVersion = null;
@@ -4485,7 +4584,7 @@
       return;
     }
 
-    upsertSessionSummary(summary);
+    upsertSessionSummary(enrichedSummary);
   }
 
   function buildSessionSummaryFromConversation(state: ConversationState): SessionSummary {
@@ -4499,8 +4598,14 @@
           ? "completed"
           : state.thread.status;
 
+    const activeProfile = activeProfileConfig();
     return {
       id: state.thread.id,
+      profileId: selectedSessionSummary?.profileId ?? existingSummary?.profileId ?? activeProfile?.id ?? activeProfileId ?? null,
+      profileLabel: selectedSessionSummary?.profileLabel ?? existingSummary?.profileLabel ?? activeProfile?.label ?? null,
+      profileCodexHome: selectedSessionSummary?.profileCodexHome ?? existingSummary?.profileCodexHome ?? activeProfile?.codexHome ?? null,
+      accountEmail: selectedSessionSummary?.accountEmail ?? existingSummary?.accountEmail ?? null,
+      accountType: selectedSessionSummary?.accountType ?? existingSummary?.accountType ?? null,
       name: getDisplayThreadTitle(state.thread.name, preview),
       preview,
       queueCount: state.queue.items.length,
@@ -4694,6 +4799,10 @@
 
     config = null;
     quota = null;
+    profileAccounts = [];
+    profileAccountsBusy = false;
+    profileAccountsRefreshPromise = null;
+    profileAccountsForceRefreshQueued = false;
     resetTickets = null;
     sessions = [];
     sessionsCursor = null;
@@ -5187,7 +5296,6 @@
       const detailCacheKey = buildSessionDetailBrowserCacheKey(sessionId);
       let knownVersion: string | null = null;
       let turnLimit = olderTurnPageSize;
-      const selectionSummary = sessions.find((session) => session.id === sessionId) ?? null;
 
       if (detailCacheKey) {
         const cachedEntry = await readSessionDetailCache(detailCacheKey);
@@ -5197,9 +5305,10 @@
         if (cachedEntry) {
           sessionDetailCacheVersion = cachedEntry.version;
           applyLoadedSessionDetail(sessionId, cachedEntry.payload);
-          const cachedUpdatedAt = normalizeSessionTimestamp(cachedEntry.payload.thread.updatedAt);
-          const summaryUpdatedAt = normalizeSessionTimestamp(selectionSummary?.updatedAt ?? 0);
-          knownVersion = summaryUpdatedAt > cachedUpdatedAt ? null : cachedEntry.version;
+          // Browser detail cache is only a paint accelerator on session switch.
+          // Always fetch the selected session once without conditional validation so
+          // a stale cached transcript cannot hide the final completed turn.
+          knownVersion = null;
           turnLimit = Math.max(olderTurnPageSize, cachedEntry.payload.thread.turns.length);
           requestTranscriptBottomScroll(true);
         }
@@ -5400,7 +5509,7 @@
       } else if (selectedSessionId === sessionId) {
         queuePendingSessionEvent(sessionId, payload);
       }
-    }, { includeInitialQueue: false });
+    }, { includeInitialQueue: false, profileId: profileIdForSession(sessionId) });
   }
 
   function disconnectStream() {
@@ -5826,6 +5935,7 @@
     replaceWithRecentWindow = false,
     selectionVersion: number | null = null
   ) {
+    const sessionProfileId = profileIdForSession(sessionId);
     const knownTurnVersions =
       !replaceWithRecentWindow && knownVersion && sessionDetailStateHash && conversation?.thread.id === sessionId
         ? boundedVersionHints(sessionTurnVersionsById, SESSION_DETAIL_VERSION_HINT_LIMIT)
@@ -5837,7 +5947,8 @@
       turnLimit,
       replaceWithRecentWindow ? null : knownVersion,
       knownTurnVersions,
-      knownStateHash
+      knownStateHash,
+      sessionProfileId
     );
     if (selectionVersion !== null && sessionSelectionVersion !== selectionVersion) {
       return null;
@@ -5873,7 +5984,7 @@
       const patchedDetail = applySessionDetailPatch(detail);
       const fallbackDetail = patchedDetail
         ? null
-        : await api.getSession(sessionId, turnLimit);
+        : await api.getSession(sessionId, turnLimit, null, null, null, sessionProfileId);
       if (selectionVersion !== null && sessionSelectionVersion !== selectionVersion) {
         return null;
       }
@@ -6193,6 +6304,7 @@
       accountLoginFlow = null;
       void refreshAccountState(false);
       void refreshQuota(true);
+      void refreshProfileAccounts(true);
       void refreshResetTickets(true);
       return;
     }
@@ -6208,6 +6320,7 @@
           noticeText = m.account_updated_notice();
           void refreshAccountState(true);
           void refreshQuota(true);
+          void refreshProfileAccounts(true);
           void refreshResetTickets(true);
         } else {
           accountLoginFlow = {
@@ -6222,6 +6335,7 @@
 
     if (event.method === "codex-webui/accountRateLimitsUpdated") {
       void refreshQuota(true);
+      void refreshProfileAccounts(true);
       void refreshResetTickets(true);
       return;
     }
@@ -6276,10 +6390,11 @@
         if (!currentBinding || currentBinding.sessionId !== sessionId) {
           return;
         }
+        const sessionProfileId = profileIdForSession(sessionId);
         if (currentDraft.trim()) {
-          await api.saveSessionDraft(sessionId, currentDraft, intent);
+          await api.saveSessionDraft(sessionId, currentDraft, intent, sessionProfileId);
         } else {
-          await api.clearSessionDraft(sessionId);
+          await api.clearSessionDraft(sessionId, sessionProfileId);
         }
       } catch (error) {
         if (selectedSessionId === sessionId) {
@@ -6304,7 +6419,7 @@
     draftPersistencePaused = true;
 
     try {
-      const saved = await api.getSessionDraft(sessionId);
+      const saved = await api.getSessionDraft(sessionId, profileIdForSession(sessionId));
       if (selectedSessionId !== sessionId) {
         return;
       }
@@ -6374,7 +6489,7 @@
     }
 
     try {
-      await api.clearSessionDraft(selectedSessionId);
+      await api.clearSessionDraft(selectedSessionId, profileIdForSession(selectedSessionId));
       pendingSteerResume = null;
       if (!draft.trim()) {
         draft = "";
@@ -7037,7 +7152,7 @@
         scheduleComposerTextareaResize();
         return;
       }
-      const response = await api.getSessionGoal(selectedBinding.sessionId);
+      const response = await api.getSessionGoal(selectedBinding.sessionId, profileIdForSession(selectedBinding.sessionId));
       applyGoalPayloadToConversation(selectedBinding.sessionId, response.goal);
       noticeText = formatGoalSummary(response.goal);
       draft = "";
@@ -7050,7 +7165,7 @@
       if (!selectedBinding) {
         return;
       }
-      const response = await api.clearSessionGoal(selectedBinding.sessionId);
+      const response = await api.clearSessionGoal(selectedBinding.sessionId, profileIdForSession(selectedBinding.sessionId));
       applyGoalPayloadToConversation(selectedBinding.sessionId, response.goal);
       noticeText = m.slash_goal_cleared();
       draft = "";
@@ -7063,20 +7178,21 @@
       return;
     }
 
+    const materializedProfileId = profileIdForSession(materialized.sessionId);
     const response =
       normalized === "pause" || normalized === "paused"
-        ? await api.setSessionGoal(materialized.sessionId, { status: "paused" })
+        ? await api.setSessionGoal(materialized.sessionId, { status: "paused" }, materializedProfileId)
         : normalized === "resume" || normalized === "active"
-          ? await api.setSessionGoal(materialized.sessionId, { status: "active" })
+          ? await api.setSessionGoal(materialized.sessionId, { status: "active" }, materializedProfileId)
           : normalized === "block" || normalized === "blocked"
-            ? await api.setSessionGoal(materialized.sessionId, { status: "blocked" })
+            ? await api.setSessionGoal(materialized.sessionId, { status: "blocked" }, materializedProfileId)
             : normalized === "usage-limited" || normalized === "usage_limited" || normalized === "usagelimited"
-              ? await api.setSessionGoal(materialized.sessionId, { status: "usageLimited" })
+              ? await api.setSessionGoal(materialized.sessionId, { status: "usageLimited" }, materializedProfileId)
               : normalized === "budget-limited" || normalized === "budget_limited" || normalized === "budgetlimited"
-                ? await api.setSessionGoal(materialized.sessionId, { status: "budgetLimited" })
+                ? await api.setSessionGoal(materialized.sessionId, { status: "budgetLimited" }, materializedProfileId)
                 : normalized === "complete" || normalized === "completed"
-                  ? await api.setSessionGoal(materialized.sessionId, { status: "complete" })
-                  : await api.setSessionGoal(materialized.sessionId, { objective: args.trim(), status: "active" });
+                  ? await api.setSessionGoal(materialized.sessionId, { status: "complete" }, materializedProfileId)
+                  : await api.setSessionGoal(materialized.sessionId, { objective: args.trim(), status: "active" }, materializedProfileId);
     applyGoalPayloadToConversation(materialized.sessionId, response.goal);
     if (normalized === "pause" || normalized === "paused") {
       noticeText = m.slash_goal_paused();
@@ -7497,6 +7613,7 @@
       }
 
       const sessionId = materialized.sessionId;
+      const sessionProfileId = profileIdForSession(sessionId);
       const activeConversation = materialized.state;
       const attachmentIds = attachmentSnapshot.map((attachment) => attachment.id);
       const selectedSkillsSnapshot = [...(activeConversation.selectedSkills ?? [])];
@@ -7525,7 +7642,8 @@
           skills: selectedSkillsSnapshot,
           attachmentIds,
           preferences,
-          clientUserMessageId
+          clientUserMessageId,
+          profileId: sessionProfileId
         })
       .then(() => {
         scheduleSessionRefresh(80);
@@ -7584,6 +7702,7 @@
     }
 
     const sessionId = selectedBinding.sessionId;
+    const sessionProfileId = profileIdForSession(sessionId);
     const draftText = options?.promptText ?? draft;
     const attachmentSnapshot = options?.attachmentSnapshot ?? [...draftAttachments];
     const prompt = draftText.trim();
@@ -7610,7 +7729,7 @@
       closeFileMentionSearch();
       scheduleComposerTextareaResize();
       composerSettingsOpen = false;
-      void api.clearSessionDraft(sessionId).catch(() => {});
+      void api.clearSessionDraft(sessionId, sessionProfileId).catch(() => {});
     }
 
     queuedMessageRequestCountsBySessionId = {
@@ -7624,7 +7743,8 @@
         clientRequestId: optimisticQueueId,
         clientUserMessageId,
         skills: selectedSkillsSnapshot,
-        attachmentIds
+        attachmentIds,
+        profileId: sessionProfileId
       })
       .then((queue) => {
         applyQueuePayloadToSession(sessionId, queue);
@@ -7685,6 +7805,7 @@
     }
 
     const sessionId = selectedBinding.sessionId;
+    const sessionProfileId = profileIdForSession(sessionId);
     const normalizedPrompt = prompt.trim();
     const steerAttachmentSnapshot =
       clearComposer || draft.trim() === normalizedPrompt ? [...draftAttachments] : [];
@@ -7715,7 +7836,8 @@
         attachmentIds,
         selectedSkillsSnapshot,
         activeTurnId,
-        clientUserMessageId
+        clientUserMessageId,
+        sessionProfileId
       );
       scheduleSessionRefresh(80);
       scheduleSelectedSessionStateRefresh(sessionId, 80);
@@ -7726,7 +7848,7 @@
         draftAttachments = [];
         closeFileMentionSearch();
         scheduleComposerTextareaResize();
-        void api.clearSessionDraft(sessionId).catch(() => {});
+        void api.clearSessionDraft(sessionId, sessionProfileId).catch(() => {});
       }
       pendingSteerResume = null;
     } catch (error) {
@@ -7754,6 +7876,7 @@
     }
 
     const sessionId = selectedBinding.sessionId;
+    const sessionProfileId = profileIdForSession(sessionId);
     const queuedItem = selectedBinding.state.queue.items.find((item) => item.id === queueId) ?? null;
     if (!queuedItem) {
       requestSelectedSessionResync(false);
@@ -7778,7 +7901,7 @@
         mode === "steer"
           ? selectedBinding.state.activeTurnId ?? getConversationLiveTurn(selectedBinding.state)?.id ?? null
           : null;
-      const queue = await api.dispatchQueuedMessage(sessionId, queueId, mode, activeTurnId);
+      const queue = await api.dispatchQueuedMessage(sessionId, queueId, mode, activeTurnId, sessionProfileId);
       applyQueuePayloadToSession(sessionId, queue);
       scheduleSessionRefresh(80);
       scheduleSelectedSessionStateRefresh(sessionId, 80);
@@ -7871,6 +7994,7 @@
     }
 
     const sessionId = selectedBinding.sessionId;
+    const sessionProfileId = profileIdForSession(sessionId);
     if (!serverQueuedMessages.some((item) => item.id === dragState.targetQueueId)) {
       return;
     }
@@ -7896,7 +8020,7 @@
     errorText = "";
     noticeText = "";
     try {
-      const queue = await api.reorderQueuedMessages(sessionId, nextQueueIds);
+      const queue = await api.reorderQueuedMessages(sessionId, nextQueueIds, sessionProfileId);
       applyQueuePayloadToSession(sessionId, queue);
     } catch (error) {
       errorText = describeError(error);
@@ -7931,6 +8055,7 @@
     }
 
     const sessionId = selectedBinding.sessionId;
+    const sessionProfileId = profileIdForSession(sessionId);
     if (isOptimisticQueueItem({ id: queueId } as SessionQueueItem)) {
       removeOptimisticQueuedItem(sessionId, queueId);
       if (editingQueueId === queueId) {
@@ -7941,7 +8066,7 @@
     }
 
     try {
-      const queue = await api.removeQueuedMessage(sessionId, queueId);
+      const queue = await api.removeQueuedMessage(sessionId, queueId, sessionProfileId);
       applyQueuePayloadToSession(sessionId, queue);
       if (editingQueueId === queueId) {
         editingQueueId = null;
@@ -8008,7 +8133,8 @@
       const queue = await api.updateQueuedMessage(selectedBinding.sessionId, queueId, {
         prompt: nextPrompt,
         skills: queuedItem.skills,
-        attachmentIds: queuedItem.attachmentIds
+        attachmentIds: queuedItem.attachmentIds,
+        profileId: profileIdForSession(selectedBinding.sessionId)
       });
       applyQueuePayloadToSession(selectedBinding.sessionId, queue);
       noticeText = m.queued_followup_updated();
@@ -8033,11 +8159,12 @@
     }
 
     const sessionId = selectedBinding.sessionId;
+    const sessionProfileId = profileIdForSession(sessionId);
     errorText = "";
     noticeText = "";
 
     try {
-      const queue = await api.resumeSessionQueue(sessionId);
+      const queue = await api.resumeSessionQueue(sessionId, sessionProfileId);
       applyQueuePayloadToSession(sessionId, queue);
       dismissedQueueResumeBySessionId = {
         ...dismissedQueueResumeBySessionId,
@@ -8197,6 +8324,75 @@
     } catch (error) {
       errorText = describeError(error);
     }
+  }
+
+  async function moveSessionProfileFromSidebar(session: SessionSummary, targetProfileId: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    const trimmedTargetProfileId = targetProfileId.trim();
+    if (!trimmedTargetProfileId) {
+      return;
+    }
+    try {
+      const response = await api.moveSessionProfile(
+        session.id,
+        trimmedTargetProfileId,
+        session.profileId ?? null
+      );
+      sessions = sessions.filter((entry) => entry.id !== session.id);
+      if (selectedSessionId === session.id) {
+        resetWorkspaceState();
+        if (response.targetProfileId) {
+          await selectAccountProfile(response.targetProfileId);
+          await selectSession(session.id);
+        }
+      } else {
+        await refreshSessions();
+      }
+      noticeText = getLocale().startsWith("ko")
+        ? `세션을 ${response.targetProfileLabel || response.targetProfileId} 계정으로 이동했습니다.`
+        : `Moved the session to ${response.targetProfileLabel || response.targetProfileId}.`;
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  function profileMoveOptionsForSession(session: SessionSummary | null) {
+    if (!session || !config) {
+      return [];
+    }
+    const currentProfileId = session.profileId ?? config.profiles.find((profile) => profile.active)?.id ?? null;
+    return config.profiles.filter((profile) => profile.id !== currentProfileId);
+  }
+
+  function openSessionProfileMoveDialog(session: SessionSummary) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    const options = profileMoveOptionsForSession(session);
+    if (options.length === 0) {
+      return;
+    }
+    profileMoveDialogSession = session;
+    profileMoveDialogTargetId = options[0]?.id ?? "";
+  }
+
+  function closeSessionProfileMoveDialog() {
+    profileMoveDialogSession = null;
+    profileMoveDialogTargetId = "";
+  }
+
+  async function confirmSessionProfileMoveDialog() {
+    const session = profileMoveDialogSession;
+    const targetProfileId = profileMoveDialogTargetId.trim();
+    if (!session || !targetProfileId) {
+      return;
+    }
+    closeSessionProfileMoveDialog();
+    await moveSessionProfileFromSidebar(session, targetProfileId);
   }
 
   async function toggleSessionPinned(session: SessionSummary) {
@@ -8378,6 +8574,37 @@
       accountLoginFlow = null;
       await refreshAccountState(true);
       await refreshQuota(true);
+      await refreshProfileAccounts(true);
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function importAccountCredentialsFromServer(
+    path: string,
+    options: { createProfile?: boolean; profileLabel?: string | null; profileId?: string | null } = {}
+  ) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    const trimmedPath = path.trim();
+    if (!trimmedPath) {
+      errorText = getLocale().startsWith("ko") ? "서버 credentials JSON 경로를 입력하세요." : "Enter a server credentials JSON path.";
+      return;
+    }
+    try {
+      const response = await api.startAccountLogin("authJsonFile", null, trimmedPath, options);
+      accountLoginFlow = null;
+      await refreshAccountState(true);
+      await refreshQuota(true);
+      await refreshProfileAccounts(true);
+      config = applyLocalComposerPreferencesToConfig(await api.getConfig());
+      if (response.type === "authJsonFile" && response.restartRequired) {
+        noticeText = getLocale().startsWith("ko")
+          ? `프로필을 설정 파일에 추가했습니다. WebUI 재시작 후 사용할 수 있습니다.`
+          : "Added the profile to the config file. Restart WebUI to use it.";
+      }
     } catch (error) {
       errorText = describeError(error);
     }
@@ -8406,6 +8633,7 @@
       accountLoginFlow = null;
       await refreshAccountState(true);
       await refreshQuota(true);
+      await refreshProfileAccounts(true);
     } catch (error) {
       errorText = describeError(error);
     }
@@ -8427,6 +8655,75 @@
       resetWorkspaceState();
       authenticated = true;
       await bootstrap();
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function renameAccountProfile(profileId: string, currentLabel: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    const nextLabel = window.prompt(getLocale().startsWith("ko") ? "새 계정 라벨을 입력하세요." : "Enter a new account label.", currentLabel);
+    if (nextLabel === null) {
+      return;
+    }
+    const trimmed = nextLabel.trim();
+    if (!trimmed || trimmed === currentLabel.trim()) {
+      return;
+    }
+    try {
+      const response = await api.updateAccountProfile(profileId, trimmed);
+      if (config) {
+        config = {
+          ...config,
+          profiles: config.profiles.map((profile) => (profile.id === profileId ? { ...profile, label: trimmed } : profile))
+        };
+      }
+      profileAccounts = profileAccounts.map((profile) => (profile.profileId === profileId ? { ...profile, label: trimmed } : profile));
+      if (response.restartRequired) {
+        noticeText = getLocale().startsWith("ko")
+          ? "계정 라벨을 설정 파일에 저장했습니다. WebUI 재시작 후 완전히 반영됩니다."
+          : "Saved the account label to the config file. Restart WebUI to fully apply it.";
+      }
+    } catch (error) {
+      errorText = describeError(error);
+    }
+  }
+
+  async function deleteAccountProfile(profileId: string, label: string) {
+    if (readOnlyRole) {
+      errorText = m.error_forbidden_role();
+      return;
+    }
+    const currentProfileId = config?.profiles.find((profile) => profile.active)?.id ?? activeProfileId;
+    if (profileId === currentProfileId) {
+      errorText = getLocale().startsWith("ko") ? "다른 계정으로 전환한 뒤 삭제하세요." : "Switch to another account before deleting it.";
+      return;
+    }
+    const confirmed = window.confirm(
+      getLocale().startsWith("ko")
+        ? `"${label}" 계정을 목록에서 삭제할까요? 저장된 auth 파일은 기본적으로 남겨둡니다.`
+        : `Remove "${label}" from the account list? Stored auth files are kept by default.`
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      const response = await api.deleteAccountProfile(profileId, false);
+      if (config) {
+        config = {
+          ...config,
+          profiles: config.profiles.filter((profile) => profile.id !== profileId)
+        };
+      }
+      profileAccounts = profileAccounts.filter((profile) => profile.profileId !== profileId);
+      if (response.restartRequired) {
+        noticeText = getLocale().startsWith("ko")
+          ? "계정을 설정 파일에서 제거했습니다. WebUI 재시작 후 완전히 반영됩니다."
+          : "Removed the account from the config file. Restart WebUI to fully apply it.";
+      }
     } catch (error) {
       errorText = describeError(error);
     }
@@ -8487,6 +8784,41 @@
       quotaRefreshPromise = null;
       if (quotaForceRefreshQueued) {
         void refreshQuota(true);
+      }
+    }
+  }
+
+  async function refreshProfileAccounts(force = false) {
+    if (readOnlyRole) {
+      return;
+    }
+    if (profileAccountsRefreshPromise) {
+      profileAccountsForceRefreshQueued = profileAccountsForceRefreshQueued || force;
+      return profileAccountsRefreshPromise;
+    }
+
+    const runForce = force || profileAccountsForceRefreshQueued;
+    profileAccountsForceRefreshQueued = false;
+    profileAccountsBusy = true;
+    profileAccountsRefreshPromise = (async () => {
+      try {
+        const payload = await api.getProfileAccounts(runForce);
+        profileAccounts = payload.profiles;
+      } catch (error) {
+        if (runForce) {
+          errorText = describeError(error);
+        }
+      } finally {
+        profileAccountsBusy = false;
+      }
+    })();
+
+    try {
+      await profileAccountsRefreshPromise;
+    } finally {
+      profileAccountsRefreshPromise = null;
+      if (profileAccountsForceRefreshQueued) {
+        void refreshProfileAccounts(true);
       }
     }
   }
@@ -9630,14 +9962,15 @@
     skills: SelectedSkill[],
     attachments: AttachmentRecord[]
   ) {
+    const optimisticId = `optimistic:${sessionId}:${clientUserMessageId}`;
     const item: SessionQueueItem = {
-      id: `optimistic:${sessionId}:${clientUserMessageId}`,
+      id: optimisticId,
       prompt,
       skills: normalizeSelectedSkills(skills),
       attachmentIds: attachments.map((attachment) => attachment.id),
       attachmentNames: attachments.map((attachment) => attachment.originalName),
       createdAt: Date.now(),
-      clientRequestId: clientUserMessageId,
+      clientRequestId: optimisticId,
       clientUserMessageId
     };
 
@@ -9646,7 +9979,7 @@
       [sessionId]: [...(optimisticQueuedItemsBySessionId[sessionId] ?? []), item]
     };
 
-    return item.id;
+    return optimisticId;
   }
 
   function removeOptimisticQueuedItem(sessionId: string, queueId: string) {
@@ -9679,6 +10012,7 @@
       return;
     }
 
+    const realIds = new Set<string>();
     const realCounts = new Map<string, number>();
     const realClientIds = new Set(
       queueItems
@@ -9686,13 +10020,21 @@
         .filter((value): value is string => value.length > 0)
     );
     for (const item of queueItems) {
+      for (const value of [item.id, item.clientRequestId, item.clientUserMessageId]) {
+        if (value) {
+          realIds.add(value);
+        }
+      }
       const signature = buildQueueItemSignature(item.prompt, item.skills, item.attachmentIds);
       realCounts.set(signature, (realCounts.get(signature) ?? 0) + 1);
     }
 
     const nextItems = optimisticItems.filter((item) => {
       const clientUserMessageId = item.clientUserMessageId ?? item.clientRequestId;
-      if (clientUserMessageId && realClientIds.has(clientUserMessageId)) {
+      if (
+        (clientUserMessageId && realClientIds.has(clientUserMessageId)) ||
+        [item.id, item.clientRequestId, item.clientUserMessageId].some((value) => value && realIds.has(value))
+      ) {
         return false;
       }
       const signature = buildQueueItemSignature(item.prompt, item.skills, item.attachmentIds);
@@ -9732,6 +10074,15 @@
   ) {
     const targetPrompt = normalizeMessageForComparison(optimistic.prompt);
     const targetAttachments = new Set(optimistic.attachmentNames.map((name) => name.trim()).filter(Boolean));
+
+    if (
+      optimistic.clientUserMessageId &&
+      currentConversation.thread.turns.some((turn) =>
+        turn.items.some((item) => item.type === "userMessage" && getUserClientId(item) === optimistic.clientUserMessageId)
+      )
+    ) {
+      return true;
+    }
 
     return currentConversation.thread.turns.some((turn, turnIndex) => {
       if (turnIndex < optimistic.baselineTurnCount) {
@@ -9853,7 +10204,7 @@
     rollbackTargetsLoading = true;
     rollbackTargetsError = "";
     try {
-      const payload = await api.listRollbackTargets(sessionId);
+      const payload = await api.listRollbackTargets(sessionId, profileIdForSession(sessionId));
       if (selectedSessionId !== sessionId) {
         return;
       }
@@ -11187,7 +11538,7 @@
     };
 
     try {
-      const response = await api.getSessionTurn(sessionId, turnId);
+      const response = await api.getSessionTurn(sessionId, turnId, profileIdForSession(sessionId));
       if (!conversation || conversation.thread.id !== sessionId) {
         return;
       }
@@ -11274,7 +11625,7 @@
     }
 
     try {
-      const response = await api.getSessionOlderTurns(selectedSessionId, beforeTurnId, olderTurnPageSize);
+      const response = await api.getSessionOlderTurns(selectedSessionId, beforeTurnId, olderTurnPageSize, profileIdForSession(selectedSessionId));
       if (!conversation || conversation.thread.id !== selectedSessionId) {
         return;
       }
@@ -11340,7 +11691,12 @@
         const previousHeight = transcriptElement?.scrollHeight ?? 0;
         const previousTop = transcriptElement?.scrollTop ?? 0;
         loadingOlderTurns = true;
-        const response = await api.getSessionOlderTurns(selectedSessionId, beforeTurnId, Math.min(100, Math.max(olderTurnPageSize, loadedStartIndex - match.turnIndex)));
+        const response = await api.getSessionOlderTurns(
+          selectedSessionId,
+          beforeTurnId,
+          Math.min(100, Math.max(olderTurnPageSize, loadedStartIndex - match.turnIndex)),
+          profileIdForSession(selectedSessionId)
+        );
         if (!conversation || conversation.thread.id !== selectedSessionId) {
           return;
         }
@@ -11437,7 +11793,7 @@
     };
 
     try {
-      const response = await api.getSessionItemDetail(sessionId, turnId, itemId);
+        const response = await api.getSessionItemDetail(sessionId, turnId, itemId, profileIdForSession(sessionId));
       if (!conversation || conversation.thread.id !== sessionId) {
         return;
       }
@@ -11451,7 +11807,7 @@
         conversation.thread.id === sessionId
       ) {
         try {
-          const response = await api.getSessionTurn(sessionId, turnId);
+          const response = await api.getSessionTurn(sessionId, turnId, profileIdForSession(sessionId));
           if (!conversation || conversation.thread.id !== sessionId) {
             return;
           }
@@ -12183,8 +12539,8 @@
     class={[
       "h-full border-r border-gray-200 transition-all duration-300",
       isMobileLayout
-        ? "fixed inset-y-0 left-0 z-[130] max-w-[calc(100vw-1.5rem)] shadow-2xl"
-        : "flex-shrink-0"
+        ? "fixed inset-y-0 left-0 z-[130] w-[min(22rem,calc(100vw-1.5rem))] max-w-[calc(100vw-1.5rem)] shadow-2xl"
+        : "w-[22rem] min-w-[22rem] max-w-[24rem] flex-shrink-0"
     ]}
   >
     <SessionSidebar
@@ -12197,6 +12553,8 @@
       notificationsUnreadCount={config?.notifications.unreadCount ?? 0}
       {quota}
       {quotaBusy}
+      {profileAccounts}
+      {profileAccountsBusy}
       {resetTickets}
       {resetTicketsBusy}
       {resetTicketUseBusyId}
@@ -12250,6 +12608,9 @@
       }}
       onRefreshQuota={() => {
         void refreshQuota(true);
+      }}
+      onRefreshProfileAccounts={(force) => {
+        void refreshProfileAccounts(force);
       }}
       onRefreshResetTickets={() => {
         void refreshResetTickets(true);
@@ -12321,11 +12682,21 @@
       onToggleArchive={(session) => {
         void archiveSessionFromSidebar(session);
       }}
+      onRequestMoveSessionProfile={openSessionProfileMoveDialog}
       onStartAccountLogin={(type) => {
         void startAccountLogin(type);
       }}
+      onImportAccountCredentials={(path, options) => {
+        void importAccountCredentialsFromServer(path, options);
+      }}
       onSelectProfile={(profileId) => {
         void selectAccountProfile(profileId);
+      }}
+      onRenameProfile={(profileId, label) => {
+        void renameAccountProfile(profileId, label);
+      }}
+      onDeleteProfile={(profileId, label) => {
+        void deleteAccountProfile(profileId, label);
       }}
       selectedId={selectedSessionId}
     />
@@ -12344,6 +12715,7 @@
       {running}
       {selectedSessionId}
       {selectedSessionSummary}
+      profiles={config?.profiles ?? []}
       searchOpenLabel={sessionSearchCopy.openSearch}
       sessionSearchOpen={sessionTurnSearchOpen}
       showArchivedSessions={showArchivedSessions}
@@ -12353,6 +12725,7 @@
       onCreateSession={() => void createSession()}
       onCreateTerminalTab={() => void createTerminalTab()}
       onEditTags={() => void editSelectedSessionTags()}
+      onRequestMoveSessionProfile={openSessionProfileMoveDialog}
       onForkHandoff={() => void forkCurrentThread("handoff")}
       onOpenComputerTab={openComputerTab}
       onOpenDiagnosticsTab={openDiagnosticsTab}
@@ -13904,6 +14277,19 @@
                   await selectSession(sessionId);
                 }}
               />
+            {:else if lazyWorkspaceLoadErrors.settings}
+              <div class="workspace-loading-card">
+                <AlertCircle size={16} class="text-rose-400" />
+                <span>{lazyWorkspaceLoadErrors.settings}</span>
+                <button
+                  class="rounded-lg border px-2 py-1 text-xs font-bold"
+                  style="border-color: var(--line); color: var(--ink);"
+                  type="button"
+                  onclick={() => void ensureLazyWorkspaceLoaded("settings")}
+                >
+                  {getLocale().startsWith("ko") ? "다시 시도" : "Retry"}
+                </button>
+              </div>
             {:else}
               <div class="workspace-loading-card">
                 <RefreshCw size={16} class="animate-spin text-gray-300" />
@@ -14136,6 +14522,88 @@
     style={sessionTurnSearchPopoverStyle || "opacity:0;pointer-events:none;"}
     totalMatches={sessionTurnSearchTotalMatches}
   />
+{/if}
+
+{#if profileMoveDialogSession}
+  {@const profileMoveOptions = profileMoveOptionsForSession(profileMoveDialogSession)}
+  <div class="fixed inset-0 z-[220] flex items-center justify-center px-4 py-6">
+    <button
+      aria-label={ui.close}
+      class="absolute inset-0 bg-slate-950/45 backdrop-blur-sm"
+      onclick={closeSessionProfileMoveDialog}
+      type="button"
+    ></button>
+    <section
+      aria-labelledby="session-profile-move-title"
+      class="relative z-[221] w-full max-w-md overflow-hidden rounded-3xl border shadow-2xl"
+      style="border-color: var(--line); background: var(--panel-strong); color: var(--ink-strong);"
+    >
+      <div class="flex items-start justify-between gap-4 border-b px-5 py-4" style="border-color: var(--line);">
+        <div class="min-w-0">
+          <p class="mb-1 inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em]" style="background: var(--panel-soft); color: var(--muted);">
+            <UserCog size={11} />
+            {ui.moveSessionToAccount}
+          </p>
+          <h2 id="session-profile-move-title" class="truncate text-base font-bold">
+            {profileMoveDialogSession.name || profileMoveDialogSession.preview || ui.newThread}
+          </h2>
+          <p class="mt-1 text-xs" style="color: var(--muted);">{ui.moveSessionToAccountDescription}</p>
+        </div>
+        <button
+          class="rounded-xl p-2 transition-colors hover:bg-black/5"
+          onclick={closeSessionProfileMoveDialog}
+          title={ui.close}
+          type="button"
+        >
+          <X size={16} />
+        </button>
+      </div>
+
+      <div class="space-y-4 px-5 py-4">
+        <div class="rounded-2xl border px-3 py-2.5 text-xs" style="border-color: var(--line); background: var(--panel-soft);">
+          <p class="mb-1 font-bold uppercase tracking-[0.16em]" style="color: var(--muted);">{ui.currentAccount}</p>
+          <p class="truncate font-semibold">
+            {profileMoveDialogSession.profileLabel || profileMoveDialogSession.accountEmail || profileMoveDialogSession.profileId || activeProfileId || "default"}
+          </p>
+          {#if profileMoveDialogSession.profileCodexHome}
+            <p class="mt-1 truncate text-[11px]" style="color: var(--muted);">{profileMoveDialogSession.profileCodexHome}</p>
+          {/if}
+        </div>
+
+        <label class="block space-y-2">
+          <span class="text-[10px] font-bold uppercase tracking-[0.18em]" style="color: var(--muted);">{ui.targetAccount}</span>
+          <select
+            bind:value={profileMoveDialogTargetId}
+            class="w-full rounded-2xl border px-3 py-2.5 text-sm font-semibold outline-none transition-colors focus:border-amber-300 focus:ring-2 focus:ring-amber-200/60"
+            style="border-color: var(--line); background: var(--panel); color: var(--ink-strong);"
+          >
+            {#each profileMoveOptions as profile (profile.id)}
+              <option value={profile.id}>{profile.label || profile.id} · {profile.codexHome}</option>
+            {/each}
+          </select>
+        </label>
+      </div>
+
+      <div class="flex items-center justify-end gap-2 border-t px-5 py-4" style="border-color: var(--line); background: var(--panel-soft);">
+        <button
+          class="ui-animated-button ui-animated-button--soft rounded-xl border px-3 py-2 text-xs font-bold"
+          style="border-color: var(--line); color: var(--ink);"
+          onclick={closeSessionProfileMoveDialog}
+          type="button"
+        >
+          {ui.close}
+        </button>
+        <button
+          class="ui-animated-button ui-animated-button--strong rounded-xl px-3 py-2 text-xs font-bold disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={!profileMoveDialogTargetId || profileMoveOptions.length === 0}
+          onclick={() => void confirmSessionProfileMoveDialog()}
+          type="button"
+        >
+          {ui.moveSession}
+        </button>
+      </div>
+    </section>
+  </div>
 {/if}
 
 {#if sessionRecoveryPrompt}

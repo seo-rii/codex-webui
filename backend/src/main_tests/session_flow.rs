@@ -55,6 +55,389 @@ fn append_session_index_fixture(
     .unwrap();
 }
 
+#[tokio::test]
+async fn move_session_profile_moves_rollout_and_ui_state() {
+    let sandbox = unique_test_dir("session-profile-move");
+    let workspace = sandbox.join("workspace");
+    let source_codex_home = sandbox.join("codex-source");
+    let target_codex_home = sandbox.join("codex-target");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&source_codex_home).unwrap();
+    fs::create_dir_all(&target_codex_home).unwrap();
+    let mut state = test_state(
+        workspace.clone(),
+        vec![workspace.clone()],
+        source_codex_home.clone(),
+    );
+    let mut config = (*state.config).clone();
+    config.config_file_path = Some(sandbox.join("codex-webui.yml"));
+    config.profiles.insert(
+        "second".to_string(),
+        RuntimeProfile {
+            label: "Second".to_string(),
+            codex_home: target_codex_home.clone(),
+            data_dir: sandbox.join(".data").join("profiles").join("second"),
+        },
+    );
+    state.config = Arc::new(config);
+
+    let session_id = "019f0000-0000-7000-8000-000000000101";
+    write_rollout_fixture(
+        &source_codex_home,
+        false,
+        "2026/06/24",
+        "2026-06-24T00-00-00",
+        session_id,
+        &workspace,
+        "Move this session to the second account",
+        &[],
+        None,
+    );
+    append_session_index_fixture(
+        &source_codex_home,
+        session_id,
+        "AI summarized moved session",
+        "2026-06-24T00:00:03Z",
+    );
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state
+            .get_mut("sessionMetaByThreadId")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(
+                session_id.to_string(),
+                json!({ "pinned": true, "tags": ["moved"] }),
+            );
+        ui_state
+            .get_mut("sessionFoldersByName")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(
+                "moved".to_string(),
+                json!({ "name": "moved", "pinned": true, "createdAt": 7, "updatedAt": 8 }),
+            );
+        ui_state
+            .get_mut("draftsByThreadId")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(
+                session_id.to_string(),
+                json!({ "draft": "queued after account move", "intent": "message" }),
+            );
+        ui_state
+            .get_mut("preferencesByThreadId")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(
+                session_id.to_string(),
+                json!({ "model": "gpt-5.4", "reasoning": "high" }),
+            );
+        ui_state
+            .get_mut("skillsByThreadId")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(
+                session_id.to_string(),
+                json!([{ "name": "reviewer", "enabled": true }]),
+            );
+        ui_state
+            .get_mut("queuesByThreadId")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(
+                session_id.to_string(),
+                json!({
+                    "items": [
+                        {
+                            "id": "queue-after-move",
+                            "prompt": "continue after account move",
+                            "attachmentIds": [],
+                            "attachmentNames": [],
+                            "createdAt": 15
+                        }
+                    ],
+                    "resumePending": false,
+                    "updatedAt": 20
+                }),
+            );
+        ui_state
+            .get_mut("goalsByThreadId")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(
+                session_id.to_string(),
+                json!({
+                    "threadId": session_id,
+                    "objective": "preserve goal after account move",
+                    "status": "active",
+                    "tokenBudget": 2000,
+                    "tokensUsed": 120,
+                    "timeUsedSeconds": 30,
+                    "createdAt": 10,
+                    "updatedAt": 20
+                }),
+            );
+        ui_state
+            .get_mut("highlightsByThreadId")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(
+                session_id.to_string(),
+                json!({ "kind": "attention", "reason": "needsInput", "at": 25 }),
+            );
+        ui_state
+            .get_mut("languageBridgeByThreadId")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(session_id.to_string(), json!({ "enabled": true }));
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let payload = move_session_profile_payload(
+        &state,
+        "default",
+        session_id,
+        json!({ "targetProfileId": "second" }),
+    )
+    .await
+    .expect("session should move to the target profile");
+
+    assert_eq!(
+        payload.get("targetProfileId").and_then(Value::as_str),
+        Some("second")
+    );
+    assert!(
+        !source_codex_home
+            .join("sessions/2026/06/24")
+            .join(format!("rollout-2026-06-24T00-00-00-{session_id}.jsonl"))
+            .exists()
+    );
+    assert!(
+        target_codex_home
+            .join("sessions/2026/06/24")
+            .join(format!("rollout-2026-06-24T00-00-00-{session_id}.jsonl"))
+            .exists()
+    );
+    assert!(
+        fs::read_to_string(target_codex_home.join("session_index.jsonl"))
+            .unwrap()
+            .contains("AI summarized moved session")
+    );
+
+    let source_meta = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state
+            .get("sessionMetaByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get(session_id))
+            .cloned())
+    })
+    .await
+    .unwrap();
+    assert!(source_meta.is_none());
+    let target_state = with_ui_state_read(&state, "second", |ui_state| {
+        Ok(json!({
+            "meta": ui_state
+                .get("sessionMetaByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "draft": ui_state
+                .get("draftsByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "preferences": ui_state
+                .get("preferencesByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "skills": ui_state
+                .get("skillsByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "queue": ui_state
+                .get("queuesByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "goal": ui_state
+                .get("goalsByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "highlight": ui_state
+                .get("highlightsByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "languageBridge": ui_state
+                .get("languageBridgeByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "folder": ui_state
+                .get("sessionFoldersByName")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get("moved"))
+                .cloned()
+                .unwrap_or(Value::Null)
+        }))
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        target_state
+            .get("meta")
+            .and_then(|meta| meta.get("pinned"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        target_state
+            .get("draft")
+            .and_then(|draft| draft.get("draft"))
+            .and_then(Value::as_str),
+        Some("queued after account move")
+    );
+    assert_eq!(
+        target_state
+            .get("preferences")
+            .and_then(|preferences| preferences.get("model"))
+            .and_then(Value::as_str),
+        Some("gpt-5.4")
+    );
+    assert_eq!(
+        target_state
+            .get("skills")
+            .and_then(Value::as_array)
+            .and_then(|skills| skills.first())
+            .and_then(|skill| skill.get("name"))
+            .and_then(Value::as_str),
+        Some("reviewer")
+    );
+    assert_eq!(
+        target_state
+            .get("queue")
+            .and_then(|queue| queue.get("items"))
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        target_state
+            .get("goal")
+            .and_then(|goal| goal.get("objective"))
+            .and_then(Value::as_str),
+        Some("preserve goal after account move")
+    );
+    assert_eq!(
+        target_state
+            .get("highlight")
+            .and_then(|highlight| highlight.get("kind"))
+            .and_then(Value::as_str),
+        Some("attention")
+    );
+    assert_eq!(
+        target_state
+            .get("languageBridge")
+            .and_then(|language_bridge| language_bridge.get("enabled"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        target_state
+            .get("folder")
+            .and_then(|folder| folder.get("pinned"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn move_session_profile_discovers_source_when_current_profile_is_target() {
+    let sandbox = unique_test_dir("session-profile-move-current-target");
+    let workspace = sandbox.join("workspace");
+    let source_codex_home = sandbox.join("codex-source");
+    let target_codex_home = sandbox.join("codex-target");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&source_codex_home).unwrap();
+    fs::create_dir_all(&target_codex_home).unwrap();
+    let mut state = test_state(
+        workspace.clone(),
+        vec![workspace.clone()],
+        source_codex_home.clone(),
+    );
+    let mut config = (*state.config).clone();
+    config.config_file_path = Some(sandbox.join("codex-webui.yml"));
+    config.profiles.insert(
+        "second".to_string(),
+        RuntimeProfile {
+            label: "Second".to_string(),
+            codex_home: target_codex_home.clone(),
+            data_dir: sandbox.join(".data").join("profiles").join("second"),
+        },
+    );
+    state.config = Arc::new(config);
+
+    let session_id = "019f0000-0000-7000-8000-000000000102";
+    write_rollout_fixture(
+        &source_codex_home,
+        false,
+        "2026/06/24",
+        "2026-06-24T00-03-00",
+        session_id,
+        &workspace,
+        "Move this session from another account to the current one",
+        &[],
+        None,
+    );
+
+    let payload = move_session_profile_payload(
+        &state,
+        "second",
+        session_id,
+        json!({ "targetProfileId": "second" }),
+    )
+    .await
+    .expect("session should move even when the active profile is the target");
+
+    assert_eq!(
+        payload.get("sourceProfileId").and_then(Value::as_str),
+        Some("default")
+    );
+    assert_eq!(
+        payload.get("targetProfileId").and_then(Value::as_str),
+        Some("second")
+    );
+    assert!(
+        !source_codex_home
+            .join("sessions/2026/06/24")
+            .join(format!("rollout-2026-06-24T00-03-00-{session_id}.jsonl"))
+            .exists()
+    );
+    assert!(
+        target_codex_home
+            .join("sessions/2026/06/24")
+            .join(format!("rollout-2026-06-24T00-03-00-{session_id}.jsonl"))
+            .exists()
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 fn write_state_thread_fixture(
     codex_home: &Path,
     session_id: &str,
@@ -486,6 +869,159 @@ async fn rollout_file_listing_and_update_avoid_app_server_thread_lists() {
     assert_eq!(
         thread_list_count_after.get("count").and_then(Value::as_i64),
         Some(0)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_sessions_payload_includes_all_profiles_unless_profile_filtered() {
+    let sandbox = unique_test_dir("session-list-all-profiles");
+    let workspace = sandbox.join("workspace");
+    let default_codex_home = sandbox.join("codex-default");
+    let second_codex_home = sandbox.join("codex-second");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&default_codex_home).unwrap();
+    fs::create_dir_all(&second_codex_home).unwrap();
+
+    let mut state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        default_codex_home.clone(),
+    );
+    let mut config = (*state.config).clone();
+    config.config_file_path = Some(sandbox.join("isolated-codex-webui.yml"));
+    config.profiles.insert(
+        "second".to_string(),
+        RuntimeProfile {
+            label: "Second".to_string(),
+            codex_home: second_codex_home.clone(),
+            data_dir: sandbox.join(".data").join("profiles").join("second"),
+        },
+    );
+    state.config = Arc::new(config);
+
+    let default_id = "019f0000-0000-7000-8000-000000000201";
+    let second_id = "019f0000-0000-7000-8000-000000000202";
+    write_rollout_fixture(
+        &default_codex_home,
+        false,
+        "2026/06/24",
+        "2026-06-24T00-01-00",
+        default_id,
+        &workspace,
+        "Default profile session",
+        &[],
+        None,
+    );
+    append_session_index_fixture(
+        &default_codex_home,
+        default_id,
+        "Default profile summary",
+        "2026-06-24T00:01:02Z",
+    );
+    write_rollout_fixture(
+        &second_codex_home,
+        false,
+        "2026/06/24",
+        "2026-06-24T00-02-00",
+        second_id,
+        &workspace,
+        "Second profile session",
+        &[],
+        None,
+    );
+    append_session_index_fixture(
+        &second_codex_home,
+        second_id,
+        "Second profile summary",
+        "2026-06-24T00:02:02Z",
+    );
+
+    let all_profiles = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let sessions = all_profiles
+        .get("sessions")
+        .and_then(Value::as_array)
+        .unwrap();
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session.get("id").and_then(Value::as_str) == Some(default_id)),
+        "default profile session should be included"
+    );
+    assert!(
+        sessions.iter().any(
+            |session| session.get("id").and_then(Value::as_str) == Some(second_id)
+                && session.get("profileId").and_then(Value::as_str) == Some("second")
+        ),
+        "second profile session should be included with its profile id"
+    );
+
+    let search_all_profiles = search_sessions_payload(
+        &state,
+        "default",
+        "Second profile",
+        "summary",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        search_all_profiles
+            .get("sessions")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .any(
+                |session| session.get("id").and_then(Value::as_str) == Some(second_id)
+                    && session.get("profileId").and_then(Value::as_str) == Some("second")
+            ),
+        "search should include matching sessions from non-active profiles"
+    );
+
+    let second_only = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria {
+            profile_ids: vec!["second".to_string()],
+            ..SessionFilterCriteria::default()
+        },
+    )
+    .await
+    .unwrap();
+    let filtered = second_only
+        .get("sessions")
+        .and_then(Value::as_array)
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(
+        filtered
+            .first()
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some(second_id)
+    );
+    assert_eq!(
+        filtered
+            .first()
+            .and_then(|session| session.get("profileId"))
+            .and_then(Value::as_str),
+        Some("second")
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -2178,6 +2714,30 @@ fn ws_session_cache_validation_returns_not_modified_for_matching_versions() {
     );
     assert!(detail_state_hash_not_modified.get("thread").is_none());
 
+    let detail_patch_when_state_hash_differs = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "session/get",
+        json!({
+            "sessionId": session_id,
+            "limit": 20,
+            "knownVersion": detail_version,
+            "knownTurnVersions": {},
+            "knownStateHash": "stale-client-state"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        detail_patch_when_state_hash_differs
+            .get("notModified")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(detail_patch_when_state_hash_differs.get("patch").is_some());
+
     with_ui_state_write(&state, "default", |ui_state| {
         let Some(queues) = ui_state
             .get_mut("queuesByThreadId")
@@ -2851,6 +3411,120 @@ async fn session_detail_clears_orphaned_active_rollout_after_restart() {
             .get("reason")
             .and_then(Value::as_str)
             .is_some_and(|reason| reason.contains("did not report an active turn"))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_detail_reconciles_stale_starting_runtime_status() {
+    let sandbox = unique_test_dir("session-detail-stale-starting");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-stale-starting-detail";
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Stale starting detail",
+                    "preview": "Stale starting detail",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][session_id] = json!({
+            "status": "starting",
+            "updatedAt": now_unix_ms().saturating_sub(60_000)
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("status"))
+            .and_then(Value::as_str),
+        Some("completed")
+    );
+    assert!(detail.get("activeTurnId").is_some_and(Value::is_null));
+    let runtime_status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][session_id].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime_status.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert!(
+        runtime_status
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason.contains("did not report an active turn"))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_summary_reconciles_stale_starting_runtime_status() {
+    let sandbox = unique_test_dir("session-summary-stale-starting");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-stale-starting-summary";
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][session_id] = json!({
+            "status": "starting",
+            "updatedAt": now_unix_ms().saturating_sub(60_000)
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let snapshot = read_session_summary_ui_snapshot(&state, "default")
+        .await
+        .unwrap();
+
+    assert!(!snapshot.active_thread_ids.contains(session_id));
+    assert_eq!(
+        snapshot
+            .runtime_status_by_thread_id
+            .get(session_id)
+            .and_then(|status| status.get("status"))
+            .and_then(Value::as_str),
+        Some("completed")
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -4780,7 +5454,7 @@ async fn send_turn_payload_uses_app_server_and_updates_session_state() {
     assert_eq!(draft.get("draft").and_then(Value::as_str), Some(""));
 
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, "default").0,
+        &resolve_runtime_profile_entry(&state.config, "default").0,
         "thread-1",
     );
     assert_eq!(
@@ -4943,7 +5617,7 @@ async fn send_turn_payload_clears_runtime_state_when_turn_start_fails() {
     assert_eq!(error.status, StatusCode::BAD_GATEWAY);
     assert!(error.message.contains("forced turn start failure"));
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, "default").0,
+        &resolve_runtime_profile_entry(&state.config, "default").0,
         &session_id,
     );
     assert!(
@@ -5045,7 +5719,7 @@ async fn start_session_compaction_payload_proxies_native_compact_start() {
     );
 
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, "default").0,
+        &resolve_runtime_profile_entry(&state.config, "default").0,
         &session_id,
     );
     assert!(
@@ -5639,7 +6313,7 @@ async fn steer_turn_payload_uses_active_turn_from_thread_reads() {
     assert!(first_text.contains("Focus on the queue deduplication race first."));
 
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, "default").0,
+        &resolve_runtime_profile_entry(&state.config, "default").0,
         "thread-1",
     );
     assert_eq!(
@@ -5773,7 +6447,7 @@ async fn session_detail_preserves_cached_active_turn_when_thread_payload_lags() 
         .await
         .unwrap();
     let runtime_key = runtime_session_key(
-        resolve_runtime_profile_entry(&state.config, "default").0,
+        &resolve_runtime_profile_entry(&state.config, "default").0,
         "thread-1",
     );
     state

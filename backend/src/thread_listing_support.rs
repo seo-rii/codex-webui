@@ -170,6 +170,9 @@ pub(crate) fn build_session_summary_from_thread_payload(
 
     Ok(json!({
         "id": session_id,
+        "profileId": snapshot.profile_id.clone(),
+        "profileLabel": snapshot.profile_label.clone(),
+        "profileCodexHome": snapshot.profile_codex_home.clone(),
         "name": display_name,
         "preview": preview,
         "queueCount": snapshot.queue_counts_by_thread_id.get(session_id).copied().unwrap_or(0),
@@ -408,6 +411,234 @@ async fn collect_session_summaries_payload(
         }
     }
 
+    sort_session_summaries(&mut summaries);
+    Ok(summaries)
+}
+
+fn session_listing_profile_ids(
+    state: &AppState,
+    active_profile_id: &str,
+    filter: &SessionFilterCriteria,
+) -> Vec<String> {
+    let (default_profile_id, profiles) = runtime_profiles_snapshot(&state.config);
+    let mut profile_ids = if filter.profile_ids.is_empty() {
+        profiles.keys().cloned().collect::<Vec<_>>()
+    } else {
+        filter
+            .profile_ids
+            .iter()
+            .filter(|profile_id| profiles.contains_key(*profile_id))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    if profile_ids.is_empty() {
+        profile_ids.push(resolve_runtime_profile_entry(&state.config, active_profile_id).0);
+    }
+
+    profile_ids.sort_by(|left, right| {
+        let left_active = left == active_profile_id || left == &default_profile_id;
+        let right_active = right == active_profile_id || right == &default_profile_id;
+        right_active.cmp(&left_active).then_with(|| left.cmp(right))
+    });
+    profile_ids.dedup();
+    profile_ids
+}
+
+async fn collect_rollout_session_summaries_payload(
+    state: &AppState,
+    profile_id: &str,
+    archived: bool,
+    filter: &SessionFilterCriteria,
+    needle: Option<&str>,
+    include_full_text: bool,
+) -> ApiResult<Option<Vec<Value>>> {
+    let mut candidates = list_rollout_candidates_payload(state, profile_id, archived).await?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let snapshot = read_session_summary_ui_snapshot(state, profile_id).await?;
+    candidates.sort_by(|left, right| {
+        let updated_difference = normalize_session_timestamp(
+            right
+                .get("indexedUpdatedAt")
+                .and_then(Value::as_i64)
+                .or_else(|| right.get("updatedAt").and_then(Value::as_i64))
+                .unwrap_or_default(),
+        )
+        .cmp(&normalize_session_timestamp(
+            left.get("indexedUpdatedAt")
+                .and_then(Value::as_i64)
+                .or_else(|| left.get("updatedAt").and_then(Value::as_i64))
+                .unwrap_or_default(),
+        ));
+        if updated_difference != std::cmp::Ordering::Equal {
+            return updated_difference;
+        }
+        right
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(left.get("id").and_then(Value::as_str).unwrap_or_default())
+    });
+
+    let matched_state_ids = match needle {
+        Some(needle) => {
+            search_state_thread_ids_payload(state, profile_id, archived, needle).await?
+        }
+        None => None,
+    };
+    let mut summaries = Vec::new();
+    for candidate_chunk in candidates.chunks(128) {
+        let hydrated_candidates = candidate_chunk
+            .iter()
+            .filter(|candidate| {
+                candidate_matches_session_filter_snapshot(candidate, &snapshot, filter)
+            })
+            .filter(|candidate| {
+                let Some(needle) = needle else {
+                    return true;
+                };
+                let indexed_match = candidate_matches_indexed_query(candidate, needle);
+                let state_match = matched_state_ids.as_ref().is_some_and(|matched_ids| {
+                    candidate
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|session_id| matched_ids.contains(session_id))
+                });
+                indexed_match || state_match || include_full_text
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if hydrated_candidates.is_empty() {
+            continue;
+        }
+
+        let hydrated_threads = hydrate_rollout_candidates_to_threads_payload(
+            state,
+            profile_id,
+            archived,
+            &hydrated_candidates,
+        )
+        .await?;
+        for (candidate, thread) in hydrated_candidates.iter().zip(hydrated_threads.into_iter()) {
+            if thread_is_subagent(&thread) {
+                continue;
+            }
+            let summary =
+                build_session_summary_from_thread_payload(&thread, &snapshot, None, None)?;
+            if !session_summary_matches_filter(&summary, filter) {
+                continue;
+            }
+            if let Some(needle) = needle {
+                let indexed_match = candidate_matches_indexed_query(candidate, needle);
+                let state_match = matched_state_ids.as_ref().is_some_and(|matched_ids| {
+                    summary
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|session_id| matched_ids.contains(session_id))
+                });
+                let summary_match =
+                    indexed_match || state_match || session_summary_matches_query(&summary, needle);
+                if !summary_match
+                    && (!include_full_text
+                        || !rollout_candidate_contains_query_payload(candidate, needle).await?)
+                {
+                    continue;
+                }
+            }
+            summaries.push(summary);
+        }
+    }
+    sort_session_summaries(&mut summaries);
+    Ok(Some(summaries))
+}
+
+async fn collect_session_summaries_with_query_payload(
+    state: &AppState,
+    profile_id: &str,
+    archived: bool,
+    filter: &SessionFilterCriteria,
+    needle: Option<&str>,
+    include_full_text: bool,
+) -> ApiResult<Vec<Value>> {
+    if let Some(summaries) = collect_rollout_session_summaries_payload(
+        state,
+        profile_id,
+        archived,
+        filter,
+        needle,
+        include_full_text,
+    )
+    .await?
+    {
+        return Ok(summaries);
+    }
+
+    let sessions = collect_session_summaries_payload(state, profile_id, archived, filter).await?;
+    let Some(needle) = needle else {
+        return Ok(sessions);
+    };
+    let mut matched = Vec::new();
+    for summary in sessions {
+        if session_summary_matches_query(&summary, needle) {
+            matched.push(summary);
+            continue;
+        }
+        if !include_full_text {
+            continue;
+        }
+        let Some(session_id) = summary.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(full_text) = cached_session_search_text(state, profile_id, session_id).await else {
+            continue;
+        };
+        if full_text.contains(needle) {
+            matched.push(summary);
+        }
+    }
+    Ok(matched)
+}
+
+async fn collect_session_summaries_for_listing_payload(
+    state: &AppState,
+    profile_id: &str,
+    archived: bool,
+    filter: &SessionFilterCriteria,
+    needle: Option<&str>,
+    include_full_text: bool,
+) -> ApiResult<Vec<Value>> {
+    let profile_ids = session_listing_profile_ids(state, profile_id, filter);
+    let mut summaries = Vec::new();
+    for listing_profile_id in profile_ids {
+        summaries.extend(
+            collect_session_summaries_with_query_payload(
+                state,
+                &listing_profile_id,
+                archived,
+                filter,
+                needle,
+                include_full_text,
+            )
+            .await?,
+        );
+    }
+    summaries.sort_by(|left, right| {
+        if left.get("id").and_then(Value::as_str) == right.get("id").and_then(Value::as_str) {
+            let left_profile = left
+                .get("profileId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let right_profile = right
+                .get("profileId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            return left_profile.cmp(right_profile);
+        }
+        std::cmp::Ordering::Equal
+    });
     sort_session_summaries(&mut summaries);
     Ok(summaries)
 }
@@ -663,6 +894,19 @@ pub(crate) async fn list_sessions_payload(
     limit: u64,
     filter: &SessionFilterCriteria,
 ) -> ApiResult<Value> {
+    let listing_profile_ids = session_listing_profile_ids(state, profile_id, filter);
+    if filter.profile_ids.is_empty() || listing_profile_ids.len() != 1 {
+        let sessions = collect_session_summaries_for_listing_payload(
+            state, profile_id, archived, filter, None, false,
+        )
+        .await?;
+        return Ok(session_summary_page(sessions, cursor, limit));
+    }
+    let profile_id = listing_profile_ids
+        .first()
+        .map(String::as_str)
+        .unwrap_or(profile_id);
+
     if let Some(payload) = scan_rollout_sessions_with_query_payload(
         state, profile_id, archived, cursor, limit, filter, None, false,
     )
@@ -691,6 +935,24 @@ pub(crate) async fn search_sessions_payload(
     }
 
     let include_full_text = scope == "full";
+    let listing_profile_ids = session_listing_profile_ids(state, profile_id, filter);
+    if filter.profile_ids.is_empty() || listing_profile_ids.len() != 1 {
+        let sessions = collect_session_summaries_for_listing_payload(
+            state,
+            profile_id,
+            archived,
+            filter,
+            Some(&needle),
+            include_full_text,
+        )
+        .await?;
+        return Ok(session_summary_page(sessions, cursor, limit));
+    }
+    let profile_id = listing_profile_ids
+        .first()
+        .map(String::as_str)
+        .unwrap_or(profile_id);
+
     if let Some(payload) = scan_rollout_sessions_with_query_payload(
         state,
         profile_id,

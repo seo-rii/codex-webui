@@ -12,12 +12,14 @@ pub(crate) async fn handle_session_fork_api_http(
     if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
 
     let result = match read_json_body(request, SMALL_JSON_BODY_LIMIT, "session fork body").await {
         Ok(payload) => {
             fork_session_payload(
                 &state,
-                &auth.profile_id,
+                &profile_id,
                 session_id,
                 payload
                     .get("mode")
@@ -49,15 +51,16 @@ pub(crate) async fn handle_session_organization_api_http(
     if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
 
-    let result = match read_json_body(request, SMALL_JSON_BODY_LIMIT, "session organization body")
-        .await
-    {
-        Ok(payload) => {
-            update_session_organization_payload(&state, &auth.profile_id, session_id, payload).await
-        }
-        Err(error) => Err(error),
-    };
+    let result =
+        match read_json_body(request, SMALL_JSON_BODY_LIMIT, "session organization body").await {
+            Ok(payload) => {
+                update_session_organization_payload(&state, &profile_id, session_id, payload).await
+            }
+            Err(error) => Err(error),
+        };
 
     match result {
         Ok(payload) => Json(payload).into_response(),
@@ -77,12 +80,14 @@ pub(crate) async fn handle_session_name_api_http(
     if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
 
     let result = match read_json_body(request, SMALL_JSON_BODY_LIMIT, "session name body").await {
         Ok(payload) => {
             rename_session_payload(
                 &state,
-                &auth.profile_id,
+                &profile_id,
                 session_id,
                 payload
                     .get("name")
@@ -113,11 +118,13 @@ pub(crate) async fn handle_session_archive_api_http(
     if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
 
     let result = if archived {
-        archive_session_payload(&state, &auth.profile_id, session_id).await
+        archive_session_payload(&state, &profile_id, session_id).await
     } else {
-        unarchive_session_payload(&state, &auth.profile_id, session_id).await
+        unarchive_session_payload(&state, &profile_id, session_id).await
     };
 
     match result {
@@ -132,10 +139,11 @@ pub(crate) async fn handle_session_draft_api_http(
     auth: AuthContext,
     session_id: &str,
 ) -> Response {
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
     let result = match request.method() {
         &Method::GET => {
-            get_session_draft_payload_for_role(&state, &auth.profile_id, session_id, auth.role)
-                .await
+            get_session_draft_payload_for_role(&state, &profile_id, session_id, auth.role).await
         }
         &Method::PATCH => {
             if !role_has_admin_access(auth.role) {
@@ -145,7 +153,7 @@ pub(crate) async fn handle_session_draft_api_http(
                 Ok(payload) => {
                     save_session_draft_payload(
                         &state,
-                        &auth.profile_id,
+                        &profile_id,
                         session_id,
                         payload
                             .get("draft")
@@ -165,7 +173,7 @@ pub(crate) async fn handle_session_draft_api_http(
             if !role_has_admin_access(auth.role) {
                 return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
             }
-            clear_session_draft_payload(&state, &auth.profile_id, session_id).await
+            clear_session_draft_payload(&state, &profile_id, session_id).await
         }
         _ => return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed."),
     };
@@ -188,6 +196,8 @@ pub(crate) async fn handle_session_messages_api_http(
     if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
 
     let result = match read_json_body(request, LARGE_JSON_BODY_LIMIT, "session message body").await
     {
@@ -203,7 +213,7 @@ pub(crate) async fn handle_session_messages_api_http(
             }
             send_turn_payload(
                 &state,
-                &auth.profile_id,
+                &profile_id,
                 session_id,
                 payload
                     .get("prompt")
@@ -237,12 +247,14 @@ pub(crate) async fn handle_session_steer_api_http(
     if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
 
     let result = match read_json_body(request, LARGE_JSON_BODY_LIMIT, "session steer body").await {
         Ok(payload) => {
             steer_turn_payload(
                 &state,
-                &auth.profile_id,
+                &profile_id,
                 session_id,
                 payload
                     .get("prompt")

@@ -7,9 +7,11 @@ pub(crate) async fn handle_session_attachments_api_http(
     session_id: &str,
 ) -> Response {
     let method = request.method().clone();
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
     match method {
         Method::GET => {
-            match list_session_attachments_payload(&state, &auth.profile_id, session_id).await {
+            match list_session_attachments_payload(&state, &profile_id, session_id).await {
                 Ok(attachments) => Json(json!({ "attachments": attachments })).into_response(),
                 Err(error) => json_error(error.status, &error.message),
             }
@@ -44,12 +46,11 @@ pub(crate) async fn handle_session_attachments_api_http(
             let mut multipart = multipart;
             let mut stored = Vec::new();
             let mut total_size = 0_u64;
-            let uploads_dir = session_uploads_dir(&state, &auth.profile_id, session_id);
+            let uploads_dir = session_uploads_dir(&state, &profile_id, session_id);
             if let Err(error) = tokio_fs::create_dir_all(&uploads_dir).await {
                 return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
             }
-            let used_storage = match profile_attachment_storage_size(&state, &auth.profile_id).await
-            {
+            let used_storage = match profile_attachment_storage_size(&state, &profile_id).await {
                 Ok(size) => size,
                 Err(error) => return json_error(error.status, &error.message),
             };
@@ -144,7 +145,7 @@ pub(crate) async fn handle_session_attachments_api_http(
 
                 match store_uploaded_attachment_file(
                     &state,
-                    &auth.profile_id,
+                    &profile_id,
                     session_id,
                     &file_name,
                     mime_type,
@@ -164,8 +165,7 @@ pub(crate) async fn handle_session_attachments_api_http(
             if stored.is_empty() {
                 return json_error(StatusCode::BAD_REQUEST, "Select at least one file.");
             }
-            if let Err(error) = emit_attachments_updated(&state, &auth.profile_id, session_id).await
-            {
+            if let Err(error) = emit_attachments_updated(&state, &profile_id, session_id).await {
                 return json_error(error.status, &error.message);
             }
             let mut response = Json(json!({
@@ -195,8 +195,10 @@ pub(crate) async fn handle_session_attachment_api_http(
     if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
 
-    match delete_attachment_payload(&state, &auth.profile_id, session_id, attachment_id).await {
+    match delete_attachment_payload(&state, &profile_id, session_id, attachment_id).await {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => json_error(error.status, &error.message),
     }

@@ -124,6 +124,13 @@ pub(crate) fn build_session_summary_from_thread_payload(
         .map(normalize_session_timestamp)
         .unwrap_or(0);
     let has_direct_live_evidence = snapshot.active_thread_ids.contains(session_id);
+    let has_runtime_live_evidence = runtime_status.as_deref().is_some_and(is_live_thread_status)
+        && runtime_status_updated_at > 0
+        && runtime_status_updated_at >= thread_updated_at;
+    let has_thread_live_evidence = thread_status.as_deref().is_some_and(is_live_thread_status)
+        && runtime_status.is_some()
+        && runtime_status_updated_at > 0
+        && thread_updated_at >= runtime_status_updated_at;
     let has_status_override = status_override
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
@@ -148,21 +155,21 @@ pub(crate) fn build_session_summary_from_thread_payload(
             },
         )
         .unwrap_or_else(|| "unknown".to_string());
-    if !has_status_override
-        && snapshot.active_thread_ids.contains(session_id)
-        && !matches!(
-            status.as_str(),
-            "failed" | "error" | "cancelled" | "canceled" | "aborted"
-        )
-    {
+    if !has_status_override && snapshot.active_thread_ids.contains(session_id) {
         status = "running".to_string();
     }
-    if !has_status_override && is_live_thread_status(&status) && !has_direct_live_evidence {
+    if !has_status_override
+        && is_live_thread_status(&status)
+        && !has_direct_live_evidence
+        && !has_runtime_live_evidence
+        && !has_thread_live_evidence
+    {
         status = "completed".to_string();
     }
     if snapshot.loaded_thread_ids_available
         && is_live_thread_status(&status)
         && !snapshot.active_thread_ids.contains(session_id)
+        && !has_runtime_live_evidence
         && !snapshot.loaded_thread_ids.contains(session_id)
     {
         status = "completed".to_string();
@@ -415,6 +422,86 @@ async fn collect_session_summaries_payload(
     Ok(summaries)
 }
 
+async fn read_session_listing_ui_snapshot(
+    state: &AppState,
+    profile_id: &str,
+) -> ApiResult<SessionSummaryUiSnapshot> {
+    let (resolved_profile_id_ref, resolved_profile) =
+        resolve_runtime_profile_entry(&state.config, profile_id);
+    let resolved_profile_id = resolved_profile_id_ref.to_string();
+    let profile_label = resolved_profile.label.clone();
+    let profile_codex_home = resolved_profile.codex_home.display().to_string();
+    let runtime_key_prefix = format!("profile::{resolved_profile_id}::session-runtime::");
+    let mut active_thread_ids = state
+        .active_turns
+        .lock()
+        .await
+        .keys()
+        .filter_map(|key| key.strip_prefix(&runtime_key_prefix).map(str::to_string))
+        .collect::<HashSet<_>>();
+    active_thread_ids.extend(
+        state
+            .pending_turn_starts
+            .lock()
+            .await
+            .iter()
+            .filter_map(|key| key.strip_prefix(&runtime_key_prefix).map(str::to_string)),
+    );
+
+    with_ui_state_read(state, profile_id, |ui_state| {
+        let queue_counts_by_thread_id = ui_state
+            .get("queuesByThreadId")
+            .and_then(Value::as_object)
+            .map(|queues| {
+                queues
+                    .iter()
+                    .map(|(thread_id, queue)| {
+                        (
+                            thread_id.clone(),
+                            queue
+                                .get("items")
+                                .and_then(Value::as_array)
+                                .map(Vec::len)
+                                .unwrap_or(0),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+
+        Ok(SessionSummaryUiSnapshot {
+            profile_id: resolved_profile_id.clone(),
+            profile_label: profile_label.clone(),
+            profile_codex_home: profile_codex_home.clone(),
+            session_meta_by_thread_id: ui_state
+                .get("sessionMetaByThreadId")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            preferences_by_thread_id: ui_state
+                .get("preferencesByThreadId")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            highlights_by_thread_id: ui_state
+                .get("highlightsByThreadId")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            runtime_status_by_thread_id: ui_state
+                .get("runtimeStatusByThreadId")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            queue_counts_by_thread_id,
+            active_thread_ids,
+            loaded_thread_ids: HashSet::new(),
+            loaded_thread_ids_available: false,
+        })
+    })
+    .await
+}
+
 fn session_listing_profile_ids(
     state: &AppState,
     active_profile_id: &str,
@@ -458,21 +545,12 @@ async fn collect_rollout_session_summaries_payload(
         return Ok(None);
     }
 
-    let snapshot = read_session_summary_ui_snapshot(state, profile_id).await?;
+    let snapshot = read_session_listing_ui_snapshot(state, profile_id).await?;
     candidates.sort_by(|left, right| {
-        let updated_difference = normalize_session_timestamp(
-            right
-                .get("indexedUpdatedAt")
-                .and_then(Value::as_i64)
-                .or_else(|| right.get("updatedAt").and_then(Value::as_i64))
-                .unwrap_or_default(),
-        )
-        .cmp(&normalize_session_timestamp(
-            left.get("indexedUpdatedAt")
-                .and_then(Value::as_i64)
-                .or_else(|| left.get("updatedAt").and_then(Value::as_i64))
-                .unwrap_or_default(),
-        ));
+        let updated_difference = normalize_session_timestamp(candidate_effective_updated_at(right))
+            .cmp(&normalize_session_timestamp(
+                candidate_effective_updated_at(left),
+            ));
         if updated_difference != std::cmp::Ordering::Equal {
             return updated_difference;
         }
@@ -495,19 +573,6 @@ async fn collect_rollout_session_summaries_payload(
             .iter()
             .filter(|candidate| {
                 candidate_matches_session_filter_snapshot(candidate, &snapshot, filter)
-            })
-            .filter(|candidate| {
-                let Some(needle) = needle else {
-                    return true;
-                };
-                let indexed_match = candidate_matches_indexed_query(candidate, needle);
-                let state_match = matched_state_ids.as_ref().is_some_and(|matched_ids| {
-                    candidate
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|session_id| matched_ids.contains(session_id))
-                });
-                indexed_match || state_match || include_full_text
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -563,7 +628,7 @@ async fn collect_session_summaries_with_query_payload(
     needle: Option<&str>,
     include_full_text: bool,
 ) -> ApiResult<Vec<Value>> {
-    if let Some(summaries) = collect_rollout_session_summaries_payload(
+    if let Some(mut summaries) = collect_rollout_session_summaries_payload(
         state,
         profile_id,
         archived,
@@ -573,10 +638,17 @@ async fn collect_session_summaries_with_query_payload(
     )
     .await?
     {
+        if needle.is_none() && !archived {
+            merge_missing_runtime_session_summaries(state, profile_id, filter, &mut summaries)
+                .await?;
+        }
         return Ok(summaries);
     }
 
-    let sessions = collect_session_summaries_payload(state, profile_id, archived, filter).await?;
+    let mut sessions = Vec::new();
+    if needle.is_none() && !archived {
+        merge_missing_runtime_session_summaries(state, profile_id, filter, &mut sessions).await?;
+    }
     let Some(needle) = needle else {
         return Ok(sessions);
     };
@@ -600,6 +672,61 @@ async fn collect_session_summaries_with_query_payload(
         }
     }
     Ok(matched)
+}
+
+async fn merge_missing_runtime_session_summaries(
+    state: &AppState,
+    profile_id: &str,
+    filter: &SessionFilterCriteria,
+    summaries: &mut Vec<Value>,
+) -> ApiResult<()> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let existing = summaries
+        .iter()
+        .filter_map(|summary| {
+            summary
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<HashSet<_>>();
+    let mut candidate_statuses = HashMap::<String, String>::new();
+    let runtime_key_prefix = format!("profile::{resolved_profile_id}::session-runtime::");
+
+    for runtime_key in state.active_turns.lock().await.keys() {
+        if let Some(session_id) = runtime_key.strip_prefix(&runtime_key_prefix) {
+            candidate_statuses.insert(session_id.to_string(), "running".to_string());
+        }
+    }
+
+    for runtime_key in state.pending_turn_starts.lock().await.iter() {
+        if let Some(session_id) = runtime_key.strip_prefix(&runtime_key_prefix) {
+            candidate_statuses
+                .entry(session_id.to_string())
+                .or_insert_with(|| "starting".to_string());
+        }
+    }
+
+    for (session_id, status) in candidate_statuses {
+        if existing.contains(&session_id) {
+            continue;
+        }
+        let summary = build_lightweight_session_summary_payload(
+            state,
+            profile_id,
+            &session_id,
+            None,
+            &status,
+        )
+        .await;
+        if session_summary_matches_filter(&summary, filter) {
+            summaries.push(summary);
+        }
+    }
+    sort_session_summaries(summaries);
+    Ok(())
 }
 
 async fn collect_session_summaries_for_listing_payload(
@@ -726,7 +853,7 @@ async fn scan_rollout_sessions_with_query_payload(
         return Ok(None);
     }
 
-    let snapshot = read_session_summary_ui_snapshot(state, profile_id).await?;
+    let snapshot = read_session_listing_ui_snapshot(state, profile_id).await?;
     let candidate_priority = |candidate: &Value| {
         let Some(session_id) = candidate.get("id").and_then(Value::as_str) else {
             return 0;
@@ -752,15 +879,8 @@ async fn scan_rollout_sessions_with_query_payload(
         }
         0
     };
-    let candidate_updated_at = |candidate: &Value| {
-        normalize_session_timestamp(
-            candidate
-                .get("indexedUpdatedAt")
-                .and_then(Value::as_i64)
-                .or_else(|| candidate.get("updatedAt").and_then(Value::as_i64))
-                .unwrap_or_default(),
-        )
-    };
+    let candidate_updated_at =
+        |candidate: &Value| normalize_session_timestamp(candidate_effective_updated_at(candidate));
     let mut candidates = candidates;
     candidates.sort_by(|left, right| {
         let priority_difference = candidate_priority(right).cmp(&candidate_priority(left));
@@ -804,19 +924,6 @@ async fn scan_rollout_sessions_with_query_payload(
             .iter()
             .filter(|candidate| {
                 candidate_matches_session_filter_snapshot(candidate, &snapshot, filter)
-            })
-            .filter(|candidate| {
-                let Some(needle) = needle else {
-                    return true;
-                };
-                let indexed_match = candidate_matches_indexed_query(candidate, needle);
-                let state_match = matched_state_ids.as_ref().is_some_and(|matched_ids| {
-                    candidate
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|session_id| matched_ids.contains(session_id))
-                });
-                indexed_match || state_match || include_full_text
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -895,7 +1002,7 @@ pub(crate) async fn list_sessions_payload(
     filter: &SessionFilterCriteria,
 ) -> ApiResult<Value> {
     let listing_profile_ids = session_listing_profile_ids(state, profile_id, filter);
-    if filter.profile_ids.is_empty() || listing_profile_ids.len() != 1 {
+    if listing_profile_ids.len() != 1 {
         let sessions = collect_session_summaries_for_listing_payload(
             state, profile_id, archived, filter, None, false,
         )
@@ -936,7 +1043,7 @@ pub(crate) async fn search_sessions_payload(
 
     let include_full_text = scope == "full";
     let listing_profile_ids = session_listing_profile_ids(state, profile_id, filter);
-    if filter.profile_ids.is_empty() || listing_profile_ids.len() != 1 {
+    if listing_profile_ids.len() != 1 {
         let sessions = collect_session_summaries_for_listing_payload(
             state,
             profile_id,
@@ -1192,14 +1299,28 @@ pub(crate) async fn emit_session_summary_updated(
     let status_override = status_override.map(str::to_string);
     let handle = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(120)).await;
-        let summary = build_session_summary_payload(
-            &state_for_task,
-            &profile_id,
-            &session_id,
-            preferences_override,
-            status_override.as_deref(),
-        )
-        .await;
+        let summary = if status_override
+            .as_deref()
+            .is_some_and(|status| status == "starting" || is_live_thread_status(status))
+        {
+            Ok(build_lightweight_session_summary_payload(
+                &state_for_task,
+                &profile_id,
+                &session_id,
+                preferences_override,
+                status_override.as_deref().unwrap_or("running"),
+            )
+            .await)
+        } else {
+            build_session_summary_payload(
+                &state_for_task,
+                &profile_id,
+                &session_id,
+                preferences_override,
+                status_override.as_deref(),
+            )
+            .await
+        };
         if let Ok(summary) = summary {
             emit_profile_global_notification(
                 &state_for_task,
@@ -1219,6 +1340,98 @@ pub(crate) async fn emit_session_summary_updated(
     if let Some(existing) = tasks.insert(task_key, handle) {
         existing.abort();
     }
+}
+
+async fn build_lightweight_session_summary_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    preferences_override: Option<Value>,
+    status: &str,
+) -> Value {
+    let fallback_summary = || {
+        let (resolved_profile_id, profile) =
+            resolve_runtime_profile_entry(&state.config, profile_id);
+        json!({
+            "id": session_id,
+            "profileId": resolved_profile_id,
+            "profileLabel": profile.label,
+            "profileCodexHome": profile.codex_home.display().to_string(),
+            "name": Value::Null,
+            "preview": "",
+            "queueCount": 0,
+            "highlight": Value::Null,
+            "pinned": false,
+            "archived": false,
+            "cwd": Value::Null,
+            "model": Value::Null,
+            "tags": [],
+            "folderIds": [],
+            "isSubagent": false,
+            "agentNickname": Value::Null,
+            "agentRole": Value::Null,
+            "accountEmail": Value::Null,
+            "accountType": Value::Null,
+            "status": status,
+            "createdAt": 0,
+            "updatedAt": now_unix_ms()
+        })
+    };
+    match read_local_thread_metadata_payload(state, profile_id, session_id).await {
+        Ok(Some(thread)) => match read_session_listing_ui_snapshot(state, profile_id).await {
+            Ok(snapshot) => build_session_summary_from_thread_payload(
+                &thread,
+                &snapshot,
+                preferences_override,
+                Some(status),
+            )
+            .unwrap_or_else(|_| fallback_summary()),
+            Err(_) => fallback_summary(),
+        },
+        _ => fallback_summary(),
+    }
+}
+
+pub(crate) async fn emit_session_status_summary_updated(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    preferences_override: Option<Value>,
+    status: &str,
+) {
+    invalidate_session_listing_cache(state, profile_id, Some(session_id)).await;
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let task_key = format!("{resolved_profile_id}:{session_id}");
+    if let Some(existing) = state
+        .session_summary_update_tasks
+        .lock()
+        .await
+        .remove(&task_key)
+    {
+        existing.abort();
+    }
+    let summary = build_lightweight_session_summary_payload(
+        state,
+        profile_id,
+        session_id,
+        preferences_override,
+        status,
+    )
+    .await;
+    emit_profile_global_notification(
+        state,
+        profile_id,
+        json!({
+            "kind": "notification",
+            "method": "codex-webui/sessionSummaryUpdated",
+            "params": {
+                "session": summary
+            }
+        }),
+    )
+    .await;
 }
 
 pub(crate) async fn invalidate_session_lists(state: &AppState, profile_id: &str) {

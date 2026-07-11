@@ -1,9 +1,11 @@
 use super::*;
 
-fn is_unmaterialized_thread_error_message(message: &str) -> bool {
+pub(crate) fn is_unmaterialized_thread_error_message(message: &str) -> bool {
     let lowered = message.to_ascii_lowercase();
     lowered.contains("not materialized yet")
         || lowered.contains("includeturns is unavailable before first user message")
+        || lowered.contains("thread not loaded")
+        || lowered.contains("no rollout found for thread id")
 }
 
 pub(crate) fn thread_agent_nickname(thread: &Value) -> Option<String> {
@@ -63,12 +65,12 @@ pub(crate) fn thread_agent_role(thread: &Value) -> Option<String> {
 }
 
 pub(crate) fn thread_source_marks_subagent(source: &Value) -> bool {
-    if source
-        .get("subagent")
-        .and_then(Value::as_object)
-        .is_some_and(|value| !value.is_empty())
-    {
-        return true;
+    if let Some(subagent) = source.get("subagent") {
+        match subagent {
+            Value::Object(value) if !value.is_empty() => return true,
+            Value::String(value) if !value.trim().is_empty() => return true,
+            _ => {}
+        }
     }
 
     let Some(source_text) = source
@@ -143,7 +145,6 @@ pub(crate) fn is_internal_session_item_type(item_type: &str) -> bool {
 }
 
 pub(crate) const EMPTY_ASSISTANT_RESPONSE_CODE: &str = "EMPTY_ASSISTANT_RESPONSE";
-pub(crate) const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "Codex completed this turn without an assistant response. Send the message again or check the Codex app-server logs.";
 
 pub(crate) fn session_turn_has_visible_agent_output(turn: &Value) -> bool {
     turn.get("items")
@@ -190,8 +191,12 @@ pub(crate) fn mark_turn_without_agent_output_failed(
     {
         return false;
     }
-    let message =
-        existing_error_message.unwrap_or_else(|| EMPTY_ASSISTANT_RESPONSE_MESSAGE.to_string());
+    let Some(message) = existing_error_message else {
+        // `turn/completed` notifications intentionally omit authoritative history in
+        // current Codex builds. An empty completed turn is hydrated via thread/read;
+        // only an explicit Codex error is enough evidence to synthesize a failure.
+        return false;
+    };
 
     let turn_id = turn
         .get("id")
@@ -361,7 +366,7 @@ fn normalize_thread_payload(thread: &Value) -> Value {
 }
 
 pub(crate) fn active_turn_id_from_turns(turns: &[Value]) -> Option<String> {
-    turns.iter().find_map(|turn| {
+    turns.iter().rev().find_map(|turn| {
         (turn.get("status").and_then(Value::as_str) == Some("inProgress"))
             .then(|| {
                 turn.get("id")
@@ -531,6 +536,61 @@ pub(crate) async fn read_local_thread_metadata_payload(
     read_rollout_thread_metadata_by_session_id(state, profile_id, session_id).await
 }
 
+pub(crate) async fn resolve_session_profile_id(
+    state: &AppState,
+    requested_profile_id: &str,
+    session_id: &str,
+) -> String {
+    let requested_runtime_key = runtime_session_key(requested_profile_id, session_id);
+    let requested_has_assignment = state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .contains_key(&requested_runtime_key);
+    if requested_has_assignment {
+        return requested_profile_id.to_string();
+    }
+    if let Some(thread) =
+        read_local_thread_metadata_payload(state, requested_profile_id, session_id)
+            .await
+            .ok()
+            .flatten()
+    {
+        // A moved thread can remain in the source profile's state DB. Treat that
+        // metadata as stale unless the profile still owns a materialized rollout.
+        if resolve_rollout_path(state, requested_profile_id, session_id, &thread).is_some() {
+            return requested_profile_id.to_string();
+        }
+    }
+
+    for candidate_profile_id in runtime_profiles_snapshot(&state.config).1.keys() {
+        if candidate_profile_id == requested_profile_id {
+            continue;
+        }
+        let candidate_runtime_key = runtime_session_key(candidate_profile_id, session_id);
+        if state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .contains_key(&candidate_runtime_key)
+        {
+            return candidate_profile_id.clone();
+        }
+        if let Some(thread) =
+            read_local_thread_metadata_payload(state, candidate_profile_id, session_id)
+                .await
+                .ok()
+                .flatten()
+        {
+            if resolve_rollout_path(state, candidate_profile_id, session_id, &thread).is_some() {
+                return candidate_profile_id.clone();
+            }
+        }
+    }
+
+    requested_profile_id.to_string()
+}
+
 pub(crate) fn resolve_rollout_path(
     state: &AppState,
     profile_id: &str,
@@ -538,6 +598,14 @@ pub(crate) fn resolve_rollout_path(
     thread: &Value,
 ) -> Option<PathBuf> {
     let profile = resolve_runtime_profile(&state.config, profile_id);
+    if let Some(path) = thread
+        .get("rolloutPath")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_file() && path.starts_with(&profile.codex_home))
+    {
+        return Some(path);
+    }
     let created_at = thread
         .get("createdAt")
         .and_then(Value::as_i64)

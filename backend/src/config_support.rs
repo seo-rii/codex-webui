@@ -99,6 +99,7 @@ pub(crate) struct Config {
     pub(crate) instance_token: Option<String>,
     pub(crate) app_server_handoff_enabled: bool,
     pub(crate) per_session_app_servers: bool,
+    pub(crate) force_yolo: bool,
     pub(crate) restart_command: Option<String>,
     pub(crate) config_file_path: Option<PathBuf>,
 }
@@ -239,6 +240,7 @@ impl Config {
                 env::var("CODEX_WEBUI_APP_SERVER_HANDOFF").ok(),
             ),
             per_session_app_servers: parse_bool_env("CODEX_WEBUI_PER_SESSION_APP_SERVERS"),
+            force_yolo: parse_bool_env("CODEX_WEBUI_FORCE_YOLO"),
             restart_command: optional_env("CODEX_WEBUI_RESTART_COMMAND"),
             config_file_path: optional_env("CODEX_WEBUI_CONFIG_PATH").map(PathBuf::from),
         };
@@ -591,10 +593,9 @@ pub(crate) fn runtime_profiles_snapshot(
         .or_else(|| config.profiles.values().next())
         .map(|profile| profile.codex_home.clone())
         .unwrap_or_else(|| config.data_dir.join("codex-home"));
-    let config_path = config
-        .config_file_path
-        .clone()
-        .or_else(webui_config_path_from_env_or_home);
+    let config_path = optional_env("CODEX_WEBUI_CONFIG_PATH")
+        .map(PathBuf::from)
+        .or_else(|| config.config_file_path.clone());
     match read_runtime_profiles_from_config_path(config_path) {
         Ok(Some((yaml_default_profile_id, profiles))) => runtime_profiles_from_shapes(
             yaml_default_profile_id.unwrap_or_else(|| config.default_profile_id.clone()),
@@ -764,6 +765,7 @@ pub(crate) struct CodexTomlDefaults {
     pub(crate) sandbox_mode: Option<String>,
     pub(crate) service_tier: String,
     pub(crate) network_access: Option<bool>,
+    pub(crate) auto_approve_mode: Option<String>,
     pub(crate) language_bridge_enabled: Option<bool>,
     pub(crate) language_bridge_output_language: Option<String>,
     pub(crate) memories_disable_on_external_context: Option<bool>,
@@ -911,6 +913,12 @@ pub(crate) fn read_codex_toml_defaults(codex_home: &Path) -> CodexTomlDefaults {
             Some("sandbox_workspace_write"),
             "network_access",
         )),
+        auto_approve_mode: parse_toml_string_value(get_toml_value(
+            &raw,
+            Some("codex_webui"),
+            "auto_approve",
+        ))
+        .filter(|value| matches!(value.as_str(), "manual" | "turn" | "session")),
         language_bridge_enabled: parse_toml_bool_value(get_toml_value(
             &raw,
             Some("codex_webui"),
@@ -1199,6 +1207,16 @@ pub(crate) async fn sync_codex_toml_with_preferences(
             }
             .to_string(),
         ),
+    );
+    raw = upsert_toml_value(
+        &raw,
+        Some("codex_webui"),
+        "auto_approve",
+        preferences
+            .get("autoApproveMode")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "manual" | "turn" | "session"))
+            .map(stringify_toml_string),
     );
     raw = upsert_toml_value(
         &raw,

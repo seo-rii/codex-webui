@@ -15,9 +15,11 @@ pub(crate) async fn handle_session_search_api_http(
     let limit = query_param_value(request.uri().query(), "limit")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(20);
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
     match search_session_turns_payload(
         &state,
-        &auth.profile_id,
+        &profile_id,
         session_id,
         &query,
         cursor.as_deref(),
@@ -45,8 +47,9 @@ pub(crate) async fn handle_session_turns_api_http(
     let limit = query_param_value(request.uri().query(), "limit")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(20);
-    match session_older_turns_payload(&state, &auth.profile_id, session_id, &before_turn_id, limit)
-        .await
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
+    match session_older_turns_payload(&state, &profile_id, session_id, &before_turn_id, limit).await
     {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => json_error(error.status, &error.message),
@@ -64,7 +67,9 @@ pub(crate) async fn handle_session_turn_api_http(
         return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
     }
 
-    match session_turn_payload(&state, &auth.profile_id, session_id, turn_id).await {
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
+    match session_turn_payload(&state, &profile_id, session_id, turn_id).await {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => json_error(error.status, &error.message),
     }
@@ -82,8 +87,9 @@ pub(crate) async fn handle_session_item_detail_api_http(
         return json_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.");
     }
 
-    match session_item_detail_payload(&state, &auth.profile_id, session_id, turn_id, item_id).await
-    {
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
+    match session_item_detail_payload(&state, &profile_id, session_id, turn_id, item_id).await {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => json_error(error.status, &error.message),
     }

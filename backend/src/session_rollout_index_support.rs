@@ -47,16 +47,16 @@ fn parse_timestamp_to_unix_ms(value: &str) -> Option<i64> {
         .and_then(|value| i64::try_from(value).ok())
 }
 
-fn candidate_effective_updated_at(candidate: &Value) -> i64 {
-    candidate
+pub(crate) fn candidate_effective_updated_at(candidate: &Value) -> i64 {
+    let indexed_updated_at = candidate
         .get("indexedUpdatedAt")
         .and_then(Value::as_i64)
-        .unwrap_or_else(|| {
-            candidate
-                .get("updatedAt")
-                .and_then(Value::as_i64)
-                .unwrap_or_default()
-        })
+        .unwrap_or_default();
+    let rollout_updated_at = candidate
+        .get("updatedAt")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    indexed_updated_at.max(rollout_updated_at)
 }
 
 fn candidate_indexed_name(candidate: &Value) -> Option<String> {
@@ -177,6 +177,14 @@ fn merge_candidate_metadata_into_thread(thread: &mut Value, candidate: &Value, a
         && !session_id.is_empty()
     {
         thread_object.insert("id".to_string(), Value::String(session_id));
+    }
+    if let Some(path) = candidate
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        thread_object.insert("rolloutPath".to_string(), Value::String(path.to_string()));
     }
     if is_placeholder_thread_name(thread_object.get("name").and_then(Value::as_str)) {
         if let Some(indexed_name) = candidate_indexed_name(candidate) {
@@ -577,6 +585,16 @@ fn collect_rollout_candidates(codex_home: &Path, archived: bool) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollout_activity_time_wins_over_older_title_index_time() {
+        let candidate = json!({
+            "indexedUpdatedAt": 100,
+            "updatedAt": 200
+        });
+
+        assert_eq!(candidate_effective_updated_at(&candidate), 200);
+    }
 
     #[cfg(unix)]
     #[test]

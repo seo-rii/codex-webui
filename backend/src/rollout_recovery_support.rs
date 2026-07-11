@@ -96,7 +96,9 @@ fn expand_rollout_path_from_error_message(
                 .map(|index| index.saturating_add(1))
         })
         .unwrap_or(0);
-    let raw_path = before[start..jsonl_end].trim();
+    let raw_path = before[start..jsonl_end]
+        .trim()
+        .trim_matches(['`', '\'', '"']);
     if raw_path.is_empty() {
         return None;
     }
@@ -129,11 +131,26 @@ async fn resolve_session_rollout_path_for_recovery(
     session_id: &str,
     error_message: Option<&str>,
 ) -> Option<PathBuf> {
+    if let Some(path) = error_message
+        .and_then(|message| expand_rollout_path_from_error_message(state, profile_id, message))
+        .filter(|path| {
+            path.exists()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&format!("{session_id}.jsonl")))
+        })
+    {
+        return Some(path);
+    }
+
     if let Ok(Some(thread)) =
         read_local_thread_metadata_payload(state, profile_id, session_id).await
     {
         if let Some(path) = resolve_rollout_path(state, profile_id, session_id, &thread) {
-            return Some(path);
+            if path.exists() {
+                return Some(path);
+            }
         }
     }
 
@@ -145,26 +162,51 @@ async fn resolve_session_rollout_path_for_recovery(
                 .and_then(|candidate| candidate.get("path").and_then(Value::as_str))
                 .map(PathBuf::from)
             {
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+
+    let profile = resolve_runtime_profile(&state.config, profile_id);
+    let sessions_root = normalize_path(profile.codex_home.join("sessions"));
+    let mut pending_dirs = vec![sessions_root.clone()];
+    while let Some(dir) = pending_dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = normalize_path(entry.path());
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending_dirs.push(path);
+                continue;
+            }
+            if !file_type.is_file()
+                || !path_is_within(&sessions_root, &path)
+                || path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&format!("{session_id}.jsonl")))
+            {
                 return Some(path);
             }
         }
     }
 
-    if let Some(path) = error_message
-        .and_then(|message| expand_rollout_path_from_error_message(state, profile_id, message))
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(&format!("{session_id}.jsonl")))
-        })
-    {
-        return Some(path);
-    }
-
     if error_message.is_none() {
         if let Ok(thread) = read_thread_metadata_payload(state, profile_id, session_id).await {
             if let Some(path) = resolve_rollout_path(state, profile_id, session_id, &thread) {
-                return Some(path);
+                if path.exists() {
+                    return Some(path);
+                }
             }
         }
     }

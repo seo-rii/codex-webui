@@ -63,9 +63,17 @@ pub(crate) async fn resolve_system_shutdown_plan(config: &Config) -> Option<Syst
         .map(str::trim)
         .unwrap_or_default()
         .to_string();
-    let direct_command = if !override_command.is_empty() {
-        resolve_command_path(&override_command).await
-    } else if let Some(command) = resolve_command_path("shutdown").await {
+    if !override_command.is_empty() {
+        return resolve_command_path(&override_command)
+            .await
+            .map(|command| SystemShutdownPlan {
+                command,
+                args: Vec::new(),
+                availability_check: None,
+            });
+    }
+
+    let direct_command = if let Some(command) = resolve_command_path("shutdown").await {
         Some(command)
     } else if let Some(command) = resolve_command_path("/usr/sbin/shutdown").await {
         Some(command)
@@ -75,9 +83,7 @@ pub(crate) async fn resolve_system_shutdown_plan(config: &Config) -> Option<Syst
         resolve_command_path("systemctl").await
     }?;
 
-    let direct_args = if !override_command.is_empty() {
-        Vec::new()
-    } else if Path::new(&direct_command)
+    let direct_args = if Path::new(&direct_command)
         .file_name()
         .and_then(|value| value.to_str())
         == Some("systemctl")

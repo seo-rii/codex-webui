@@ -13,19 +13,20 @@ pub(crate) async fn handle_session_queue_api_http(
     if requires_admin && !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
 
     let result = if suffix.is_empty() {
         match request.method() {
             &Method::GET => {
-                get_session_queue_payload_for_role(&state, &auth.profile_id, session_id, auth.role)
-                    .await
+                get_session_queue_payload_for_role(&state, &profile_id, session_id, auth.role).await
             }
             &Method::POST => {
                 match read_json_body(request, LARGE_JSON_BODY_LIMIT, "queue request body").await {
                     Ok(payload) => {
                         enqueue_session_queue_payload(
                             &state,
-                            &auth.profile_id,
+                            &profile_id,
                             session_id,
                             payload
                                 .get("prompt")
@@ -53,7 +54,7 @@ pub(crate) async fn handle_session_queue_api_http(
                 "Method not allowed.",
             ))
         } else {
-            resume_session_queue_payload(&state, &auth.profile_id, session_id).await
+            resume_session_queue_payload(&state, &profile_id, session_id).await
         }
     } else if suffix == "/reorder" {
         if request.method() != Method::POST {
@@ -66,8 +67,7 @@ pub(crate) async fn handle_session_queue_api_http(
             {
                 Ok(payload) => {
                     let queue_ids = string_array_from_value(payload.get("queueIds"));
-                    reorder_session_queue_payload(&state, &auth.profile_id, session_id, &queue_ids)
-                        .await
+                    reorder_session_queue_payload(&state, &profile_id, session_id, &queue_ids).await
                 }
                 Err(error) => Err(error),
             }
@@ -79,13 +79,8 @@ pub(crate) async fn handle_session_queue_api_http(
         } else {
             match request.method() {
                 &Method::DELETE => {
-                    remove_session_queue_item_payload(
-                        &state,
-                        &auth.profile_id,
-                        session_id,
-                        queue_id,
-                    )
-                    .await
+                    remove_session_queue_item_payload(&state, &profile_id, session_id, queue_id)
+                        .await
                 }
                 &Method::PATCH => {
                     match read_json_body(
@@ -98,7 +93,7 @@ pub(crate) async fn handle_session_queue_api_http(
                         Ok(payload) => {
                             update_session_queue_item_payload(
                                 &state,
-                                &auth.profile_id,
+                                &profile_id,
                                 session_id,
                                 queue_id,
                                 payload.get("prompt").and_then(Value::as_str),
@@ -121,7 +116,7 @@ pub(crate) async fn handle_session_queue_api_http(
                         Ok(payload) => {
                             dispatch_session_queue_item_payload(
                                 &state,
-                                &auth.profile_id,
+                                &profile_id,
                                 session_id,
                                 queue_id,
                                 payload
@@ -164,8 +159,10 @@ pub(crate) async fn handle_session_abort_api_http(
     if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
 
-    match abort_turn_payload(&state, &auth.profile_id, session_id).await {
+    match abort_turn_payload(&state, &profile_id, session_id).await {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => json_error(error.status, &error.message),
     }
@@ -183,6 +180,8 @@ pub(crate) async fn handle_session_approval_api_http(
     if !role_has_admin_access(auth.role) {
         return json_error(StatusCode::FORBIDDEN, "This action requires an admin role.");
     }
+    let profile_id =
+        resolve_http_session_profile_id(&state, &auth, session_id, request.uri().query()).await;
 
     let result = match read_json_body(request, SMALL_JSON_BODY_LIMIT, "approval request body").await
     {
@@ -194,7 +193,7 @@ pub(crate) async fn handle_session_approval_api_http(
                 .to_string();
             resolve_server_request_payload(
                 &state,
-                &auth.profile_id,
+                &profile_id,
                 session_id,
                 &request_id,
                 payload.get("result").cloned().unwrap_or(Value::Null),

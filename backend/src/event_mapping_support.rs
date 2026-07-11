@@ -389,6 +389,7 @@ pub(crate) fn map_app_server_session_notification(
         "turn/started" | "turn/completed" => {
             let fallback_turn_id = mapped
                 .get("turnId")
+                .or_else(|| mapped.get("turn_id"))
                 .and_then(Value::as_str)
                 .unwrap_or("turn-0")
                 .to_string();
@@ -397,13 +398,22 @@ pub(crate) fn map_app_server_session_notification(
             } else {
                 "completed"
             };
-            let turn = mapped.get("turn").cloned().unwrap_or_else(|| {
+            let mut turn = mapped.get("turn").cloned().unwrap_or_else(|| {
                 json!({
                     "id": fallback_turn_id,
                     "status": fallback_status,
                     "items": []
                 })
             });
+            if let Some(turn_object) = turn.as_object_mut() {
+                let missing_turn_id = turn_object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty());
+                if missing_turn_id {
+                    turn_object.insert("id".to_string(), Value::String(fallback_turn_id));
+                }
+            }
             let mut normalized_turn = normalize_session_turn_payload(&turn, 0);
             if notification.method == "turn/completed" {
                 mark_turn_without_agent_output_failed(&mut normalized_turn, "live");

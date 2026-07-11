@@ -52,7 +52,12 @@ function runCheck({ command, args, cwd }) {
     console.log(`\n$ ${command} ${args.join(" ")}`);
     const child = spawn(command, args, {
       cwd,
-      env: process.env,
+      env: {
+        ...process.env,
+        CARGO_BUILD_JOBS: process.env.CARGO_BUILD_JOBS ?? "2",
+        CARGO_INCREMENTAL: process.env.CARGO_INCREMENTAL ?? "0",
+        RUST_MIN_STACK: process.env.RUST_MIN_STACK ?? String(16 * 1024 * 1024)
+      },
       stdio: "inherit"
     });
     child.on("error", reject);

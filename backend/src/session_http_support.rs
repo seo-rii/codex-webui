@@ -1,5 +1,25 @@
 use super::*;
 
+pub(crate) async fn resolve_http_session_profile_id(
+    state: &AppState,
+    auth: &AuthContext,
+    session_id: &str,
+    query: Option<&str>,
+) -> String {
+    let requested_profile_id = query_param_value(query, "profileId")
+        .or_else(|| query_param_value(query, "profile_id"))
+        .map(|value| sanitize_profile_id(&value))
+        .filter(|value| {
+            !value.is_empty()
+                && runtime_profiles_snapshot(&state.config)
+                    .1
+                    .contains_key(value)
+        })
+        .unwrap_or_else(|| auth.profile_id.clone());
+
+    resolve_session_profile_id(state, &requested_profile_id, session_id).await
+}
+
 pub(crate) async fn handle_sessions_api_http(
     state: AppState,
     request: Request,
@@ -86,12 +106,15 @@ pub(crate) async fn handle_session_api_http(
     request: Request,
     auth: AuthContext,
 ) -> Response {
+    let query = request.uri().query().map(str::to_string);
     let result = match request.method() {
         &Method::GET => {
-            let limit = query_param_value(request.uri().query(), "limit")
+            let limit = query_param_value(query.as_deref(), "limit")
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(20);
-            session_detail_payload(&state, &auth.profile_id, session_id, limit).await
+            let profile_id =
+                resolve_http_session_profile_id(&state, &auth, session_id, query.as_deref()).await;
+            session_detail_payload(&state, &profile_id, session_id, limit).await
         }
         &Method::PATCH => {
             if !role_has_admin_access(auth.role) {
@@ -109,13 +132,15 @@ pub(crate) async fn handle_session_api_http(
                     {
                         return json_error(StatusCode::FORBIDDEN, &owner_required_error_value());
                     }
-                    save_session_preferences_payload(
+                    let profile_id = resolve_http_session_profile_id(
                         &state,
-                        &auth.profile_id,
+                        &auth,
                         session_id,
-                        preferences,
+                        query.as_deref(),
                     )
-                    .await
+                    .await;
+                    save_session_preferences_payload(&state, &profile_id, session_id, preferences)
+                        .await
                 }
                 Err(error) => Err(error),
             }

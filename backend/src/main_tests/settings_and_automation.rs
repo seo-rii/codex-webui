@@ -1045,6 +1045,90 @@ async fn session_subscription_coalesces_text_delta_events() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_subscription_flushes_continuous_text_delta_streams() {
+    let sandbox = unique_test_dir("session-delta-continuous-flush");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let (out_tx, mut out_rx) = mpsc::channel(8);
+    let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    subscribe_session(
+        state.clone(),
+        out_tx,
+        subscriptions,
+        "default".to_string(),
+        "thread-continuous-delta".to_string(),
+        UserRole::Admin,
+        true,
+    )
+    .await
+    .expect("subscription should start");
+
+    let _initial_queue = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+        .await
+        .expect("initial queue event should arrive")
+        .expect("initial queue event should be readable");
+    let relay = state
+        .relays
+        .lock()
+        .await
+        .get(&session_relay_key("default", "thread-continuous-delta"))
+        .cloned()
+        .expect("session relay should exist");
+
+    let sender = tokio::spawn(async move {
+        for index in 0..50 {
+            relay
+                .send(json!({
+                    "kind": "notification",
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-continuous-delta",
+                        "turnId": "turn-1",
+                        "itemId": "agent-1",
+                        "delta": format!("{index:02}")
+                    }
+                }))
+                .expect("delta should publish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+
+    let started_at = Instant::now();
+    let envelope = tokio::time::timeout(Duration::from_millis(450), out_rx.recv())
+        .await
+        .expect("continuous delta stream should flush before the sender goes idle")
+        .expect("delta event should be readable");
+    assert!(
+        started_at.elapsed() < Duration::from_millis(450),
+        "continuous stream waited for idle completion before flushing"
+    );
+    let ServerEnvelope::Event { event, .. } = envelope else {
+        panic!("expected session event");
+    };
+    assert_eq!(
+        event.get("method").and_then(Value::as_str),
+        Some("item/agentMessage/delta")
+    );
+    let delta = event
+        .get("params")
+        .and_then(|params| params.get("delta"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(!delta.is_empty());
+    assert!(
+        delta.len() < 100,
+        "continuous stream should be flushed in slices, not only after all deltas"
+    );
+
+    sender.abort();
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn viewer_global_subscription_filters_sensitive_events() {
     let sandbox = unique_test_dir("viewer-global-redaction");
     let workspace = sandbox.join("workspace");
@@ -1828,6 +1912,7 @@ async fn syncs_codex_toml_with_preferences_for_plan_mode() {
             "mode": "plan",
             "effort": "high",
             "networkAccess": true,
+            "autoApproveMode": "session",
             "languageBridgeEnabled": true,
             "languageBridgeOutputLanguage": "Korean"
         }),
@@ -1845,6 +1930,7 @@ async fn syncs_codex_toml_with_preferences_for_plan_mode() {
     assert!(raw.contains("[sandbox_workspace_write]"));
     assert!(raw.contains("network_access = true"));
     assert!(raw.contains("[codex_webui]"));
+    assert!(raw.contains("auto_approve = \"session\""));
     assert!(raw.contains("language_bridge = true"));
     assert!(raw.contains("language_bridge_output_language = \"Korean\""));
     let temp_files = fs::read_dir(&codex_home)
@@ -1868,7 +1954,7 @@ async fn session_preferences_defaults_include_model_context_window_from_codex_to
     fs::write(
         config_toml_path(&codex_home),
         format!(
-            "{CONFIG_SCHEMA_HEADER}\nmodel_context_window = 100000000\n[codex_webui]\nlanguage_bridge = true\nlanguage_bridge_output_language = \"Korean\"\n"
+            "{CONFIG_SCHEMA_HEADER}\nmodel_context_window = 100000000\n[codex_webui]\nauto_approve = \"session\"\nlanguage_bridge = true\nlanguage_bridge_output_language = \"Korean\"\n"
         ),
     )
     .unwrap();
@@ -1881,6 +1967,10 @@ async fn session_preferences_defaults_include_model_context_window_from_codex_to
         Some(100000000)
     );
     assert_eq!(
+        defaults.get("autoApproveMode").and_then(Value::as_str),
+        Some("session")
+    );
+    assert_eq!(
         defaults
             .get("languageBridgeEnabled")
             .and_then(Value::as_bool),
@@ -1891,6 +1981,47 @@ async fn session_preferences_defaults_include_model_context_window_from_codex_to
             .get("languageBridgeOutputLanguage")
             .and_then(Value::as_str),
         Some("Korean")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn force_yolo_overrides_stored_session_permissions() {
+    let sandbox = unique_test_dir("force-yolo-session-preferences");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let mut state = test_state(workspace.clone(), vec![workspace], codex_home);
+    Arc::get_mut(&mut state.config).unwrap().force_yolo = true;
+    let preferences = normalize_session_preferences_payload(
+        &state,
+        "default",
+        json!({
+            "approvalPolicy": "on-request",
+            "sandboxMode": "workspace-write",
+            "autoApproveMode": "manual",
+            "networkAccess": false
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(preferences.get("approvalPolicy"), Some(&json!("never")));
+    assert_eq!(
+        preferences.get("sandboxMode"),
+        Some(&json!("danger-full-access"))
+    );
+    assert_eq!(preferences.get("autoApproveMode"), Some(&json!("session")));
+    assert_eq!(preferences.get("networkAccess"), Some(&json!(true)));
+
+    let defaults = session_preferences_defaults_payload(&state, "default").await;
+    assert_eq!(defaults.get("approvalPolicy"), Some(&json!("never")));
+    assert_eq!(
+        defaults.get("sandboxMode"),
+        Some(&json!("danger-full-access"))
     );
 
     let _ = fs::remove_dir_all(sandbox);

@@ -54,8 +54,13 @@ fn rough_ws_response_size(message: &ServerEnvelope) -> usize {
                     .unwrap_or_default(),
             )
             .saturating_add(error.as_ref().map(String::len).unwrap_or_default()),
-        ServerEnvelope::Event { session_id, event } => 48usize
+        ServerEnvelope::Event {
+            session_id,
+            profile_id,
+            event,
+        } => 48usize
             .saturating_add(session_id.len())
+            .saturating_add(profile_id.len())
             .saturating_add(rough_json_value_size(event)),
         ServerEnvelope::TerminalEvent { terminal_id, event } => 56usize
             .saturating_add(terminal_id.len())

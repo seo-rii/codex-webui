@@ -316,31 +316,50 @@ pub(crate) async fn move_session_profile_payload(
                     .and_then(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string))
                     .is_some_and(|id| id == session_id)
             })
+            .map(str::to_string)
             .collect::<Vec<_>>();
         if !matching_index_lines.is_empty() {
             let target_index_path = target_profile.codex_home.join("session_index.jsonl");
-            if let Some(parent) = target_index_path.parent() {
-                tokio_fs::create_dir_all(parent).await.map_err(|error| {
-                    api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-                })?;
-            }
-            let mut target_index = tokio_fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&target_index_path)
+            let target_index = tokio_fs::read_to_string(&target_index_path)
+                .await
+                .unwrap_or_default();
+            let mut target_lines = target_index
+                .lines()
+                .filter(|line| {
+                    !serde_json::from_str::<Value>(line)
+                        .ok()
+                        .and_then(|entry| {
+                            entry.get("id").and_then(Value::as_str).map(str::to_string)
+                        })
+                        .is_some_and(|id| id == session_id)
+                })
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            target_lines.extend(matching_index_lines);
+            let target_index_bytes = format!("{}\n", target_lines.join("\n")).into_bytes();
+            write_file_atomically(&target_index_path, target_index_bytes)
                 .await
                 .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-            for line in matching_index_lines {
-                target_index
-                    .write_all(line.as_bytes())
-                    .await
-                    .map_err(|error| {
-                        api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-                    })?;
-                target_index.write_all(b"\n").await.map_err(|error| {
-                    api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-                })?;
-            }
+
+            let retained_source_lines = raw_index
+                .lines()
+                .filter(|line| {
+                    !serde_json::from_str::<Value>(line)
+                        .ok()
+                        .and_then(|entry| {
+                            entry.get("id").and_then(Value::as_str).map(str::to_string)
+                        })
+                        .is_some_and(|id| id == session_id)
+                })
+                .collect::<Vec<_>>();
+            let source_index_bytes = if retained_source_lines.is_empty() {
+                Vec::new()
+            } else {
+                format!("{}\n", retained_source_lines.join("\n")).into_bytes()
+            };
+            write_file_atomically(&source_index_path, source_index_bytes)
+                .await
+                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
         }
     }
 

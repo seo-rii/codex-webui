@@ -92,7 +92,7 @@ pub(crate) struct SessionSummaryUiSnapshot {
     pub(crate) loaded_thread_ids_available: bool,
 }
 
-const ACTIVE_SESSION_STATUS_RECONCILE_AFTER_MS: u64 = 5_000;
+const ACTIVE_SESSION_STATUS_RECONCILE_AFTER_MS: u64 = 60_000;
 const ACTIVE_SESSION_STATUS_RECONCILE_LIMIT: usize = 4;
 const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS: u64 = 1_000;
 const LOADED_THREAD_IDS_CACHE_TTL: Duration = Duration::from_secs(5);

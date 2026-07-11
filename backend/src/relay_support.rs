@@ -1,6 +1,9 @@
 use super::*;
 
-const RELAY_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+const RELAY_SEND_TIMEOUT: Duration = Duration::from_millis(500);
+const RELAY_DELTA_IDLE_FLUSH_TIMEOUT: Duration = Duration::from_millis(50);
+const RELAY_DELTA_MAX_FLUSH_INTERVAL: Duration = Duration::from_millis(120);
+const RELAY_DELTA_MAX_BYTES: usize = 4 * 1024;
 
 async fn send_relay_envelope(
     out_tx: &mpsc::Sender<ServerEnvelope>,
@@ -11,9 +14,15 @@ async fn send_relay_envelope(
         Ok(Ok(())) => true,
         Ok(Err(_)) => false,
         Err(_) => {
+            let reason = format!("relay send stalled while sending {context}");
             warn!(
                 context = context,
-                "dropping websocket subscription after stalled relay send"
+                "requesting websocket resync after stalled relay send"
+            );
+            let _ = queue_ws_envelope(
+                out_tx,
+                ServerEnvelope::ResyncRequired { reason },
+                "stalled-relay-resync",
             );
             false
         }
@@ -38,14 +47,16 @@ pub(crate) async fn subscribe_session(
     let handle = tokio::spawn(async move {
         let mut pending_delta_event: Option<Value> = None;
         let mut pending_delta_key = String::new();
+        let mut pending_delta_started_at: Option<Instant> = None;
         loop {
-            match tokio::time::timeout(Duration::from_millis(50), receiver.recv()).await {
+            match tokio::time::timeout(RELAY_DELTA_IDLE_FLUSH_TIMEOUT, receiver.recv()).await {
                 Err(_) => {
                     if let Some(event) = pending_delta_event.take() {
                         if !send_relay_envelope(
                             &stream_out_tx,
                             ServerEnvelope::Event {
                                 session_id: session_key.clone(),
+                                profile_id: profile_key.clone(),
                                 event,
                             },
                             "session-subscription-output-delta",
@@ -56,6 +67,7 @@ pub(crate) async fn subscribe_session(
                         }
                     }
                     pending_delta_key.clear();
+                    pending_delta_started_at = None;
                 }
                 Ok(Ok(event)) => {
                     let Some(mut event) = filter_session_event_for_role(role, event) else {
@@ -114,6 +126,7 @@ pub(crate) async fn subscribe_session(
                                     &stream_out_tx,
                                     ServerEnvelope::Event {
                                         session_id: session_key.clone(),
+                                        profile_id: profile_key.clone(),
                                         event: pending_event,
                                     },
                                     "session-subscription-output-delta",
@@ -129,6 +142,7 @@ pub(crate) async fn subscribe_session(
                                 "{event_method}\u{0}{turn_id}\u{0}{item_id}\u{0}{role}\u{0}{summary_index}"
                             );
                             if pending_delta_event.is_some() && pending_delta_key == next_key {
+                                pending_delta_started_at.get_or_insert_with(Instant::now);
                                 if let Some(params) = pending_delta_event
                                     .as_mut()
                                     .and_then(|pending| pending.get_mut("params"))
@@ -152,6 +166,7 @@ pub(crate) async fn subscribe_session(
                                         &stream_out_tx,
                                         ServerEnvelope::Event {
                                             session_id: session_key.clone(),
+                                            profile_id: profile_key.clone(),
                                             event: pending_event,
                                         },
                                         "session-subscription-output-delta",
@@ -162,6 +177,7 @@ pub(crate) async fn subscribe_session(
                                     }
                                 }
                                 pending_delta_key = next_key;
+                                pending_delta_started_at = Some(Instant::now());
                                 event.get_mut("params").and_then(Value::as_object_mut).map(
                                     |params| {
                                         params.insert(
@@ -172,18 +188,25 @@ pub(crate) async fn subscribe_session(
                                 );
                                 pending_delta_event = Some(event);
                             }
-                            if pending_delta_event
+                            let pending_delta_bytes = pending_delta_event
                                 .as_ref()
                                 .and_then(|pending| pending.get("params"))
                                 .and_then(|params| params.get("delta"))
                                 .and_then(Value::as_str)
-                                .is_some_and(|value| value.len() >= 16 * 1024)
+                                .map(str::len)
+                                .unwrap_or(0);
+                            let pending_delta_elapsed =
+                                pending_delta_started_at.is_some_and(|started_at| {
+                                    started_at.elapsed() >= RELAY_DELTA_MAX_FLUSH_INTERVAL
+                                });
+                            if pending_delta_bytes >= RELAY_DELTA_MAX_BYTES || pending_delta_elapsed
                             {
                                 if let Some(pending_event) = pending_delta_event.take() {
                                     if !send_relay_envelope(
                                         &stream_out_tx,
                                         ServerEnvelope::Event {
                                             session_id: session_key.clone(),
+                                            profile_id: profile_key.clone(),
                                             event: pending_event,
                                         },
                                         "session-subscription-output-delta",
@@ -194,6 +217,7 @@ pub(crate) async fn subscribe_session(
                                     }
                                 }
                                 pending_delta_key.clear();
+                                pending_delta_started_at = None;
                             }
                             continue;
                         }
@@ -204,6 +228,7 @@ pub(crate) async fn subscribe_session(
                             &stream_out_tx,
                             ServerEnvelope::Event {
                                 session_id: session_key.clone(),
+                                profile_id: profile_key.clone(),
                                 event: pending_event,
                             },
                             "session-subscription-output-delta",
@@ -214,10 +239,12 @@ pub(crate) async fn subscribe_session(
                         }
                     }
                     pending_delta_key.clear();
+                    pending_delta_started_at = None;
                     if !send_relay_envelope(
                         &stream_out_tx,
                         ServerEnvelope::Event {
                             session_id: session_key.clone(),
+                            profile_id: profile_key.clone(),
                             event,
                         },
                         "session-subscription",
@@ -229,6 +256,16 @@ pub(crate) async fn subscribe_session(
                 }
                 Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
                     warn!("websocket lagged on session {session_key}: skipped {skipped} messages");
+                    let _ = queue_ws_envelope(
+                        &stream_out_tx,
+                        ServerEnvelope::ResyncRequired {
+                            reason: format!(
+                                "session relay lagged for {profile_key}:{session_key}; skipped {skipped} messages"
+                            ),
+                        },
+                        "session-relay-lag-resync",
+                    );
+                    break;
                 }
                 Ok(Err(broadcast::error::RecvError::Closed)) => break,
             }
@@ -238,6 +275,7 @@ pub(crate) async fn subscribe_session(
                 &stream_out_tx,
                 ServerEnvelope::Event {
                     session_id: session_key.clone(),
+                    profile_id: profile_key.clone(),
                     event,
                 },
                 "session-subscription-output-delta",
@@ -265,6 +303,7 @@ pub(crate) async fn subscribe_session(
             &out_tx,
             ServerEnvelope::Event {
                 session_id: session_id.clone(),
+                profile_id: profile_id.clone(),
                 event: json!({
                     "kind": "notification",
                     "method": "codex-webui/queueUpdated",
@@ -311,6 +350,16 @@ pub(crate) async fn subscribe_terminal(
                     warn!(
                         "websocket lagged on terminal {terminal_key}: skipped {skipped} messages"
                     );
+                    let _ = queue_ws_envelope(
+                        &out_tx,
+                        ServerEnvelope::ResyncRequired {
+                            reason: format!(
+                                "terminal relay lagged for {terminal_key}; skipped {skipped} messages"
+                            ),
+                        },
+                        "terminal-relay-lag-resync",
+                    );
+                    break;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -331,36 +380,91 @@ pub(crate) async fn subscribe_global(
     profile_id: String,
     role: UserRole,
 ) -> Result<()> {
-    let relay = ensure_global_relay(&state, &profile_id).await?;
-    let mut receiver = relay.subscribe();
-    let handle = tokio::spawn(async move {
-        loop {
-            match receiver.recv().await {
-                Ok(event) => {
-                    let Some(event) = filter_global_event_for_role(role, event) else {
-                        continue;
-                    };
-                    if !send_relay_envelope(
-                        &out_tx,
-                        ServerEnvelope::GlobalEvent { event },
-                        "global-subscription",
-                    )
-                    .await
-                    {
+    let mut profile_ids = state.config.profiles.keys().cloned().collect::<Vec<_>>();
+    if !profile_ids.iter().any(|entry| entry == &profile_id) {
+        profile_ids.push(profile_id);
+    }
+    profile_ids.sort();
+    profile_ids.dedup();
+
+    let mut handles = Vec::new();
+    for subscribed_profile_id in profile_ids {
+        let relay = ensure_global_relay(&state, &subscribed_profile_id).await?;
+        let mut receiver = relay.subscribe();
+        let out_tx = out_tx.clone();
+        let subscription_label = format!("global-subscription:{subscribed_profile_id}");
+        let warning_profile_id = subscribed_profile_id.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => {
+                        if event.get("method").and_then(Value::as_str)
+                            == Some("codex-webui/resyncRequired")
+                        {
+                            let reason = event
+                                .get("params")
+                                .and_then(|params| params.get("reason"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("global app-server relay lagged")
+                                .to_string();
+                            let _ = queue_ws_envelope(
+                                &out_tx,
+                                ServerEnvelope::ResyncRequired { reason },
+                                "global-app-server-lag-resync",
+                            );
+                            break;
+                        }
+                        let Some(mut event) = filter_global_event_for_role(role, event) else {
+                            continue;
+                        };
+                        if let Some(event_object) = event.as_object_mut() {
+                            let params = event_object
+                                .entry("params".to_string())
+                                .or_insert_with(|| json!({}));
+                            if let Some(params) = params.as_object_mut() {
+                                params.insert(
+                                    "profileId".to_string(),
+                                    Value::String(warning_profile_id.clone()),
+                                );
+                            }
+                        }
+                        if !send_relay_envelope(
+                            &out_tx,
+                            ServerEnvelope::GlobalEvent { event },
+                            &subscription_label,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(
+                            "websocket lagged on global relay for {warning_profile_id}: skipped {skipped} messages"
+                        );
+                        let _ = queue_ws_envelope(
+                            &out_tx,
+                            ServerEnvelope::ResyncRequired {
+                                reason: format!(
+                                    "global relay lagged for {warning_profile_id}; skipped {skipped} messages"
+                                ),
+                            },
+                            "global-relay-lag-resync",
+                        );
                         break;
                     }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!("websocket lagged on global relay: skipped {skipped} messages");
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
-        }
-    });
+        });
+        handles.push((global_relay_key(&subscribed_profile_id), handle));
+    }
 
     let mut current = subscriptions.lock().await;
-    if let Some(existing) = current.insert(global_relay_key(&profile_id), handle) {
-        existing.abort();
+    for (relay_key, handle) in handles {
+        if let Some(existing) = current.insert(relay_key, handle) {
+            existing.abort();
+        }
     }
     Ok(())
 }
@@ -552,6 +656,15 @@ async fn bridge_app_server_global_notifications(
                 warn!(
                     "global app-server relay lagged for {profile_id}: skipped {skipped} messages"
                 );
+                let _ = sender.send(json!({
+                    "kind": "notification",
+                    "method": "codex-webui/resyncRequired",
+                    "params": {
+                        "reason": format!(
+                            "global app-server relay lagged for {profile_id}; skipped {skipped} messages"
+                        )
+                    }
+                }));
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }

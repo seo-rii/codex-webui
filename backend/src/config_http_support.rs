@@ -106,7 +106,7 @@ pub(crate) async fn session_preferences_defaults_payload(
             .map(|value| normalize_language_bridge_output_language(&value))
             .unwrap_or_else(|| "auto".to_string());
 
-    json!({
+    let mut defaults = json!({
         "cwd": default_cwd,
         "model": env::var("CODEX_WEBUI_DEFAULT_MODEL")
             .ok()
@@ -130,6 +130,7 @@ pub(crate) async fn session_preferences_defaults_payload(
             "CODEX_WEBUI_DEFAULT_AUTO_APPROVE",
             &["manual", "turn", "session"]
         )
+        .or_else(|| codex_defaults.auto_approve_mode.clone())
         .unwrap_or_else(|| "manual".to_string()),
         "steeringResumeMode": env_choice(
             "CODEX_WEBUI_DEFAULT_STEERING_RESUME",
@@ -140,7 +141,11 @@ pub(crate) async fn session_preferences_defaults_payload(
         "languageBridgeOutputLanguage": language_bridge_output_language,
         "shutdownOnCompletion": false,
         "gitRepoPath": Value::Null
-    })
+    });
+    if let Some(preferences) = defaults.as_object_mut() {
+        apply_forced_session_preferences(&state.config, preferences);
+    }
+    defaults
 }
 
 pub(crate) async fn config_models_payload(
@@ -505,9 +510,7 @@ pub(crate) async fn get_config_payload(state: &AppState, profile_id: &str) -> Ap
         "systemShutdown": {
             "available": shutdown_available,
             "delaySeconds": state.config.system_shutdown_delay_seconds,
-            "armed": shutdown_available
-                && state.config.system_shutdown_enabled
-                && shutdown_after_queue_completes
+            "armed": state.config.system_shutdown_enabled && shutdown_after_queue_completes
         },
         "startup": {
             "pausedQueues": paused_queues,

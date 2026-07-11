@@ -825,6 +825,24 @@ fn session_summary_normalizes_live_thread_without_runtime_evidence_to_completed(
         Some("completed")
     );
 
+    snapshot.runtime_status_by_thread_id.insert(
+        "thread-live".to_string(),
+        json!({
+            "status": "running",
+            "updatedAt": 3
+        }),
+    );
+    let summary_with_runtime_status =
+        build_session_summary_from_thread_payload(&thread, &snapshot, None, None)
+            .expect("loaded summary should be built");
+    assert_eq!(
+        summary_with_runtime_status
+            .get("status")
+            .and_then(Value::as_str),
+        Some("running")
+    );
+
+    snapshot.runtime_status_by_thread_id.clear();
     snapshot.active_thread_ids.insert("thread-live".to_string());
     let loaded_summary = build_session_summary_from_thread_payload(&thread, &snapshot, None, None)
         .expect("loaded summary should be built");
@@ -2492,6 +2510,37 @@ fn maps_session_item_notifications_use_item_id_when_payload_omits_item_id() {
 }
 
 #[test]
+fn maps_turn_completion_uses_top_level_turn_id_when_turn_payload_omits_id() {
+    let mapped = map_app_server_session_notification(&AppServerNotification {
+        method: "turn/completed".to_string(),
+        params: json!({
+            "threadId": "thread-1",
+            "turnId": "turn-live-42",
+            "turn": {
+                "status": "completed",
+                "items": [
+                    {
+                        "id": "assistant-final",
+                        "type": "agentMessage",
+                        "text": "Final answer"
+                    }
+                ]
+            }
+        }),
+    })
+    .expect("notification should map");
+
+    assert_eq!(
+        mapped
+            .get("params")
+            .and_then(|params| params.get("turn"))
+            .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str),
+        Some("turn-live-42")
+    );
+}
+
+#[test]
 fn maps_large_image_generation_notifications_as_deferred() {
     let large_result = "a".repeat(300 * 1024);
     let mapped = map_app_server_session_notification(&AppServerNotification {
@@ -3077,6 +3126,7 @@ async fn pending_server_requests_are_capped_per_session() {
                 format!("request-{index}"),
                 PendingServerRequestEntry {
                     raw_id: json!(format!("request-{index}")),
+                    client_key: "default".to_string(),
                     method: "item/commandExecution/requestApproval".to_string(),
                     params: json!({ "threadId": "thread-1" }),
                     created_at: index.to_string(),

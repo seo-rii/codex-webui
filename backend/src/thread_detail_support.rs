@@ -2,17 +2,30 @@ use super::*;
 
 const SESSION_DETAIL_ROLLOUT_TAIL_INITIAL_BYTES: u64 = 8 * 1024 * 1024;
 const SESSION_DETAIL_ROLLOUT_TAIL_MAX_BYTES: u64 = 8 * 1024 * 1024;
-const SESSION_OLDER_ROLLOUT_TAIL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_DETAIL_GOAL_TIMEOUT_MS: u64 = 150;
 const SESSION_DETAIL_ACTIVE_RECONCILE_TIMEOUT_MS: u64 = 1_000;
 const SESSION_DETAIL_INLINE_IMAGE_RESULT_MAX_CHARS: usize = 256 * 1024;
 
-struct LocalRolloutTurnWindow {
-    turns: Vec<Value>,
-    loaded_start: usize,
-    known_total_turns: Option<usize>,
+pub(crate) struct LocalRolloutTurnWindow {
+    pub(crate) turns: Vec<Value>,
+    pub(crate) loaded_start: usize,
+    pub(crate) known_total_turns: Option<usize>,
+    pub(crate) truncated: bool,
+    pub(crate) token_usage: Value,
+    pub(crate) recovery: Option<RolloutRecoveryInfoPayload>,
+    pub(crate) modified_at_ms: Option<u64>,
+}
+
+struct RolloutRecord {
+    value: Value,
+    absolute_offset: u64,
+}
+
+struct RolloutRecordWindow {
+    records: Vec<RolloutRecord>,
     truncated: bool,
-    token_usage: Value,
+    corruption_detected: bool,
+    modified_at_ms: Option<u64>,
 }
 
 async fn clear_completed_session_highlight_on_open(
@@ -552,10 +565,15 @@ fn rollout_tail_records(
     path: &Path,
     target_turns: usize,
     max_bytes: u64,
-) -> Result<(Vec<Value>, bool), String> {
+) -> Result<RolloutRecordWindow, String> {
     let metadata =
         fs::metadata(path).map_err(|error| format!("failed to stat rollout file: {error}"))?;
     let file_len = metadata.len();
+    let modified_at_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
     let mut window = SESSION_DETAIL_ROLLOUT_TAIL_INITIAL_BYTES.min(file_len.max(1));
     let target_turns = target_turns.max(1);
 
@@ -563,29 +581,72 @@ fn rollout_tail_records(
         let start = file_len.saturating_sub(window);
         let mut file = fs::File::open(path)
             .map_err(|error| format!("failed to open rollout file: {error}"))?;
+        let starts_at_line_boundary = if start == 0 {
+            true
+        } else {
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start.saturating_sub(1)))
+                .map_err(|error| format!("failed to seek rollout file: {error}"))?;
+            let mut previous = [0_u8; 1];
+            std::io::Read::read_exact(&mut file, &mut previous)
+                .map_err(|error| format!("failed to inspect rollout boundary: {error}"))?;
+            previous[0] == b'\n'
+        };
         std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start))
             .map_err(|error| format!("failed to seek rollout file: {error}"))?;
         let mut buffer = Vec::with_capacity(window.min(usize::MAX as u64) as usize);
         std::io::Read::read_to_end(&mut file, &mut buffer)
             .map_err(|error| format!("failed to read rollout file: {error}"))?;
-        let text = String::from_utf8_lossy(&buffer);
-        let mut lines = text.lines();
-        if start > 0 {
-            lines.next();
+        let mut cursor = 0_usize;
+        if !starts_at_line_boundary {
+            cursor = buffer
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|index| index.saturating_add(1))
+                .unwrap_or(buffer.len());
         }
-        let records = lines
-            .filter_map(|line| {
-                let trimmed = line.trim();
-                rollout_tail_line_may_affect_detail(trimmed)
-                    .then(|| serde_json::from_str::<Value>(trimmed).ok())
-                    .flatten()
-            })
-            .collect::<Vec<_>>();
+        let mut records = Vec::new();
+        let mut corruption_detected = false;
+        while cursor < buffer.len() {
+            let line_start = cursor;
+            let next_newline = buffer[cursor..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|relative| cursor.saturating_add(relative));
+            let Some(line_end) = next_newline else {
+                // A writer may be appending the final JSONL record. Do not classify a
+                // partial trailing line as corruption until its newline is durable.
+                break;
+            };
+            cursor = line_end.saturating_add(1);
+            let mut line = &buffer[line_start..line_end];
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len().saturating_sub(1)];
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(line) else {
+                corruption_detected = true;
+                continue;
+            };
+            let trimmed = text.trim();
+            let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+                corruption_detected = true;
+                continue;
+            };
+            if rollout_tail_line_may_affect_detail(trimmed) {
+                records.push(RolloutRecord {
+                    value,
+                    absolute_offset: start.saturating_add(line_start as u64),
+                });
+            }
+        }
         let started_turn_count = records
             .iter()
             .filter(|record| {
-                record.get("type").and_then(Value::as_str) == Some("event_msg")
+                record.value.get("type").and_then(Value::as_str) == Some("event_msg")
                     && record
+                        .value
                         .get("payload")
                         .and_then(|payload| payload.get("type"))
                         .and_then(Value::as_str)
@@ -593,7 +654,12 @@ fn rollout_tail_records(
             })
             .count();
         if start == 0 || started_turn_count > target_turns || window >= max_bytes.min(file_len) {
-            return Ok((records, start > 0));
+            return Ok(RolloutRecordWindow {
+                records,
+                truncated: start > 0,
+                corruption_detected,
+                modified_at_ms,
+            });
         }
         window = window.saturating_mul(2).min(max_bytes).min(file_len);
     }
@@ -627,16 +693,23 @@ fn rollout_tail_line_may_affect_detail(line: &str) -> bool {
 }
 
 fn build_turn_window_from_rollout_records(
-    records: Vec<Value>,
+    record_window: RolloutRecordWindow,
     limit: usize,
-    truncated: bool,
 ) -> LocalRolloutTurnWindow {
+    let RolloutRecordWindow {
+        records,
+        truncated,
+        corruption_detected: _,
+        modified_at_ms,
+    } = record_window;
     let mut turns = Vec::new();
     let mut current_index = None;
     let mut call_turn_indices: HashMap<String, usize> = HashMap::new();
     let mut token_usage = Value::Null;
 
-    for (record_index, record) in records.iter().enumerate() {
+    for record in &records {
+        let record_identity = record.absolute_offset;
+        let record = &record.value;
         let timestamp_ms = parse_rollout_timestamp_ms(record);
         let record_type = record
             .get("type")
@@ -667,12 +740,17 @@ fn build_turn_window_from_rollout_records(
             }
             ("event_msg", "task_complete") => {
                 let turn_id = payload.get("turn_id").and_then(Value::as_str);
+                let previous_current_index = current_index;
                 let index = ensure_rollout_turn_index(
                     &mut turns,
                     &mut current_index,
                     turn_id,
                     timestamp_ms,
                 );
+                // Completion for an older turn may arrive after a newer turn has
+                // started. Updating that turn must not redirect following unscoped
+                // records back to the completed turn.
+                current_index = previous_current_index;
                 if let Some(turn) = turns.get_mut(index).and_then(Value::as_object_mut) {
                     if turn.get("status").and_then(Value::as_str) != Some("failed") {
                         turn.insert("status".to_string(), json!("completed"));
@@ -718,7 +796,7 @@ fn build_turn_window_from_rollout_records(
                             if let Some(items) = turn.get_mut("items").and_then(Value::as_array_mut)
                             {
                                 items.push(json!({
-                                    "id": format!("{turn_item_prefix}:agent-complete:{record_index}"),
+                                    "id": format!("{turn_item_prefix}:agent-complete:{record_identity}"),
                                     "type": "agentMessage",
                                     "text": last_agent_message,
                                     "phase": "final_answer"
@@ -728,7 +806,7 @@ fn build_turn_window_from_rollout_records(
                     }
                     mark_turn_without_agent_output_failed(
                         &mut turns[index],
-                        record_index.to_string(),
+                        record_identity.to_string(),
                     );
                 }
             }
@@ -796,7 +874,7 @@ fn build_turn_window_from_rollout_records(
                     push_rollout_item(
                         &mut turns[index],
                         json!({
-                            "id": format!("{turn_item_prefix}:user:{record_index}"),
+                            "id": format!("{turn_item_prefix}:user:{record_identity}"),
                             "type": "userMessage",
                             "text": message
                         }),
@@ -825,7 +903,7 @@ fn build_turn_window_from_rollout_records(
                     &mut turns[index],
                     context_compaction_item_from_rollout_payload(
                         item,
-                        format!("{turn_item_prefix}:context-compaction:{record_index}"),
+                        format!("{turn_item_prefix}:context-compaction:{record_identity}"),
                         "running",
                     ),
                 );
@@ -853,7 +931,7 @@ fn build_turn_window_from_rollout_records(
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| {
-                        format!("{turn_item_prefix}:context-compaction:{record_index}")
+                        format!("{turn_item_prefix}:context-compaction:{record_identity}")
                     });
                 let updated = update_rollout_item(&mut turns[index], &compaction_id, |existing| {
                     if let Some(object) = existing.as_object_mut() {
@@ -888,7 +966,7 @@ fn build_turn_window_from_rollout_records(
                     push_rollout_item(
                         &mut turns[index],
                         json!({
-                            "id": format!("{turn_item_prefix}:agent:{record_index}"),
+                            "id": format!("{turn_item_prefix}:agent:{record_identity}"),
                             "type": "agentMessage",
                             "text": message,
                             "phase": payload.get("phase").cloned().unwrap_or(Value::Null)
@@ -927,7 +1005,7 @@ fn build_turn_window_from_rollout_records(
                     &mut turns[index],
                     web_search_item_from_rollout_payload(
                         payload,
-                        format!("{turn_item_prefix}:web-search:{record_index}"),
+                        format!("{turn_item_prefix}:web-search:{record_identity}"),
                         "running",
                     ),
                 );
@@ -942,7 +1020,7 @@ fn build_turn_window_from_rollout_records(
                     .to_string();
                 let item = web_search_item_from_rollout_payload(
                     payload,
-                    format!("{turn_item_prefix}:web-search:{record_index}"),
+                    format!("{turn_item_prefix}:web-search:{record_identity}"),
                     "completed",
                 );
                 let item_id = item
@@ -971,7 +1049,7 @@ fn build_turn_window_from_rollout_records(
                     &mut turns[index],
                     image_generation_item_from_rollout_payload(
                         payload,
-                        format!("{turn_item_prefix}:image-generation:{record_index}"),
+                        format!("{turn_item_prefix}:image-generation:{record_identity}"),
                         "running",
                     ),
                 );
@@ -986,7 +1064,7 @@ fn build_turn_window_from_rollout_records(
                     .to_string();
                 let item = image_generation_item_from_rollout_payload(
                     payload,
-                    format!("{turn_item_prefix}:image-generation:{record_index}"),
+                    format!("{turn_item_prefix}:image-generation:{record_identity}"),
                     "completed",
                 );
                 let item_id = item
@@ -1019,7 +1097,7 @@ fn build_turn_window_from_rollout_records(
                             .or_else(|| payload.get("id"))
                             .and_then(Value::as_str)
                             .map(str::to_string)
-                            .unwrap_or_else(|| format!("{turn_item_prefix}:image-view:{record_index}")),
+                            .unwrap_or_else(|| format!("{turn_item_prefix}:image-view:{record_identity}")),
                         "type": "imageView",
                         "path": payload.get("path").cloned().unwrap_or(Value::Null),
                         "status": "completed"
@@ -1043,7 +1121,7 @@ fn build_turn_window_from_rollout_records(
                     &mut turns[index],
                     review_mode_item_from_rollout_payload(
                         payload,
-                        format!("{turn_item_prefix}:{payload_type}:{record_index}"),
+                        format!("{turn_item_prefix}:{payload_type}:{record_identity}"),
                         item_type,
                     ),
                 );
@@ -1170,7 +1248,7 @@ fn build_turn_window_from_rollout_records(
                 push_rollout_item(
                     &mut turns[index],
                     json!({
-                        "id": format!("{turn_item_prefix}:reasoning:{record_index}"),
+                        "id": format!("{turn_item_prefix}:reasoning:{record_identity}"),
                         "type": "reasoning",
                         "text": text,
                         "summary": summary
@@ -1189,7 +1267,7 @@ fn build_turn_window_from_rollout_records(
                     &mut turns[index],
                     context_compaction_item_from_rollout_payload(
                         payload,
-                        format!("{turn_item_prefix}:context-compaction:{record_index}"),
+                        format!("{turn_item_prefix}:context-compaction:{record_identity}"),
                         if payload.get("encrypted_content").is_some() {
                             "completed"
                         } else {
@@ -1223,7 +1301,7 @@ fn build_turn_window_from_rollout_records(
         }
     }
     let known_total_turns = (!truncated).then_some(turns.len());
-    let window_size = limit.clamp(1, 200);
+    let window_size = limit.max(1);
     let loaded_start = turns.len().saturating_sub(window_size);
     let turns = turns[loaded_start..].to_vec();
     LocalRolloutTurnWindow {
@@ -1232,10 +1310,12 @@ fn build_turn_window_from_rollout_records(
         known_total_turns,
         truncated,
         token_usage,
+        recovery: None,
+        modified_at_ms,
     }
 }
 
-async fn read_local_rollout_turn_window(
+pub(crate) async fn read_local_rollout_turn_window(
     rollout_path: PathBuf,
     limit: usize,
 ) -> ApiResult<LocalRolloutTurnWindow> {
@@ -1253,10 +1333,18 @@ async fn read_local_rollout_turn_window_with_max(
     max_bytes: u64,
 ) -> ApiResult<LocalRolloutTurnWindow> {
     tokio::task::spawn_blocking(move || {
-        let (records, truncated) = rollout_tail_records(&rollout_path, limit, max_bytes)?;
-        Ok::<_, String>(build_turn_window_from_rollout_records(
-            records, limit, truncated,
-        ))
+        let record_window = rollout_tail_records(&rollout_path, limit, max_bytes)?;
+        let corruption_detected = record_window.corruption_detected;
+        let mut turn_window = build_turn_window_from_rollout_records(record_window, limit);
+        if corruption_detected {
+            let rollout_buffer = fs::read(&rollout_path)
+                .map_err(|error| format!("failed to inspect corrupted rollout file: {error}"))?;
+            let recovery = inspect_rollout_recovery_content(&rollout_buffer).info;
+            if recovery.available {
+                turn_window.recovery = Some(recovery);
+            }
+        }
+        Ok::<_, String>(turn_window)
     })
     .await
     .map_err(|error| {
@@ -1273,11 +1361,21 @@ async fn read_local_rollout_turn_window_with_max(
     })
 }
 
+pub(crate) async fn read_local_rollout_full_window(
+    rollout_path: PathBuf,
+) -> ApiResult<LocalRolloutTurnWindow> {
+    read_local_rollout_turn_window_with_max(rollout_path, usize::MAX, u64::MAX).await
+}
+
 async fn find_rollout_path_by_session_id(
     state: &AppState,
     profile_id: &str,
     session_id: &str,
 ) -> ApiResult<Option<PathBuf>> {
+    if let Some(path) = find_rollout_path_by_session_id_direct(state, profile_id, session_id) {
+        return Ok(Some(path));
+    }
+
     for archived in [false, true] {
         let candidates = list_rollout_candidates_payload(state, profile_id, archived).await?;
         for candidate in candidates {
@@ -1295,6 +1393,74 @@ async fn find_rollout_path_by_session_id(
         }
     }
     Ok(None)
+}
+
+fn find_rollout_path_by_session_id_direct(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    let profile = resolve_runtime_profile(&state.config, profile_id);
+    for date in uuid_v7_session_date_candidates(session_id) {
+        let day_directory = profile
+            .codex_home
+            .join("sessions")
+            .join(date.year().to_string())
+            .join(format!("{:02}", u8::from(date.month())))
+            .join(format!("{:02}", date.day()));
+        if let Some(path) = find_rollout_path_in_directory(&day_directory, session_id) {
+            return Some(path);
+        }
+    }
+    find_rollout_path_in_directory(&profile.codex_home.join("archived_sessions"), session_id)
+}
+
+fn uuid_v7_session_date_candidates(session_id: &str) -> Vec<time::Date> {
+    let hex = session_id
+        .chars()
+        .filter(|character| *character != '-')
+        .collect::<String>();
+    let Ok(timestamp_ms) = u64::from_str_radix(hex.get(..12).unwrap_or_default(), 16) else {
+        return Vec::new();
+    };
+    let Ok(timestamp_seconds) = i64::try_from(timestamp_ms / 1000) else {
+        return Vec::new();
+    };
+    let Ok(base) = time::OffsetDateTime::from_unix_timestamp(timestamp_seconds) else {
+        return Vec::new();
+    };
+    let mut dates = Vec::with_capacity(3);
+    for offset in [0_i64, -1, 1] {
+        let Some(candidate) = base.checked_add(time::Duration::days(offset)) else {
+            continue;
+        };
+        let date = candidate.date();
+        if !dates.contains(&date) {
+            dates.push(date);
+        }
+    }
+    dates
+}
+
+fn find_rollout_path_in_directory(directory: &Path, session_id: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(directory).ok()?;
+    let suffix = format!("{session_id}.jsonl");
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(&suffix))
+        {
+            return Some(entry.path());
+        }
+    }
+    None
 }
 
 async fn read_local_session_detail_source(
@@ -1416,11 +1582,71 @@ pub(crate) async fn session_detail_payload(
         mut visible_turns,
         total_turns,
         start,
-        hydration_state,
+        mut hydration_state,
         hydration_message,
         hydration_recovery,
     ) = match read_local_session_detail_source(state, profile_id, session_id, limit).await? {
-        Some((mut thread, turn_window)) => {
+        Some((mut thread, mut turn_window)) => {
+            let metadata_status = normalized_thread_status(thread.get("status"));
+            let metadata_updated_at = thread
+                .get("updatedAt")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let terminal_metadata_is_newer_than_rollout = metadata_status
+                .as_deref()
+                .is_some_and(|status| !is_live_thread_status(status) && status != "notLoaded")
+                && turn_window
+                    .modified_at_ms
+                    .is_some_and(|modified_at| metadata_updated_at > modified_at);
+            if terminal_metadata_is_newer_than_rollout {
+                if let Ok(Some(response)) = tokio::time::timeout(
+                    Duration::from_millis(SESSION_DETAIL_ACTIVE_RECONCILE_TIMEOUT_MS),
+                    async {
+                        let Ok(client) =
+                            app_server_client_for_session(state, profile_id, session_id).await
+                        else {
+                            return None;
+                        };
+                        client
+                            .request_with_timeout(
+                                "thread/read",
+                                json!({
+                                    "threadId": session_id,
+                                    "includeTurns": true
+                                }),
+                                Duration::from_millis(SESSION_DETAIL_ACTIVE_RECONCILE_TIMEOUT_MS),
+                                false,
+                            )
+                            .await
+                            .ok()
+                    },
+                )
+                .await
+                {
+                    if let Some(authoritative_thread) = response.get("thread").cloned() {
+                        let authoritative_turns = authoritative_thread
+                            .get("turns")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        if !authoritative_turns.is_empty() {
+                            let window_size = limit.clamp(1, 200) as usize;
+                            let loaded_start =
+                                authoritative_turns.len().saturating_sub(window_size);
+                            turn_window.turns = authoritative_turns[loaded_start..].to_vec();
+                            turn_window.loaded_start = loaded_start;
+                            turn_window.known_total_turns = Some(authoritative_turns.len());
+                            turn_window.truncated = false;
+                            if let Some(token_usage) =
+                                authoritative_thread.get("tokenUsage").cloned()
+                            {
+                                turn_window.token_usage = token_usage;
+                            }
+                            thread = authoritative_thread;
+                        }
+                    }
+                }
+            }
             if !turn_window.token_usage.is_null() {
                 if let Some(thread_object) = thread.as_object_mut() {
                     thread_object
@@ -1446,20 +1672,36 @@ pub(crate) async fn session_detail_payload(
             let total_turns = turn_window
                 .known_total_turns
                 .unwrap_or_else(|| start.saturating_add(visible_turns.len()));
+            let recovery = turn_window
+                .recovery
+                .as_ref()
+                .map(|recovery| json!(recovery))
+                .unwrap_or_else(|| {
+                    json!({
+                        "available": false,
+                        "issue": Value::Null,
+                        "totalLines": Value::Null,
+                        "recoverableLines": Value::Null,
+                        "skippedLines": Value::Null
+                    })
+                });
+            let has_recovery = turn_window.recovery.is_some();
             (
                 thread,
                 visible_turns,
                 total_turns,
                 start,
-                if start > 0 { "idle" } else { "complete" },
-                Value::Null,
-                json!({
-                    "available": false,
-                    "issue": Value::Null,
-                    "totalLines": Value::Null,
-                    "recoverableLines": Value::Null,
-                    "skippedLines": Value::Null
-                }),
+                if has_recovery {
+                    "error"
+                } else if start > 0 {
+                    "idle"
+                } else {
+                    "complete"
+                },
+                has_recovery
+                    .then(|| Value::String("The rollout contains recoverable corruption.".into()))
+                    .unwrap_or(Value::Null),
+                recovery,
             )
         }
         None => match read_thread_payload(state, profile_id, session_id, true).await {
@@ -1496,46 +1738,83 @@ pub(crate) async fn session_detail_payload(
                 )
             }
             Err(error) => {
-                let thread = read_thread_metadata_payload(state, profile_id, session_id)
-                    .await
-                    .map_err(|_| error.clone())?;
-                let rollout_path = resolve_rollout_path(state, profile_id, session_id, &thread)
-                    .ok_or_else(|| error.clone())?;
-                let rollout_buffer = tokio_fs::read(&rollout_path)
-                    .await
-                    .map_err(|_| error.clone())?;
-                let plan = inspect_rollout_recovery_content(&rollout_buffer);
-                if !plan.info.available
-                    || plan.info.recoverable_lines == 0
-                    || plan.recovered_content.trim().is_empty()
-                {
-                    return Err(error);
-                }
+                if is_unmaterialized_thread_error_message(&error.message) {
+                    let thread = read_thread_metadata_payload(state, profile_id, session_id)
+                        .await
+                        .unwrap_or_else(|_| {
+                            json!({
+                                "id": session_id,
+                                "name": Value::Null,
+                                "preview": "",
+                                "cwd": Value::Null,
+                                "status": "notLoaded",
+                                "createdAt": 0,
+                                "updatedAt": 0,
+                                "archived": false,
+                                "turns": []
+                            })
+                        });
+                    (
+                        thread,
+                        Vec::new(),
+                        0,
+                        0,
+                        "idle",
+                        Value::Null,
+                        json!({
+                            "available": false,
+                            "issue": "thread_not_loaded",
+                            "totalLines": Value::Null,
+                            "recoverableLines": Value::Null,
+                            "skippedLines": Value::Null
+                        }),
+                    )
+                } else {
+                    let thread = read_thread_metadata_payload(state, profile_id, session_id)
+                        .await
+                        .map_err(|_| error.clone())?;
+                    let rollout_path = resolve_rollout_path(state, profile_id, session_id, &thread)
+                        .ok_or_else(|| error.clone())?;
+                    let rollout_buffer = tokio_fs::read(&rollout_path)
+                        .await
+                        .map_err(|_| error.clone())?;
+                    let plan = inspect_rollout_recovery_content(&rollout_buffer);
+                    if !plan.info.available
+                        || plan.info.recoverable_lines == 0
+                        || plan.recovered_content.trim().is_empty()
+                    {
+                        return Err(error);
+                    }
 
-                let turns = thread
-                    .get("turns")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let total_turns = turns.len();
-                let window_size = limit.clamp(1, 200) as usize;
-                let start = total_turns.saturating_sub(window_size);
-                let visible_turns = turns[start..]
-                    .iter()
-                    .enumerate()
-                    .map(|(visible_index, turn)| {
-                        summarize_session_turn_for_detail_payload(turn, start + visible_index, true)
-                    })
-                    .collect::<Vec<_>>();
-                (
-                    thread,
-                    visible_turns,
-                    total_turns,
-                    start,
-                    "error",
-                    Value::String(error.message),
-                    json!(plan.info),
-                )
+                    let turns = thread
+                        .get("turns")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let total_turns = turns.len();
+                    let window_size = limit.clamp(1, 200) as usize;
+                    let start = total_turns.saturating_sub(window_size);
+                    let visible_turns = turns[start..]
+                        .iter()
+                        .enumerate()
+                        .map(|(visible_index, turn)| {
+                            summarize_session_turn_for_detail_payload(
+                                turn,
+                                start + visible_index,
+                                true,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        thread,
+                        visible_turns,
+                        total_turns,
+                        start,
+                        "error",
+                        Value::String(error.message),
+                        json!(plan.info),
+                    )
+                }
             }
         },
     };
@@ -1663,8 +1942,21 @@ pub(crate) async fn session_detail_payload(
             }
         }
     }
-    apply_language_bridge_translations_to_turns(state, profile_id, session_id, &mut visible_turns)
-        .await?;
+    if let Err(error) = apply_language_bridge_translations_to_turns(
+        state,
+        profile_id,
+        session_id,
+        &mut visible_turns,
+    )
+    .await
+    {
+        tracing::warn!(
+            profile_id,
+            session_id,
+            error = %error.message,
+            "failed to apply language bridge translations to session detail"
+        );
+    }
     let active_turn_id_from_payload = if stale_active_turn_after_exit {
         None
     } else {
@@ -1699,6 +1991,9 @@ pub(crate) async fn session_detail_payload(
             .cloned()
             .unwrap_or_else(|| json!("unknown"))
     };
+    if active_turn_id.is_some() && hydration_state == "complete" {
+        hydration_state = "idle";
+    }
     let preferences = with_ui_state_read(state, profile_id, |ui_state| {
         Ok(ui_state
             .get("preferencesByThreadId")
@@ -1711,13 +2006,33 @@ pub(crate) async fn session_detail_payload(
                 })
             }))
     })
-    .await?;
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(
+            profile_id,
+            session_id,
+            error = %error.message,
+            "failed to read session preferences for detail"
+        );
+        json!({
+            "cwd": thread.get("cwd").cloned().unwrap_or(Value::Null)
+        })
+    });
     let selected_skills = with_ui_state_read(state, profile_id, |ui_state| {
         Ok(Value::Array(session_selected_skills_from_ui_state(
             ui_state, session_id,
         )))
     })
-    .await?;
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(
+            profile_id,
+            session_id,
+            error = %error.message,
+            "failed to read selected skills for session detail"
+        );
+        json!([])
+    });
     let cached_goal = cached_session_goal_or_null_payload(state, profile_id, session_id).await;
     let goal = if cached_goal.is_null() {
         tokio::time::timeout(
@@ -1732,8 +2047,43 @@ pub(crate) async fn session_detail_payload(
         cached_goal
     };
     clear_completed_session_highlight_on_open(state, profile_id, session_id).await;
+    let (detail_profile_id, detail_profile) =
+        resolve_runtime_profile_entry(&state.config, profile_id);
+
+    let attachments = list_session_attachments_payload(state, profile_id, session_id)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                profile_id,
+                session_id,
+                error = %error.message,
+                "failed to read session attachments for detail"
+            );
+            Vec::new()
+        });
+    let queue = get_session_queue_payload(state, profile_id, session_id)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                profile_id,
+                session_id,
+                error = %error.message,
+                "failed to read session queue for detail"
+            );
+            json!({
+                "sessionId": session_id,
+                "items": [],
+                "resumeRequired": false,
+                "updatedAt": Value::Null
+            })
+        });
 
     let payload = json!({
+        "profileId": detail_profile_id,
+        "profileLabel": detail_profile.label,
+        "profileCodexHome": detail_profile.codex_home.display().to_string(),
+        "accountEmail": Value::Null,
+        "accountType": Value::Null,
         "thread": {
             "id": thread.get("id").cloned().unwrap_or_else(|| json!(session_id)),
             "preview": thread.get("preview").cloned().unwrap_or_else(|| json!("")),
@@ -1750,8 +2100,8 @@ pub(crate) async fn session_detail_payload(
         "preferences": preferences,
         "selectedSkills": selected_skills,
         "goal": goal,
-        "attachments": list_session_attachments_payload(state, profile_id, session_id).await?,
-        "queue": get_session_queue_payload(state, profile_id, session_id).await?,
+        "attachments": attachments,
+        "queue": queue,
         "pendingRequests": session_pending_requests_payload(state, profile_id, session_id).await,
         "activeTurnId": active_turn_id,
         "tokenUsage": thread.get("tokenUsage").cloned().unwrap_or(Value::Null),
@@ -1989,12 +2339,10 @@ pub(crate) async fn session_older_turns_payload(
     if let Some(rollout_path) =
         find_rollout_path_by_session_id(state, profile_id, session_id).await?
     {
-        let turn_window = read_local_rollout_turn_window_with_max(
-            rollout_path,
-            200,
-            SESSION_OLDER_ROLLOUT_TAIL_MAX_BYTES,
-        )
-        .await?;
+        // Older-page requests are explicit and infrequent. Parse the complete
+        // rollout here so pagination can cross both the 200-turn and tail-byte
+        // boundaries without pretending that missing history does not exist.
+        let turn_window = read_local_rollout_full_window(rollout_path).await?;
         let turns = turn_window.turns;
         let Some(before_index) = turns
             .iter()
@@ -2004,7 +2352,7 @@ pub(crate) async fn session_older_turns_payload(
                 "turns": [],
                 "loadedTurns": turn_window.loaded_start,
                 "totalTurns": turn_window.loaded_start.saturating_add(turns.len()),
-                "remainingTurns": 0
+                "remainingTurns": usize::from(turn_window.truncated)
             }));
         };
         let window_size = limit.clamp(1, 200) as usize;
@@ -2020,18 +2368,11 @@ pub(crate) async fn session_older_turns_payload(
                 )
             })
             .collect::<Vec<_>>();
-        let remaining_turns = if visible_turns.is_empty() {
-            0
-        } else {
-            turn_window
-                .loaded_start
-                .saturating_add(start)
-                .saturating_add(usize::from(turn_window.truncated))
-        };
+        let remaining_turns = turn_window.loaded_start.saturating_add(start);
         return Ok(json!({
             "turns": visible_turns,
             "loadedTurns": turn_window.loaded_start.saturating_add(before_index),
-            "totalTurns": turn_window.loaded_start.saturating_add(turns.len()).saturating_add(usize::from(turn_window.truncated)),
+            "totalTurns": turn_window.known_total_turns.unwrap_or_else(|| turn_window.loaded_start.saturating_add(turns.len())),
             "remainingTurns": remaining_turns
         }));
     }
@@ -2078,12 +2419,7 @@ pub(crate) async fn session_rollback_targets_payload(
     if let Some(rollout_path) =
         find_rollout_path_by_session_id(state, profile_id, session_id).await?
     {
-        let turn_window = read_local_rollout_turn_window_with_max(
-            rollout_path,
-            500,
-            SESSION_OLDER_ROLLOUT_TAIL_MAX_BYTES,
-        )
-        .await?;
+        let turn_window = read_local_rollout_full_window(rollout_path).await?;
         return Ok(rollback_targets_from_turns(
             &turn_window.turns,
             turn_window.loaded_start,
@@ -2115,12 +2451,7 @@ pub(crate) async fn session_turn_payload(
     if let Some(rollout_path) =
         find_rollout_path_by_session_id(state, profile_id, session_id).await?
     {
-        let turn_window = read_local_rollout_turn_window_with_max(
-            rollout_path,
-            200,
-            SESSION_OLDER_ROLLOUT_TAIL_MAX_BYTES,
-        )
-        .await?;
+        let turn_window = read_local_rollout_full_window(rollout_path).await?;
         if let Some(turn) = turn_window
             .turns
             .iter()

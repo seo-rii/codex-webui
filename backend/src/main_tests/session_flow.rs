@@ -1,4 +1,5 @@
 use super::*;
+use axum::body::{Body, to_bytes};
 use rusqlite::{Connection, params};
 
 fn write_rollout_fixture(
@@ -225,6 +226,20 @@ async fn move_session_profile_moves_rollout_and_ui_state() {
             .unwrap()
             .contains("AI summarized moved session")
     );
+    let source_index_entries = fs::read_to_string(source_codex_home.join("session_index.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry.get("id").and_then(Value::as_str) == Some(session_id))
+        .count();
+    let target_index_entries = fs::read_to_string(target_codex_home.join("session_index.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry.get("id").and_then(Value::as_str) == Some(session_id))
+        .count();
+    assert_eq!(source_index_entries, 0);
+    assert_eq!(target_index_entries, 1);
 
     let source_meta = with_ui_state_read(&state, "default", |ui_state| {
         Ok(ui_state
@@ -1022,6 +1037,362 @@ async fn list_sessions_payload_includes_all_profiles_unless_profile_filtered() {
             .and_then(|session| session.get("profileId"))
             .and_then(Value::as_str),
         Some("second")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_turn_send_routes_by_session_profile_when_request_profile_is_stale() {
+    let sandbox = unique_test_dir("session-send-profile-routing");
+    let workspace = sandbox.join("workspace");
+    let default_codex_home = sandbox.join("codex-default");
+    let second_codex_home = sandbox.join("codex-second");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&default_codex_home).unwrap();
+    fs::create_dir_all(&second_codex_home).unwrap();
+
+    let mut state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        default_codex_home.clone(),
+    );
+    let mut config = (*state.config).clone();
+    config.config_file_path = Some(sandbox.join("isolated-codex-webui.yml"));
+    config.profiles.insert(
+        "second".to_string(),
+        RuntimeProfile {
+            label: "Second".to_string(),
+            codex_home: second_codex_home.clone(),
+            data_dir: sandbox.join(".data").join("profiles").join("second"),
+        },
+    );
+    state.config = Arc::new(config);
+
+    let session_id = "019f0000-0000-7000-8000-000000000302";
+    write_rollout_fixture(
+        &second_codex_home,
+        false,
+        "2026/06/24",
+        "2026-06-24T00-03-00",
+        session_id,
+        &workspace,
+        "Second profile send",
+        &[],
+        None,
+    );
+    app_server_client(&state, "second")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Second profile send",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let auth = AuthContext {
+        role: UserRole::Admin,
+        profile_id: "default".to_string(),
+    };
+
+    let detail = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "session/get",
+        json!({
+            "sessionId": session_id,
+            "profileId": "default",
+            "limit": 20
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        detail.get("profileId").and_then(Value::as_str),
+        Some("second")
+    );
+
+    execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "turn/send",
+        json!({
+            "sessionId": session_id,
+            "profileId": "default",
+            "prompt": "Route this to the second profile",
+            "preferences": {
+                "cwd": workspace.display().to_string(),
+                "model": "gpt-5"
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let second_thread = read_thread_payload(&state, "second", session_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        second_thread
+            .get("lastTurnStart")
+            .and_then(|value| value.get("input"))
+            .and_then(Value::as_array)
+            .and_then(|input| input.first())
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str),
+        Some("Route this to the second profile")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_session_detail_routes_by_actual_session_profile() {
+    let sandbox = unique_test_dir("http-session-detail-profile-routing");
+    let workspace = sandbox.join("workspace");
+    let default_codex_home = sandbox.join("codex-default");
+    let second_codex_home = sandbox.join("codex-second");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&default_codex_home).unwrap();
+    fs::create_dir_all(&second_codex_home).unwrap();
+
+    let mut state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        default_codex_home.clone(),
+    );
+    let mut config = (*state.config).clone();
+    config.config_file_path = Some(sandbox.join("isolated-codex-webui.yml"));
+    config.profiles.insert(
+        "second".to_string(),
+        RuntimeProfile {
+            label: "Second".to_string(),
+            codex_home: second_codex_home.clone(),
+            data_dir: sandbox.join(".data").join("profiles").join("second"),
+        },
+    );
+    state.config = Arc::new(config);
+
+    let session_id = "019f0000-0000-7000-8000-000000000303";
+    write_rollout_fixture(
+        &second_codex_home,
+        false,
+        "2026/06/24",
+        "2026-06-24T00-03-01",
+        session_id,
+        &workspace,
+        "Second profile detail",
+        &[],
+        None,
+    );
+
+    let auth = AuthContext {
+        role: UserRole::Admin,
+        profile_id: "default".to_string(),
+    };
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/sessions/{session_id}?profileId=default"))
+        .body(Body::empty())
+        .unwrap();
+    let response = handle_session_api_http(state.clone(), session_id, request, auth).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        payload.get("profileId").and_then(Value::as_str),
+        Some("second")
+    );
+    assert_eq!(
+        payload
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(Value::as_str),
+        Some(session_id)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_approval_resolve_routes_by_actual_session_profile() {
+    let sandbox = unique_test_dir("approval-profile-routing");
+    let workspace = sandbox.join("workspace");
+    let default_codex_home = sandbox.join("codex-default");
+    let second_codex_home = sandbox.join("codex-second");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&default_codex_home).unwrap();
+    fs::create_dir_all(&second_codex_home).unwrap();
+
+    let mut state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        default_codex_home.clone(),
+    );
+    let mut config = (*state.config).clone();
+    config.config_file_path = Some(sandbox.join("isolated-codex-webui.yml"));
+    config.profiles.insert(
+        "second".to_string(),
+        RuntimeProfile {
+            label: "Second".to_string(),
+            codex_home: second_codex_home.clone(),
+            data_dir: sandbox.join(".data").join("profiles").join("second"),
+        },
+    );
+    state.config = Arc::new(config);
+
+    let session_id = "019f0000-0000-7000-8000-000000000304";
+    write_rollout_fixture(
+        &second_codex_home,
+        false,
+        "2026/06/24",
+        "2026-06-24T00-03-02",
+        session_id,
+        &workspace,
+        "Second profile approval",
+        &[],
+        None,
+    );
+    let resolved_second_profile_id = resolve_runtime_profile_entry(&state.config, "second").0;
+    app_server_client(&state, &resolved_second_profile_id)
+        .await
+        .unwrap();
+    state
+        .pending_server_requests
+        .lock()
+        .await
+        .entry(runtime_session_key(&resolved_second_profile_id, session_id))
+        .or_default()
+        .insert(
+            "srv-second".to_string(),
+            PendingServerRequestEntry {
+                raw_id: json!("srv-second"),
+                client_key: resolved_second_profile_id.clone(),
+                method: "input/request".to_string(),
+                params: json!({
+                    "threadId": session_id,
+                    "question": "Continue on second?"
+                }),
+                created_at: now_rfc3339(),
+                created_at_ms: now_unix_ms(),
+            },
+        );
+
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let auth = AuthContext {
+        role: UserRole::Admin,
+        profile_id: "default".to_string(),
+    };
+
+    let payload = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &auth,
+        "approval/resolve",
+        json!({
+            "sessionId": session_id,
+            "profileId": "default",
+            "requestId": "srv-second",
+            "result": { "answer": "yes" }
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+    assert!(
+        state
+            .pending_server_requests
+            .lock()
+            .await
+            .get(&runtime_session_key(
+                &resolved_second_profile_id,
+                session_id
+            ))
+            .is_none()
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_detail_uses_direct_rollout_lookup_when_rollout_index_cache_misses() {
+    let sandbox = unique_test_dir("session-detail-direct-rollout-lookup");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let session_id = "019d8253-a534-7dc2-a323-864d5c56eb65";
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/13",
+        "2026-04-13T00-33-33",
+        session_id,
+        &workspace,
+        "Open this old session",
+        &[],
+        None,
+    );
+
+    state.session_thread_cache.lock().await.insert(
+        "default:rollout-index:archived=false".to_string(),
+        CachedSessionThreads {
+            created_at: Instant::now(),
+            threads: vec![],
+            next_cursor: String::new(),
+        },
+    );
+
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(Value::as_str),
+        Some(session_id)
+    );
+    assert!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("turns"))
+            .and_then(Value::as_array)
+            .is_some_and(|turns| !turns.is_empty())
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -3557,6 +3928,7 @@ async fn app_server_exit_clears_cached_running_session_state() {
             "request-crashed".to_string(),
             PendingServerRequestEntry {
                 raw_id: json!("request-crashed"),
+                client_key: "default".to_string(),
                 method: "input/request".to_string(),
                 params: json!({ "threadId": session_id }),
                 created_at: "2026-05-20T00:00:00Z".to_string(),
@@ -3701,6 +4073,50 @@ async fn app_server_exit_clears_cached_running_session_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_server_exit_ignores_unassigned_stale_runtime_status() {
+    let sandbox = unique_test_dir("app-server-exit-stale-runtime-only");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let session_id = "thread-stale-runtime-only";
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][session_id] = json!({
+            "status": "running",
+            "updatedAt": now_unix_ms().saturating_sub(120_000)
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let affected = clear_runtime_activity_after_app_server_client_exit(
+        &state,
+        "default",
+        "default",
+        Some("old default app-server exited"),
+    )
+    .await;
+
+    assert!(
+        affected.is_empty(),
+        "stale persisted runtime status alone must not make an app-server exit fail the session"
+    );
+    let ui_state = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ui_state["runtimeStatusByThreadId"][session_id]["status"].as_str(),
+        Some("running")
+    );
+    assert!(ui_state["highlightsByThreadId"].get(session_id).is_none());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_reconcile_marks_lost_active_session_failed_without_app_server() {
     let sandbox = unique_test_dir("runtime-reconcile-no-app-server");
     let workspace = sandbox.join("workspace");
@@ -3754,7 +4170,7 @@ async fn runtime_reconcile_marks_lost_active_session_failed_without_app_server()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn runtime_reconcile_marks_session_failed_when_app_server_forgets_active_turn() {
+async fn runtime_reconcile_completes_session_when_app_server_becomes_idle() {
     let sandbox = unique_test_dir("runtime-reconcile-forgotten-turn");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -3822,16 +4238,7 @@ async fn runtime_reconcile_marks_session_failed_when_app_server_forgets_active_t
         .unwrap();
     assert_eq!(
         ui_state["runtimeStatusByThreadId"][session_id]["status"].as_str(),
-        Some("failed")
-    );
-    assert!(
-        ui_state["runtimeStatusByThreadId"][session_id]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("no longer has an active turn"))
-    );
-    assert_eq!(
-        ui_state["highlightsByThreadId"][session_id]["kind"].as_str(),
-        Some("attention")
+        Some("completed")
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -4243,7 +4650,7 @@ async fn local_session_detail_marks_failed_context_compaction_tail_terminal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_session_detail_marks_silent_empty_completion_failed() {
+async fn local_session_detail_keeps_silent_empty_completion_terminal() {
     let sandbox = unique_test_dir("session-detail-empty-completion-failed");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -4311,23 +4718,17 @@ async fn local_session_detail_marks_silent_empty_completion_failed() {
         .and_then(|turns| turns.first())
         .expect("silent turn should remain visible");
 
-    assert_eq!(turn.get("status").and_then(Value::as_str), Some("failed"));
     assert_eq!(
-        turn.get("error")
-            .and_then(|error| error.get("code"))
-            .and_then(Value::as_str),
-        Some(EMPTY_ASSISTANT_RESPONSE_CODE)
+        turn.get("status").and_then(Value::as_str),
+        Some("completed")
     );
+    assert!(turn.get("error").is_none_or(Value::is_null));
     assert!(
         turn.get("items")
             .and_then(Value::as_array)
-            .is_some_and(|items| items.iter().any(|item| {
-                item.get("type").and_then(Value::as_str) == Some("agentMessage")
-                    && item
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| text.contains("without an assistant response"))
-            }))
+            .is_some_and(|items| items
+                .iter()
+                .all(|item| { item.get("type").and_then(Value::as_str) != Some("agentMessage") }))
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -5758,6 +6159,679 @@ async fn start_session_compaction_payload_proxies_native_compact_start() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_failed_status_does_not_override_live_streaming_turn() {
+    let sandbox = unique_test_dir("runtime-failed-status-live-turn");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        None,
+        Some("False failed status"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    send_turn_payload(
+        &state,
+        "default",
+        &session_id,
+        "Keep streaming after a stale failed status notification.",
+        None,
+        None,
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        Some("client-live-failed-status"),
+    )
+    .await
+    .unwrap();
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "thread/status/changed".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "status": "failed"
+            }),
+        },
+    )
+    .await;
+
+    let runtime_status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][&session_id].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime_status.get("status").and_then(Value::as_str),
+        Some("running")
+    );
+    let runtime_key = runtime_session_key(
+        &resolve_runtime_profile_entry(&state.config, "default").0,
+        &session_id,
+    );
+    assert_eq!(
+        state.active_turns.lock().await.get(&runtime_key).cloned(),
+        Some("turn-1".to_string())
+    );
+
+    let summary = build_session_summary_payload(&state, "default", &session_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.get("status").and_then(Value::as_str),
+        Some("running")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_failed_status_does_not_override_live_turn_when_thread_read_is_not_loaded() {
+    let sandbox = unique_test_dir("runtime-failed-status-thread-not-loaded");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        None,
+        Some("False failed status when read is not loaded"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let runtime_key = runtime_session_key(
+        &resolve_runtime_profile_entry(&state.config, "default").0,
+        &session_id,
+    );
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-still-streaming".to_string());
+    set_runtime_session_status(&state, "default", &session_id, "running").await;
+
+    let client = app_server_client_for_session(&state, "default", &session_id)
+        .await
+        .unwrap();
+    client
+        .request(
+            "debug/setError",
+            json!({
+                "method": "thread/read",
+                "message": "thread not loaded: test"
+            }),
+        )
+        .await
+        .unwrap();
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "thread/status/changed".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "status": "failed"
+            }),
+        },
+    )
+    .await;
+
+    let runtime_status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][&session_id].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime_status.get("status").and_then(Value::as_str),
+        Some("running")
+    );
+    assert_eq!(
+        state.active_turns.lock().await.get(&runtime_key).cloned(),
+        Some("turn-still-streaming".to_string())
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_failed_status_clears_active_turn_on_generic_thread_read_error() {
+    let sandbox = unique_test_dir("runtime-failed-status-generic-read-error");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        None,
+        Some("Real failed status"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let runtime_key = runtime_session_key(
+        &resolve_runtime_profile_entry(&state.config, "default").0,
+        &session_id,
+    );
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-stale".to_string());
+    set_runtime_session_status(&state, "default", &session_id, "running").await;
+
+    let client = app_server_client_for_session(&state, "default", &session_id)
+        .await
+        .unwrap();
+    client
+        .request(
+            "debug/setError",
+            json!({
+                "method": "thread/read",
+                "message": "backend read failed"
+            }),
+        )
+        .await
+        .unwrap();
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "thread/status/changed".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "status": "failed"
+            }),
+        },
+    )
+    .await;
+
+    let runtime_status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][&session_id].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime_status.get("status").and_then(Value::as_str),
+        Some("failed")
+    );
+    assert!(state.active_turns.lock().await.get(&runtime_key).is_none());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_item_notification_uses_volatile_activity_over_stale_failed_status() {
+    let sandbox = unique_test_dir("live-item-recovers-stale-failed-status");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        None,
+        Some("Live item recovers failed status"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let runtime_key = runtime_session_key(
+        &resolve_runtime_profile_entry(&state.config, "default").0,
+        &session_id,
+    );
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][&session_id] = json!({
+            "status": "failed",
+            "updatedAt": now_unix_ms()
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "item/agentMessage/delta".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "turnId": "turn-still-streaming",
+                "itemId": "item-agent",
+                "delta": "still working"
+            }),
+        },
+    )
+    .await;
+
+    let runtime_status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][&session_id].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime_status.get("status").and_then(Value::as_str),
+        Some("failed")
+    );
+    assert_eq!(
+        state.active_turns.lock().await.get(&runtime_key).cloned(),
+        Some("turn-still-streaming".to_string())
+    );
+
+    let summary = build_session_summary_payload(&state, "default", &session_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.get("status").and_then(Value::as_str),
+        Some("running")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_summary_active_turn_overrides_stale_failed_runtime_status() {
+    let sandbox = unique_test_dir("summary-active-overrides-failed");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        None,
+        Some("Active should beat failed"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let runtime_key = runtime_session_key(
+        &resolve_runtime_profile_entry(&state.config, "default").0,
+        &session_id,
+    );
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key, "turn-live".to_string());
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][&session_id] = json!({
+            "status": "failed",
+            "updatedAt": now_unix_ms()
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let summary = build_session_summary_payload(&state, "default", &session_id, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        summary.get("status").and_then(Value::as_str),
+        Some("running")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_turn_payload_starts_new_thread_when_resume_reports_thread_not_loaded() {
+    let cases = ["thread not loaded", "no rollout found for thread id"];
+    for (index, case) in cases.iter().enumerate() {
+        let sandbox = unique_test_dir(&format!(
+            "new-thread-resume-missing-rollout-first-send-{index}"
+        ));
+        let workspace = sandbox.join("workspace");
+        let codex_home = sandbox.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let state =
+            test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+        let created = create_session_payload(
+            &state,
+            "default",
+            json!({
+                "cwd": workspace.display().to_string(),
+                "model": "gpt-5"
+            }),
+            None,
+            Some("Fresh thread"),
+        )
+        .await
+        .unwrap();
+        let session_id = created
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let resume_error = match *case {
+            "thread not loaded" => format!("thread not loaded: {session_id}"),
+            _ => format!("no rollout found for thread id {session_id}"),
+        };
+        let client = app_server_client(&state, "default").await.unwrap();
+        client
+            .request(
+                "debug/setError",
+                json!({
+                    "method": "thread/resume",
+                    "message": resume_error
+                }),
+            )
+            .await
+            .unwrap();
+
+        let payload = send_turn_payload(
+            &state,
+            "default",
+            &session_id,
+            "Start the fresh thread.",
+            None,
+            None,
+            json!({
+                "cwd": workspace.display().to_string(),
+                "model": "gpt-5"
+            }),
+            Some(&format!("client-new-thread-resume-not-loaded-{index}")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            payload.get("turnId").and_then(Value::as_str),
+            Some("turn-1")
+        );
+        let turn_start_count = client
+            .request("debug/requestCount", json!({ "target": "turn/start" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            turn_start_count.get("count").and_then(Value::as_u64),
+            Some(1)
+        );
+
+        let _ = fs::remove_dir_all(sandbox);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_turn_payload_falls_back_when_resume_reports_thread_read_timeout() {
+    let sandbox = unique_test_dir("turn-send-resume-thread-read-timeout");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-resume-read-timeout";
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "debug/setError",
+            json!({
+                "method": "thread/resume",
+                "message": "codex app-server request timed out: thread/read"
+            }),
+        )
+        .await
+        .unwrap();
+
+    let payload = send_turn_payload(
+        &state,
+        "default",
+        session_id,
+        "Send despite the failed resume read.",
+        None,
+        None,
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        Some("client-resume-read-timeout"),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        payload.get("turnId").and_then(Value::as_str),
+        Some("turn-1")
+    );
+    let request_log = client.request("debug/requestLog", json!({})).await.unwrap();
+    let methods = request_log
+        .get("methods")
+        .and_then(Value::as_array)
+        .unwrap();
+    let resume_index = methods
+        .iter()
+        .position(|method| method.as_str() == Some("thread/resume"))
+        .unwrap();
+    let start_index = methods
+        .iter()
+        .position(|method| method.as_str() == Some("turn/start"))
+        .unwrap();
+    assert!(resume_index < start_index);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_turn_payload_bounds_resume_timeout_and_preserves_profile_routing() {
+    let sandbox = unique_test_dir("turn-send-bounded-resume-profile-routing");
+    let workspace = sandbox.join("workspace");
+    let default_codex_home = sandbox.join("codex-home-default");
+    let second_codex_home = sandbox.join("codex-home-second");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&default_codex_home).unwrap();
+    fs::create_dir_all(&second_codex_home).unwrap();
+
+    let mut state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        default_codex_home,
+    );
+    let mut config = (*state.config).clone();
+    config.profiles.insert(
+        "second".to_string(),
+        RuntimeProfile {
+            label: "Second".to_string(),
+            codex_home: second_codex_home,
+            data_dir: sandbox.join(".data").join("profiles").join("second"),
+        },
+    );
+    state.config = Arc::new(config);
+
+    let default_client = app_server_client(&state, "default").await.unwrap();
+    let second_client = app_server_client(&state, "second").await.unwrap();
+    second_client
+        .request(
+            "debug/setDelay",
+            json!({
+                "method": "thread/resume",
+                "delayMs": 500
+            }),
+        )
+        .await
+        .unwrap();
+
+    let started_at = Instant::now();
+    let payload = send_turn_payload(
+        &state,
+        "second",
+        "thread-second-profile-resume-timeout",
+        "Keep this turn on the second profile.",
+        None,
+        None,
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        Some("client-second-profile-resume-timeout"),
+    )
+    .await
+    .unwrap();
+
+    assert!(started_at.elapsed() < Duration::from_secs(2));
+    assert_eq!(
+        payload.get("turnId").and_then(Value::as_str),
+        Some("turn-1")
+    );
+    let second_turn_starts = second_client
+        .request("debug/requestCount", json!({ "target": "turn/start" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        second_turn_starts.get("count").and_then(Value::as_u64),
+        Some(1)
+    );
+    let default_turn_starts = default_client
+        .request("debug/requestCount", json!({ "target": "turn/start" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        default_turn_starts.get("count").and_then(Value::as_u64),
+        Some(0)
+    );
+    let runtime_key = runtime_session_key(
+        &resolve_runtime_profile_entry(&state.config, "second").0,
+        "thread-second-profile-resume-timeout",
+    );
+    assert_eq!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_key)
+            .map(String::as_str),
+        Some("second")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_turn_payload_clears_stale_cached_active_turn_before_starting() {
+    let sandbox = unique_test_dir("send-turn-clears-stale-active-turn");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-stale-active";
+    let runtime_key = runtime_session_key(
+        &resolve_runtime_profile_entry(&state.config, "default").0,
+        session_id,
+    );
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-stale".to_string());
+    set_runtime_session_status(&state, "default", session_id, "running").await;
+
+    let payload = send_turn_payload(
+        &state,
+        "default",
+        session_id,
+        "Start after stale active cache.",
+        None,
+        None,
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        Some("client-stale-active-start"),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        payload.get("turnId").and_then(Value::as_str),
+        Some("turn-1")
+    );
+    assert_eq!(
+        state.active_turns.lock().await.get(&runtime_key).cloned(),
+        Some("turn-1".to_string())
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_turn_payload_surfaces_rollout_recovery_when_resume_fails() {
     let sandbox = unique_test_dir("turn-send-resume-rollout-recovery");
     let workspace = sandbox.join("workspace");
@@ -5820,7 +6894,6 @@ async fn send_turn_payload_surfaces_rollout_recovery_when_resume_fails() {
         )
         .await
         .unwrap();
-
     let error = send_turn_payload(
         &state,
         "default",
@@ -5861,6 +6934,14 @@ async fn send_turn_payload_surfaces_rollout_recovery_when_resume_fails() {
             .and_then(Value::as_u64),
         Some(2)
     );
+    let turn_start_count = client
+        .request("debug/requestCount", json!({ "target": "turn/start" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        turn_start_count.get("count").and_then(Value::as_u64),
+        Some(0)
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -5881,6 +6962,8 @@ async fn send_turn_payload_translates_language_bridge_prompt_with_temp_session()
         json!({
             "cwd": workspace.display().to_string(),
             "model": "gpt-5",
+            "sandboxMode": "workspace-write",
+            "networkAccess": false,
             "languageBridgeEnabled": true,
             "languageBridgeOutputLanguage": "Korean"
         }),
@@ -5905,6 +6988,8 @@ async fn send_turn_payload_translates_language_bridge_prompt_with_temp_session()
         json!({
             "cwd": workspace.display().to_string(),
             "model": "gpt-5",
+            "sandboxMode": "workspace-write",
+            "networkAccess": false,
             "languageBridgeEnabled": true,
             "languageBridgeOutputLanguage": "Korean"
         }),
@@ -5913,7 +6998,9 @@ async fn send_turn_payload_translates_language_bridge_prompt_with_temp_session()
     .await
     .unwrap();
 
-    let client = app_server_client(&state, "default").await.unwrap();
+    let client = app_server_client_for_session(&state, "default", &session_id)
+        .await
+        .unwrap();
     let raw_thread = client
         .request(
             "thread/read",
@@ -5962,12 +7049,73 @@ async fn send_turn_payload_translates_language_bridge_prompt_with_temp_session()
         .unwrap_or_default();
     assert!(instructions.contains("Language bridge is enabled"));
     assert!(instructions.contains("Korean"));
+    let threads_payload = client
+        .request(
+            "thread/list",
+            json!({
+                "limit": 20
+            }),
+        )
+        .await
+        .unwrap();
+    let translation_thread = threads_payload
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|threads| {
+            threads
+                .iter()
+                .filter(|thread| {
+                    thread.get("id").and_then(Value::as_str) != Some(session_id.as_str())
+                })
+                .filter(|thread| thread.get("ephemeral").and_then(Value::as_bool) == Some(true))
+                .find(|thread| {
+                    thread
+                        .get("lastTurnStart")
+                        .and_then(|turn_start| turn_start.get("input"))
+                        .and_then(Value::as_array)
+                        .and_then(|items| items.first())
+                        .and_then(|item| item.get("text"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| {
+                            text.contains(
+                                "Translate the following user request into clear, concise English",
+                            )
+                        })
+                })
+        })
+        .expect("language bridge should use an ephemeral translation thread");
+    assert_ne!(
+        translation_thread
+            .get("threadSource")
+            .and_then(Value::as_str),
+        Some("subagent")
+    );
+    assert_ne!(
+        translation_thread
+            .get("isSubagent")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let translation_turn_start = translation_thread
+        .get("lastTurnStart")
+        .expect("translation thread should start a turn");
+    assert_eq!(
+        translation_turn_start
+            .get("permissions")
+            .and_then(Value::as_str),
+        Some(":read-only")
+    );
+    assert!(
+        translation_turn_start
+            .get("sandboxPolicy")
+            .is_none_or(Value::is_null)
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn completed_turn_uses_language_bridge_response_translation_subagent() {
+async fn completed_turn_uses_language_bridge_response_translation_worker() {
     let sandbox = unique_test_dir("turn-language-bridge-response-translation");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -5982,6 +7130,8 @@ async fn completed_turn_uses_language_bridge_response_translation_subagent() {
         json!({
             "cwd": workspace.display().to_string(),
             "model": "gpt-5",
+            "sandboxMode": "workspace-write",
+            "networkAccess": false,
             "languageBridgeEnabled": true,
             "languageBridgeOutputLanguage": "Korean"
         }),
@@ -6041,58 +7191,6 @@ async fn completed_turn_uses_language_bridge_response_translation_subagent() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(translated.as_deref(), Some("번역된 응답입니다."));
-
-    let client = app_server_client(&state, "default").await.unwrap();
-    let threads_payload = client
-        .request(
-            "thread/list",
-            json!({
-                "limit": 20
-            }),
-        )
-        .await
-        .unwrap();
-    let translation_turn_start = threads_payload
-        .get("data")
-        .and_then(Value::as_array)
-        .and_then(|threads| {
-            threads
-                .iter()
-                .filter(|thread| {
-                    thread.get("id").and_then(Value::as_str) != Some(session_id.as_str())
-                })
-                .filter(|thread| thread.get("isSubagent").and_then(Value::as_bool) == Some(true))
-                .filter_map(|thread| thread.get("lastTurnStart"))
-                .find(|turn_start| {
-                    turn_start
-                        .get("input")
-                        .and_then(Value::as_array)
-                        .and_then(|items| items.first())
-                        .and_then(|item| item.get("text"))
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| text.contains("Translate the following Codex answer"))
-                })
-        })
-        .expect("response translation subagent should start a turn");
-    assert_eq!(
-        translation_turn_start
-            .get("permissions")
-            .and_then(Value::as_str),
-        Some(":read-only")
-    );
-    assert!(
-        translation_turn_start
-            .get("sandboxPolicy")
-            .is_none_or(Value::is_null)
-    );
-    assert_eq!(
-        translation_turn_start
-            .get("runtimeWorkspaceRoots")
-            .and_then(Value::as_array)
-            .and_then(|roots| roots.first())
-            .and_then(Value::as_str),
-        Some(workspace.to_str().unwrap())
-    );
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -6468,6 +7566,699 @@ async fn session_detail_preserves_cached_active_turn_when_thread_payload_lags() 
         state.active_turns.lock().await.get(&runtime_key).cloned(),
         Some("turn-2".to_string())
     );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_detail_returns_local_payload_when_app_server_thread_is_not_loaded() {
+    let sandbox = unique_test_dir("session-detail-thread-not-loaded");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let session_id = "019e6455-2102-7ac3-93df-22eff7b87901";
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/06/24",
+        "2026-06-24T00-04-00",
+        session_id,
+        &workspace,
+        "Thread not loaded fallback",
+        &[],
+        None,
+    );
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "debug/setError",
+            json!({
+                "method": "thread/read",
+                "message": format!("thread not loaded: {session_id}")
+            }),
+        )
+        .await
+        .unwrap();
+    let runtime_key = runtime_session_key(
+        &resolve_runtime_profile_entry(&state.config, "default").0,
+        session_id,
+    );
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key, "turn-loaded-elsewhere".to_string());
+    set_runtime_session_status(&state, "default", session_id, "running").await;
+
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(Value::as_str),
+        Some(session_id)
+    );
+    assert_eq!(
+        detail
+            .get("hydration")
+            .and_then(|hydration| hydration.get("state"))
+            .and_then(Value::as_str),
+        Some("idle")
+    );
+    assert_eq!(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("status"))
+            .and_then(Value::as_str),
+        Some("running")
+    );
+    assert_eq!(
+        detail.get("activeTurnId").and_then(Value::as_str),
+        Some("turn-loaded-elsewhere")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_rollout_older_turns_cross_turn_and_byte_tail_boundaries() {
+    let sandbox = unique_test_dir("rollout-older-unbounded");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    let session_id = "019f5000-0000-7000-8000-000000000001";
+    let rollout_dir = codex_home.join("sessions/2026/07/10");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join(format!("rollout-2026-07-10T00-00-00-{session_id}.jsonl"));
+    let mut content = format!(
+        "{}\n",
+        json!({
+            "timestamp": "2026-07-10T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "timestamp": "2026-07-10T00:00:00.000Z",
+                "cwd": workspace.display().to_string()
+            }
+        })
+    );
+    for index in 0..205 {
+        content.push_str(&format!(
+            "{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-07-10T00:00:01.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": format!("turn-{index:03}") }
+            }),
+            json!({
+                "timestamp": "2026-07-10T00:00:02.000Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": format!("message {index:03}") }
+            }),
+            json!({
+                "timestamp": "2026-07-10T00:00:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": format!("turn-{index:03}"),
+                    "last_agent_message": format!("answer {index:03}")
+                }
+            })
+        ));
+        if index == 0 {
+            content.push_str(&format!(
+                "{}\n",
+                json!({
+                    "timestamp": "2026-07-10T00:00:03.500Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "x".repeat(17 * 1024 * 1024)
+                        }]
+                    }
+                })
+            ));
+        }
+    }
+    fs::write(&rollout_path, content).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace], codex_home.clone());
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+    let before_turn_id = detail
+        .get("thread")
+        .and_then(|thread| thread.get("turns"))
+        .and_then(Value::as_array)
+        .and_then(|turns| turns.first())
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .unwrap();
+    let older = session_older_turns_payload(&state, "default", session_id, before_turn_id, 200)
+        .await
+        .unwrap();
+    let older_turns = older.get("turns").and_then(Value::as_array).unwrap();
+    assert_eq!(older_turns.len(), 185);
+    assert_eq!(
+        older_turns
+            .first()
+            .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str),
+        Some("turn-000")
+    );
+    assert_eq!(older.get("remainingTurns").and_then(Value::as_u64), Some(0));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_rollout_corruption_is_exposed_and_recovery_keeps_a_backup() {
+    let sandbox = unique_test_dir("rollout-direct-corruption-recovery");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    let session_id = "019f5000-0000-7000-8000-000000000002";
+    let rollout_dir = codex_home.join("sessions/2026/07/10");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join(format!("rollout-2026-07-10T00-00-01-{session_id}.jsonl"));
+    let mut content = format!(
+        "{}\n{}\n{}\n",
+        json!({
+            "timestamp": "2026-07-10T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "timestamp": "2026-07-10T00:00:00.000Z",
+                "cwd": workspace.display().to_string()
+            }
+        }),
+        json!({
+            "timestamp": "2026-07-10T00:00:01.000Z",
+            "type": "event_msg",
+            "payload": { "type": "task_started", "turn_id": "turn-corrupt" }
+        }),
+        json!({
+            "timestamp": "2026-07-10T00:00:02.000Z",
+            "type": "event_msg",
+            "payload": { "type": "user_message", "message": "recover me" }
+        })
+    )
+    .into_bytes();
+    content.extend_from_slice(b"{\"broken\":\"");
+    content.push(0xff);
+    content.extend_from_slice(b"\"}\n");
+    content.extend_from_slice(
+        format!(
+            "{}\n",
+            json!({
+                "timestamp": "2026-07-10T00:00:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-corrupt",
+                    "last_agent_message": "recoverable final"
+                }
+            })
+        )
+        .as_bytes(),
+    );
+    fs::write(&rollout_path, content).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace], codex_home.clone());
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        detail
+            .get("hydration")
+            .and_then(|hydration| hydration.get("state"))
+            .and_then(Value::as_str),
+        Some("error")
+    );
+    assert_eq!(
+        detail
+            .get("hydration")
+            .and_then(|hydration| hydration.get("recovery"))
+            .and_then(|recovery| recovery.get("issue"))
+            .and_then(Value::as_str),
+        Some("invalidUtf8")
+    );
+
+    let recovered = recover_session_rollout_payload(&state, "default", UserRole::Admin, session_id)
+        .await
+        .unwrap();
+    let backup_path = recovered
+        .get("backupPath")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap();
+    assert!(backup_path.exists());
+    let repaired = fs::read_to_string(&rollout_path).unwrap();
+    assert!(
+        repaired
+            .lines()
+            .all(|line| serde_json::from_str::<Value>(line).is_ok())
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn local_rollout_invalid_json_is_exposed_as_recoverable() {
+    let sandbox = unique_test_dir("rollout-invalid-json-recovery");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    let session_id = "019f5000-0000-7000-8000-000000000004";
+    let rollout_dir = codex_home.join("sessions/2026/07/10");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join(format!("rollout-2026-07-10T00-00-04-{session_id}.jsonl"));
+    fs::write(
+        rollout_path,
+        format!(
+            "{}\n{{not valid json}}\n{}\n",
+            json!({
+                "timestamp": "2026-07-10T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-07-10T00:00:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-10T00:00:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-json",
+                    "last_agent_message": "valid content survives"
+                }
+            })
+        ),
+    )
+    .unwrap();
+    let state = test_state_with_fake_app_server(workspace.clone(), vec![workspace], codex_home);
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        detail
+            .get("hydration")
+            .and_then(|hydration| hydration.get("recovery"))
+            .and_then(|recovery| recovery.get("issue"))
+            .and_then(Value::as_str),
+        Some("invalidJson")
+    );
+    assert!(
+        serde_json::to_string(
+            detail
+                .get("thread")
+                .and_then(|thread| thread.get("turns"))
+                .unwrap()
+        )
+        .unwrap()
+        .contains("valid content survives")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn local_rollout_late_completion_does_not_retarget_current_turn() {
+    let sandbox = unique_test_dir("rollout-late-completion");
+    let rollout_path = sandbox.join("rollout.jsonl");
+    fs::create_dir_all(&sandbox).unwrap();
+    let records = [
+        json!({ "timestamp": "2026-07-10T00:00:00Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "turn-a" } }),
+        json!({ "timestamp": "2026-07-10T00:00:01Z", "type": "event_msg", "payload": { "type": "user_message", "message": "A" } }),
+        json!({ "timestamp": "2026-07-10T00:00:02Z", "type": "event_msg", "payload": { "type": "task_complete", "turn_id": "turn-a", "last_agent_message": "A done" } }),
+        json!({ "timestamp": "2026-07-10T00:00:03Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "turn-b" } }),
+        json!({ "timestamp": "2026-07-10T00:00:04Z", "type": "event_msg", "payload": { "type": "user_message", "message": "B" } }),
+        json!({ "timestamp": "2026-07-10T00:00:05Z", "type": "event_msg", "payload": { "type": "task_complete", "turn_id": "turn-a", "last_agent_message": "A done" } }),
+        json!({ "timestamp": "2026-07-10T00:00:06Z", "type": "event_msg", "payload": { "type": "agent_message", "message": "B is still active", "phase": "commentary" } }),
+    ];
+    fs::write(
+        &rollout_path,
+        format!(
+            "{}\n",
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    )
+    .unwrap();
+
+    let window = read_local_rollout_full_window(rollout_path).await.unwrap();
+    let turn_a = window
+        .turns
+        .iter()
+        .find(|turn| turn.get("id").and_then(Value::as_str) == Some("turn-a"))
+        .unwrap();
+    let turn_b = window
+        .turns
+        .iter()
+        .find(|turn| turn.get("id").and_then(Value::as_str) == Some("turn-b"))
+        .unwrap();
+    assert!(
+        !serde_json::to_string(turn_a)
+            .unwrap()
+            .contains("B is still active")
+    );
+    assert!(
+        serde_json::to_string(turn_b)
+            .unwrap()
+            .contains("B is still active")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn local_rollout_item_ids_remain_stable_when_tail_boundary_moves() {
+    let sandbox = unique_test_dir("rollout-stable-tail-id");
+    let rollout_path = sandbox.join("rollout.jsonl");
+    fs::create_dir_all(&sandbox).unwrap();
+    let mut content = String::new();
+    for index in 0..2_400 {
+        content.push_str(&format!(
+            "{}\n",
+            json!({
+                "timestamp": "2026-07-10T00:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": format!("filler-{index}-{}", "x".repeat(4096)),
+                    "phase": "commentary"
+                }
+            })
+        ));
+    }
+    content.push_str(&format!(
+        "{}\n",
+        json!({
+            "timestamp": "2026-07-10T00:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "message": "stable-tail-target",
+                "phase": "commentary"
+            }
+        })
+    ));
+    fs::write(&rollout_path, content).unwrap();
+    let first = read_local_rollout_turn_window(rollout_path.clone(), 20)
+        .await
+        .unwrap();
+    let first_id = first
+        .turns
+        .iter()
+        .flat_map(|turn| {
+            turn.get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .find(|item| item.get("text").and_then(Value::as_str) == Some("stable-tail-target"))
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&rollout_path)
+        .unwrap();
+    use std::io::Write;
+    writeln!(
+        file,
+        "{}",
+        json!({
+            "timestamp": "2026-07-10T00:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "y".repeat(1024 * 1024) }]
+            }
+        })
+    )
+    .unwrap();
+    let second = read_local_rollout_turn_window(rollout_path, 20)
+        .await
+        .unwrap();
+    let second_id = second
+        .turns
+        .iter()
+        .flat_map(|turn| {
+            turn.get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .find(|item| item.get("text").and_then(Value::as_str) == Some("stable-tail-target"))
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap();
+    assert_eq!(first_id, second_id);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_session_detail_reconciles_rollout_older_than_native_metadata() {
+    let sandbox = unique_test_dir("terminal-detail-authoritative-reconcile");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    let session_id = "019f5000-0000-7000-8000-000000000003";
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/07/10",
+        "2026-07-10T00-00-03",
+        session_id,
+        &workspace,
+        "authoritative terminal detail",
+        &[
+            r#"{"timestamp":"2026-07-10T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-terminal"}}"#,
+            r#"{"timestamp":"2026-07-10T00:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-terminal","last_agent_message":"stale local final"}}"#,
+        ],
+        None,
+    );
+    let future_updated_at = i64::try_from(now_unix_ms()).unwrap().saturating_add(60_000);
+    write_state_thread_fixture(
+        &codex_home,
+        session_id,
+        "Authoritative terminal detail",
+        "authoritative terminal detail",
+        &workspace,
+        false,
+        future_updated_at.saturating_sub(1_000),
+        future_updated_at,
+        None,
+        None,
+        false,
+    );
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Authoritative terminal detail",
+                    "preview": "authoritative terminal detail",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": future_updated_at - 1_000,
+                    "updatedAt": future_updated_at,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "turns": [{
+                        "id": "turn-terminal",
+                        "status": "completed",
+                        "error": Value::Null,
+                        "startedAt": future_updated_at - 500,
+                        "completedAt": future_updated_at,
+                        "durationMs": 500,
+                        "items": [{
+                            "id": "native-final",
+                            "type": "agentMessage",
+                            "text": "authoritative native final"
+                        }]
+                    }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let detail = session_detail_payload(&state, "default", session_id, 20)
+        .await
+        .unwrap();
+    let serialized = serde_json::to_string(
+        detail
+            .get("thread")
+            .and_then(|thread| thread.get("turns"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(serialized.contains("authoritative native final"));
+    assert!(!serialized.contains("stale local final"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_dispatch_guard_releases_after_abort_and_followup_drain_runs() {
+    let sandbox = unique_test_dir("queue-guard-abort");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({ "cwd": workspace.display().to_string(), "model": "gpt-5" }),
+        None,
+        Some("Queue cancellation regression"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let guarded_state = state.clone();
+    let guarded_session_id = session_id.clone();
+    let guard_task = tokio::spawn(async move {
+        with_queue_dispatch_guard(
+            &guarded_state,
+            "default",
+            &guarded_session_id,
+            std::future::pending::<()>(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !state.queue_dispatching.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    guard_task.abort();
+    let _ = guard_task.await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if state.queue_dispatching.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    enqueue_session_queue_payload(
+        &state,
+        "default",
+        &session_id,
+        "dispatch after cancelled drain",
+        Some("request-after-cancel"),
+        Some("message-after-cancel"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let queue = get_session_queue_payload(&state, "default", &session_id)
+                .await
+                .unwrap();
+            if queue
+                .get("items")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let client = app_server_client_for_session(&state, "default", &session_id)
+        .await
+        .unwrap();
+    let count = client
+        .request("debug/requestCount", json!({ "target": "turn/start" }))
+        .await
+        .unwrap();
+    assert_eq!(count.get("count").and_then(Value::as_u64), Some(1));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn queue_retry_registration_waits_for_lock_instead_of_being_lost() {
+    let sandbox = unique_test_dir("queue-retry-lock-contention");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    let state = test_state_with_fake_app_server(workspace, Vec::new(), codex_home);
+    let retries = state.queue_drain_retries.lock().await;
+    schedule_queue_drain_retry(&state, "default", "thread-lock-contention", 5);
+    tokio::task::yield_now().await;
+    assert!(retries.is_empty());
+    drop(retries);
+
+    let retry_key = runtime_session_key("default", "thread-lock-contention");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if state
+                .queue_drain_retries
+                .lock()
+                .await
+                .contains_key(&retry_key)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    if let Some(handle) = state.queue_drain_retries.lock().await.remove(&retry_key) {
+        handle.abort();
+    }
 
     let _ = fs::remove_dir_all(sandbox);
 }

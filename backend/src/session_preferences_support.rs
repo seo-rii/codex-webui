@@ -1,5 +1,19 @@
 use super::*;
 
+pub(crate) fn apply_forced_session_preferences(
+    config: &Config,
+    preferences: &mut serde_json::Map<String, Value>,
+) {
+    if !config.force_yolo {
+        return;
+    }
+
+    preferences.insert("approvalPolicy".to_string(), json!("never"));
+    preferences.insert("sandboxMode".to_string(), json!("danger-full-access"));
+    preferences.insert("autoApproveMode".to_string(), json!("session"));
+    preferences.insert("networkAccess".to_string(), json!(true));
+}
+
 pub(crate) fn preferences_payload_requires_owner(preferences: &Value) -> bool {
     preferences.as_object().is_some_and(|entries| {
         entries
@@ -84,6 +98,7 @@ pub(crate) async fn normalize_session_preferences_payload(
                 .unwrap_or("auto"),
         )),
     );
+    apply_forced_session_preferences(&state.config, &mut next_preferences);
 
     Ok(Value::Object(next_preferences))
 }

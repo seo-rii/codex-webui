@@ -112,6 +112,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
             instance_token: None,
             app_server_handoff_enabled: false,
             per_session_app_servers: false,
+            force_yolo: false,
             restart_command: None,
             config_file_path: None,
         }),
@@ -144,6 +145,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
         session_app_server_assignments: Arc::new(Mutex::new(HashMap::new())),
         active_turns: Arc::new(Mutex::new(HashMap::new())),
         pending_turn_starts: Arc::new(Mutex::new(HashSet::new())),
+        recent_client_user_messages: Arc::new(Mutex::new(HashMap::new())),
         pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
         account_login_flows: Arc::new(Mutex::new(HashMap::new())),
         shutdown_timers: Arc::new(Mutex::new(HashMap::new())),
@@ -190,6 +192,7 @@ thread_counter = 0
 timestamp_counter = 0
 turn_counter = 0
 request_counts = {}
+request_log = []
 method_delays = {}
 method_errors = {}
 rate_limits_response = {
@@ -218,6 +221,7 @@ for raw_line in sys.stdin:
     method = payload.get("method")
     params = payload.get("params") or {}
     request_counts[method] = int(request_counts.get(method, 0) or 0) + 1
+    request_log.append(method)
 
     def write(message):
         sys.stdout.write(json.dumps(message) + "\n")
@@ -841,8 +845,31 @@ for raw_line in sys.stdin:
                 "count": int(request_counts.get(target, 0) or 0)
             }
         })
+    elif method == "debug/requestLog":
+        write({
+            "id": request_id,
+            "result": {
+                "methods": list(request_log)
+            }
+        })
     elif method == "thread/resume":
         thread_id = params.get("threadId", "")
+        if thread_id and thread_id not in threads:
+            timestamp_counter += 1
+            threads[thread_id] = {
+                "id": thread_id,
+                "name": "New thread",
+                "preview": "",
+                "cwd": params.get("cwd", ""),
+                "archived": False,
+                "createdAt": timestamp_counter,
+                "updatedAt": timestamp_counter,
+                "status": "idle",
+                "isSubagent": False,
+                "agentNickname": None,
+                "agentRole": None,
+                "turns": []
+            }
         if thread_id in threads:
             threads[thread_id]["status"] = "idle"
             threads[thread_id]["resumeCount"] = int(threads[thread_id].get("resumeCount", 0) or 0) + 1
@@ -1023,6 +1050,15 @@ for raw_line in sys.stdin:
             "agentRole": None,
             "turns": []
         }
+        if bool(thread.get("isSubagent", False)):
+            write({
+                "id": request_id,
+                "error": {
+                    "code": -32602,
+                    "message": "direct app-server input is not allowed for multi-agent v2 sub-agents"
+                }
+            })
+            continue
         input_items = params.get("input") or []
         text_item = next(
             (

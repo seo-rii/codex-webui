@@ -324,6 +324,7 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             session_app_server_assignments: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             pending_turn_starts: Arc::new(Mutex::new(HashSet::new())),
+            recent_client_user_messages: Arc::new(Mutex::new(HashMap::new())),
             pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
             account_login_flows: Arc::new(Mutex::new(HashMap::new())),
             shutdown_timers: Arc::new(Mutex::new(HashMap::new())),

@@ -150,16 +150,42 @@ async fn request_thread_goal(
             format!("Failed to connect to codex app-server: {error}"),
         )
     })?;
-    if dedicate_unassigned_session {
-        client
-            .request("thread/read", json!({ "threadId": session_id }))
-            .await
-            .map_err(|error| {
-                api_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("Failed to load the session before updating its goal: {error}"),
+    let requested_status = params
+        .get("status")
+        .and_then(Value::as_str)
+        .and_then(canonical_goal_status);
+    let should_resume = dedicate_unassigned_session
+        && method == "thread/goal/set"
+        && matches!(requested_status, None | Some("active"))
+        && (params.get("objective").is_some() || requested_status == Some("active"));
+    if should_resume {
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            let result = client
+                .request(
+                    "thread/resume",
+                    json!({
+                        "threadId": session_id,
+                        "excludeTurns": true
+                    }),
                 )
-            })?;
+                .await;
+            match result {
+                Ok(_) => break,
+                Err(error) => {
+                    let message = error.to_string();
+                    if message.contains("is closing; retry thread/resume") && attempts < 4 {
+                        tokio::time::sleep(Duration::from_millis(250 * attempts as u64)).await;
+                        continue;
+                    }
+                    return Err(api_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to resume the session before updating its goal: {message}"),
+                    ));
+                }
+            }
+        }
     }
     match client.request(method, params.clone()).await {
         Ok(response) => Ok(response),

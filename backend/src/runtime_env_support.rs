@@ -1,5 +1,119 @@
 use super::*;
 
+const APP_SERVER_ASSIGNMENTS_VERSION: u32 = 1;
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedAppServerAssignments {
+    version: u32,
+    assignments: HashMap<String, String>,
+}
+
+fn app_server_assignments_path(state: &AppState) -> PathBuf {
+    state.config.data_dir.join("app-server-assignments.json")
+}
+
+fn loaded_assignment_stores() -> &'static tokio::sync::Mutex<HashSet<PathBuf>> {
+    static STORES: std::sync::OnceLock<tokio::sync::Mutex<HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    STORES.get_or_init(|| tokio::sync::Mutex::new(HashSet::new()))
+}
+
+fn assignment_store_write_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn valid_persisted_assignment(runtime_key: &str, client_key: &str) -> bool {
+    let Some(rest) = runtime_key.strip_prefix("profile::") else {
+        return false;
+    };
+    let Some((profile_id, session_id)) = rest.split_once("::session-runtime::") else {
+        return false;
+    };
+    if profile_id.is_empty() || session_id.is_empty() {
+        return false;
+    }
+    client_key == profile_id
+        || client_key.strip_prefix(profile_id).is_some_and(|suffix| {
+            suffix.strip_prefix("::session::") == Some(session_id)
+                || suffix.strip_prefix("::goal::") == Some(session_id)
+        })
+}
+
+async fn ensure_app_server_assignments_loaded(state: &AppState) {
+    let path = app_server_assignments_path(state);
+    let mut loaded = loaded_assignment_stores().lock().await;
+    if loaded.contains(&path) {
+        return;
+    }
+    if let Some(persisted) = read_app_server_assignments(&path).await {
+        let mut assignments = state.session_app_server_assignments.lock().await;
+        restore_persisted_assignments(&mut assignments, persisted);
+    }
+    loaded.insert(path);
+}
+
+fn restore_persisted_assignments(
+    assignments: &mut HashMap<String, String>,
+    persisted: PersistedAppServerAssignments,
+) {
+    for (runtime_key, client_key) in persisted.assignments {
+        if valid_persisted_assignment(&runtime_key, &client_key) {
+            assignments.entry(runtime_key).or_insert(client_key);
+        }
+    }
+}
+
+async fn persist_app_server_assignments(state: &AppState) -> Result<()> {
+    ensure_app_server_assignments_loaded(state).await;
+    let _write_guard = assignment_store_write_lock().lock().await;
+    let path = app_server_assignments_path(state);
+    let assignments = state.session_app_server_assignments.lock().await.clone();
+    write_app_server_assignments(&path, assignments).await
+}
+
+async fn read_app_server_assignments(path: &Path) -> Option<PersistedAppServerAssignments> {
+    tokio::fs::read(path)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PersistedAppServerAssignments>(&bytes).ok())
+        .filter(|payload| payload.version == APP_SERVER_ASSIGNMENTS_VERSION)
+}
+
+async fn write_app_server_assignments(
+    path: &Path,
+    assignments: HashMap<String, String>,
+) -> Result<()> {
+    let payload = PersistedAppServerAssignments {
+        version: APP_SERVER_ASSIGNMENTS_VERSION,
+        assignments,
+    };
+    let bytes = serde_json::to_vec_pretty(&payload)
+        .context("failed to encode app-server assignment metadata")?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("app-server assignment path has no parent"))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let temp_path = parent.join(format!(
+        ".app-server-assignments.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut file = tokio::fs::File::create(&temp_path).await?;
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&temp_path, &path).await?;
+    if let Ok(directory) = tokio::fs::File::open(parent).await {
+        let _ = directory.sync_all().await;
+    }
+    Ok(())
+}
+
 pub(crate) async fn app_server_client(
     state: &AppState,
     profile_id: &str,
@@ -19,6 +133,7 @@ pub(crate) async fn app_server_client_for_session(
     profile_id: &str,
     session_id: &str,
 ) -> Result<AppServerClient> {
+    ensure_app_server_assignments_loaded(state).await;
     let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
     let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
     let client_key = state
@@ -36,6 +151,7 @@ pub(crate) async fn app_server_client_for_session_turn(
     profile_id: &str,
     session_id: &str,
 ) -> Result<AppServerClient> {
+    ensure_app_server_assignments_loaded(state).await;
     let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
     let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
     let cached_goal_uses_goal_app_server = with_ui_state_read(state, profile_id, |ui_state| {
@@ -92,6 +208,14 @@ pub(crate) async fn app_server_client_for_session_turn(
             .or_insert(desired_client_key)
             .clone()
     };
+    if let Err(error) = persist_app_server_assignments(state).await {
+        warn!(
+            profile_id = %resolved_profile_id,
+            session_id,
+            error = %error,
+            "failed to persist app-server assignment"
+        );
+    }
     app_server_client_with_key(state, &resolved_profile_id, &profile, client_key).await
 }
 
@@ -100,6 +224,7 @@ pub(crate) async fn app_server_client_for_goal_session(
     profile_id: &str,
     session_id: &str,
 ) -> Result<AppServerClient> {
+    ensure_app_server_assignments_loaded(state).await;
     let (resolved_profile_id, profile) = resolve_runtime_profile_entry(&state.config, profile_id);
     let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
     let existing_assignment = state
@@ -129,6 +254,14 @@ pub(crate) async fn app_server_client_for_goal_session(
             .or_insert(desired_client_key)
             .clone()
     };
+    if let Err(error) = persist_app_server_assignments(state).await {
+        warn!(
+            profile_id = %resolved_profile_id,
+            session_id,
+            error = %error,
+            "failed to persist goal app-server assignment"
+        );
+    }
     app_server_client_with_key(state, &resolved_profile_id, &profile, client_key).await
 }
 
@@ -152,6 +285,7 @@ pub(crate) async fn app_server_client_key_for_session(
     profile_id: &str,
     session_id: &str,
 ) -> String {
+    ensure_app_server_assignments_loaded(state).await;
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
     let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
     state
@@ -194,6 +328,7 @@ pub(crate) async fn session_ids_for_app_server_client(
     profile_id: &str,
     client_key: &str,
 ) -> HashSet<String> {
+    ensure_app_server_assignments_loaded(state).await;
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
     let runtime_key_prefix = format!("profile::{resolved_profile_id}::session-runtime::");
     let assignments = state.session_app_server_assignments.lock().await.clone();
@@ -208,7 +343,6 @@ pub(crate) async fn session_ids_for_app_server_client(
         }
     }
 
-    let client_is_default = client_key == resolved_profile_id;
     {
         let active_turns = state.active_turns.lock().await;
         for runtime_key in active_turns.keys() {
@@ -219,7 +353,7 @@ pub(crate) async fn session_ids_for_app_server_client(
             if assigned_client_key.is_some_and(|assigned| assigned != client_key) {
                 continue;
             }
-            if client_is_default || assigned_client_key.is_some() {
+            if client_key == resolved_profile_id || assigned_client_key.is_some() {
                 session_ids.insert(session_id.to_string());
             }
         }
@@ -234,38 +368,10 @@ pub(crate) async fn session_ids_for_app_server_client(
             if assigned_client_key.is_some_and(|assigned| assigned != client_key) {
                 continue;
             }
-            if client_is_default || assigned_client_key.is_some() {
+            if client_key == resolved_profile_id || assigned_client_key.is_some() {
                 session_ids.insert(session_id.to_string());
             }
         }
-    }
-
-    if client_is_default {
-        let live_runtime_status_session_ids = with_ui_state_read(state, profile_id, |ui_state| {
-            let session_ids = ui_state
-                .get("runtimeStatusByThreadId")
-                .and_then(Value::as_object)
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter_map(|(session_id, status)| {
-                            let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
-                            if assignments.contains_key(&runtime_key) {
-                                return None;
-                            }
-                            normalized_thread_status(Some(status))
-                                .as_deref()
-                                .is_some_and(is_live_thread_status)
-                                .then(|| session_id.clone())
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            Ok(session_ids)
-        })
-        .await
-        .unwrap_or_default();
-        session_ids.extend(live_runtime_status_session_ids);
     }
 
     session_ids
@@ -276,10 +382,19 @@ pub(crate) async fn clear_app_server_assignments_for_sessions(
     profile_id: &str,
     session_ids: &[String],
 ) {
+    ensure_app_server_assignments_loaded(state).await;
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
     let mut assignments = state.session_app_server_assignments.lock().await;
     for session_id in session_ids {
         assignments.remove(&runtime_session_key(&resolved_profile_id, session_id));
+    }
+    drop(assignments);
+    if let Err(error) = persist_app_server_assignments(state).await {
+        warn!(
+            profile_id = %resolved_profile_id,
+            error = %error,
+            "failed to persist cleared app-server assignments"
+        );
     }
 }
 
@@ -534,5 +649,35 @@ pub(crate) fn compare_versions(left: &(u64, u64, u64), right: &(u64, u64, u64)) 
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
+    }
+}
+
+#[cfg(test)]
+mod assignment_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dedicated_session_client_key_survives_assignment_store_restart() {
+        let directory =
+            std::env::temp_dir().join(format!("codex-webui-assignment-restart-{}", Uuid::new_v4()));
+        let path = directory.join("app-server-assignments.json");
+        let runtime_key = "profile::work::session-runtime::thread-1".to_string();
+        let client_key = "work::goal::thread-1".to_string();
+        write_app_server_assignments(
+            &path,
+            HashMap::from([(runtime_key.clone(), client_key.clone())]),
+        )
+        .await
+        .expect("assignment metadata should persist atomically");
+
+        let persisted = read_app_server_assignments(&path)
+            .await
+            .expect("a restarted gateway should read assignment metadata");
+        let mut restored = HashMap::new();
+        restore_persisted_assignments(&mut restored, persisted);
+        assert_eq!(restored.get(&runtime_key), Some(&client_key));
+        assert!(valid_persisted_assignment(&runtime_key, &client_key));
+
+        let _ = tokio::fs::remove_dir_all(directory).await;
     }
 }

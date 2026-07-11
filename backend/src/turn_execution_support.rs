@@ -1,10 +1,14 @@
 use super::*;
-use crate::thread_listing_support::emit_session_summary_updated;
+use crate::thread_listing_support::{
+    emit_session_status_summary_updated, emit_session_summary_updated,
+};
 use crate::thread_read_support::{
-    active_turn_id_from_turns, emit_session_notification, read_thread_payload,
+    active_turn_id_from_turns, emit_session_notification, is_unmaterialized_thread_error_message,
+    read_thread_payload,
 };
 
 const DUPLICATE_TURN_START_ACTIVE_GRACE_MS: u64 = 30_000;
+const RECENT_CLIENT_USER_MESSAGE_TTL: Duration = Duration::from_secs(60 * 30);
 const LANGUAGE_BRIDGE_TRANSLATION_TIMEOUT: Duration = Duration::from_secs(180);
 const LANGUAGE_BRIDGE_TRANSLATION_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CODEX_PERMISSION_PROFILE_READ_ONLY: &str = ":read-only";
@@ -49,6 +53,34 @@ fn responsesapi_client_metadata_for_user_message(client_user_message_id: Option<
             })
         })
         .unwrap_or(Value::Null)
+}
+
+fn client_user_message_key(runtime_key: &str, client_user_message_id: &str) -> String {
+    format!("{runtime_key}::client-user-message::{client_user_message_id}")
+}
+
+async fn recently_sent_client_user_message(
+    state: &AppState,
+    runtime_key: &str,
+    client_user_message_id: &str,
+) -> bool {
+    let key = client_user_message_key(runtime_key, client_user_message_id);
+    let now = Instant::now();
+    let mut recent = state.recent_client_user_messages.lock().await;
+    recent.retain(|_, sent_at| now.duration_since(*sent_at) <= RECENT_CLIENT_USER_MESSAGE_TTL);
+    recent.contains_key(&key)
+}
+
+async fn remember_sent_client_user_message(
+    state: &AppState,
+    runtime_key: &str,
+    client_user_message_id: &str,
+) {
+    let key = client_user_message_key(runtime_key, client_user_message_id);
+    let now = Instant::now();
+    let mut recent = state.recent_client_user_messages.lock().await;
+    recent.retain(|_, sent_at| now.duration_since(*sent_at) <= RECENT_CLIENT_USER_MESSAGE_TTL);
+    recent.insert(key, now);
 }
 
 async fn resolve_selected_attachment_records(
@@ -472,7 +504,6 @@ async fn translate_prompt_with_language_bridge(
                 "permissions": CODEX_PERMISSION_PROFILE_READ_ONLY,
                 "developerInstructions": "You are a private translation preprocessor for Codex Web UI. Return only the requested JSON. Do not call tools and do not solve the user's task.",
                 "ephemeral": true,
-                "threadSource": "subagent",
                 "personality": "none"
             }),
         )
@@ -686,7 +717,7 @@ pub(crate) async fn spawn_language_bridge_response_translation_for_completed_tur
                     profile_id,
                     session_id,
                     error = %error,
-                    "failed to start language bridge response translation subagent"
+                    "failed to start language bridge response translation worker"
                 );
                 return;
             }
@@ -697,9 +728,9 @@ pub(crate) async fn spawn_language_bridge_response_translation_for_completed_tur
                 json!({
                     "cwd": cwd,
                     "model": preferences.get("model").cloned().unwrap_or(Value::Null),
-                    "developerInstructions": "You are a private response translation subagent for Codex Web UI. Translate only the final answer. Do not call tools and do not add commentary.",
+                    "permissions": CODEX_PERMISSION_PROFILE_READ_ONLY,
+                    "developerInstructions": "You are a private response translation worker for Codex Web UI. Translate only the final answer. Do not call tools and do not add commentary.",
                     "ephemeral": true,
-                    "threadSource": "subagent",
                     "personality": "none"
                 }),
             )
@@ -711,7 +742,7 @@ pub(crate) async fn spawn_language_bridge_response_translation_for_completed_tur
                     profile_id,
                     session_id,
                     error = %error,
-                    "failed to create language bridge response translation subagent"
+                    "failed to create language bridge response translation worker"
                 );
                 return;
             }
@@ -724,7 +755,7 @@ pub(crate) async fn spawn_language_bridge_response_translation_for_completed_tur
         else {
             warn!(
                 profile_id,
-                session_id, "language bridge response translation subagent returned no thread id"
+                session_id, "language bridge response translation worker returned no thread id"
             );
             return;
         };
@@ -898,6 +929,69 @@ async fn turn_app_server_error(
     )
 }
 
+async fn resume_thread_before_app_server_turn(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    client: &AppServerClient,
+    context: &str,
+) -> ApiResult<()> {
+    let mut attempts = 0usize;
+    loop {
+        attempts += 1;
+        #[cfg(not(test))]
+        let resume_timeout = client.request_timeout();
+        #[cfg(test)]
+        let resume_timeout = Duration::from_millis(100);
+        let result = client
+            .request_with_timeout(
+                "thread/resume",
+                json!({
+                    "threadId": session_id,
+                    "excludeTurns": true
+                }),
+                resume_timeout,
+                true,
+            )
+            .await;
+
+        match result {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                let message = format!("{context}: {error}");
+                if message.contains("is closing; retry thread/resume") && attempts < 4 {
+                    tokio::time::sleep(Duration::from_millis(250 * attempts as u64)).await;
+                    continue;
+                }
+                if let Some(recovery_error) =
+                    session_rollout_recovery_required_error(state, profile_id, session_id, &message)
+                        .await
+                {
+                    return Err(recovery_error);
+                }
+                if is_unmaterialized_thread_error_message(&message) {
+                    return Ok(());
+                }
+                if app_server_request_timed_out(&error)
+                    || app_server_request_interrupted(&error)
+                    || message
+                        .to_ascii_lowercase()
+                        .contains("codex app-server request timed out")
+                {
+                    warn!(
+                        profile_id,
+                        session_id,
+                        error = %error,
+                        "thread resume did not complete; falling back to direct turn start"
+                    );
+                    return Ok(());
+                }
+                return Err(turn_app_server_error(state, profile_id, client, context, error).await);
+            }
+        }
+    }
+}
+
 async fn session_rollout_recovery_required_error(
     state: &AppState,
     profile_id: &str,
@@ -908,9 +1002,50 @@ async fn session_rollout_recovery_required_error(
         return None;
     }
 
-    let recovery =
-        inspect_session_rollout_recovery_payload(state, profile_id, session_id, Some(message))
-            .await?;
+    let recovery = match inspect_session_rollout_recovery_payload(
+        state,
+        profile_id,
+        session_id,
+        Some(message),
+    )
+    .await
+    {
+        Some(recovery) => recovery,
+        None => {
+            let mut recovered = None;
+            for token in message.split_whitespace() {
+                let trimmed = token.trim().trim_matches(['`', '\'', '"', ':', ',', ';']);
+                if !trimmed.contains(".jsonl") {
+                    continue;
+                }
+                let Some(jsonl_end) = trimmed.find(".jsonl").map(|index| index + ".jsonl".len())
+                else {
+                    continue;
+                };
+                let path = normalize_path(PathBuf::from(&trimmed[..jsonl_end]));
+                if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+                    || path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_none_or(|name| !name.ends_with(&format!("{session_id}.jsonl")))
+                {
+                    continue;
+                }
+                let Ok(buffer) = tokio_fs::read(path).await else {
+                    continue;
+                };
+                let plan = inspect_rollout_recovery_content(&buffer);
+                if plan.info.available
+                    && plan.info.recoverable_lines > 0
+                    && !plan.recovered_content.trim().is_empty()
+                {
+                    recovered = Some(json!(plan.info));
+                    break;
+                }
+            }
+            recovered?
+        }
+    };
     Some(api_error(
         StatusCode::CONFLICT,
         json!({
@@ -981,6 +1116,15 @@ pub(crate) async fn send_turn_payload(
         &resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
+    if let Some(client_id) = client_user_message_id.as_deref() {
+        if recently_sent_client_user_message(state, &runtime_key, client_id).await {
+            return Ok(json!({
+                "ok": true,
+                "duplicate": true,
+                "clientUserMessageId": client_id
+            }));
+        }
+    }
     clear_stale_session_runtime_activity_if_app_server_missing(
         state,
         profile_id,
@@ -1013,34 +1157,7 @@ pub(crate) async fn send_turn_payload(
             return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
         }
 
-        if let Some(cached_active_turn_id) =
-            state.active_turns.lock().await.get(&runtime_key).cloned()
-        {
-            let runtime_status_updated_at = with_ui_state_read(state, profile_id, |ui_state| {
-                Ok(ui_state
-                    .get("runtimeStatusByThreadId")
-                    .and_then(Value::as_object)
-                    .and_then(|entries| entries.get(session_id))
-                    .and_then(|entry| entry.get("updatedAt"))
-                    .and_then(Value::as_u64))
-            })
-            .await
-            .ok()
-            .flatten();
-            if runtime_status_updated_at.is_some_and(|updated_at| {
-                now_unix_ms().saturating_sub(updated_at) < DUPLICATE_TURN_START_ACTIVE_GRACE_MS
-            }) {
-                return Err(api_error(
-                    StatusCode::CONFLICT,
-                    json!({
-                        "code": "TURN_ALREADY_RUNNING",
-                        "message": "A response is already running for this session.",
-                        "turnId": cached_active_turn_id
-                    })
-                    .to_string(),
-                ));
-            }
-
+        if state.active_turns.lock().await.contains_key(&runtime_key) {
             let thread = read_thread_payload(state, profile_id, session_id, true).await?;
             let active_turn_id = thread
                 .get("turns")
@@ -1067,7 +1184,7 @@ pub(crate) async fn send_turn_payload(
         }
 
         set_runtime_session_status(state, profile_id, session_id, "starting").await;
-        emit_session_summary_updated(state, profile_id, session_id, None, Some("starting")).await;
+        emit_session_status_summary_updated(state, profile_id, session_id, None, "starting").await;
         emit_session_notification(
             state,
             profile_id,
@@ -1092,7 +1209,6 @@ pub(crate) async fn send_turn_payload(
         .and_then(Value::as_str)
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "A working directory is required."))?
         .to_string();
-    let thread = read_thread_payload(state, profile_id, session_id, false).await?;
     let next_selected_skills = if requested_selected_skills.is_empty() {
         with_ui_state_read(state, profile_id, |ui_state| {
             Ok(session_selected_skills_from_ui_state(ui_state, session_id))
@@ -1139,29 +1255,14 @@ pub(crate) async fn send_turn_payload(
                 format!("Failed to connect to codex app-server: {error}"),
             )
         })?;
-    if thread.get("status").and_then(Value::as_str) == Some("notLoaded") {
-        if let Err(error) = client
-            .request(
-                "thread/resume",
-                json!({
-                    "threadId": session_id,
-                    "config": preferences_model_context_config(&next_preferences),
-                    "persistExtendedHistory": true
-                }),
-            )
-            .await
-        {
-            let message = format!("Failed to resume the session before sending: {error}");
-            if let Some(recovery_error) =
-                session_rollout_recovery_required_error(state, profile_id, session_id, &message)
-                    .await
-            {
-                return Err(recovery_error);
-            }
-            return Err(api_error(StatusCode::BAD_GATEWAY, message));
-        }
-    }
-
+    resume_thread_before_app_server_turn(
+        state,
+        profile_id,
+        session_id,
+        &client,
+        "Failed to resume the session before sending",
+    )
+    .await?;
     let mut effective_prompt = trimmed_prompt.to_string();
     let mut resolved_output_language = None;
     if language_bridge_enabled(&next_preferences) && !trimmed_prompt.is_empty() {
@@ -1292,6 +1393,9 @@ pub(crate) async fn send_turn_payload(
             .await
             .insert(runtime_key.clone(), turn_id);
     }
+    if let Some(client_id) = client_user_message_id.as_deref() {
+        remember_sent_client_user_message(state, &runtime_key, client_id).await;
+    }
     if let Some(output_language) = resolved_output_language.as_deref() {
         remember_language_bridge_output_language(state, profile_id, session_id, output_language)
             .await?;
@@ -1315,12 +1419,12 @@ pub(crate) async fn send_turn_payload(
     state.pending_turn_starts.lock().await.remove(&runtime_key);
 
     clear_session_draft_payload(state, profile_id, session_id).await?;
-    emit_session_summary_updated(
+    emit_session_status_summary_updated(
         state,
         profile_id,
         session_id,
         Some(next_preferences.clone()),
-        None,
+        "running",
     )
     .await;
 
@@ -1407,34 +1511,7 @@ pub(crate) async fn start_session_compaction_payload(
     }
 
     let result = async {
-        if let Some(cached_active_turn_id) =
-            state.active_turns.lock().await.get(&runtime_key).cloned()
-        {
-            let runtime_status_updated_at = with_ui_state_read(state, profile_id, |ui_state| {
-                Ok(ui_state
-                    .get("runtimeStatusByThreadId")
-                    .and_then(Value::as_object)
-                    .and_then(|entries| entries.get(session_id))
-                    .and_then(|entry| entry.get("updatedAt"))
-                    .and_then(Value::as_u64))
-            })
-            .await
-            .ok()
-            .flatten();
-            if runtime_status_updated_at.is_some_and(|updated_at| {
-                now_unix_ms().saturating_sub(updated_at) < DUPLICATE_TURN_START_ACTIVE_GRACE_MS
-            }) {
-                return Err(api_error(
-                    StatusCode::CONFLICT,
-                    json!({
-                        "code": "TURN_ALREADY_RUNNING",
-                        "message": "A response is already running for this session.",
-                        "turnId": cached_active_turn_id
-                    })
-                    .to_string(),
-                ));
-            }
-
+        if state.active_turns.lock().await.contains_key(&runtime_key) {
             let thread = read_thread_payload(state, profile_id, session_id, true).await?;
             let active_turn_id = thread
                 .get("turns")
@@ -1487,6 +1564,14 @@ pub(crate) async fn start_session_compaction_payload(
                     format!("Failed to connect to codex app-server: {error}"),
                 )
             })?;
+        resume_thread_before_app_server_turn(
+            state,
+            profile_id,
+            session_id,
+            &client,
+            "Failed to resume the session before compacting",
+        )
+        .await?;
         let response = match client
             .request("thread/compact/start", json!({ "threadId": session_id }))
             .await
@@ -1510,17 +1595,16 @@ pub(crate) async fn start_session_compaction_payload(
             .and_then(Value::as_str)
             .or_else(|| response.get("turnId").and_then(Value::as_str))
             .map(str::to_string);
+        let mut observed_thread_status = None;
         if turn_id.is_none() {
-            turn_id = read_thread_payload(state, profile_id, session_id, true)
-                .await
-                .ok()
-                .and_then(|thread| {
-                    thread
-                        .get("turns")
-                        .and_then(Value::as_array)
-                        .map(Vec::as_slice)
-                        .and_then(active_turn_id_from_turns)
-                });
+            if let Ok(thread) = read_thread_payload(state, profile_id, session_id, true).await {
+                turn_id = thread
+                    .get("turns")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .and_then(active_turn_id_from_turns);
+                observed_thread_status = normalized_thread_status(thread.get("status"));
+            }
         }
         if let Some(turn_id) = turn_id.as_deref() {
             state
@@ -1530,7 +1614,15 @@ pub(crate) async fn start_session_compaction_payload(
                 .insert(runtime_key.clone(), turn_id.to_string());
         }
         state.pending_turn_starts.lock().await.remove(&runtime_key);
-        set_runtime_session_status(state, profile_id, session_id, "running").await;
+        let next_status = if turn_id.is_some() {
+            "running"
+        } else {
+            observed_thread_status
+                .as_deref()
+                .map(runtime_status_from_codex_thread_status)
+                .unwrap_or("completed")
+        };
+        set_runtime_session_status(state, profile_id, session_id, next_status).await;
         set_session_highlight(state, profile_id, session_id, None).await;
         emit_session_notification(
             state,
@@ -1541,12 +1633,12 @@ pub(crate) async fn start_session_compaction_payload(
                 "method": "thread/status/changed",
                 "params": {
                     "threadId": session_id,
-                    "status": "running"
+                    "status": next_status
                 }
             }),
         )
         .await;
-        emit_session_summary_updated(state, profile_id, session_id, None, Some("running")).await;
+        emit_session_summary_updated(state, profile_id, session_id, None, Some(next_status)).await;
 
         Ok(json!({
             "ok": true,
@@ -1637,6 +1729,14 @@ pub(crate) async fn steer_turn_payload(
                 format!("Failed to connect to codex app-server: {error}"),
             )
         })?;
+    resume_thread_before_app_server_turn(
+        state,
+        profile_id,
+        session_id,
+        &client,
+        "Failed to resume the session before steering",
+    )
+    .await?;
     let preferences = with_ui_state_read(state, profile_id, |ui_state| {
         Ok(ui_state
             .get("preferencesByThreadId")

@@ -50,6 +50,7 @@ pub(crate) struct AppState {
     pub(crate) session_app_server_assignments: Arc<Mutex<HashMap<String, String>>>,
     pub(crate) active_turns: Arc<Mutex<HashMap<String, String>>>,
     pub(crate) pending_turn_starts: Arc<Mutex<HashSet<String>>>,
+    pub(crate) recent_client_user_messages: Arc<Mutex<HashMap<String, Instant>>>,
     pub(crate) pending_server_requests:
         Arc<Mutex<HashMap<String, HashMap<String, PendingServerRequestEntry>>>>,
     pub(crate) account_login_flows: Arc<Mutex<HashMap<String, PendingAccountLoginFlow>>>,
@@ -145,6 +146,7 @@ pub(crate) struct CachedGitRepositories {
 #[allow(dead_code)]
 pub(crate) struct PendingServerRequestEntry {
     pub(crate) raw_id: Value,
+    pub(crate) client_key: String,
     pub(crate) method: String,
     pub(crate) params: Value,
     pub(crate) created_at: String,
@@ -248,6 +250,8 @@ pub(crate) enum ServerEnvelope {
     Event {
         #[serde(rename = "sessionId")]
         session_id: String,
+        #[serde(rename = "profileId")]
+        profile_id: String,
         event: Value,
     },
     TerminalEvent {

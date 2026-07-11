@@ -121,6 +121,7 @@ pub(crate) async fn enqueue_session_queue_payload(
     }
     emit_queue_updated(state, profile_id, session_id, Some(queue.clone())).await;
     spawn_queue_drain(state, profile_id, session_id);
+    tokio::task::yield_now().await;
 
     Ok(queue)
 }

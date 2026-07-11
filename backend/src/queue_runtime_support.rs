@@ -2,12 +2,41 @@ use super::*;
 
 const QUEUE_DRAIN_RETRY_DELAYS_MS: [u64; 6] = [250, 750, 1_500, 3_000, 5_000, 10_000];
 const QUEUE_ACTIVE_STATUS_FRESH_MS: u64 = 30_000;
+const QUEUE_CACHED_ACTIVE_PROBE_GRACE_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionTurnActivity {
     Active,
     Idle,
     Unknown,
+}
+
+struct QueueDispatchGuard {
+    dispatching: Arc<Mutex<HashSet<String>>>,
+    key: Option<String>,
+}
+
+impl QueueDispatchGuard {
+    async fn release(mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        self.dispatching.lock().await.remove(&key);
+    }
+}
+
+impl Drop for QueueDispatchGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let dispatching = self.dispatching.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                dispatching.lock().await.remove(&key);
+            });
+        }
+    }
 }
 
 pub(crate) async fn with_queue_dispatch_guard<T, F>(
@@ -31,20 +60,16 @@ where
         current.insert(key.clone());
     }
 
+    let guard = QueueDispatchGuard {
+        dispatching: state.queue_dispatching.clone(),
+        key: Some(key),
+    };
     let result = work.await;
-    state.queue_dispatching.lock().await.remove(&key);
+    guard.release().await;
     Some(result)
 }
 
-async fn cancel_queue_drain_retry(state: &AppState, profile_id: &str, session_id: &str) {
-    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
-    let key = runtime_session_key(&resolved_profile_id, session_id);
-    if let Some(handle) = state.queue_drain_retries.lock().await.remove(&key) {
-        handle.abort();
-    }
-}
-
-fn schedule_queue_drain_retry(
+pub(crate) fn schedule_queue_drain_retry(
     state: &AppState,
     profile_id: &str,
     session_id: &str,
@@ -74,7 +99,6 @@ fn schedule_queue_drain_retry(
         if retries.contains_key(&key) {
             return;
         }
-
         let state_for_retry = state_for_registration.clone();
         let retry_key = key.clone();
         let handle = tokio::spawn(async move {
@@ -89,6 +113,15 @@ fn schedule_queue_drain_retry(
         });
         retries.insert(key, handle);
     });
+}
+
+fn queue_dispatch_error_is_transient(error: &ApiError) -> bool {
+    let message = error.message.to_ascii_lowercase();
+    message.contains("process limit reached")
+        || message.contains("app-server request timed out")
+        || message.contains("request timed out")
+        || message.contains("codex app-server request channel closed")
+        || message.contains("codex app-server is not running")
 }
 
 pub(crate) async fn remove_session_queue_item_after_dispatch(
@@ -365,7 +398,6 @@ async fn maybe_drain_queue_with_attempt(
             .and_then(Value::as_array)
             .is_none_or(|items| items.is_empty())
         {
-            cancel_queue_drain_retry(state, profile_id, session_id).await;
             maybe_schedule_global_shutdown(state, profile_id, None).await;
             return;
         }
@@ -374,7 +406,6 @@ async fn maybe_drain_queue_with_attempt(
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            cancel_queue_drain_retry(state, profile_id, session_id).await;
             return;
         }
         match session_turn_activity(state, profile_id, session_id).await {
@@ -383,25 +414,33 @@ async fn maybe_drain_queue_with_attempt(
                 return;
             }
             SessionTurnActivity::Unknown => {
-                let status_is_stale = with_ui_state_read(state, profile_id, |ui_state| {
+                let cached_active_turn_exists =
+                    state.active_turns.lock().await.contains_key(&runtime_key);
+                let live_status_age_ms = with_ui_state_read(state, profile_id, |ui_state| {
                     Ok(ui_state
                         .get("runtimeStatusByThreadId")
                         .and_then(Value::as_object)
                         .and_then(|entries| entries.get(session_id))
-                        .is_some_and(|status| {
+                        .and_then(|status| {
                             normalized_thread_status(Some(status))
                                 .as_deref()
                                 .is_some_and(is_live_thread_status)
-                                && status.get("updatedAt").and_then(Value::as_u64).is_some_and(
-                                    |updated_at| {
-                                        now_unix_ms().saturating_sub(updated_at)
-                                            >= QUEUE_ACTIVE_STATUS_FRESH_MS
-                                    },
-                                )
+                                .then(|| {
+                                    status
+                                        .get("updatedAt")
+                                        .and_then(Value::as_u64)
+                                        .map(|updated_at| now_unix_ms().saturating_sub(updated_at))
+                                })
+                                .flatten()
                         }))
                 })
                 .await
-                .unwrap_or(false);
+                .unwrap_or(None);
+                let status_is_stale =
+                    live_status_age_ms.is_some_and(|age| age >= QUEUE_ACTIVE_STATUS_FRESH_MS);
+                let cached_active_probe_is_stale = cached_active_turn_exists
+                    && live_status_age_ms
+                        .is_some_and(|age| age >= QUEUE_CACHED_ACTIVE_PROBE_GRACE_MS);
                 let local_still_active = match local_session_has_active_turn_payload(
                     state, profile_id, session_id,
                 )
@@ -410,7 +449,7 @@ async fn maybe_drain_queue_with_attempt(
                     Ok(Some(value)) => value,
                     Ok(None) | Err(_) => false,
                 };
-                if !status_is_stale || local_still_active {
+                if (!status_is_stale && !cached_active_probe_is_stale) || local_still_active {
                     schedule_queue_drain_retry(state, profile_id, session_id, attempt);
                     return;
                 }
@@ -472,6 +511,10 @@ async fn maybe_drain_queue_with_attempt(
                 .await;
             }
             Err(error) => {
+                if queue_dispatch_error_is_transient(&error) {
+                    schedule_queue_drain_retry(state, profile_id, session_id, attempt);
+                    return;
+                }
                 let failed_at = now_unix_ms();
                 let _ = with_ui_state_write(state, profile_id, |ui_state| {
                     let Some(queue) = ui_state

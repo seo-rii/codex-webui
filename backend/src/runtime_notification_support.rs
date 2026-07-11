@@ -352,8 +352,7 @@ pub(crate) async fn emit_runtime_profile_config_updated(state: &AppState, profil
                 "systemShutdown": {
                     "available": shutdown_available,
                     "delaySeconds": state_for_task.config.system_shutdown_delay_seconds,
-                    "armed": shutdown_available
-                        && state_for_task.config.system_shutdown_enabled
+                    "armed": state_for_task.config.system_shutdown_enabled
                         && shutdown_after_queue_completes
                 },
                 "startup": {
@@ -375,6 +374,8 @@ fn notification_thread_id(method: &str, params: &Value) -> Option<String> {
     params
         .get("threadId")
         .or_else(|| params.get("thread_id"))
+        .or_else(|| params.get("sessionId"))
+        .or_else(|| params.get("session_id"))
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| {
@@ -407,6 +408,7 @@ fn notification_thread_name(params: &Value) -> Option<String> {
 fn notification_turn_id(params: &Value) -> Option<String> {
     params
         .get("turnId")
+        .or_else(|| params.get("turn_id"))
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| {
@@ -416,6 +418,36 @@ fn notification_turn_id(params: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
+}
+
+fn notification_method_carries_live_turn_activity(method: &str) -> bool {
+    matches!(
+        method,
+        "item/started"
+            | "item/completed"
+            | "item/agentMessage/delta"
+            | "item/plan/delta"
+            | "item/reasoning/textDelta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/summaryPartAdded"
+            | "item/commandExecution/outputDelta"
+            | "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/call"
+            | "turn/plan/updated"
+            | "turn/diff/updated"
+    )
+}
+
+pub(crate) fn runtime_status_from_codex_thread_status(status: &str) -> &str {
+    match status {
+        "active" | "running" => "running",
+        "idle" | "completed" => "completed",
+        "systemError" | "system_error" | "failed" | "error" => "failed",
+        "notLoaded" | "not_loaded" | "unknown" => "stopped",
+        other => other,
+    }
 }
 
 async fn session_has_cached_runtime_activity(state: &AppState, runtime_key: &str) -> bool {
@@ -909,20 +941,25 @@ async fn mark_runtime_session_terminal_after_reconcile(
         Ok(())
     })
     .await;
-    let (automation_status, automation_error) = automation_status_for_thread_status(status);
-    let automation_error = if status == "completed" {
-        None
-    } else {
-        automation_error.as_deref().or(Some(reason))
-    };
-    complete_active_automation_runs_for_session(
-        state,
-        profile_id,
-        session_id,
-        &automation_status,
-        automation_error,
-    )
-    .await;
+    if matches!(
+        status,
+        "completed" | "failed" | "error" | "cancelled" | "canceled" | "aborted"
+    ) {
+        let (automation_status, automation_error) = automation_status_for_thread_status(status);
+        let automation_error = if status == "completed" {
+            None
+        } else {
+            automation_error.as_deref().or(Some(reason))
+        };
+        complete_active_automation_runs_for_session(
+            state,
+            profile_id,
+            session_id,
+            &automation_status,
+            automation_error,
+        )
+        .await;
+    }
     clear_session_pending_requests(state, profile_id, session_id).await;
     emit_session_notification(
         state,
@@ -939,10 +976,12 @@ async fn mark_runtime_session_terminal_after_reconcile(
         }),
     )
     .await;
-    if status == "completed" {
+    if matches!(status, "completed" | "stopped") {
         spawn_queue_drain(state, profile_id, session_id);
-        maybe_schedule_global_shutdown(state, profile_id, None).await;
-    } else {
+        if status == "completed" {
+            maybe_schedule_global_shutdown(state, profile_id, None).await;
+        }
+    } else if status == "failed" {
         mark_runtime_session_attention(state, profile_id, session_id, "failed", reason).await;
     }
     emit_session_summary_updated(state, profile_id, session_id, None, Some(status)).await;
@@ -1012,26 +1051,22 @@ pub(crate) async fn reconcile_lost_runtime_activity_for_profile(
         else {
             continue;
         };
-        let status =
+        let codex_status =
             normalized_thread_status(thread.get("status")).unwrap_or_else(|| "unknown".to_string());
-        if is_live_thread_status(&status) {
+        let status = runtime_status_from_codex_thread_status(&codex_status);
+        if status == "running" {
             continue;
         }
-        let terminal_status = if status == "completed" {
-            "completed"
-        } else {
-            "failed"
-        };
-        let reason = if terminal_status == "completed" {
-            "codex app-server reports the turn is complete"
-        } else {
-            "codex app-server no longer has an active turn"
+        let reason = match status {
+            "completed" => "codex app-server reports the thread is idle",
+            "failed" => "codex app-server reports a system error",
+            _ => "codex app-server does not currently have the thread loaded",
         };
         mark_runtime_session_terminal_after_reconcile(
             state,
             profile_id,
             &session_id,
-            terminal_status,
+            status,
             reason,
         )
         .await;
@@ -1040,12 +1075,41 @@ pub(crate) async fn reconcile_lost_runtime_activity_for_profile(
     reconciled
 }
 
-pub(crate) async fn set_runtime_session_status(
+async fn persist_runtime_session_status(
     state: &AppState,
     profile_id: &str,
     session_id: &str,
     status: &str,
+    authoritative: bool,
 ) {
+    let current_status = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("runtimeStatusByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get(session_id))
+            .and_then(|entry| normalized_thread_status(Some(entry))))
+    })
+    .await
+    .ok()
+    .flatten();
+    if current_status.as_deref() == Some(status) {
+        return;
+    }
+    if status == "running"
+        && !authoritative
+        && matches!(
+            current_status.as_deref(),
+            Some("completed" | "failed" | "stopped" | "cancelled" | "canceled" | "aborted")
+        )
+    {
+        let runtime_key = runtime_session_key(
+            &resolve_runtime_profile_entry(&state.config, profile_id).0,
+            session_id,
+        );
+        if !session_has_cached_runtime_activity(state, &runtime_key).await {
+            return;
+        }
+    }
     let _ = with_ui_state_write(state, profile_id, |ui_state| {
         let Some(runtime_status_by_thread_id) = ui_state
             .get_mut("runtimeStatusByThreadId")
@@ -1066,6 +1130,92 @@ pub(crate) async fn set_runtime_session_status(
         Ok(())
     })
     .await;
+}
+
+pub(crate) async fn set_runtime_session_status(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    status: &str,
+) {
+    persist_runtime_session_status(state, profile_id, session_id, status, false).await;
+}
+
+async fn set_authoritative_runtime_session_status(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    status: &str,
+) {
+    persist_runtime_session_status(state, profile_id, session_id, status, true).await;
+}
+
+async fn terminal_status_conflicts_with_live_turn(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    runtime_key: &str,
+) -> bool {
+    let has_cached_active_turn = state.active_turns.lock().await.contains_key(runtime_key);
+    let has_fresh_live_runtime_status = if has_cached_active_turn {
+        true
+    } else {
+        with_ui_state_read(state, profile_id, |ui_state| {
+            Ok(ui_state
+                .get("runtimeStatusByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id))
+                .is_some_and(|entry| {
+                    normalized_thread_status(Some(entry))
+                        .as_deref()
+                        .is_some_and(is_live_thread_status)
+                        && entry.get("updatedAt").and_then(Value::as_u64).is_some_and(
+                            |updated_at| {
+                                now_unix_ms().saturating_sub(updated_at)
+                                    < RUNTIME_ACTIVITY_RECONCILE_INTERVAL_SECS.saturating_mul(1_000)
+                            },
+                        )
+                }))
+        })
+        .await
+        .unwrap_or(false)
+    };
+    if !has_fresh_live_runtime_status {
+        return false;
+    }
+    let Ok(client) = app_server_client_for_session(state, profile_id, session_id).await else {
+        return false;
+    };
+    let response = match client
+        .request_with_timeout(
+            "thread/read",
+            json!({
+                "threadId": session_id,
+                "includeTurns": true
+            }),
+            Duration::from_millis(RUNTIME_ACTIVITY_RECONCILE_TIMEOUT_MS),
+            false,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return is_unmaterialized_thread_error_message(&error.to_string()),
+    };
+    let active_turn_id = response
+        .get("thread")
+        .and_then(|thread| thread.get("turns"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .and_then(active_turn_id_from_turns);
+    if let Some(turn_id) = active_turn_id {
+        state
+            .active_turns
+            .lock()
+            .await
+            .insert(runtime_key.to_string(), turn_id);
+        return true;
+    }
+    false
 }
 
 pub(crate) async fn handle_profile_runtime_notification(
@@ -1095,7 +1245,8 @@ pub(crate) async fn handle_profile_runtime_notification(
                     .await
                     .insert(runtime_key.clone(), turn_id);
             }
-            set_runtime_session_status(state, profile_id, &session_id, "running").await;
+            set_authoritative_runtime_session_status(state, profile_id, &session_id, "running")
+                .await;
             cancel_scheduled_shutdown_for_activity(state, profile_id).await;
             set_session_highlight(state, profile_id, &session_id, None).await;
         }
@@ -1110,6 +1261,40 @@ pub(crate) async fn handle_profile_runtime_notification(
                 active_turns.remove(&runtime_key);
             }
             drop(active_turns);
+            if state.active_turns.lock().await.contains_key(&runtime_key) {
+                if let Ok(client) =
+                    app_server_client_for_session(state, profile_id, &session_id).await
+                {
+                    if let Ok(response) = client
+                        .request_with_timeout(
+                            "thread/read",
+                            json!({
+                                "threadId": session_id,
+                                "includeTurns": true
+                            }),
+                            Duration::from_millis(RUNTIME_ACTIVITY_RECONCILE_TIMEOUT_MS),
+                            false,
+                        )
+                        .await
+                    {
+                        let active_turn_id = response
+                            .get("thread")
+                            .and_then(|thread| thread.get("turns"))
+                            .and_then(Value::as_array)
+                            .map(Vec::as_slice)
+                            .and_then(active_turn_id_from_turns);
+                        if let Some(active_turn_id) = active_turn_id {
+                            state
+                                .active_turns
+                                .lock()
+                                .await
+                                .insert(runtime_key.clone(), active_turn_id);
+                        } else {
+                            state.active_turns.lock().await.remove(&runtime_key);
+                        }
+                    }
+                }
+            }
             let still_active = session_has_cached_runtime_activity(state, &runtime_key).await;
             set_runtime_session_status(
                 state,
@@ -1179,6 +1364,17 @@ pub(crate) async fn handle_profile_runtime_notification(
                 .await;
             }
         }
+        method if notification_method_carries_live_turn_activity(method) => {
+            state.pending_turn_starts.lock().await.remove(&runtime_key);
+            if let Some(turn_id) = notification_turn_id(&notification.params) {
+                state
+                    .active_turns
+                    .lock()
+                    .await
+                    .insert(runtime_key.clone(), turn_id);
+            }
+            cancel_scheduled_shutdown_for_activity(state, profile_id).await;
+        }
         "thread/name/updated" => {
             let thread_name = notification_thread_name(&notification.params);
             if let Err(error) =
@@ -1191,30 +1387,67 @@ pub(crate) async fn handle_profile_runtime_notification(
             }
         }
         "thread/status/changed" => {
-            let status = normalized_thread_status(notification.params.get("status"))
+            let codex_status = normalized_thread_status(notification.params.get("status"))
                 .unwrap_or_else(|| "unknown".to_string());
-            if is_live_thread_status(&status) {
+            let status = runtime_status_from_codex_thread_status(&codex_status).to_string();
+            if status == "running" {
                 state.pending_turn_starts.lock().await.remove(&runtime_key);
-                set_runtime_session_status(state, profile_id, &session_id, "running").await;
+                set_authoritative_runtime_session_status(state, profile_id, &session_id, "running")
+                    .await;
                 cancel_scheduled_shutdown_for_activity(state, profile_id).await;
             } else {
+                if terminal_status_conflicts_with_live_turn(
+                    state,
+                    profile_id,
+                    &session_id,
+                    &runtime_key,
+                )
+                .await
+                {
+                    set_runtime_session_status(state, profile_id, &session_id, "running").await;
+                    emit_session_summary_updated(
+                        state,
+                        profile_id,
+                        &session_id,
+                        None,
+                        Some("running"),
+                    )
+                    .await;
+                    return;
+                }
                 state.pending_turn_starts.lock().await.remove(&runtime_key);
                 state.active_turns.lock().await.remove(&runtime_key);
                 clear_session_pending_requests(state, profile_id, &session_id).await;
                 set_runtime_session_status(state, profile_id, &session_id, &status).await;
-                let (automation_status, automation_error) =
-                    automation_status_for_thread_status(&status);
-                complete_active_automation_runs_for_session(
-                    state,
-                    profile_id,
-                    &session_id,
-                    &automation_status,
-                    automation_error.as_deref(),
-                )
-                .await;
+                if matches!(
+                    status.as_str(),
+                    "completed" | "failed" | "error" | "cancelled" | "canceled" | "aborted"
+                ) {
+                    let (automation_status, automation_error) =
+                        automation_status_for_thread_status(&status);
+                    complete_active_automation_runs_for_session(
+                        state,
+                        profile_id,
+                        &session_id,
+                        &automation_status,
+                        automation_error.as_deref(),
+                    )
+                    .await;
+                }
                 spawn_queue_drain(state, profile_id, &session_id);
-                maybe_schedule_global_shutdown(state, profile_id, None).await;
+                if status == "completed" {
+                    maybe_schedule_global_shutdown(state, profile_id, None).await;
+                }
             }
+        }
+        "serverRequest/resolved" => {
+            handle_server_request_resolved_notification(
+                state,
+                profile_id,
+                &session_id,
+                &notification.params,
+            )
+            .await;
         }
         "thread/archived" | "thread/unarchived" => {
             emit_profile_global_notification(
@@ -1253,6 +1486,27 @@ pub(crate) async fn handle_profile_runtime_notification(
                 .and_then(Value::as_object_mut)
                 .and_then(|params| params.get_mut("turn"))
             {
+                if !session_turn_has_visible_agent_output(turn) {
+                    let completed_turn_id =
+                        turn.get("id").and_then(Value::as_str).map(str::to_string);
+                    if let Ok(thread) =
+                        read_thread_payload(state, profile_id, &session_id, true).await
+                    {
+                        if let Some(authoritative_turn) = thread
+                            .get("turns")
+                            .and_then(Value::as_array)
+                            .and_then(|turns| {
+                                completed_turn_id.as_deref().and_then(|turn_id| {
+                                    turns.iter().find(|candidate| {
+                                        candidate.get("id").and_then(Value::as_str) == Some(turn_id)
+                                    })
+                                })
+                            })
+                        {
+                            *turn = authoritative_turn.clone();
+                        }
+                    }
+                }
                 let mut turns = vec![turn.clone()];
                 if apply_language_bridge_translations_to_turns(
                     state,
@@ -1267,6 +1521,18 @@ pub(crate) async fn handle_profile_runtime_notification(
                         *turn = translated_turn;
                     }
                 }
+            }
+        }
+        if notification.method == "thread/status/changed" {
+            if let Some(status) = event
+                .get_mut("params")
+                .and_then(Value::as_object_mut)
+                .and_then(|params| params.get_mut("status"))
+            {
+                let normalized =
+                    normalized_thread_status(Some(status)).unwrap_or_else(|| "unknown".to_string());
+                *status =
+                    Value::String(runtime_status_from_codex_thread_status(&normalized).to_string());
             }
         }
         emit_session_notification(state, profile_id, &session_id, event).await;
@@ -1289,7 +1555,8 @@ pub(crate) async fn handle_profile_runtime_notification(
                 }
                 .to_string(),
             ),
-            "thread/status/changed" => normalized_thread_status(notification.params.get("status")),
+            "thread/status/changed" => normalized_thread_status(notification.params.get("status"))
+                .map(|status| runtime_status_from_codex_thread_status(&status).to_string()),
             _ => None,
         };
         emit_session_summary_updated(
@@ -1451,20 +1718,65 @@ pub(crate) fn register_runtime_profile_monitor(
         handle.abort();
     }
 
+    let maintenance_key = format!("{resolved_profile_id}::__profile_maintenance");
+    if !monitors
+        .get(&maintenance_key)
+        .is_some_and(|handle| !handle.is_finished())
+    {
+        if let Some(handle) = monitors.remove(&maintenance_key) {
+            handle.abort();
+        }
+        let maintenance_state = state.clone();
+        let maintenance_profile_id = resolved_profile_id.clone();
+        let maintenance_handle = tokio::spawn(async move {
+            let mut automation_reconcile_interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(60));
+            automation_reconcile_interval
+                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut runtime_activity_reconcile_interval = tokio::time::interval(
+                tokio::time::Duration::from_secs(RUNTIME_ACTIVITY_RECONCILE_INTERVAL_SECS),
+            );
+            runtime_activity_reconcile_interval
+                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            automation_reconcile_interval.tick().await;
+            runtime_activity_reconcile_interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = automation_reconcile_interval.tick() => {
+                        let reconciled = reconcile_stale_automation_runs_for_profile(
+                            &maintenance_state,
+                            &maintenance_profile_id,
+                        )
+                        .await;
+                        if reconciled > 0 {
+                            tracing::debug!(
+                                "reconciled {reconciled} stale automation run(s) for {maintenance_profile_id}"
+                            );
+                        }
+                    },
+                    _ = runtime_activity_reconcile_interval.tick() => {
+                        let reconciled = reconcile_lost_runtime_activity_for_profile(
+                            &maintenance_state,
+                            &maintenance_profile_id,
+                        )
+                        .await;
+                        if !reconciled.is_empty() {
+                            warn!(
+                                "reconciled {} lost runtime session(s) for {maintenance_profile_id}",
+                                reconciled.len()
+                            );
+                        }
+                    },
+                }
+            }
+        });
+        monitors.insert(maintenance_key, maintenance_handle);
+    }
+
     let monitor_state = state.clone();
     let monitor_profile_id = resolved_profile_id.clone();
     let monitor_client_key = client_key.to_string();
     let handle = tokio::spawn(async move {
-        let mut automation_reconcile_interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(60));
-        automation_reconcile_interval
-            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut runtime_activity_reconcile_interval = tokio::time::interval(
-            tokio::time::Duration::from_secs(RUNTIME_ACTIVITY_RECONCILE_INTERVAL_SECS),
-        );
-        runtime_activity_reconcile_interval
-            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        runtime_activity_reconcile_interval.tick().await;
         loop {
             tokio::select! {
                 notification = notifications.recv() => match notification {
@@ -1501,17 +1813,11 @@ pub(crate) fn register_runtime_profile_monitor(
                         warn!(
                             "runtime app-server relay lagged for {monitor_profile_id}: skipped {skipped} messages"
                         );
-                        let reconciled = reconcile_lost_runtime_activity_for_profile(
-                            &monitor_state,
-                            &monitor_profile_id,
-                        )
-                        .await;
-                        if !reconciled.is_empty() {
-                            warn!(
-                                "reconciled {} lost runtime session(s) after app-server relay lag for {monitor_profile_id}",
-                                reconciled.len()
-                            );
-                        }
+                        // The global relay already asks connected clients to resync after a
+                        // broadcast gap. Running native thread/read calls here creates a
+                        // feedback loop when the app-server is busy: more reads cause more
+                        // lag, and short reconciliation deadlines can interfere with user RPCs.
+                        // The single per-profile maintenance task performs the bounded repair.
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
@@ -1531,31 +1837,6 @@ pub(crate) fn register_runtime_profile_monitor(
                         );
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
-                },
-                _ = automation_reconcile_interval.tick() => {
-                    let reconciled = reconcile_stale_automation_runs_for_profile(
-                        &monitor_state,
-                        &monitor_profile_id,
-                    )
-                    .await;
-                    if reconciled > 0 {
-                        tracing::debug!(
-                            "reconciled {reconciled} stale automation run(s) for {monitor_profile_id}"
-                        );
-                    }
-                },
-                _ = runtime_activity_reconcile_interval.tick() => {
-                    let reconciled = reconcile_lost_runtime_activity_for_profile(
-                        &monitor_state,
-                        &monitor_profile_id,
-                    )
-                    .await;
-                    if !reconciled.is_empty() {
-                        warn!(
-                            "reconciled {} lost runtime session(s) for {monitor_profile_id}",
-                            reconciled.len()
-                        );
-                    }
                 },
             }
         }

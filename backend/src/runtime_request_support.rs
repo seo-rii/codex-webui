@@ -1,5 +1,23 @@
 use super::*;
 
+const RESOLVED_SERVER_REQUEST_TOMBSTONE_TTL_MS: u64 = 5 * 60 * 1_000;
+const RESOLVED_SERVER_REQUEST_TOMBSTONE_LIMIT: usize = 4_096;
+static RESOLVED_SERVER_REQUEST_TOMBSTONES: std::sync::OnceLock<
+    tokio::sync::Mutex<HashMap<String, u64>>,
+> = std::sync::OnceLock::new();
+
+fn resolved_server_request_tombstones() -> &'static tokio::sync::Mutex<HashMap<String, u64>> {
+    RESOLVED_SERVER_REQUEST_TOMBSTONES.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+fn resolved_server_request_tombstone_key(
+    state: &AppState,
+    runtime_key: &str,
+    request_id: &str,
+) -> String {
+    format!("{state:p}:{runtime_key}:{request_id}")
+}
+
 fn pending_request_id(raw_id: &Value) -> String {
     raw_id
         .as_str()
@@ -13,6 +31,21 @@ pub(crate) async fn set_session_highlight(
     session_id: &str,
     highlight: Option<Value>,
 ) {
+    let unchanged = with_ui_state_read(state, profile_id, |ui_state| {
+        let current = ui_state
+            .get("highlightsByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get(session_id));
+        Ok(match highlight.as_ref() {
+            Some(next) => current == Some(next),
+            None => current.is_none(),
+        })
+    })
+    .await
+    .unwrap_or(false);
+    if unchanged {
+        return;
+    }
     let result = with_ui_state_write(state, profile_id, |ui_state| {
         let Some(highlights_by_thread_id) = ui_state
             .get_mut("highlightsByThreadId")
@@ -36,6 +69,61 @@ pub(crate) async fn set_session_highlight(
 
     if result.is_ok() {
         emit_session_summary_updated(state, profile_id, session_id, None, None).await;
+    }
+}
+
+pub(crate) async fn handle_server_request_resolved_notification(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    params: &Value,
+) {
+    let Some(request_id) = params
+        .get("requestId")
+        .or_else(|| params.get("request_id"))
+        .map(pending_request_id)
+    else {
+        return;
+    };
+    let runtime_key = runtime_session_key(
+        &resolve_runtime_profile_entry(&state.config, profile_id).0,
+        session_id,
+    );
+    let tombstone_key = resolved_server_request_tombstone_key(state, &runtime_key, &request_id);
+    let now = now_unix_ms();
+    {
+        let mut tombstones = resolved_server_request_tombstones().lock().await;
+        tombstones.retain(|_, resolved_at| {
+            now.saturating_sub(*resolved_at) <= RESOLVED_SERVER_REQUEST_TOMBSTONE_TTL_MS
+        });
+        if tombstones.len() >= RESOLVED_SERVER_REQUEST_TOMBSTONE_LIMIT {
+            if let Some(oldest_key) = tombstones
+                .iter()
+                .min_by_key(|(_, resolved_at)| **resolved_at)
+                .map(|(key, _)| key.clone())
+            {
+                tombstones.remove(&oldest_key);
+            }
+        }
+        tombstones.insert(tombstone_key, now);
+    }
+
+    let remaining = {
+        let mut pending_requests = state.pending_server_requests.lock().await;
+        let remaining = pending_requests
+            .get_mut(&runtime_key)
+            .map(|entries| {
+                entries.remove(&request_id);
+                entries.len()
+            })
+            .unwrap_or(0);
+        if remaining == 0 {
+            pending_requests.remove(&runtime_key);
+        }
+        remaining
+    };
+    if remaining == 0 {
+        set_session_highlight(state, profile_id, session_id, None).await;
     }
 }
 
@@ -157,9 +245,19 @@ pub(crate) async fn clear_session_pending_requests(
     }
 }
 
-async fn session_accepts_server_request(state: &AppState, runtime_key: &str) -> bool {
+async fn session_accepts_server_request(
+    state: &AppState,
+    runtime_key: &str,
+    client_key: &str,
+) -> bool {
     state.active_turns.lock().await.contains_key(runtime_key)
         || state.pending_turn_starts.lock().await.contains(runtime_key)
+        || state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(runtime_key)
+            .is_some_and(|assigned_client_key| assigned_client_key == client_key)
 }
 
 pub(crate) async fn handle_profile_server_request(
@@ -181,7 +279,19 @@ pub(crate) async fn handle_profile_server_request(
         &resolve_runtime_profile_entry(&state.config, profile_id).0,
         &session_id,
     );
-    if !session_accepts_server_request(state, &runtime_key).await {
+    let request_id = pending_request_id(&request.id);
+    let tombstone_key = resolved_server_request_tombstone_key(state, &runtime_key, &request_id);
+    {
+        let now = now_unix_ms();
+        let mut tombstones = resolved_server_request_tombstones().lock().await;
+        tombstones.retain(|_, resolved_at| {
+            now.saturating_sub(*resolved_at) <= RESOLVED_SERVER_REQUEST_TOMBSTONE_TTL_MS
+        });
+        if tombstones.contains_key(&tombstone_key) {
+            return;
+        }
+    }
+    if !session_accepts_server_request(state, &runtime_key, client_key).await {
         if let Ok(client) = app_server_client_by_key(state, profile_id, client_key).await {
             let _ = client
                 .reject(
@@ -250,35 +360,43 @@ pub(crate) async fn handle_profile_server_request(
         }
     }
 
-    let request_id = pending_request_id(&request.id);
     let created_at_ms = now_unix_ms();
-    {
+    let request_was_new = {
         let mut pending_requests = state.pending_server_requests.lock().await;
         let entries = pending_requests.entry(runtime_key).or_default();
-        entries.insert(
-            request_id.clone(),
-            PendingServerRequestEntry {
-                raw_id: request.id.clone(),
-                method: request.method.clone(),
-                params: request.params.clone(),
-                created_at: now_rfc3339(),
-                created_at_ms,
-            },
-        );
-        if entries.len() > PENDING_SERVER_REQUEST_MAX_PER_SESSION {
-            let mut ordered = entries
-                .iter()
-                .filter(|(id, _)| id.as_str() != request_id)
-                .map(|(id, pending)| (id.clone(), pending.created_at_ms))
-                .collect::<Vec<_>>();
-            ordered.sort_by_key(|(_, created_at)| *created_at);
-            for (id, _) in ordered {
-                if entries.len() <= PENDING_SERVER_REQUEST_MAX_PER_SESSION {
-                    break;
+        if entries.contains_key(&request_id) {
+            false
+        } else {
+            entries.insert(
+                request_id.clone(),
+                PendingServerRequestEntry {
+                    raw_id: request.id.clone(),
+                    client_key: client_key.to_string(),
+                    method: request.method.clone(),
+                    params: request.params.clone(),
+                    created_at: now_rfc3339(),
+                    created_at_ms,
+                },
+            );
+            if entries.len() > PENDING_SERVER_REQUEST_MAX_PER_SESSION {
+                let mut ordered = entries
+                    .iter()
+                    .filter(|(id, _)| id.as_str() != request_id)
+                    .map(|(id, pending)| (id.clone(), pending.created_at_ms))
+                    .collect::<Vec<_>>();
+                ordered.sort_by_key(|(_, created_at)| *created_at);
+                for (id, _) in ordered {
+                    if entries.len() <= PENDING_SERVER_REQUEST_MAX_PER_SESSION {
+                        break;
+                    }
+                    entries.remove(&id);
                 }
-                entries.remove(&id);
             }
+            true
         }
+    };
+    if !request_was_new {
+        return;
     }
 
     emit_session_notification(
@@ -301,7 +419,9 @@ pub(crate) async fn handle_profile_server_request(
             "method": "codex-webui/sessionAttention",
             "params": {
                 "sessionId": session_id,
-                "reason": "approval"
+                "reason": "approval",
+                "requestId": request_id,
+                "requestMethod": request.method
             }
         }),
     )
@@ -329,6 +449,31 @@ pub(crate) async fn handle_profile_server_request(
         })),
     )
     .await;
+
+    if request.method == "item/tool/requestUserInput" {
+        if let Some(auto_resolution_ms) = request
+            .params
+            .get("autoResolutionMs")
+            .or_else(|| request.params.get("auto_resolution_ms"))
+            .and_then(Value::as_u64)
+        {
+            let auto_state = state.clone();
+            let auto_profile_id = profile_id.to_string();
+            let auto_session_id = session_id;
+            let auto_request_id = request_id;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(auto_resolution_ms)).await;
+                let _ = resolve_server_request_payload(
+                    &auto_state,
+                    &auto_profile_id,
+                    &auto_session_id,
+                    &auto_request_id,
+                    json!({ "answers": {} }),
+                )
+                .await;
+            });
+        }
+    }
 }
 
 pub(crate) async fn abort_turn_payload(
@@ -367,6 +512,32 @@ pub(crate) async fn abort_turn_payload(
     Ok(json!({ "interrupted": true }))
 }
 
+pub(crate) fn normalize_server_request_response(
+    pending: &PendingServerRequestEntry,
+    result: Value,
+) -> Value {
+    if pending.method != "item/permissions/requestApproval" || result.get("permissions").is_some() {
+        return result;
+    }
+    let decision = result
+        .get("decision")
+        .and_then(Value::as_str)
+        .unwrap_or("decline");
+    let permissions = if matches!(decision, "accept" | "acceptForSession") {
+        pending
+            .params
+            .get("permissions")
+            .cloned()
+            .unwrap_or_else(|| json!({}))
+    } else {
+        json!({})
+    };
+    json!({
+        "permissions": permissions,
+        "scope": if decision == "acceptForSession" { "session" } else { "turn" }
+    })
+}
+
 pub(crate) async fn resolve_server_request_payload(
     state: &AppState,
     profile_id: &str,
@@ -390,7 +561,7 @@ pub(crate) async fn resolve_server_request_payload(
         return Err(api_error(StatusCode::NOT_FOUND, "SERVER_REQUEST_NOT_FOUND"));
     };
 
-    let client = app_server_client_for_session(state, profile_id, session_id)
+    let client = app_server_client_by_key(state, profile_id, &pending.client_key)
         .await
         .map_err(|error| {
             api_error(
@@ -398,6 +569,7 @@ pub(crate) async fn resolve_server_request_payload(
                 format!("Failed to connect to codex app-server: {error}"),
             )
         })?;
+    let result = normalize_server_request_response(&pending, result);
     client
         .respond(pending.raw_id.clone(), result)
         .await

@@ -137,7 +137,7 @@
 
   const SESSION_LIST_BROWSER_CACHE_SCHEMA_VERSION = 2;
   const SESSION_LIST_VERSION_HINT_LIMIT = 240;
-  const SESSION_DETAIL_VERSION_HINT_LIMIT = 320;
+  const SESSION_DETAIL_VERSION_HINT_LIMIT = 5_000;
 
   type WorkspaceTabId =
     | "chat"
@@ -263,6 +263,8 @@
   let sessionsLoadingMore = $state(false);
   let conversation = $state<ConversationState | null>(null);
   let selectedSessionId = $state<string | null>(null);
+  let selectedSessionProfileId = $state<string | null>(null);
+  let sessionProfileIdsBySessionId = $state<Record<string, string>>({});
   let profileMoveDialogSession = $state<SessionSummary | null>(null);
   let profileMoveDialogTargetId = $state("");
   let activeProfileId = $state<string | null>(null);
@@ -416,9 +418,11 @@
     hiddenDurationMs: number;
     eventCount: number;
     refreshing: boolean;
+    refreshRetries: number;
   } | null>(null);
   let startupAlertModalOpen = $state(false);
   let startupAlertDismissed = $state(false);
+  let startupAlertInitialConfigHandled = $state(false);
   let sessionRecoveryPrompt = $state<SessionRecoveryPromptState | null>(null);
   let dismissedSessionRecoveryPromptForSessionId = $state<string | null>(null);
   let manualCompactPrompt = $state<ManualCompactPromptState | null>(null);
@@ -1248,6 +1252,7 @@
     dismissLastComposerPromptChip();
     resetSessionTurnSearch();
     selectedSessionId = null;
+    selectedSessionProfileId = null;
     conversation = createDraftConversation(preferences, options.title ?? null);
     draftPersistencePaused = false;
     pendingSessionEvents = {};
@@ -1321,7 +1326,8 @@
       sessionId,
       hiddenDurationMs,
       eventCount: 0,
-      refreshing: false
+      refreshing: false,
+      refreshRetries: 0
     };
     staleSessionCatchupTimer = setTimeout(() => {
       staleSessionCatchupTimer = null;
@@ -1506,9 +1512,13 @@
     upsertSessionSummary(created);
     if (activeSessionFolder) {
       try {
-        const response = await api.updateSessionOrganization(created.id, {
-          tags: [activeSessionFolder]
-        });
+        const response = await api.updateSessionOrganization(
+          created.id,
+          {
+            tags: [activeSessionFolder]
+          },
+          profileIdForSession(created.id)
+        );
         upsertSessionSummary({
           ...created,
           pinned: response.meta.pinned,
@@ -1522,16 +1532,66 @@
         errorText = describeError(error);
       }
     }
-    const restored = await selectSession(created.id);
-    if (!restored || !conversation || selectedSessionId !== created.id) {
-      activateDraftSession(draftState.preferences, {
-        draftText: draftTextSnapshot,
-        draftAttachments: draftAttachmentSnapshot,
-        title: draftTitleSnapshot
-      });
-      draftSelectedSkills = draftSelectedSkillsSnapshot;
-      throw new Error("Failed to open the created session.");
-    }
+    const now = Date.now();
+    const createdProfileId = created.profileId ?? profileIdForSession(created.id);
+    const createdSelectionVersion = sessionSelectionVersion + 1;
+    sessionSelectionVersion = createdSelectionVersion;
+    selectedSessionId = created.id;
+    selectedSessionProfileId = createdProfileId;
+    syncSelectedSessionInUrl(created.id);
+    connectStream(created.id, createdProfileId, createdSelectionVersion);
+    pendingInitialTranscriptScrollSessionId = created.id;
+    requestTranscriptBottomScroll(true);
+    conversation = createConversationState({
+      profileId: createdProfileId,
+      profileLabel: created.profileLabel ?? null,
+      profileCodexHome: created.profileCodexHome ?? null,
+      accountEmail: created.accountEmail ?? null,
+      accountType: created.accountType ?? null,
+      thread: {
+        id: created.id,
+        preview: created.preview ?? "",
+        name: created.name ?? nextTitle,
+        cwd: created.cwd ?? draftState.preferences.cwd,
+        status: created.status ?? "idle",
+        createdAt: normalizeSessionTimestamp(created.createdAt) || now,
+        updatedAt: normalizeSessionTimestamp(created.updatedAt) || now,
+        isSubagent: created.isSubagent ?? false,
+        agentNickname: created.agentNickname ?? null,
+        agentRole: created.agentRole ?? null,
+        turns: []
+      },
+      preferences: created.preferences ?? draftState.preferences,
+      selectedSkills: draftSelectedSkillsSnapshot,
+      goal: null,
+      attachments: [],
+      queue: {
+        sessionId: created.id,
+        items: [],
+        resumeRequired: false,
+        updatedAt: null
+      },
+      pendingRequests: [],
+      activeTurnId: null,
+      tokenUsage: null,
+      hydration: {
+        state: "complete",
+        loadedTurns: 0,
+        totalTurns: 0,
+        remainingTurns: 0,
+        message: null,
+        recovery: {
+          available: false,
+          issue: null,
+          totalLines: null,
+          recoverableLines: null,
+          skippedLines: null
+        }
+      },
+      cacheVersion: "",
+      notModified: false
+    });
+    markConversationCacheDirty();
 
     draft = draftTextSnapshot;
     draftAttachments = draftAttachmentSnapshot;
@@ -1556,13 +1616,15 @@
   }
 
   function syncStartupAlertModal(nextConfig: AppConfigPayload | null, forceOpen = false) {
+    const allowInitialOpen = !startupAlertInitialConfigHandled;
+    startupAlertInitialConfigHandled = true;
     if (!hasStartupAlerts(nextConfig)) {
       startupAlertModalOpen = false;
       startupAlertDismissed = false;
       return;
     }
 
-    if (forceOpen || !startupAlertDismissed) {
+    if (forceOpen || (allowInitialOpen && !startupAlertDismissed)) {
       startupAlertModalOpen = true;
     }
   }
@@ -1640,6 +1702,9 @@
   let composerHistoryDraft = $state("");
   let lastComposerPromptChip = $state<{ sessionId: string; prompt: string } | null>(null);
   let notificationPermissionRequested = false;
+  const recentAttentionNotificationKeys: Record<string, number> = {};
+  const recentLiveSessionEvidenceTtlMs = 8_000;
+  let recentLiveSessionEvidenceAtBySessionId: Record<string, number> = {};
   const handledResumeDraftKeys = new Set<string>();
   const pendingComposerMutationSignatures = new Set<string>();
   let pendingComposerMutationRevision = $state(0);
@@ -1648,6 +1713,61 @@
 
   function isLiveConversationStatus(status: string | null | undefined) {
     return status === "running" || status === "active";
+  }
+
+  function noteRecentLiveSessionEvidence(sessionId: string) {
+    if (!sessionId) {
+      return;
+    }
+    const seenAt = Date.now();
+    recentLiveSessionEvidenceAtBySessionId = {
+      ...recentLiveSessionEvidenceAtBySessionId,
+      [sessionId]: seenAt
+    };
+    setTimeout(() => {
+      if (recentLiveSessionEvidenceAtBySessionId[sessionId] === seenAt) {
+        clearRecentLiveSessionEvidence(sessionId);
+      }
+    }, recentLiveSessionEvidenceTtlMs + 100);
+  }
+
+  function clearRecentLiveSessionEvidence(sessionId: string) {
+    if (!sessionId || recentLiveSessionEvidenceAtBySessionId[sessionId] === undefined) {
+      return;
+    }
+    const nextEvidence = { ...recentLiveSessionEvidenceAtBySessionId };
+    delete nextEvidence[sessionId];
+    recentLiveSessionEvidenceAtBySessionId = nextEvidence;
+  }
+
+  function hasRecentLiveSessionEvidence(sessionId: string | null | undefined) {
+    if (!sessionId) {
+      return false;
+    }
+    const seenAt = recentLiveSessionEvidenceAtBySessionId[sessionId] ?? 0;
+    return seenAt > 0 && Date.now() - seenAt < recentLiveSessionEvidenceTtlMs;
+  }
+
+  function shouldDeferTerminalSessionStatus(sessionId: string | null | undefined, status: string | null | undefined) {
+    return Boolean(sessionId && status && !isLiveConversationStatus(status) && hasRecentLiveSessionEvidence(sessionId));
+  }
+
+  function shouldSuppressAttentionReason(sessionId: string, reason: string, profileId: string | null = null) {
+    if (
+      selectedSessionId === sessionId &&
+      profileId &&
+      selectedSessionProfileId &&
+      selectedSessionProfileId !== profileId
+    ) {
+      return false;
+    }
+    if (!hasRecentLiveSessionEvidence(sessionId)) {
+      return false;
+    }
+    if (reason === "failed" || reason === "stopped") {
+      return true;
+    }
+    return reason === "needsInput" && conversation?.thread.id === sessionId && conversation.pendingRequests.length === 0;
   }
 
   function getConversationLiveTurn(currentConversation: ConversationState | null = conversation) {
@@ -1727,7 +1847,12 @@
 
     const matchingConversation = currentConversation?.thread.id === sessionId ? currentConversation : null;
     const cachedQueue = sessionQueueSnapshotsBySessionId[sessionId] ?? null;
-    const selectedSummaryQueueCount = sessions.find((session) => session.id === sessionId)?.queueCount ?? 0;
+    const selectedSummaryQueueCount =
+      sessions.find(
+        (session) =>
+          session.id === sessionId &&
+          (!selectedSessionProfileId || !session.profileId || session.profileId === selectedSessionProfileId)
+      )?.queueCount ?? 0;
     const hasCachedQueuedWork =
       (matchingConversation?.queue.items.length ?? 0) > 0 ||
       (cachedQueue?.items.length ?? 0) > 0 ||
@@ -1851,8 +1976,11 @@
 
   const running = $derived.by(() => {
     const currentConversation = conversation;
+    const sessionId = currentConversation?.thread.id ?? null;
     return Boolean(
-      hasConversationLiveTurn(currentConversation) || isLiveConversationStatus(currentConversation?.thread.status)
+      hasConversationLiveTurn(currentConversation) ||
+        isLiveConversationStatus(currentConversation?.thread.status) ||
+        hasRecentLiveSessionEvidence(sessionId)
     );
   });
   const sessionListNeedsActiveStatusPolling = $derived.by(() => {
@@ -1923,10 +2051,22 @@
 
     return readOnlyRole || sending || startingMessage || submitComposerBusy || uploading;
   });
-  const selectedSessionSummary = $derived(sessions.find((session) => session.id === selectedSessionId) ?? null);
+  const selectedSessionSummary = $derived(
+    sessions.find(
+      (session) =>
+        session.id === selectedSessionId &&
+        (!selectedSessionProfileId || !session.profileId || session.profileId === selectedSessionProfileId)
+    ) ??
+      sessions.find((session) => session.id === selectedSessionId) ??
+      null
+  );
   const sessionHighlights = $derived.by(() =>
     Object.fromEntries(
-      sessions.flatMap((session) => (session.highlight ? ([[session.id, session.highlight]] as const) : []))
+      sessions.flatMap((session) =>
+        session.highlight && !shouldSuppressAttentionReason(session.id, String(session.highlight.reason ?? ""))
+          ? ([[session.id, session.highlight]] as const)
+          : []
+      )
     )
   );
   const selectedSessionQueue = $derived.by(() => {
@@ -3670,6 +3810,44 @@
     new Notification(title, { body });
   }
 
+  function notifyAttentionEvent(
+    sessionId: string,
+    reason: string,
+    requestId: string | null,
+    profileId: string | null = null
+  ) {
+    if (shouldSuppressAttentionReason(sessionId, reason, profileId)) {
+      return;
+    }
+    const now = Date.now();
+    for (const [key, notifiedAt] of Object.entries(recentAttentionNotificationKeys)) {
+      if (now - notifiedAt > 60_000) {
+        delete recentAttentionNotificationKeys[key];
+      }
+    }
+    const notificationKey = `${profileId ?? ""}:${sessionId}:${reason}:${requestId ?? ""}`;
+    if (now - (recentAttentionNotificationKeys[notificationKey] ?? 0) < 15_000) {
+      return;
+    }
+    recentAttentionNotificationKeys[notificationKey] = now;
+
+    if (reason === "completed") {
+      void notifyBrowser(m.task_completed_notification_title(), m.task_completed_notification_body());
+      return;
+    }
+    if (reason === "approval" || reason === "needsInput") {
+      void notifyBrowser(m.input_required_notification_title(), m.input_required_notification_body());
+      return;
+    }
+    if (reason === "stopped") {
+      void notifyBrowser(m.session_stopped(), "");
+      return;
+    }
+    if (reason === "failed") {
+      void notifyBrowser(m.session_failed(), "");
+    }
+  }
+
   function normalizeDiffPath(rawPath: string | null) {
     if (!rawPath) {
       return null;
@@ -4372,10 +4550,8 @@
   }
 
   function markConversationCacheDirty() {
-    sessionDetailCacheVersion = null;
-    sessionDetailStateHash = null;
-    sessionDetailMetadataVersion = null;
-    sessionTurnVersionsById = {};
+    // Streamed state is newer than the browser cache, but the last server snapshot
+    // remains the correct base for conditional detail reads and patches.
     scheduleSessionDetailCachePersist(null);
   }
 
@@ -4407,22 +4583,51 @@
     return config?.profiles.find((profile) => profile.active) ?? config?.profiles.find((profile) => profile.id === activeProfileId) ?? null;
   }
 
+  function rememberSessionProfile(summary: Pick<SessionSummary, "id" | "profileId"> | null | undefined) {
+    if (!summary?.id || !summary.profileId) {
+      return;
+    }
+    if (sessionProfileIdsBySessionId[summary.id] !== summary.profileId) {
+      sessionProfileIdsBySessionId = {
+        ...sessionProfileIdsBySessionId,
+        [summary.id]: summary.profileId
+      };
+    }
+  }
+
+  function sessionSummaryKey(summary: Pick<SessionSummary, "id" | "profileId">) {
+    return `${summary.profileId ?? sessionProfileIdsBySessionId[summary.id] ?? ""}:${summary.id}`;
+  }
+
+  function hasDuplicateSessionIds(summaries: Pick<SessionSummary, "id">[]) {
+    return summaries.some(
+      (summary, index, collection) => collection.findIndex((candidate) => candidate.id === summary.id) !== index
+    );
+  }
+
   function profileIdForSession(sessionId: string | null | undefined) {
     if (!sessionId) {
       return activeProfileId;
     }
+    if (selectedSessionId === sessionId && selectedSessionProfileId) {
+      return selectedSessionProfileId;
+    }
     const summary =
+      sessions.find(
+        (session) =>
+          session.id === sessionId &&
+          (!selectedSessionProfileId || !session.profileId || session.profileId === selectedSessionProfileId)
+      ) ??
       sessions.find((session) => session.id === sessionId) ??
       (selectedSessionSummary?.id === sessionId ? selectedSessionSummary : null);
-    return summary?.profileId ?? activeProfileId;
+    return summary?.profileId ?? sessionProfileIdsBySessionId[sessionId] ?? activeProfileId;
   }
 
   function enrichSessionSummaryContext(summary: SessionSummary): SessionSummary {
-    const activeProfile = activeProfileConfig();
-    const profile =
-      (summary.profileId ? config?.profiles.find((entry) => entry.id === summary.profileId) : null) ?? activeProfile;
-    const summaryProfileId = summary.profileId ?? profile?.id ?? activeProfileId ?? null;
-    const isActiveProfile = !summaryProfileId || summaryProfileId === activeProfile?.id || summaryProfileId === activeProfileId;
+    const cachedProfileId = summary.id ? (sessionProfileIdsBySessionId[summary.id] ?? null) : null;
+    const summaryProfileId = summary.profileId ?? cachedProfileId ?? null;
+    const profile = summaryProfileId ? config?.profiles.find((entry) => entry.id === summaryProfileId) : null;
+    const isActiveProfile = Boolean(summaryProfileId && summaryProfileId === activeProfileId);
     return {
       ...summary,
       profileId: summaryProfileId,
@@ -4438,12 +4643,20 @@
       payload.sessions.filter((session) => !isSubagentSessionSummary(session)),
       payload.summaryVersions
     );
+    for (const session of visiblePayloadSessions) {
+      rememberSessionProfile(session);
+    }
     const baseSessions = append ? sessions : [];
     const deduped = [...baseSessions, ...visiblePayloadSessions].filter(
-      (session, index, collection) => collection.findIndex((candidate) => candidate.id === session.id) === index
+      (session, index, collection) =>
+        collection.findIndex((candidate) => sessionSummaryKey(candidate) === sessionSummaryKey(session)) === index
     );
 
-    if (shouldPinSession(pinnedSession) && pinnedSession && !deduped.some((session) => session.id === pinnedSession.id)) {
+    if (
+      shouldPinSession(pinnedSession) &&
+      pinnedSession &&
+      !deduped.some((session) => sessionSummaryKey(session) === sessionSummaryKey(pinnedSession))
+    ) {
       deduped.unshift(pinnedSession);
     }
 
@@ -4468,6 +4681,9 @@
 
   function applySessionListPatch(payload: SessionListPatchPayload, pinnedSession: SessionSummary | null) {
     const patch = payload.patch;
+    if (hasDuplicateSessionIds(sessions) || hasDuplicateSessionIds(patch.upserts) || hasDuplicateSessionIds(patch.sessionIds.map((id) => ({ id })))) {
+      return false;
+    }
     const currentById = new Map(sessions.map((session) => [session.id, session]));
     const upsertsById = new Map(
       patch.upserts.filter((session) => !isSubagentSessionSummary(session)).map((session) => [session.id, session])
@@ -4489,11 +4705,19 @@
 
     const deduped = reuseUnchangedSessionSummaries(
       pageSessions.filter(
-        (session, index, collection) => collection.findIndex((candidate) => candidate.id === session.id) === index
+        (session, index, collection) =>
+          collection.findIndex((candidate) => sessionSummaryKey(candidate) === sessionSummaryKey(session)) === index
       ),
       patch.summaryVersions
     );
-    if (shouldPinSession(pinnedSession) && pinnedSession && !deduped.some((session) => session.id === pinnedSession.id)) {
+    for (const session of deduped) {
+      rememberSessionProfile(session);
+    }
+    if (
+      shouldPinSession(pinnedSession) &&
+      pinnedSession &&
+      !deduped.some((session) => sessionSummaryKey(session) === sessionSummaryKey(pinnedSession))
+    ) {
       deduped.unshift(pinnedSession);
     }
 
@@ -4522,8 +4746,9 @@
 
   function upsertSessionSummary(summary: SessionSummary, cacheDirty = true) {
     const enrichedSummary = enrichSessionSummaryContext(summary);
+    rememberSessionProfile(enrichedSummary);
     if (isSubagentSessionSummary(enrichedSummary)) {
-      setSessionsStable(sessions.filter((session) => session.id !== enrichedSummary.id));
+      setSessionsStable(sessions.filter((session) => sessionSummaryKey(session) !== sessionSummaryKey(enrichedSummary)));
       if (cacheDirty) {
         sessionListCacheVersion = null;
         sessionListStateHash = null;
@@ -4532,7 +4757,10 @@
       }
       return;
     }
-    setSessionsStable([enrichedSummary, ...sessions.filter((session) => session.id !== enrichedSummary.id)]);
+    setSessionsStable([
+      enrichedSummary,
+      ...sessions.filter((session) => sessionSummaryKey(session) !== sessionSummaryKey(enrichedSummary))
+    ]);
     if (cacheDirty) {
       sessionListCacheVersion = null;
       sessionListStateHash = null;
@@ -4543,8 +4771,9 @@
 
   function applySessionSummaryUpdate(summary: SessionSummary) {
     const enrichedSummary = enrichSessionSummaryContext(summary);
+    rememberSessionProfile(enrichedSummary);
     if (isSubagentSessionSummary(enrichedSummary)) {
-      const nextSessions = sessions.filter((session) => session.id !== enrichedSummary.id);
+      const nextSessions = sessions.filter((session) => sessionSummaryKey(session) !== sessionSummaryKey(enrichedSummary));
       if (nextSessions.length !== sessions.length) {
         setSessionsStable(nextSessions);
         sessionListCacheVersion = null;
@@ -4561,7 +4790,7 @@
     }
 
     if (enrichedSummary.archived !== showArchivedSessions) {
-      const nextSessions = sessions.filter((session) => session.id !== enrichedSummary.id);
+      const nextSessions = sessions.filter((session) => sessionSummaryKey(session) !== sessionSummaryKey(enrichedSummary));
       if (nextSessions.length !== sessions.length) {
         setSessionsStable(nextSessions);
         sessionListCacheVersion = null;
@@ -4573,7 +4802,7 @@
     }
 
     if (!matchesSessionSummaryFilter(enrichedSummary, sessionFilter)) {
-      const nextSessions = sessions.filter((session) => session.id !== enrichedSummary.id);
+      const nextSessions = sessions.filter((session) => sessionSummaryKey(session) !== sessionSummaryKey(enrichedSummary));
       if (nextSessions.length !== sessions.length) {
         setSessionsStable(nextSessions);
         sessionListCacheVersion = null;
@@ -4589,21 +4818,43 @@
 
   function buildSessionSummaryFromConversation(state: ConversationState): SessionSummary {
     const hasLiveTurn = hasConversationLiveTurn(state);
+    const hasRecentLiveEvidence = hasRecentLiveSessionEvidence(state.thread.id);
     const preview = deriveConversationSummaryPreview(state.thread.preview, state.thread.turns);
-    const existingSummary = sessions.find((session) => session.id === state.thread.id) ?? null;
+    const existingSummary =
+      sessions.find(
+        (session) =>
+          session.id === state.thread.id &&
+          (!selectedSessionProfileId || !session.profileId || session.profileId === selectedSessionProfileId)
+      ) ?? null;
     const status =
-      hasLiveTurn
+      hasLiveTurn || hasRecentLiveEvidence
         ? "running"
         : isLiveConversationStatus(state.thread.status) && state.thread.turns.length > 0
           ? "completed"
           : state.thread.status;
+    const updatedAt = Math.max(
+      normalizeSessionTimestamp(state.thread.updatedAt),
+      normalizeSessionTimestamp(existingSummary?.updatedAt ?? 0),
+      normalizeSessionTimestamp(state.thread.createdAt),
+      hasLiveTurn || hasRecentLiveEvidence ? Date.now() : 0
+    );
 
     const activeProfile = activeProfileConfig();
+    const summaryProfileId =
+      selectedSessionSummary?.profileId ??
+      existingSummary?.profileId ??
+      sessionProfileIdsBySessionId[state.thread.id] ??
+      (selectedSessionId === state.thread.id ? selectedSessionProfileId : null) ??
+      activeProfile?.id ??
+      activeProfileId ??
+      null;
+    const summaryProfile =
+      (summaryProfileId ? config?.profiles.find((entry) => entry.id === summaryProfileId) : null) ?? activeProfile;
     return {
       id: state.thread.id,
-      profileId: selectedSessionSummary?.profileId ?? existingSummary?.profileId ?? activeProfile?.id ?? activeProfileId ?? null,
-      profileLabel: selectedSessionSummary?.profileLabel ?? existingSummary?.profileLabel ?? activeProfile?.label ?? null,
-      profileCodexHome: selectedSessionSummary?.profileCodexHome ?? existingSummary?.profileCodexHome ?? activeProfile?.codexHome ?? null,
+      profileId: summaryProfileId,
+      profileLabel: selectedSessionSummary?.profileLabel ?? existingSummary?.profileLabel ?? summaryProfile?.label ?? null,
+      profileCodexHome: selectedSessionSummary?.profileCodexHome ?? existingSummary?.profileCodexHome ?? summaryProfile?.codexHome ?? null,
       accountEmail: selectedSessionSummary?.accountEmail ?? existingSummary?.accountEmail ?? null,
       accountType: selectedSessionSummary?.accountType ?? existingSummary?.accountType ?? null,
       name: getDisplayThreadTitle(state.thread.name, preview),
@@ -4618,11 +4869,7 @@
         normalizeSessionTimestamp(state.thread.createdAt),
         normalizeSessionTimestamp(existingSummary?.createdAt ?? 0)
       ),
-      updatedAt: Math.max(
-        normalizeSessionTimestamp(state.thread.updatedAt),
-        normalizeSessionTimestamp(existingSummary?.updatedAt ?? 0),
-        normalizeSessionTimestamp(state.thread.createdAt)
-      ),
+      updatedAt,
       status,
       isSubagent: state.thread.isSubagent,
       agentNickname: state.thread.agentNickname,
@@ -4670,10 +4917,16 @@
       clearTimeout(selectedSessionDetailRefreshTimer);
     }
 
+    const scheduledSelectionVersion = sessionSelectionVersion;
+    const scheduledProfileId = profileIdForSession(sessionId);
     const nextDelay = delay === 0 ? 0 : Math.max(delay, 180);
     selectedSessionDetailRefreshTimer = setTimeout(() => {
       selectedSessionDetailRefreshTimer = null;
-      if (selectedSessionId !== sessionId) {
+      if (
+        selectedSessionId !== sessionId ||
+        sessionSelectionVersion !== scheduledSelectionVersion ||
+        profileIdForSession(sessionId) !== scheduledProfileId
+      ) {
         return;
       }
 
@@ -4681,8 +4934,10 @@
         sessionId,
         replaceWithRecentWindow ? olderTurnPageSize : Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize),
         false,
-        replaceWithRecentWindow ? null : sessionDetailCacheVersion,
-        replaceWithRecentWindow
+        sessionDetailCacheVersion,
+        replaceWithRecentWindow,
+        scheduledSelectionVersion,
+        scheduledProfileId
       ).catch(() => {});
     }, nextDelay);
   }
@@ -4696,11 +4951,15 @@
 
   function scheduleSelectedSessionCompletionRefresh(sessionId: string) {
     clearSelectedSessionCompletionRefreshes();
+    const scheduledSelectionVersion = sessionSelectionVersion;
+    const scheduledProfileId = profileIdForSession(sessionId);
     selectedSessionCompletionRefreshTimers = [180, 900, 2200].map((delay) => {
       const timer = setTimeout(() => {
         selectedSessionCompletionRefreshTimers = selectedSessionCompletionRefreshTimers.filter((candidate) => candidate !== timer);
         if (
           selectedSessionId !== sessionId ||
+          sessionSelectionVersion !== scheduledSelectionVersion ||
+          profileIdForSession(sessionId) !== scheduledProfileId ||
           !conversation ||
           conversation.thread.id !== sessionId ||
           loadingDetail ||
@@ -4713,8 +4972,10 @@
           sessionId,
           Math.max(conversation.thread.turns.length, olderTurnPageSize),
           false,
-          null,
-          false
+          sessionDetailCacheVersion,
+          false,
+          scheduledSelectionVersion,
+          scheduledProfileId
         ).catch(() => {});
       }, delay);
       return timer;
@@ -4816,6 +5077,8 @@
     sessionSummaryVersionsById = {};
     conversation = null;
     selectedSessionId = null;
+    selectedSessionProfileId = null;
+    sessionProfileIdsBySessionId = {};
     sessionDetailCacheVersion = null;
     sessionDetailStateHash = null;
     sessionDetailMetadataVersion = null;
@@ -4883,6 +5146,7 @@
     editingQueuePrompt = "";
     startupAlertModalOpen = false;
     startupAlertDismissed = false;
+    startupAlertInitialConfigHandled = false;
     sessionRecoveryPrompt = null;
     dismissedSessionRecoveryPromptForSessionId = null;
     syncSelectedSessionInUrl(null);
@@ -5225,21 +5489,34 @@
     }
   }
 
-  async function selectSession(sessionId: string) {
-    if (selectedSessionId === sessionId && conversation) {
+  async function selectSession(sessionId: string, profileId: string | null = null) {
+    const currentSelectionProfileId =
+      selectedSessionId === sessionId
+        ? (selectedSessionProfileId ?? conversation?.profileId ?? sessionProfileIdsBySessionId[sessionId] ?? activeProfileId)
+        : null;
+    if (selectedSessionId === sessionId && conversation && (!profileId || currentSelectionProfileId === profileId)) {
       syncSelectedSessionInUrl(sessionId);
       if (!isLiveConversationStatus(conversation.thread.status)) {
         void refreshSelectedSessionState(
           sessionId,
           Math.max(conversation.thread.turns.length, olderTurnPageSize),
           false,
-          null,
+          sessionDetailCacheVersion,
           false
         ).catch(() => {});
       }
       return true;
     }
 
+    const matchingSummaries = sessions.filter((session) => session.id === sessionId);
+    const summaryForSelection =
+      (profileId
+        ? matchingSummaries.find((session) => session.profileId === profileId) ??
+          (matchingSummaries.length === 1 && !matchingSummaries[0].profileId ? matchingSummaries[0] : null)
+        : null) ??
+      matchingSummaries[0] ??
+      null;
+    const resolvedProfileId = profileId ?? summaryForSelection?.profileId ?? sessionProfileIdsBySessionId[sessionId] ?? activeProfileId;
     const selectionVersion = sessionSelectionVersion + 1;
     sessionSelectionVersion = selectionVersion;
     clearHydrationRefresh();
@@ -5247,8 +5524,63 @@
     resetSessionTurnSearch();
     loadingDetail = true;
     selectedSessionId = sessionId;
+    selectedSessionProfileId = resolvedProfileId;
+    if (resolvedProfileId) {
+      rememberSessionProfile({ id: sessionId, profileId: resolvedProfileId });
+    }
     syncSelectedSessionInUrl(sessionId);
-    conversation = null;
+    conversation =
+      summaryForSelection && config
+        ? createConversationState({
+            profileId: resolvedProfileId,
+            profileLabel: summaryForSelection.profileLabel ?? null,
+            profileCodexHome: summaryForSelection.profileCodexHome ?? null,
+            accountEmail: summaryForSelection.accountEmail ?? null,
+            accountType: summaryForSelection.accountType ?? null,
+            thread: {
+              id: summaryForSelection.id,
+              preview: summaryForSelection.preview,
+              name: summaryForSelection.name,
+              cwd: summaryForSelection.cwd,
+              status: summaryForSelection.status,
+              createdAt: normalizeSessionTimestamp(summaryForSelection.createdAt),
+              updatedAt: normalizeSessionTimestamp(summaryForSelection.updatedAt),
+              isSubagent: summaryForSelection.isSubagent,
+              agentNickname: summaryForSelection.agentNickname,
+              agentRole: summaryForSelection.agentRole,
+              turns: []
+            },
+            preferences: summaryForSelection.preferences ?? config.defaults,
+            selectedSkills: [],
+            goal: null,
+            attachments: [],
+            queue: sessionQueueSnapshotsBySessionId[sessionId] ?? {
+              sessionId,
+              items: [],
+              resumeRequired: false,
+              updatedAt: null
+            },
+            pendingRequests: [],
+            activeTurnId: null,
+            tokenUsage: null,
+            hydration: {
+              state: "loading",
+              loadedTurns: 0,
+              totalTurns: null,
+              remainingTurns: 0,
+              message: null,
+              recovery: {
+                available: false,
+                issue: null,
+                totalLines: null,
+                recoverableLines: null,
+                skippedLines: null
+              }
+            },
+            cacheVersion: "",
+            notModified: false
+          })
+        : null;
     pendingSessionEvents = {
       [sessionId]: []
     };
@@ -5290,10 +5622,10 @@
     composerSettingsOpen = false;
     activeWorkspaceTabId = "chat";
     disconnectStream();
-    connectStream(sessionId);
+    connectStream(sessionId, resolvedProfileId, selectionVersion);
 
     try {
-      const detailCacheKey = buildSessionDetailBrowserCacheKey(sessionId);
+      const detailCacheKey = buildSessionDetailBrowserCacheKey(sessionId, resolvedProfileId);
       let knownVersion: string | null = null;
       let turnLimit = olderTurnPageSize;
 
@@ -5305,16 +5637,24 @@
         if (cachedEntry) {
           sessionDetailCacheVersion = cachedEntry.version;
           applyLoadedSessionDetail(sessionId, cachedEntry.payload);
-          // Browser detail cache is only a paint accelerator on session switch.
-          // Always fetch the selected session once without conditional validation so
-          // a stale cached transcript cannot hide the final completed turn.
-          knownVersion = null;
+          knownVersion =
+            cachedEntry.payload.stateHash && cachedEntry.payload.turnVersions
+              ? cachedEntry.version
+              : null;
           turnLimit = Math.max(olderTurnPageSize, cachedEntry.payload.thread.turns.length);
           requestTranscriptBottomScroll(true);
         }
       }
 
-      const nextConversation = await refreshSelectedSessionState(sessionId, turnLimit, true, knownVersion, false, selectionVersion);
+      const nextConversation = await refreshSelectedSessionState(
+        sessionId,
+        turnLimit,
+        true,
+        knownVersion,
+        false,
+        selectionVersion,
+        resolvedProfileId
+      );
       if (selectedSessionId !== sessionId || sessionSelectionVersion !== selectionVersion || !nextConversation) {
         return false;
       }
@@ -5331,7 +5671,15 @@
           if (selectedSessionId !== sessionId || sessionSelectionVersion !== selectionVersion) {
             return;
           }
-          void refreshSelectedSessionState(sessionId, olderTurnPageSize, false, sessionDetailCacheVersion, false, selectionVersion).catch(() => {});
+          void refreshSelectedSessionState(
+            sessionId,
+            olderTurnPageSize,
+            false,
+            sessionDetailCacheVersion,
+            false,
+            selectionVersion,
+            resolvedProfileId
+          ).catch(() => {});
         }, 250);
       } else {
         clearHydrationRefresh();
@@ -5340,10 +5688,14 @@
       return true;
     } catch (error) {
       if (selectedSessionId === sessionId && sessionSelectionVersion === selectionVersion) {
-        disconnectStream();
         clearHydrationRefresh();
         errorText = describeError(error);
-        syncSelectedSessionInUrl(null);
+        if (conversation?.thread.id === sessionId) {
+          scheduleSelectedSessionStateRefresh(sessionId, 1_500);
+        } else {
+          disconnectStream();
+          syncSelectedSessionInUrl(null);
+        }
       }
       return false;
     } finally {
@@ -5358,9 +5710,16 @@
     }
   }
 
-  function connectStream(sessionId: string) {
+  function connectStream(sessionId: string, profileId: string | null, selectionVersion: number) {
     disconnectStream();
     releaseSessionStream = api.subscribeSession(sessionId, (payload: StreamEvent) => {
+      if (
+        selectedSessionId !== sessionId ||
+        selectedSessionProfileId !== profileId ||
+        sessionSelectionVersion !== selectionVersion
+      ) {
+        return;
+      }
       const queuePayload = queuePayloadFromEvent(payload);
       if (queuePayload) {
         applyQueuePayloadToSession(sessionId, queuePayload);
@@ -5391,7 +5750,7 @@
       }
 
       if (payload.kind === "serverRequest") {
-        notifyBrowser(m.input_required_notification_title(), m.input_required_notification_body());
+        notifyAttentionEvent(sessionId, "approval", payload.id, profileId);
       }
 
       if (conversation?.thread.id === sessionId) {
@@ -5419,7 +5778,7 @@
               sessionId,
               olderTurnPageSize,
               false,
-              null,
+              sessionDetailCacheVersion,
               true
             ).catch((error) => {
               clearStaleSessionCatchup();
@@ -5447,6 +5806,46 @@
           return;
         }
 
+        if (payload.kind === "notification") {
+          if (
+            payload.method === "turn/started" ||
+            payload.method === "turn/plan/updated" ||
+            payload.method === "turn/diff/updated" ||
+            payload.method === "thread/tokenUsage/updated" ||
+            payload.method === "thread/goal/updated" ||
+            (payload.method === "thread/status/changed" && isLiveConversationStatus(String(payload.params.status ?? ""))) ||
+            payload.method === "thread/realtime/started" ||
+            payload.method === "thread/realtime/transcript/delta" ||
+            payload.method === "thread/realtime/transcript/done" ||
+            [
+              "item/started",
+              "item/completed",
+              "item/agentMessage/delta",
+              "item/plan/delta",
+              "item/reasoning/textDelta",
+              "item/reasoning/summaryTextDelta",
+              "item/reasoning/summaryPartAdded",
+              "item/commandExecution/outputDelta",
+              "item/commandExecution/requestApproval",
+              "item/fileChange/requestApproval",
+              "item/permissions/requestApproval",
+              "item/tool/call"
+            ].includes(payload.method)
+          ) {
+            noteRecentLiveSessionEvidence(sessionId);
+          }
+          if (payload.method === "turn/completed" || payload.method === "thread/realtime/closed") {
+            clearRecentLiveSessionEvidence(sessionId);
+          }
+          if (
+            payload.method === "thread/status/changed" &&
+            shouldDeferTerminalSessionStatus(sessionId, String(payload.params.status ?? ""))
+          ) {
+            scheduleSelectedSessionStateRefresh(sessionId, recentLiveSessionEvidenceTtlMs + 250);
+            return;
+          }
+        }
+
         conversation = applyLocalComposerPreferencesToConversation(
           normalizeConversationExecutionState(applyStreamEvent(conversation, payload))
         );
@@ -5466,7 +5865,21 @@
 
         if (
           payload.kind === "notification" &&
-          ["turn/started", "turn/completed", "thread/name/updated", "thread/status/changed"].includes(payload.method)
+          (["turn/started", "turn/completed", "thread/name/updated", "thread/status/changed"].includes(payload.method) ||
+            ([
+              "item/started",
+              "item/agentMessage/delta",
+              "item/plan/delta",
+              "item/reasoning/textDelta",
+              "item/reasoning/summaryTextDelta",
+              "item/reasoning/summaryPartAdded",
+              "item/commandExecution/outputDelta",
+              "item/commandExecution/requestApproval",
+              "item/fileChange/requestApproval",
+              "item/permissions/requestApproval",
+              "item/tool/call"
+            ].includes(payload.method) &&
+              !isLiveConversationStatus(selectedSessionSummary?.status)))
         ) {
           applySessionSummaryUpdate(buildSessionSummaryFromConversation(conversation));
         }
@@ -5509,7 +5922,7 @@
       } else if (selectedSessionId === sessionId) {
         queuePendingSessionEvent(sessionId, payload);
       }
-    }, { includeInitialQueue: false, profileId: profileIdForSession(sessionId) });
+    }, { includeInitialQueue: false, profileId });
   }
 
   function disconnectStream() {
@@ -5607,7 +6020,6 @@
         pausedQueues: nextPausedQueues
       }
     };
-    syncStartupAlertModal(config);
   }
 
   function applyQueuePayloadToSession(sessionId: string, queue: SessionQueuePayload) {
@@ -5643,6 +6055,14 @@
     }
 
     const patch = payload.patch;
+    if (
+      !sessionDetailStateHash ||
+      patch.baseStateHash !== sessionDetailStateHash ||
+      !sessionDetailCacheVersion ||
+      patch.baseCacheVersion !== sessionDetailCacheVersion
+    ) {
+      return null;
+    }
     const currentTurnsById = new Map(conversation.thread.turns.map((turn) => [turn.id, turn]));
     const upsertsById = new Map(patch.turnUpserts.map((turn) => [turn.id, turn]));
     const turns: SessionDetailPayload["thread"]["turns"] = [];
@@ -5686,13 +6106,12 @@
   function applyLoadedSessionDetail(
     sessionId: string,
     detail: SessionDetailPayload,
-    replaceExisting = false,
     flushPendingEvents = true
   ) {
     const pendingEventsBeforeFlush = pendingSessionEvents[sessionId] ?? [];
     const hadPendingQueueUpdate = flushPendingEvents && pendingEventsBeforeFlush.some(isQueueUpdatedEvent);
     let nextConversation =
-      !replaceExisting && conversation && conversation.thread.id === detail.thread.id
+      conversation && conversation.thread.id === detail.thread.id
         ? mergeConversationState(conversation, detail)
         : createConversationState(detail);
     if (flushPendingEvents) {
@@ -5854,7 +6273,7 @@
     };
 
     try {
-      await api.startSessionCompact(prompt.sessionId);
+      await api.startSessionCompact(prompt.sessionId, profileIdForSession(prompt.sessionId));
       noticeText = ui.manualCompactStarted;
       dismissedManualCompactPromptForSessionId = null;
       manualCompactPrompt = null;
@@ -5901,7 +6320,10 @@
     };
 
     try {
-      const payload: SessionRolloutRecoveryPayload = await api.recoverSessionRollout(prompt.sessionId);
+      const payload: SessionRolloutRecoveryPayload = await api.recoverSessionRollout(
+        prompt.sessionId,
+        profileIdForSession(prompt.sessionId)
+      );
       noticeText = m.session_history_recovery_success({
         recovered: String(payload.recoveredLines),
         skipped: String(payload.skippedLines)
@@ -5933,24 +6355,30 @@
     loadDraft = false,
     knownVersion: string | null = sessionDetailCacheVersion,
     replaceWithRecentWindow = false,
-    selectionVersion: number | null = null
+    selectionVersion: number | null = null,
+    expectedProfileId: string | null = null
   ) {
-    const sessionProfileId = profileIdForSession(sessionId);
+    const requestSelectionVersion = selectionVersion ?? sessionSelectionVersion;
+    const sessionProfileId = expectedProfileId ?? profileIdForSession(sessionId);
     const knownTurnVersions =
-      !replaceWithRecentWindow && knownVersion && sessionDetailStateHash && conversation?.thread.id === sessionId
+      knownVersion && sessionDetailStateHash && conversation?.thread.id === sessionId
         ? boundedVersionHints(sessionTurnVersionsById, SESSION_DETAIL_VERSION_HINT_LIMIT)
         : null;
     const knownStateHash =
-      !replaceWithRecentWindow && knownVersion && conversation?.thread.id === sessionId ? sessionDetailStateHash : null;
+      knownVersion && conversation?.thread.id === sessionId ? sessionDetailStateHash : null;
     const detail = await api.getSession(
       sessionId,
       turnLimit,
-      replaceWithRecentWindow ? null : knownVersion,
+      knownVersion,
       knownTurnVersions,
       knownStateHash,
       sessionProfileId
     );
-    if (selectionVersion !== null && sessionSelectionVersion !== selectionVersion) {
+    if (
+      selectedSessionId !== sessionId ||
+      selectedSessionProfileId !== sessionProfileId ||
+      sessionSelectionVersion !== requestSelectionVersion
+    ) {
       return null;
     }
     if (isCacheValidationResponse(detail)) {
@@ -5971,7 +6399,13 @@
         }
       }
       if (loadDraft) {
-        await loadSavedDraft(sessionId, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
+        await loadSavedDraft(
+          sessionId,
+          nextConversation.activeTurnId,
+          nextConversation.preferences.steeringResumeMode,
+          sessionProfileId,
+          requestSelectionVersion
+        );
       }
       clearHydrationRefresh();
       clearStaleSessionCatchup();
@@ -5985,14 +6419,21 @@
       const fallbackDetail = patchedDetail
         ? null
         : await api.getSession(sessionId, turnLimit, null, null, null, sessionProfileId);
-      if (selectionVersion !== null && sessionSelectionVersion !== selectionVersion) {
+      if (
+        selectedSessionId !== sessionId ||
+        selectedSessionProfileId !== sessionProfileId ||
+        sessionSelectionVersion !== requestSelectionVersion
+      ) {
         return null;
       }
       const nextDetail = patchedDetail ?? fallbackDetail;
       if (!nextDetail || isCacheValidationResponse(nextDetail) || isSessionDetailPatchResponse(nextDetail)) {
         return null;
       }
-      if (selectedSessionId !== nextDetail.thread.id) {
+      if (
+        selectedSessionId !== nextDetail.thread.id ||
+        (nextDetail.profileId && nextDetail.profileId !== sessionProfileId)
+      ) {
         return null;
       }
 
@@ -6000,13 +6441,16 @@
         replaceWithRecentWindow && staleSessionCatchup?.sessionId === nextDetail.thread.id
           ? staleSessionCatchup.eventCount
           : 0;
+      if (nextDetail.profileId) {
+        selectedSessionProfileId = nextDetail.profileId;
+        rememberSessionProfile({ id: nextDetail.thread.id, profileId: nextDetail.profileId });
+      }
       const nextConversation = applyLoadedSessionDetail(
         nextDetail.thread.id,
         nextDetail,
-        replaceWithRecentWindow,
         !replaceWithRecentWindow
       );
-      const detailCacheKey = buildSessionDetailBrowserCacheKey(nextDetail.thread.id);
+      const detailCacheKey = buildSessionDetailBrowserCacheKey(nextDetail.thread.id, sessionProfileId);
       if (detailCacheKey) {
         void writeSessionDetailCache(
           detailCacheKey,
@@ -6014,17 +6458,34 @@
           nextDetail.cacheVersion
         );
       }
-      if (replaceWithRecentWindow && skippedEventCount > 0) {
-        scheduleSelectedSessionStateRefresh(nextDetail.thread.id, 160, true);
+      if (replaceWithRecentWindow && skippedEventCount > 0 && staleSessionCatchup) {
+        if (staleSessionCatchup.refreshRetries < 1) {
+          staleSessionCatchup = {
+            ...staleSessionCatchup,
+            refreshRetries: staleSessionCatchup.refreshRetries + 1
+          };
+          scheduleSelectedSessionStateRefresh(nextDetail.thread.id, 2_000, true);
+        } else {
+          clearStaleSessionCatchup();
+        }
       }
       if (loadDraft) {
-        await loadSavedDraft(nextDetail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
+        await loadSavedDraft(
+          nextDetail.thread.id,
+          nextConversation.activeTurnId,
+          nextConversation.preferences.steeringResumeMode,
+          sessionProfileId,
+          requestSelectionVersion
+        );
       }
       preserveTranscriptScrollAfterDataUpdate(isInitialTranscriptScrollPending(nextDetail.thread.id) || replaceWithRecentWindow);
       return nextConversation;
     }
 
-    if (selectedSessionId !== detail.thread.id) {
+    if (
+      selectedSessionId !== detail.thread.id ||
+      (detail.profileId && detail.profileId !== sessionProfileId)
+    ) {
       return null;
     }
 
@@ -6032,21 +6493,38 @@
       replaceWithRecentWindow && staleSessionCatchup?.sessionId === detail.thread.id
         ? staleSessionCatchup.eventCount
         : 0;
+    if (detail.profileId) {
+      selectedSessionProfileId = detail.profileId;
+      rememberSessionProfile({ id: detail.thread.id, profileId: detail.profileId });
+    }
     const nextConversation = applyLoadedSessionDetail(
       detail.thread.id,
       detail,
-      replaceWithRecentWindow,
       !replaceWithRecentWindow
     );
-    const detailCacheKey = buildSessionDetailBrowserCacheKey(detail.thread.id);
+    const detailCacheKey = buildSessionDetailBrowserCacheKey(detail.thread.id, sessionProfileId);
     if (detailCacheKey) {
       void writeSessionDetailCache(detailCacheKey, sanitizeSessionDetailForBrowserCache(detail), detail.cacheVersion);
     }
     if (loadDraft) {
-      await loadSavedDraft(detail.thread.id, nextConversation.activeTurnId, nextConversation.preferences.steeringResumeMode);
+      await loadSavedDraft(
+        detail.thread.id,
+        nextConversation.activeTurnId,
+        nextConversation.preferences.steeringResumeMode,
+        sessionProfileId,
+        requestSelectionVersion
+      );
     }
-    if (replaceWithRecentWindow && skippedEventCount > 0) {
-      scheduleSelectedSessionStateRefresh(detail.thread.id, 160, true);
+    if (replaceWithRecentWindow && skippedEventCount > 0 && staleSessionCatchup) {
+      if (staleSessionCatchup.refreshRetries < 1) {
+        staleSessionCatchup = {
+          ...staleSessionCatchup,
+          refreshRetries: staleSessionCatchup.refreshRetries + 1
+        };
+        scheduleSelectedSessionStateRefresh(detail.thread.id, 2_000, true);
+      } else {
+        clearStaleSessionCatchup();
+      }
     }
     preserveTranscriptScrollAfterDataUpdate(isInitialTranscriptScrollPending(detail.thread.id) || replaceWithRecentWindow);
     return nextConversation;
@@ -6114,12 +6592,18 @@
     if (event.kind !== "notification") {
       return;
     }
+    const eventProfileId =
+      typeof event.params.profileId === "string" && event.params.profileId.trim()
+        ? event.params.profileId.trim()
+        : null;
+    const eventMatchesSelectedProfile =
+      !eventProfileId || !selectedSessionProfileId || eventProfileId === selectedSessionProfileId;
 
     if (event.method === "thread/goal/updated" || event.method === "thread/goal/cleared") {
       const goal = (event.params.goal ?? null) as SessionDetailPayload["goal"];
       const goalThreadId = goal?.threadId ?? "";
       const sessionId = String(event.params.threadId ?? event.params.thread_id ?? goalThreadId ?? "");
-      if (sessionId && selectedSessionId === sessionId) {
+      if (sessionId && selectedSessionId === sessionId && eventMatchesSelectedProfile) {
         applyGoalPayloadToConversation(sessionId, event.method === "thread/goal/cleared" ? null : goal);
       }
       return;
@@ -6128,29 +6612,68 @@
     if (event.method === "codex-webui/sessionAttention") {
       const sessionId = String(event.params.sessionId ?? "");
       const reason = String(event.params.reason ?? "");
+      const requestId = typeof event.params.requestId === "string" ? event.params.requestId : null;
       if (!sessionId) {
         return;
       }
-      if (reason === "completed") {
-        void notifyBrowser(m.task_completed_notification_title(), m.task_completed_notification_body());
-      } else {
-        void notifyBrowser(m.input_required_notification_title(), m.input_required_notification_body());
-      }
+      notifyAttentionEvent(sessionId, reason, requestId, eventProfileId);
       return;
     }
 
     if (event.method === "codex-webui/sessionSummaryUpdated") {
-      const summary = event.params.session as SessionSummary | undefined;
+      const incomingSummary = event.params.session as SessionSummary | undefined;
+      const summary = incomingSummary
+        ? {
+            ...incomingSummary,
+            profileId: incomingSummary.profileId ?? eventProfileId
+          }
+        : undefined;
       if (summary?.id) {
+        let summaryForList = summary;
+        const summaryMatchesSelectedProfile =
+          !summary.profileId || !selectedSessionProfileId || summary.profileId === selectedSessionProfileId;
+        if (summaryMatchesSelectedProfile && summary.status !== undefined && summary.status !== null) {
+          if (isLiveConversationStatus(summary.status)) {
+            noteRecentLiveSessionEvidence(summary.id);
+          } else if (!shouldDeferTerminalSessionStatus(summary.id, summary.status)) {
+            clearRecentLiveSessionEvidence(summary.id);
+          }
+        }
         if (
           summary.id === selectedSessionId &&
+          summaryMatchesSelectedProfile &&
           conversation &&
           conversation.thread.id === summary.id
         ) {
-          const nextStatus = summary.status ?? conversation.thread.status;
+          const conversationHasLiveTurn = hasConversationLiveTurn(conversation);
+          const effectiveSummaryStatus = summary.status ?? conversation.thread.status;
+          const shouldPreserveLiveStatus =
+            (conversationHasLiveTurn || hasRecentLiveSessionEvidence(summary.id)) &&
+            !isLiveConversationStatus(effectiveSummaryStatus);
+          const nextStatus = shouldPreserveLiveStatus
+            ? isLiveConversationStatus(conversation.thread.status)
+              ? conversation.thread.status
+              : "running"
+            : effectiveSummaryStatus;
           const summaryUpdatedAt = normalizeSessionTimestamp(summary.updatedAt);
           const conversationUpdatedAt = normalizeSessionTimestamp(conversation.thread.updatedAt);
           const summaryIsNewer = summaryUpdatedAt > conversationUpdatedAt;
+          if (shouldPreserveLiveStatus) {
+            summaryForList = {
+              ...summary,
+              status: nextStatus,
+              highlight:
+                summary.highlight?.kind === "attention" &&
+                shouldSuppressAttentionReason(
+                  summary.id,
+                  String(summary.highlight.reason ?? ""),
+                  summary.profileId ?? null
+                )
+                  ? null
+                  : summary.highlight
+            };
+            scheduleSelectedSessionStateRefresh(summary.id, recentLiveSessionEvidenceTtlMs + 250);
+          }
           conversation = {
             ...conversation,
             activeTurnId: isLiveConversationStatus(nextStatus) ? conversation.activeTurnId : null,
@@ -6167,7 +6690,7 @@
             scheduleSelectedSessionCompletionRefresh(summary.id);
           }
         }
-        applySessionSummaryUpdate(summary);
+        applySessionSummaryUpdate(summaryForList);
       } else {
         scheduleSessionRefresh(60);
       }
@@ -6176,6 +6699,10 @@
 
     if (event.method === "codex-webui/sessionListsInvalidated") {
       scheduleSessionRefresh(60);
+      return;
+    }
+
+    if (eventProfileId && activeProfileId && eventProfileId !== activeProfileId) {
       return;
     }
 
@@ -6415,12 +6942,22 @@
     return `${sessionId}:${updatedAt ?? 0}`;
   }
 
-  async function loadSavedDraft(sessionId: string, activeTurnId: string | null, resumeMode: SessionPreferences["steeringResumeMode"]) {
+  async function loadSavedDraft(
+    sessionId: string,
+    activeTurnId: string | null,
+    resumeMode: SessionPreferences["steeringResumeMode"],
+    profileId: string | null,
+    selectionVersion: number
+  ) {
     draftPersistencePaused = true;
 
     try {
-      const saved = await api.getSessionDraft(sessionId, profileIdForSession(sessionId));
-      if (selectedSessionId !== sessionId) {
+      const saved = await api.getSessionDraft(sessionId, profileId);
+      if (
+        selectedSessionId !== sessionId ||
+        selectedSessionProfileId !== profileId ||
+        sessionSelectionVersion !== selectionVersion
+      ) {
         return;
       }
 
@@ -6461,10 +6998,22 @@
       pendingSteerResume = null;
       draft = saved.draft;
     } catch (error) {
-      errorText = describeError(error);
+      if (
+        selectedSessionId === sessionId &&
+        selectedSessionProfileId === profileId &&
+        sessionSelectionVersion === selectionVersion
+      ) {
+        errorText = describeError(error);
+      }
     } finally {
       queueMicrotask(() => {
-        draftPersistencePaused = false;
+        if (
+          selectedSessionId === sessionId &&
+          selectedSessionProfileId === profileId &&
+          sessionSelectionVersion === selectionVersion
+        ) {
+          draftPersistencePaused = false;
+        }
       });
     }
   }
@@ -6686,7 +7235,7 @@
         selectedSkills: nextSkills
       };
       markConversationCacheDirty();
-      void api.saveSessionSkills(selectedSessionId, nextSkills).catch((error) => {
+      void api.saveSessionSkills(selectedSessionId, nextSkills, profileIdForSession(selectedSessionId)).catch((error) => {
         errorText = describeError(error);
       });
       return;
@@ -6722,7 +7271,11 @@
           requestSelectedSessionResync(false);
           return;
         }
-        const saved = await api.savePreferences(sessionId, currentBinding.state.preferences);
+        const saved = await api.savePreferences(
+          sessionId,
+          currentBinding.state.preferences,
+          profileIdForSession(sessionId)
+        );
         if (saveVersion !== preferenceSaveVersion) {
           return;
         }
@@ -7042,7 +7595,7 @@
     }
 
     try {
-      await api.renameSession(selectedSessionId, nextTitle);
+      await api.renameSession(selectedSessionId, nextTitle, profileIdForSession(selectedSessionId));
       const archived = selectedSessionSummary?.archived ?? showArchivedSessions;
       upsertSessionSummary({
         id: selectedSessionId,
@@ -7257,7 +7810,11 @@
       return;
     }
     const { target, delivery } = parseReviewSlashTarget(args);
-    const response = await api.startReview(materialized.sessionId, { target, delivery });
+    const response = await api.startReview(
+      materialized.sessionId,
+      { target, delivery },
+      profileIdForSession(materialized.sessionId)
+    );
     draft = "";
     scheduleComposerTextareaResize();
     scheduleSessionRefresh(80);
@@ -7310,7 +7867,7 @@
         return true;
       }
       try {
-        await api.startSessionCompact(selectedBinding.sessionId);
+        await api.startSessionCompact(selectedBinding.sessionId, profileIdForSession(selectedBinding.sessionId));
         noticeText = ui.manualCompactStarted;
         dismissedManualCompactPromptForSessionId = null;
         if (manualCompactPrompt?.sessionId === selectedBinding.sessionId) {
@@ -7502,10 +8059,11 @@
       if (!selectedBinding) {
         return true;
       }
+      const sessionProfileId = profileIdForSession(selectedBinding.sessionId);
       const normalized = args.toLowerCase();
       try {
         if (["stop", "off", "end"].includes(normalized)) {
-          await api.stopRealtimeSession(selectedBinding.sessionId);
+          await api.stopRealtimeSession(selectedBinding.sessionId, sessionProfileId);
           noticeText = m.realtime_stopped();
         } else if (normalized === "voices") {
           const response = await api.listRealtimeVoices();
@@ -7516,7 +8074,8 @@
         } else {
           await api.startRealtimeSession(selectedBinding.sessionId, {
             outputModality: "text",
-            prompt: args ? args : null
+            prompt: args ? args : null,
+            profileId: sessionProfileId
           });
           noticeText = m.realtime_started();
         }
@@ -7532,7 +8091,8 @@
       try {
         const response = await api.listCodexApps({
           limit: 20,
-          threadId: selectedSessionId ?? null
+          threadId: selectedSessionId ?? null,
+          profileId: selectedSessionId ? profileIdForSession(selectedSessionId) : null
         });
         const names = response.data.map((app) => app.name).filter(Boolean);
         noticeText = names.length > 0 ? `${m.apps()}: ${names.slice(0, 8).join(", ")}` : m.no_apps();
@@ -8257,7 +8817,11 @@
         return;
       }
 
-      const response = await api.uploadAttachments(materialized.sessionId, Array.from(files));
+      const response = await api.uploadAttachments(
+        materialized.sessionId,
+        Array.from(files),
+        profileIdForSession(materialized.sessionId)
+      );
       draftAttachments = [...draftAttachments, ...response.attachments];
     } catch (error) {
       errorText = describeError(error);
@@ -8279,7 +8843,11 @@
       return;
     }
     try {
-      await api.deleteAttachment(selectedBinding.sessionId, attachmentId);
+      await api.deleteAttachment(
+        selectedBinding.sessionId,
+        attachmentId,
+        profileIdForSession(selectedBinding.sessionId)
+      );
       draftAttachments = draftAttachments.filter((attachment) => attachment.id !== attachmentId);
     } catch (error) {
       errorText = describeError(error);
@@ -8296,7 +8864,7 @@
       return;
     }
     try {
-      await api.abortTurn(selectedBinding.sessionId);
+      await api.abortTurn(selectedBinding.sessionId, profileIdForSession(selectedBinding.sessionId));
     } catch (error) {
       errorText = describeError(error);
     }
@@ -8309,11 +8877,11 @@
     }
     try {
       if (showArchivedSessions || session.archived) {
-        const response = await api.unarchiveSession(session.id);
+        const response = await api.unarchiveSession(session.id, profileIdForSession(session.id));
         applySessionSummaryUpdate(response.session);
         noticeText = m.session_restored_notice();
       } else {
-        await api.archiveSession(session.id);
+        await api.archiveSession(session.id, profileIdForSession(session.id));
         applySessionSummaryUpdate({
           ...session,
           archived: true,
@@ -8402,9 +8970,13 @@
     }
     try {
       const nextPinned = !session.pinned;
-      const response = await api.updateSessionOrganization(session.id, {
-        pinned: nextPinned
-      });
+      const response = await api.updateSessionOrganization(
+        session.id,
+        {
+          pinned: nextPinned
+        },
+        profileIdForSession(session.id)
+      );
       applySessionSummaryUpdate({
         ...session,
         pinned: response.meta.pinned,
@@ -8437,9 +9009,13 @@
 
     const nextTags = [...new Set(nextValue.split(",").map((entry) => entry.trim()).filter((entry) => entry.length > 0))];
     try {
-      const response = await api.updateSessionOrganization(selectedSessionId, {
-        tags: nextTags
-      });
+      const response = await api.updateSessionOrganization(
+        selectedSessionId,
+        {
+          tags: nextTags
+        },
+        profileIdForSession(selectedSessionId)
+      );
       applySessionSummaryUpdate({
         ...selectedSessionSummary,
         pinned: response.meta.pinned,
@@ -8465,7 +9041,7 @@
     }
 
     try {
-      await api.archiveSession(selectedSessionId);
+      await api.archiveSession(selectedSessionId, profileIdForSession(selectedSessionId));
       showArchivedSessions = true;
       await refreshSessions();
       noticeText = m.session_archived_notice();
@@ -8484,7 +9060,7 @@
     }
 
     try {
-      const response = await api.unarchiveSession(selectedSessionId);
+      const response = await api.unarchiveSession(selectedSessionId, profileIdForSession(selectedSessionId));
       showArchivedSessions = false;
       await refreshSessions(response.session);
       noticeText = m.session_restored_notice();
@@ -9129,7 +9705,7 @@
     computerInputBusy = true;
     computerInputStatus = null;
     try {
-      const result = await api.sendComputerInput(selectedSessionId, input);
+      const result = await api.sendComputerInput(selectedSessionId, input, profileIdForSession(selectedSessionId));
       computerInputStatus = `${ui.computerInputDelivered} · ${result.routed}`;
     } catch (error) {
       computerInputStatus = ui.computerInputFailed;
@@ -9569,9 +10145,13 @@
       ? [...new Set([...selectedSessionSummary.tags, folderName])]
       : selectedSessionSummary.tags.filter((tag) => tag !== folderName);
     try {
-      const response = await api.updateSessionOrganization(selectedSessionId, {
-        tags: nextTags
-      });
+      const response = await api.updateSessionOrganization(
+        selectedSessionId,
+        {
+          tags: nextTags
+        },
+        profileIdForSession(selectedSessionId)
+      );
       applySessionSummaryUpdate({
         ...selectedSessionSummary,
         pinned: response.meta.pinned,
@@ -9778,7 +10358,7 @@
       return;
     }
     try {
-      await api.resolveRequest(selectedBinding.sessionId, request.id, result);
+      await api.resolveRequest(selectedBinding.sessionId, request.id, result, profileIdForSession(selectedBinding.sessionId));
       if (conversation?.thread.id === selectedBinding.sessionId) {
         conversation = {
           ...conversation,
@@ -10270,7 +10850,7 @@
     }
     const sessionId = selectedSessionId;
     try {
-      const response = await api.rollbackSession(sessionId, numTurns);
+      const response = await api.rollbackSession(sessionId, numTurns, profileIdForSession(sessionId));
       if (selectedSessionId === sessionId && conversation) {
         conversation = normalizeConversationExecutionState({
           ...conversation,
@@ -10308,11 +10888,15 @@
       return;
     }
     try {
-      const response = await api.forkSession(selectedSessionId, {
-        mode,
-        turnId: options.turnId ?? null,
-        messageText: options.messageText ?? null
-      });
+      const response = await api.forkSession(
+        selectedSessionId,
+        {
+          mode,
+          turnId: options.turnId ?? null,
+          messageText: options.messageText ?? null
+        },
+        profileIdForSession(selectedSessionId)
+      );
       upsertSessionSummary(response.session);
       await selectSession(response.session.id);
       draft = response.draft;
@@ -10363,7 +10947,7 @@
     }
     const sessionId = selectedSessionId;
     try {
-      const response = await api.rollbackSession(sessionId, numTurns);
+      const response = await api.rollbackSession(sessionId, numTurns, profileIdForSession(sessionId));
       if (selectedSessionId === sessionId && conversation) {
         conversation = normalizeConversationExecutionState({
           ...conversation,
@@ -12673,8 +13257,8 @@
       onDeleteSavedFilter={(filterId) => {
         void deleteSavedSessionFilter(filterId);
       }}
-      onSelect={(sessionId) => {
-        void selectSession(sessionId);
+      onSelect={(sessionId, profileId) => {
+        void selectSession(sessionId, profileId ?? null);
       }}
       onTogglePin={(session) => {
         void toggleSessionPinned(session);
@@ -14190,9 +14774,9 @@
                 currentPreferences={conversation?.preferences ?? config?.defaults ?? null}
                 models={config?.models ?? []}
                 readOnly={readOnlyRole}
-                onOpenSession={async (sessionId) => {
+                onOpenSession={async (sessionId, profileId = null) => {
                   activeWorkspaceTabId = "chat";
-                  await selectSession(sessionId);
+                  await selectSession(sessionId, profileId);
                 }}
                 onUseResponse={async (contestant) => {
                   activeWorkspaceTabId = "chat";
@@ -14240,7 +14824,6 @@
                 onConfigSaved={async () => {
                   config = applyLocalComposerPreferencesToConfig(await api.getConfig());
                   syncConfiguredTheme(config);
-                  syncStartupAlertModal(config);
                 }}
                 onAutostartSaved={async (enabled) => {
                   await saveAutostartEnabled(enabled);
@@ -14272,9 +14855,9 @@
                 onCleanupAutomationWorktrees={async () => {
                   await cleanupAutomationWorktrees();
                 }}
-                onOpenSession={async (sessionId) => {
+                onOpenSession={async (sessionId, profileId = null) => {
                   activeWorkspaceTabId = "chat";
-                  await selectSession(sessionId);
+                  await selectSession(sessionId, profileId);
                 }}
               />
             {:else if lazyWorkspaceLoadErrors.settings}
@@ -14399,9 +14982,9 @@
               sessions={sessions}
               selectedSessionId={selectedSessionId}
               webRole={webRole}
-              onOpenSession={async (sessionId) => {
+              onOpenSession={async (sessionId, profileId = null) => {
                 activeWorkspaceTabId = "chat";
-                await selectSession(sessionId);
+                await selectSession(sessionId, profileId);
               }}
             />
           {:else}
@@ -14414,7 +14997,11 @@
       {:else if activeWorkspaceTabId === "memory"}
         <div class="h-full overflow-y-auto" style="background: var(--bg);">
           {#if MemoryWorkspaceView}
-            <MemoryWorkspaceView selectedSessionId={selectedSessionId} webRole={webRole} />
+            <MemoryWorkspaceView
+              selectedSessionId={selectedSessionId}
+              selectedSessionProfileId={profileIdForSession(selectedSessionId)}
+              webRole={webRole}
+            />
           {:else}
             <div class="workspace-loading-card h-full">
               <RefreshCw size={16} class="animate-spin text-gray-300" />
@@ -14484,6 +15071,7 @@
           <TerminalWorkspaceView
             terminalId={activeWorkspaceTabId.replace(/^terminal:/u, "")}
             selectedSessionId={selectedSessionId}
+            selectedSessionProfileId={profileIdForSession(selectedSessionId)}
             readOnly={readOnlyRole}
             onAttachContext={(payload) => {
               attachTerminalContext(payload);

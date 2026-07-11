@@ -79,7 +79,7 @@ function ensureTurn(state: ConversationState, turnId: string, seed?: Partial<Cod
   };
 }
 
-function upsertItem(turn: CodexTurn, item: CodexItem) {
+function upsertItem(turn: CodexTurn, item: CodexItem, authoritative = false) {
   const normalizedItem: CodexItem = {
     ...item,
     type: normalizeItemTypeName(item.type)
@@ -96,7 +96,9 @@ function upsertItem(turn: CodexTurn, item: CodexItem) {
     turn.items = [...turn.items, normalizedItem];
     return;
   }
-  turn.items = turn.items.map((candidate, candidateIndex) => (candidateIndex === index ? mergeItem(candidate, normalizedItem) : candidate));
+  turn.items = turn.items.map((candidate, candidateIndex) =>
+    candidateIndex === index ? (authoritative ? normalizedItem : mergeItem(candidate, normalizedItem)) : candidate
+  );
 }
 
 function resolveConversationRunningTurn(state: ConversationState) {
@@ -106,6 +108,15 @@ function resolveConversationRunningTurn(state: ConversationState) {
 
   const activeTurn = [...state.thread.turns].reverse().find((turn) => String(turn.status ?? "") === "inProgress");
   return activeTurn ? activeTurn.id : null;
+}
+
+function markSeededTurnLive(state: ConversationState, turnId: string, seeded: ReturnType<typeof ensureTurn>) {
+  seeded.turn.status = "inProgress";
+  seeded.turn.completedAt = null;
+  seeded.turn.durationMs = null;
+  state.thread.turns = seeded.turns;
+  state.activeTurnId = turnId;
+  state.thread.status = "running";
 }
 
 function pruneLivePlansForRunningTurns(livePlans: ConversationState["livePlans"], turns: CodexTurn[]) {
@@ -120,6 +131,37 @@ function isLiveThreadStatus(status: string | null | undefined) {
 
 function realtimeTurnIdForThread(threadId: string) {
   return `realtime:${threadId}`;
+}
+
+function isRealtimeTurnId(turnId: string | null | undefined) {
+  return String(turnId ?? "").startsWith("realtime:");
+}
+
+function hasNonRealtimeTurnActivity(state: ConversationState) {
+  return state.thread.turns.some((turn) => {
+    if (isRealtimeTurnId(turn.id)) {
+      return false;
+    }
+    if (String(turn.status ?? "") === "inProgress") {
+      return true;
+    }
+    return turn.items.some((item) => normalizeItemTypeName(item.type) !== "userMessage");
+  });
+}
+
+function withoutRealtimeTurn(state: ConversationState) {
+  const filteredTurns = state.thread.turns.filter((turn) => !isRealtimeTurnId(turn.id));
+  if (filteredTurns.length === state.thread.turns.length && !isRealtimeTurnId(state.activeTurnId)) {
+    return state;
+  }
+  return {
+    ...state,
+    activeTurnId: isRealtimeTurnId(state.activeTurnId) ? null : state.activeTurnId,
+    thread: {
+      ...state.thread,
+      turns: filteredTurns
+    }
+  };
 }
 
 function realtimeItemTypeForRole(role: unknown) {
@@ -458,9 +500,13 @@ function mergePendingRequests(
   existingRequests: SessionDetailPayload["pendingRequests"],
   incomingRequests: SessionDetailPayload["pendingRequests"]
 ) {
-  const merged = new Map(existingRequests.map((request) => [request.id, request] as const));
+  const existingById = new Map(existingRequests.map((request) => [request.id, request] as const));
+  const merged = new Map<string, (typeof incomingRequests)[number]>();
   for (const request of incomingRequests) {
-    merged.set(request.id, request);
+    merged.set(request.id, {
+      ...existingById.get(request.id),
+      ...request
+    });
   }
   return [...merged.values()].sort((left, right) => String(left.createdAt ?? "").localeCompare(String(right.createdAt ?? "")));
 }
@@ -516,40 +562,16 @@ export function createConversationState(detail: SessionDetailPayload): Conversat
 
 export function mergeConversationState(current: ConversationState, detail: SessionDetailPayload): ConversationState {
   const incoming = createConversationState(detail);
-  const incomingSettled = !isLiveThreadStatus(incoming.thread.status) && !incoming.activeTurnId;
-  const mergedTurns = mergeTurns(current.thread.turns, incoming.thread.turns).map((turn) =>
-    incomingSettled && String(turn.status ?? "") === "inProgress"
-      ? {
-          ...turn,
-          status: incoming.thread.status === "failed" || incoming.thread.status === "error" ? "failed" : "completed",
-          completedAt: turn.completedAt ?? Date.now()
-        }
-      : turn
+  const incomingTurnIds = new Set(incoming.thread.turns.map((turn) => turn.id));
+  const livePlans = pruneLivePlansForRunningTurns(current.livePlans, incoming.thread.turns);
+  const liveDiffs = Object.fromEntries(
+    Object.entries(current.liveDiffs).filter(([turnId]) => incomingTurnIds.has(turnId))
   );
-  const hasLiveTurn = mergedTurns.some((turn) => String(turn.status ?? "") === "inProgress");
-  const threadStatus = hasLiveTurn
-    ? (isLiveThreadStatus(incoming.thread.status) ? incoming.thread.status : current.thread.status || "running")
-    : incoming.thread.status;
-  const livePlans = pruneLivePlansForRunningTurns(current.livePlans, mergedTurns);
 
   return {
     ...incoming,
-    thread: {
-      ...current.thread,
-      ...incoming.thread,
-      turns: mergedTurns,
-      status: threadStatus,
-      updatedAt: Math.max(Number(current.thread.updatedAt ?? 0), Number(incoming.thread.updatedAt ?? 0))
-    },
-    queue: mergeQueue(current.queue, incoming.queue),
-    pendingRequests: mergePendingRequests(current.pendingRequests, incoming.pendingRequests),
-    goal: incoming.goal ?? current.goal ?? null,
-    tokenUsage: incoming.tokenUsage ?? current.tokenUsage ?? null,
-    hydration: mergeHydration(current.hydration, incoming.hydration, mergedTurns.length),
     livePlans,
-    liveDiffs: {
-      ...current.liveDiffs
-    }
+    liveDiffs
   };
 }
 
@@ -591,7 +613,14 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
   }
 
   if (method === "thread/status/changed") {
-    next.thread.status = typeof params.status === "string" ? params.status : next.thread.status;
+    const incomingStatus = typeof params.status === "string" ? params.status : next.thread.status;
+    const runningTurnId = resolveConversationRunningTurn(next);
+    if (!isLiveThreadStatus(incomingStatus) && runningTurnId) {
+      next.activeTurnId = runningTurnId;
+      next.thread.status = "running";
+      return next;
+    }
+    next.thread.status = incomingStatus;
     if (next.thread.status !== "running" && next.thread.status !== "active") {
       next.activeTurnId = resolveConversationRunningTurn(next);
       next.livePlans = pruneLivePlansForRunningTurns(next.livePlans, next.thread.turns);
@@ -777,6 +806,9 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
   }
 
   if (method === "thread/realtime/started") {
+    if (hasNonRealtimeTurnActivity(next)) {
+      return next;
+    }
     const turnId = realtimeTurnIdForThread(next.thread.id);
     const seeded = ensureTurn(next, turnId, {
       status: "inProgress",
@@ -791,6 +823,9 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
   }
 
   if (method === "thread/realtime/transcript/delta" || method === "thread/realtime/transcript/done") {
+    if (hasNonRealtimeTurnActivity(next)) {
+      return withoutRealtimeTurn(next);
+    }
     const turnId = realtimeTurnIdForThread(next.thread.id);
     const role = String(params.role ?? "assistant");
     const itemId = `${turnId}:${role}`;
@@ -824,6 +859,9 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
   }
 
   if (method === "thread/realtime/error") {
+    if (hasNonRealtimeTurnActivity(next)) {
+      return withoutRealtimeTurn(next);
+    }
     const turnId = realtimeTurnIdForThread(next.thread.id);
     const seeded = ensureTurn(next, turnId, {
       status: "inProgress",
@@ -860,6 +898,9 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
   }
 
   if (method === "turn/started" || method === "turn/completed") {
+    const withoutRealtime = withoutRealtimeTurn(next);
+    next.thread.turns = withoutRealtime.thread.turns;
+    next.activeTurnId = withoutRealtime.activeTurnId;
     const turn = params.turn as CodexTurn;
     const seeded = ensureTurn(next, turn.id, turn);
     seeded.turn.status = turn.status;
@@ -886,6 +927,13 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
 
   if (method === "item/started" || method === "item/completed") {
     const turnId = String(params.turnId ?? "");
+    if (!turnId) {
+      next.thread.status = "running";
+      return next;
+    }
+    const withoutRealtime = withoutRealtimeTurn(next);
+    next.thread.turns = withoutRealtime.thread.turns;
+    next.activeTurnId = withoutRealtime.activeTurnId;
     const seeded = ensureTurn(next, turnId);
     const streamItem = (params.item as CodexItem) ?? ({ id: String(params.itemId ?? ""), type: "unknown" } satisfies CodexItem);
     const itemType = normalizeItemTypeName(streamItem.type);
@@ -895,14 +943,25 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
       ...streamItem,
       type: itemType,
       lifecycleStatus
-    });
-    next.thread.turns = seeded.turns;
+    }, method === "item/completed");
+    if (method === "item/started") {
+      markSeededTurnLive(next, turnId, seeded);
+    } else {
+      next.thread.turns = seeded.turns;
+    }
     return next;
   }
 
   if (method === "item/agentMessage/delta" || method === "item/plan/delta") {
     const turnId = String(params.turnId ?? "");
     const itemId = String(params.itemId ?? "");
+    if (!turnId) {
+      next.thread.status = "running";
+      return next;
+    }
+    const withoutRealtime = withoutRealtimeTurn(next);
+    next.thread.turns = withoutRealtime.thread.turns;
+    next.activeTurnId = withoutRealtime.activeTurnId;
     const seeded = ensureTurn(next, turnId);
     const type = method === "item/agentMessage/delta" ? "agentMessage" : "plan";
     const existing =
@@ -917,7 +976,7 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
       ...existing,
       text: `${String(existing.text ?? "")}${String(params.delta ?? "")}`
     });
-    next.thread.turns = seeded.turns;
+    markSeededTurnLive(next, turnId, seeded);
     return next;
   }
 
@@ -928,6 +987,13 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
   ) {
     const turnId = String(params.turnId ?? "");
     const itemId = String(params.itemId ?? "");
+    if (!turnId) {
+      next.thread.status = "running";
+      return next;
+    }
+    const withoutRealtime = withoutRealtimeTurn(next);
+    next.thread.turns = withoutRealtime.thread.turns;
+    next.activeTurnId = withoutRealtime.activeTurnId;
     const seeded = ensureTurn(next, turnId);
     const existing =
       seeded.turn.items.find((candidate) => candidate.id === itemId) ??
@@ -957,13 +1023,20 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
           : String(existing.text ?? ""),
       summary
     });
-    next.thread.turns = seeded.turns;
+    markSeededTurnLive(next, turnId, seeded);
     return next;
   }
 
   if (method === "item/commandExecution/outputDelta") {
     const turnId = String(params.turnId ?? "");
     const itemId = String(params.itemId ?? "");
+    if (!turnId) {
+      next.thread.status = "running";
+      return next;
+    }
+    const withoutRealtime = withoutRealtimeTurn(next);
+    next.thread.turns = withoutRealtime.thread.turns;
+    next.activeTurnId = withoutRealtime.activeTurnId;
     const seeded = ensureTurn(next, turnId);
     const existing =
       seeded.turn.items.find((candidate) => candidate.id === itemId) ??
@@ -979,7 +1052,7 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
       ...existing,
       aggregatedOutput: `${String(existing.aggregatedOutput ?? "")}${String(params.delta ?? "")}`
     });
-    next.thread.turns = seeded.turns;
+    markSeededTurnLive(next, turnId, seeded);
     return next;
   }
 

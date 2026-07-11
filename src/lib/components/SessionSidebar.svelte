@@ -165,7 +165,7 @@
     activeSessionFolder: string | null;
     activeSavedSessionFilterId: string | null;
     showArchived: boolean;
-    onSelect: (sessionId: string) => void;
+    onSelect: (sessionId: string, profileId?: string | null) => void;
     onCreate: () => void;
     onLoadMore: () => void;
     onSearchQueryChange: (query: string) => void;
@@ -1557,13 +1557,13 @@
         </div>
       {/if}
 
-      {#each sessions as session (session.id)}
+      {#each sessions as session (`${session.profileId ?? ""}:${session.id}`)}
         <div class="group relative" data-session-id={session.id}>
           <button
             class={`w-full rounded-xl p-3 text-left transition-all relative ${
               session.id === selectedId ? "bg-white shadow-sm border border-gray-200 ring-1 ring-gray-200/50" : sessionCardHighlightClass(session.id)
             }`}
-            onclick={() => onSelect(session.id)}
+            onclick={() => onSelect(session.id, session.profileId ?? null)}
             type="button"
           >
             <div class="flex flex-col gap-1.5">

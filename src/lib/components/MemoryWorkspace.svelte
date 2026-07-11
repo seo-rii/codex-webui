@@ -9,9 +9,11 @@
 
   let {
     selectedSessionId = null,
+    selectedSessionProfileId = null,
     webRole = "admin"
   }: {
     selectedSessionId?: string | null;
+    selectedSessionProfileId?: string | null;
     webRole?: UserRole | null;
   } = $props();
 
@@ -22,7 +24,7 @@
   let errorText = $state("");
   let noticeText = $state("");
   let mounted = false;
-  let lastLoadedSessionId: string | null = null;
+  let lastLoadedSessionKey: string | null = null;
 
   const readOnly = $derived(webRole === "viewer");
   const canUpdateSessionMode = $derived(Boolean(selectedSessionId) && !readOnly && !modeBusy);
@@ -68,7 +70,8 @@
   });
 
   $effect(() => {
-    if (!mounted || selectedSessionId === lastLoadedSessionId) {
+    const sessionKey = `${selectedSessionProfileId ?? ""}:${selectedSessionId ?? ""}`;
+    if (!mounted || sessionKey === lastLoadedSessionKey) {
       return;
     }
     void loadMemoryStatus();
@@ -84,8 +87,8 @@
     errorText = "";
     noticeText = "";
     try {
-      memory = await api.getMemoryStatus(selectedSessionId);
-      lastLoadedSessionId = selectedSessionId;
+      memory = await api.getMemoryStatus(selectedSessionId, selectedSessionProfileId);
+      lastLoadedSessionKey = `${selectedSessionProfileId ?? ""}:${selectedSessionId ?? ""}`;
     } catch (error) {
       errorText = error instanceof Error ? error.message : String(error);
     } finally {
@@ -122,7 +125,7 @@
     errorText = "";
     noticeText = "";
     try {
-      const result = await api.setSessionMemoryMode(selectedSessionId, mode);
+      const result = await api.setSessionMemoryMode(selectedSessionId, mode, selectedSessionProfileId);
       if (memory) {
         memory = {
           ...memory,

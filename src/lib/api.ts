@@ -349,25 +349,27 @@ export const api = {
     return ws.request<CodexRuntimeProcessesPayload>("runtime/processes/list");
   },
 
-  getMemoryStatus(sessionId: string | null = null) {
-    return ws.request<CodexMemoryStatusPayload>("memory/status", { sessionId });
+  getMemoryStatus(sessionId: string | null = null, profileId: string | null = null) {
+    return ws.request<CodexMemoryStatusPayload>("memory/status", { sessionId, profileId });
   },
 
   resetMemory() {
     return ws.request<CodexMemoryResetPayload>("memory/reset");
   },
 
-  setSessionMemoryMode(sessionId: string, mode: "enabled" | "disabled") {
+  setSessionMemoryMode(sessionId: string, mode: "enabled" | "disabled", profileId: string | null = null) {
     return ws.request<SessionMemoryModePayload>("session/memoryMode/set", {
       sessionId,
-      mode
+      mode,
+      profileId
     });
   },
 
-  compareParserWithNativeSession(sessionId: string, limit = 5) {
+  compareParserWithNativeSession(sessionId: string, limit = 5, profileId: string | null = null) {
     return ws.request<ParserDiagnosticsPayload>("diagnostics/parser/compare", {
       sessionId,
-      limit
+      limit,
+      profileId
     });
   },
 
@@ -454,10 +456,12 @@ export const api = {
       realtimeSessionId?: string | null;
       transport?: Record<string, unknown> | null;
       voice?: string | null;
+      profileId?: string | null;
     } = {}
   ) {
     return ws.request<Record<string, unknown>>("codex/realtime/start", {
       threadId,
+      profileId: params.profileId ?? null,
       outputModality: params.outputModality ?? "text",
       prompt: params.prompt ?? null,
       realtimeSessionId: params.realtimeSessionId ?? null,
@@ -466,16 +470,16 @@ export const api = {
     });
   },
 
-  appendRealtimeText(threadId: string, text: string) {
-    return ws.request<Record<string, unknown>>("codex/realtime/appendText", { threadId, text });
+  appendRealtimeText(threadId: string, text: string, profileId: string | null = null) {
+    return ws.request<Record<string, unknown>>("codex/realtime/appendText", { threadId, text, profileId });
   },
 
-  stopRealtimeSession(threadId: string) {
-    return ws.request<Record<string, unknown>>("codex/realtime/stop", { threadId });
+  stopRealtimeSession(threadId: string, profileId: string | null = null) {
+    return ws.request<Record<string, unknown>>("codex/realtime/stop", { threadId, profileId });
   },
 
-  sendComputerInput(sessionId: string, input: ComputerInputEvent) {
-    return ws.request<ComputerInputPayload>("computer/input", { sessionId, input });
+  sendComputerInput(sessionId: string, input: ComputerInputEvent, profileId: string | null = null) {
+    return ws.request<ComputerInputPayload>("computer/input", { sessionId, input, profileId });
   },
 
   getEditableFile(filePath: string) {
@@ -600,8 +604,8 @@ export const api = {
     });
   },
 
-  recoverSessionRollout(sessionId: string) {
-    return ws.request<SessionRolloutRecoveryPayload>("session/recovery", { sessionId });
+  recoverSessionRollout(sessionId: string, profileId: string | null = null) {
+    return ws.request<SessionRolloutRecoveryPayload>("session/recovery", { sessionId, profileId });
   },
 
   forkSession(
@@ -610,10 +614,12 @@ export const api = {
       mode: "fork" | "handoff";
       turnId?: string | null;
       messageText?: string | null;
-    }
+    },
+    profileId: string | null = null
   ) {
     return ws.request<SessionForkPayload>("session/fork", {
       sessionId,
+      profileId,
       ...payload
     });
   },
@@ -623,19 +629,22 @@ export const api = {
     payload: {
       target: SessionReviewTarget;
       delivery?: "inline" | "detached" | null;
-    }
+    },
+    profileId: string | null = null
   ) {
     return ws.request<SessionReviewStartPayload>("session/review/start", {
       sessionId,
       target: payload.target,
-      delivery: payload.delivery ?? null
+      delivery: payload.delivery ?? null,
+      profileId
     });
   },
 
-  rollbackSession(sessionId: string, numTurns: number) {
+  rollbackSession(sessionId: string, numTurns: number, profileId: string | null = null) {
     return ws.request<SessionRollbackPayload>("session/rollback", {
       sessionId,
-      numTurns
+      numTurns,
+      profileId
     });
   },
 
@@ -771,16 +780,16 @@ export const api = {
     return ws.request<{ goal: null; cleared: boolean }>("session/goal/clear", { sessionId, profileId });
   },
 
-  savePreferences(sessionId: string, preferences: Partial<SessionPreferences>) {
-    return ws.request<SessionPreferences>("session/savePreferences", { sessionId, preferences });
+  savePreferences(sessionId: string, preferences: Partial<SessionPreferences>, profileId: string | null = null) {
+    return ws.request<SessionPreferences>("session/savePreferences", { sessionId, preferences, profileId });
   },
 
-  saveSessionSkills(sessionId: string, skills: SelectedSkill[]) {
-    return ws.request<SelectedSkill[]>("session/skills/save", { sessionId, skills });
+  saveSessionSkills(sessionId: string, skills: SelectedSkill[], profileId: string | null = null) {
+    return ws.request<SelectedSkill[]>("session/skills/save", { sessionId, skills, profileId });
   },
 
-  renameSession(sessionId: string, name: string) {
-    return ws.request<{ ok: true }>("session/rename", { sessionId, name });
+  renameSession(sessionId: string, name: string, profileId: string | null = null) {
+    return ws.request<{ ok: true }>("session/rename", { sessionId, name, profileId });
   },
 
   moveSessionProfile(sessionId: string, targetProfileId: string, sourceProfileId: string | null = null) {
@@ -800,13 +809,18 @@ export const api = {
     }>("session/profile/move", params);
   },
 
-  updateSessionOrganization(sessionId: string, patch: Partial<{ pinned: boolean; tags: string[] }>) {
+  updateSessionOrganization(
+    sessionId: string,
+    patch: Partial<{ pinned: boolean; tags: string[] }>,
+    profileId: string | null = null
+  ) {
     return ws.request<{
       meta: { pinned: boolean; tags: string[] };
       knownTags: string[];
       sessionFolders: AppConfigPayload["sessionOrganization"]["sessionFolders"];
     }>("session/organization/update", {
       sessionId,
+      profileId,
       ...patch
     });
   },
@@ -843,12 +857,12 @@ export const api = {
     return ws.request<{ promptPresets: PromptPreset[] }>("promptPresets/delete", { presetId });
   },
 
-  archiveSession(sessionId: string) {
-    return ws.request<{ ok: true }>("session/archive", { sessionId });
+  archiveSession(sessionId: string, profileId: string | null = null) {
+    return ws.request<{ ok: true }>("session/archive", { sessionId, profileId });
   },
 
-  unarchiveSession(sessionId: string) {
-    return ws.request<{ ok: true; session: SessionSummary }>("session/unarchive", { sessionId });
+  unarchiveSession(sessionId: string, profileId: string | null = null) {
+    return ws.request<{ ok: true; session: SessionSummary }>("session/unarchive", { sessionId, profileId });
   },
 
   getAccount() {
@@ -929,42 +943,47 @@ export const api = {
     });
   },
 
-  async uploadAttachments(sessionId: string, files: File[]) {
+  async uploadAttachments(sessionId: string, files: File[], profileId: string | null = null) {
     const formData = new FormData();
     for (const file of files) {
       formData.append("files", file);
     }
-    return request<{ attachments: AttachmentRecord[] }>(apiPath(`/sessions/${sessionId}/attachments`), {
+    const query = profileId ? `?profileId=${encodeURIComponent(profileId)}` : "";
+    return request<{ attachments: AttachmentRecord[] }>(apiPath(`/sessions/${sessionId}/attachments${query}`), {
       method: "POST",
       body: formData,
       credentials: "include"
     });
   },
 
-  deleteAttachment(sessionId: string, attachmentId: string) {
+  deleteAttachment(sessionId: string, attachmentId: string, profileId: string | null = null) {
     return ws.request<{ ok: true }>("attachments/delete", {
       sessionId,
-      attachmentId
+      attachmentId,
+      profileId
     });
   },
 
-  resolveRequest(sessionId: string, requestId: string, result: unknown) {
+  resolveRequest(sessionId: string, requestId: string, result: unknown, profileId: string | null = null) {
     return ws.request<{ ok: true }>("approval/resolve", {
       sessionId,
       requestId,
-      result
+      result,
+      profileId
     });
   },
 
-  abortTurn(sessionId: string) {
+  abortTurn(sessionId: string, profileId: string | null = null) {
     return ws.request<{ interrupted: boolean }>("turn/abort", {
-      sessionId
+      sessionId,
+      profileId
     });
   },
 
-  startSessionCompact(sessionId: string) {
+  startSessionCompact(sessionId: string, profileId: string | null = null) {
     return ws.request<{ ok: true; turnId?: string | null }>("session/compact/start", {
-      sessionId
+      sessionId,
+      profileId
     });
   },
 
@@ -1094,11 +1113,12 @@ export const api = {
     return ws.request<TerminalSnapshotPayload>("terminal/read", { terminalId });
   },
 
-  attachTerminalContext(sessionId: string, terminalId: string, maxBytes = 24_000) {
+  attachTerminalContext(sessionId: string, terminalId: string, maxBytes = 24_000, profileId: string | null = null) {
     return ws.request<TerminalContextPayload>("terminal/context/attach", {
       sessionId,
       terminalId,
-      maxBytes
+      maxBytes,
+      profileId
     });
   },
 

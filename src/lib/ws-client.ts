@@ -29,6 +29,7 @@ type ServerEnvelope =
   | {
       kind: "event";
       sessionId: string;
+      profileId?: string | null;
       event: StreamEvent;
     }
   | {
@@ -167,8 +168,36 @@ function dedupeKeyForRequest(method: string, params: unknown) {
   }
 }
 
-function requestCanReplayAfterReconnect(method: string) {
-  return DEDUPED_READ_METHODS.has(method);
+function requestCanReplayAfterReconnect(method: string, params: unknown) {
+  if (!params || typeof params !== "object") {
+    return false;
+  }
+  const payload = params as Record<string, unknown>;
+  if (method === "turn/send" || method === "turn/steer") {
+    return typeof payload.clientUserMessageId === "string" && payload.clientUserMessageId.trim().length > 0;
+  }
+  if (method === "session/queue/enqueue") {
+    return typeof payload.clientRequestId === "string" && payload.clientRequestId.trim().length > 0;
+  }
+  return false;
+}
+
+function normalizeSubscriptionProfileId(profileId: string | null | undefined) {
+  const value = typeof profileId === "string" ? profileId.trim() : "";
+  return value || "default";
+}
+
+function sessionSubscriptionKey(sessionId: string, profileId: string | null | undefined) {
+  return `${normalizeSubscriptionProfileId(profileId)}:${sessionId}`;
+}
+
+function profileIdFromSessionEvent(event: StreamEvent) {
+  const params = event && typeof event === "object" && "params" in event ? event.params : null;
+  if (!params || typeof params !== "object") {
+    return null;
+  }
+  const profileId = (params as { profileId?: unknown; profile_id?: unknown }).profileId ?? (params as { profile_id?: unknown }).profile_id;
+  return typeof profileId === "string" && profileId.trim() ? profileId.trim() : null;
 }
 
 export class WebSocketRpcClient {
@@ -230,7 +259,7 @@ export class WebSocketRpcClient {
         message,
         resolve: resolve as (value: unknown) => void,
         reject,
-        replayable: requestCanReplayAfterReconnect(method),
+        replayable: requestCanReplayAfterReconnect(method, params),
         sentGeneration: null,
         timeoutTimer
       });
@@ -250,23 +279,24 @@ export class WebSocketRpcClient {
   }
 
   subscribeSession(sessionId: string, handler: SessionEventHandler, options: SessionSubscriptionOptions = {}) {
-    const current = this.sessionHandlers.get(sessionId) ?? new Set<SessionEventHandler>();
+    const subscriptionKey = sessionSubscriptionKey(sessionId, options.profileId ?? null);
+    const current = this.sessionHandlers.get(subscriptionKey) ?? new Set<SessionEventHandler>();
     const shouldSubscribe = current.size === 0;
     current.add(handler);
-    this.sessionHandlers.set(sessionId, current);
+    this.sessionHandlers.set(subscriptionKey, current);
     if (shouldSubscribe) {
-      this.sessionSubscriptionOptions.set(sessionId, {
+      this.sessionSubscriptionOptions.set(subscriptionKey, {
         includeInitialQueue: options.includeInitialQueue ?? true,
-        profileId: options.profileId ?? null
+        profileId: normalizeSubscriptionProfileId(options.profileId ?? null)
       });
     }
     this.ensureConnected();
     if (shouldSubscribe) {
-      this.sendSessionSubscribe(sessionId);
+      this.sendSessionSubscribe(subscriptionKey, sessionId);
     }
 
     return () => {
-      const handlers = this.sessionHandlers.get(sessionId);
+      const handlers = this.sessionHandlers.get(subscriptionKey);
       if (!handlers) {
         return;
       }
@@ -276,9 +306,9 @@ export class WebSocketRpcClient {
         return;
       }
 
-      const options = this.sessionSubscriptionOptions.get(sessionId);
-      this.sessionHandlers.delete(sessionId);
-      this.sessionSubscriptionOptions.delete(sessionId);
+      const options = this.sessionSubscriptionOptions.get(subscriptionKey);
+      this.sessionHandlers.delete(subscriptionKey);
+      this.sessionSubscriptionOptions.delete(subscriptionKey);
       this.sendTransient("session/unsubscribe", {
         sessionId,
         profileId: options?.profileId ?? null
@@ -449,6 +479,9 @@ export class WebSocketRpcClient {
     });
 
     socket.addEventListener("message", (event) => {
+      if (this.socket !== socket) {
+        return;
+      }
       if (typeof event.data !== "string") {
         return;
       }
@@ -468,13 +501,10 @@ export class WebSocketRpcClient {
       }
 
       if (payload.kind === "resyncRequired") {
-        if (this.resyncRequiredListeners.size === 0) {
-          this.forceReconnect();
-          return;
-        }
         for (const listener of this.resyncRequiredListeners) {
           listener(payload.reason);
         }
+        this.forceReconnect();
         return;
       }
 
@@ -495,12 +525,25 @@ export class WebSocketRpcClient {
       }
 
       if (payload.kind === "event") {
-        const handlers = this.sessionHandlers.get(payload.sessionId);
-        if (!handlers) {
+        const eventProfileId =
+          normalizeSubscriptionProfileId(payload.profileId) !== "default" || payload.profileId
+            ? normalizeSubscriptionProfileId(payload.profileId)
+            : profileIdFromSessionEvent(payload.event);
+        const handlerSets = eventProfileId
+          ? [this.sessionHandlers.get(sessionSubscriptionKey(payload.sessionId, eventProfileId))]
+          : Array.from(this.sessionHandlers.entries())
+              .filter(([key]) => key.endsWith(`:${payload.sessionId}`))
+              .map(([, handlers]) => handlers);
+        if (handlerSets.every((handlers) => !handlers)) {
           return;
         }
-        for (const handler of handlers) {
-          handler(payload.event);
+        for (const handlers of handlerSets) {
+          if (!handlers) {
+            continue;
+          }
+          for (const handler of handlers) {
+            handler(payload.event);
+          }
         }
         return;
       }
@@ -574,9 +617,16 @@ export class WebSocketRpcClient {
       if (pending.sentGeneration !== null && !pending.replayable) {
         this.pending.delete(id);
         clearTimeout(pending.timeoutTimer);
-        pending.reject(new Error("WebSocket reconnected before the mutation completed. Refreshing session state."));
+        const skippedReadReplay = DEDUPED_READ_METHODS.has(pending.message.method);
+        pending.reject(
+          new Error(
+            skippedReadReplay
+              ? "WebSocket reconnected before the read completed. Refreshing server state."
+              : "WebSocket reconnected before the mutation completed. Refreshing server state."
+          )
+        );
         for (const listener of this.resyncRequiredListeners) {
-          listener("mutationReplaySkipped");
+          listener(skippedReadReplay ? "readReplaySkipped" : "mutationReplaySkipped");
         }
         continue;
       }
@@ -591,8 +641,9 @@ export class WebSocketRpcClient {
       this.sendTransient("events/subscribe", {});
     }
 
-    for (const sessionId of this.sessionHandlers.keys()) {
-      this.sendSessionSubscribe(sessionId);
+    for (const [subscriptionKey, options] of this.sessionSubscriptionOptions.entries()) {
+      const sessionId = subscriptionKey.slice(subscriptionKey.indexOf(":") + 1);
+      this.sendSessionSubscribe(subscriptionKey, sessionId, options);
     }
 
     for (const terminalId of this.terminalHandlers.keys()) {
@@ -614,8 +665,14 @@ export class WebSocketRpcClient {
     this.socket.send(JSON.stringify(payload));
   }
 
-  private sendSessionSubscribe(sessionId: string) {
-    const options = this.sessionSubscriptionOptions.get(sessionId) ?? { includeInitialQueue: true, profileId: null };
+  private sendSessionSubscribe(
+    subscriptionKey: string,
+    sessionId: string,
+    subscriptionOptions: Required<SessionSubscriptionOptions> | null = null
+  ) {
+    const options =
+      subscriptionOptions ??
+      this.sessionSubscriptionOptions.get(subscriptionKey) ?? { includeInitialQueue: true, profileId: null };
     this.sendTransient("session/subscribe", {
       sessionId,
       includeInitialQueue: options.includeInitialQueue,

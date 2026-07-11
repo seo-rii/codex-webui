@@ -110,7 +110,7 @@
     onDeleteAutomation?: ((automationId: string) => void | Promise<void>) | null;
     onRunAutomation?: ((automationId: string) => void | Promise<void>) | null;
     onCleanupAutomationWorktrees?: (() => void | Promise<void>) | null;
-    onOpenSession?: ((sessionId: string) => void | Promise<void>) | null;
+    onOpenSession?: ((sessionId: string, profileId?: string | null) => void | Promise<void>) | null;
     onConfigSaved?: (() => void | Promise<void>) | null;
   } = $props();
 
@@ -1706,7 +1706,7 @@
                       {#each process.sessions as session (session.sessionId)}
                         <button
                           class="runtime-session-chip"
-                          onclick={() => void onOpenSession?.(session.sessionId)}
+                          onclick={() => void onOpenSession?.(session.sessionId, process.profileId)}
                           title={`${ui.openSession}: ${session.sessionId}`}
                           type="button"
                         >

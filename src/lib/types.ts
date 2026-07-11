@@ -511,6 +511,11 @@ export type CodexAccountLoginFlow =
     };
 
 export type SessionDetailPayload = {
+  profileId?: string | null;
+  profileLabel?: string | null;
+  profileCodexHome?: string | null;
+  accountEmail?: string | null;
+  accountType?: "apiKey" | "chatgpt" | string | null;
   thread: CodexThread;
   preferences: SessionPreferences;
   selectedSkills: SelectedSkill[];

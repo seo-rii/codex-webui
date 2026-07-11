@@ -30,7 +30,7 @@
     selectedSessionId?: string | null;
     connectionState?: WsConnectionState;
     webRole?: UserRole | null;
-    onOpenSession?: ((sessionId: string) => void | Promise<void>) | null;
+    onOpenSession?: ((sessionId: string, profileId?: string | null) => void | Promise<void>) | null;
   } = $props();
 
   let runtimeStatus = $state<CodexRuntimeStatus | null>(null);
@@ -131,6 +131,18 @@
     }
   }
 
+  function profileIdForSession(sessionId: string) {
+    const loadedSession = sessions.find((session) => session.id === sessionId);
+    if (loadedSession?.profileId) {
+      return loadedSession.profileId;
+    }
+
+    const process = runtimeProcesses.find((entry) =>
+      entry.sessions.some((session) => session.sessionId === sessionId)
+    );
+    return process?.profileId ?? null;
+  }
+
   async function compareParserWithNative() {
     const sessionId = parserSessionId.trim();
     if (!sessionId || !canLoadAdminDiagnostics) {
@@ -140,7 +152,7 @@
     parserError = "";
     parserResult = null;
     try {
-      parserResult = await api.compareParserWithNativeSession(sessionId, parserLimit);
+      parserResult = await api.compareParserWithNativeSession(sessionId, parserLimit, profileIdForSession(sessionId));
     } catch (error) {
       parserError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -326,7 +338,7 @@
             {#if process.sessions.length > 0}
               <div class="diagnostics-session-chips">
                 {#each process.sessions as session (session.sessionId)}
-                  <button class="diagnostics-chip" onclick={() => void onOpenSession?.(session.sessionId)} type="button">
+                  <button class="diagnostics-chip" onclick={() => void onOpenSession?.(session.sessionId, process.profileId)} type="button">
                     {session.title ?? session.sessionId}
                     <span>{session.status}</span>
                   </button>

@@ -11,11 +11,13 @@
   let {
     terminalId,
     selectedSessionId = null,
+    selectedSessionProfileId = null,
     readOnly = false,
     onAttachContext = null
   }: {
     terminalId: string;
     selectedSessionId?: string | null;
+    selectedSessionProfileId?: string | null;
     readOnly?: boolean;
     onAttachContext?: ((payload: TerminalContextPayload) => void | Promise<void>) | null;
   } = $props();
@@ -69,7 +71,7 @@
     attachingContext = true;
     errorText = "";
     try {
-      const payload = await api.attachTerminalContext(selectedSessionId, terminalId);
+      const payload = await api.attachTerminalContext(selectedSessionId, terminalId, 24_000, selectedSessionProfileId);
       await onAttachContext?.(payload);
     } catch (error) {
       errorText = error instanceof Error ? error.message : ui.failedInitialize;

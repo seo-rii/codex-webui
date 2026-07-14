@@ -5,6 +5,15 @@ export type ConversationState = SessionDetailPayload & {
   liveDiffs: Record<string, string>;
 };
 
+export function normalizeSessionStateProfileId(profileId: string | null | undefined) {
+  const normalized = typeof profileId === "string" ? profileId.trim() : "";
+  return normalized || "default";
+}
+
+export function sessionStateKey(sessionId: string, profileId: string | null | undefined) {
+  return `${normalizeSessionStateProfileId(profileId)}\u0000${sessionId}`;
+}
+
 function cloneTurn(turn: CodexTurn): CodexTurn {
   return {
     ...turn,
@@ -79,7 +88,7 @@ function ensureTurn(state: ConversationState, turnId: string, seed?: Partial<Cod
   };
 }
 
-function upsertItem(turn: CodexTurn, item: CodexItem, authoritative = false) {
+function upsertItem(turn: CodexTurn, item: CodexItem) {
   const normalizedItem: CodexItem = {
     ...item,
     type: normalizeItemTypeName(item.type)
@@ -97,7 +106,7 @@ function upsertItem(turn: CodexTurn, item: CodexItem, authoritative = false) {
     return;
   }
   turn.items = turn.items.map((candidate, candidateIndex) =>
-    candidateIndex === index ? (authoritative ? normalizedItem : mergeItem(candidate, normalizedItem)) : candidate
+    candidateIndex === index ? mergeItem(candidate, normalizedItem) : candidate
   );
 }
 
@@ -221,6 +230,33 @@ function preferRicherArray<T>(existing: unknown, incoming: unknown): T[] | undef
   return incomingEntries.length >= existingEntries.length ? incomingEntries : existingEntries;
 }
 
+function mergeStructuredMetadata(existing: unknown, incoming: unknown): unknown {
+  if (incoming === undefined || incoming === null) {
+    return existing;
+  }
+  if (existing === undefined || existing === null) {
+    return incoming;
+  }
+  if (Array.isArray(existing) && Array.isArray(incoming)) {
+    return incoming.length >= existing.length ? incoming : existing;
+  }
+  if (
+    typeof existing === "object" &&
+    typeof incoming === "object" &&
+    !Array.isArray(existing) &&
+    !Array.isArray(incoming)
+  ) {
+    const existingRecord = existing as Record<string, unknown>;
+    const incomingRecord = incoming as Record<string, unknown>;
+    const merged: Record<string, unknown> = { ...existingRecord };
+    for (const [key, value] of Object.entries(incomingRecord)) {
+      merged[key] = mergeStructuredMetadata(existingRecord[key], value);
+    }
+    return merged;
+  }
+  return incoming;
+}
+
 function mergeItem(existingItem: CodexItem | undefined, incomingItem: CodexItem): CodexItem {
   const normalizedIncomingItem: CodexItem = {
     ...incomingItem,
@@ -306,6 +342,31 @@ function mergeItem(existingItem: CodexItem | undefined, incomingItem: CodexItem)
       existingLifecycle === "completed" && incomingLifecycle === "inProgress"
         ? existingItem.lifecycleStatus
         : (incomingItem.lifecycleStatus ?? existingItem.lifecycleStatus);
+  }
+  if (incomingItem.status !== undefined || existingItem.status !== undefined) {
+    const incomingStatus = String(incomingItem.status ?? "");
+    const existingStatus = String(existingItem.status ?? "");
+    const existingIsTerminal = ["completed", "failed", "cancelled", "canceled", "aborted"].includes(existingStatus);
+    const incomingIsRunning = ["running", "inProgress", "pending"].includes(incomingStatus);
+    merged.status = existingIsTerminal && incomingIsRunning ? existingItem.status : (incomingItem.status ?? existingItem.status);
+  }
+  for (const key of [
+    "annotations",
+    "memoryCitation",
+    "memory_citation",
+    "internalChatMessageMetadataPassthrough",
+    "internal_chat_message_metadata_passthrough",
+    "metadata",
+    "_meta"
+  ]) {
+    if (key in normalizedExistingItem || key in normalizedIncomingItem) {
+      merged[key] = mergeStructuredMetadata(normalizedExistingItem[key], normalizedIncomingItem[key]);
+    }
+  }
+  for (const key of ["content", "citations", "citationResults", "results", "sources"]) {
+    if (key in normalizedExistingItem || key in normalizedIncomingItem) {
+      merged[key] = preferRicherArray(normalizedExistingItem[key], normalizedIncomingItem[key]);
+    }
   }
 
   return merged;
@@ -425,8 +486,14 @@ function mergeTurn(existingTurn: CodexTurn | undefined, incomingTurn: CodexTurn)
     hiddenItemCount:
       status === "inProgress"
         ? 0
-        : Math.max(Number(existingTurn.hiddenItemCount ?? 0), Number(incomingTurn.hiddenItemCount ?? 0))
+        : incomingTurn.detailState === "full"
+          ? Number(incomingTurn.hiddenItemCount ?? 0)
+          : Math.max(Number(existingTurn.hiddenItemCount ?? 0), Number(incomingTurn.hiddenItemCount ?? 0))
   };
+}
+
+export function mergeConversationTurnState(existingTurn: CodexTurn, incomingTurn: CodexTurn): CodexTurn {
+  return mergeTurn(existingTurn, incomingTurn);
 }
 
 function normalizeTurnTimestamp(value: number | null | undefined) {
@@ -476,9 +543,12 @@ function normalizeTurnOrder(turns: CodexTurn[]) {
     .map((entry) => entry.turn);
 }
 
-function mergeTurns(existingTurns: CodexTurn[], incomingTurns: CodexTurn[]) {
+function mergeTurns(existingTurns: CodexTurn[], incomingTurns: CodexTurn[], retainExistingOnly = true) {
   const existingById = new Map(existingTurns.map((turn) => [turn.id, turn] as const));
   const incomingById = new Map(incomingTurns.map((turn) => [turn.id, turn] as const));
+  if (!retainExistingOnly) {
+    return normalizeTurnOrder(incomingTurns.map((turn) => mergeTurn(existingById.get(turn.id), turn)));
+  }
   const merged = existingTurns.map((turn) => {
     const incomingTurn = incomingById.get(turn.id);
     return incomingTurn ? mergeTurn(turn, incomingTurn) : cloneTurn(turn);
@@ -560,18 +630,46 @@ export function createConversationState(detail: SessionDetailPayload): Conversat
   };
 }
 
-export function mergeConversationState(current: ConversationState, detail: SessionDetailPayload): ConversationState {
+export function mergeConversationState(
+  current: ConversationState,
+  detail: SessionDetailPayload,
+  retainCurrentOnlyTurns = true
+): ConversationState {
   const incoming = createConversationState(detail);
-  const incomingTurnIds = new Set(incoming.thread.turns.map((turn) => turn.id));
-  const livePlans = pruneLivePlansForRunningTurns(current.livePlans, incoming.thread.turns);
-  const liveDiffs = Object.fromEntries(
-    Object.entries(current.liveDiffs).filter(([turnId]) => incomingTurnIds.has(turnId))
+  const incomingSettled = !isLiveThreadStatus(incoming.thread.status) && !incoming.activeTurnId;
+  const mergedTurns = mergeTurns(current.thread.turns, incoming.thread.turns, retainCurrentOnlyTurns).map((turn) =>
+    incomingSettled && String(turn.status ?? "") === "inProgress"
+      ? {
+          ...turn,
+          status: incoming.thread.status === "failed" || incoming.thread.status === "error" ? "failed" : "completed",
+          completedAt: turn.completedAt ?? Date.now()
+        }
+      : turn
   );
+  const hasLiveTurn = mergedTurns.some((turn) => String(turn.status ?? "") === "inProgress");
+  const threadStatus = hasLiveTurn
+    ? (isLiveThreadStatus(incoming.thread.status) ? incoming.thread.status : current.thread.status || "running")
+    : incoming.thread.status;
+  const livePlans = pruneLivePlansForRunningTurns(current.livePlans, mergedTurns);
 
   return {
     ...incoming,
+    thread: {
+      ...current.thread,
+      ...incoming.thread,
+      turns: mergedTurns,
+      status: threadStatus,
+      updatedAt: Math.max(Number(current.thread.updatedAt ?? 0), Number(incoming.thread.updatedAt ?? 0))
+    },
+    queue: mergeQueue(current.queue, incoming.queue),
+    pendingRequests: mergePendingRequests(current.pendingRequests, incoming.pendingRequests),
+    goal: incoming.goal ?? current.goal ?? null,
+    tokenUsage: incoming.tokenUsage ?? current.tokenUsage ?? null,
+    hydration: mergeHydration(current.hydration, incoming.hydration, mergedTurns.length),
     livePlans,
-    liveDiffs
+    liveDiffs: {
+      ...current.liveDiffs
+    }
   };
 }
 
@@ -608,7 +706,11 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
   }
 
   if (method === "thread/name/updated") {
-    next.thread.name = (params.threadName as string | null | undefined) ?? null;
+    next.thread.name =
+      (params.threadName as string | null | undefined) ??
+      (params.thread_name as string | null | undefined) ??
+      (params.name as string | null | undefined) ??
+      null;
     return next;
   }
 
@@ -709,12 +811,8 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
   }
 
   if (method === "codex-webui/sessionHydrationChunk") {
-    const existingTurnIds = new Set(next.thread.turns.map((turn) => turn.id));
     const incomingTurns = Array.isArray(params.turns) ? (params.turns as CodexTurn[]) : [];
-    next.thread.turns = [
-      ...next.thread.turns,
-      ...incomingTurns.filter((turn) => turn?.id && !existingTurnIds.has(turn.id))
-    ];
+    next.thread.turns = mergeTurns(next.thread.turns, incomingTurns.filter((turn) => turn?.id));
     next.hydration = {
       state: "loading",
       loadedTurns: Number(params.loadedTurns ?? next.thread.turns.length),
@@ -902,13 +1000,7 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
     next.thread.turns = withoutRealtime.thread.turns;
     next.activeTurnId = withoutRealtime.activeTurnId;
     const turn = params.turn as CodexTurn;
-    const seeded = ensureTurn(next, turn.id, turn);
-    seeded.turn.status = turn.status;
-    seeded.turn.error = turn.error;
-    seeded.turn.startedAt = turn.startedAt;
-    seeded.turn.completedAt = turn.completedAt;
-    seeded.turn.durationMs = turn.durationMs;
-    next.thread.turns = seeded.turns;
+    next.thread.turns = mergeTurns(next.thread.turns, [turn]);
     next.activeTurnId = method === "turn/started" ? turn.id : next.activeTurnId === turn.id ? null : next.activeTurnId;
     if (method === "turn/completed") {
       delete next.livePlans[turn.id];
@@ -943,7 +1035,7 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
       ...streamItem,
       type: itemType,
       lifecycleStatus
-    }, method === "item/completed");
+    });
     if (method === "item/started") {
       markSeededTurnLive(next, turnId, seeded);
     } else {

@@ -1512,16 +1512,16 @@
   .field input,
   .inline-field input {
     width: 100%;
-    border: 1px solid rgba(83, 61, 42, 0.14);
+    border: 1px solid var(--line);
     border-radius: 1rem;
-    background: rgba(255, 255, 255, 0.86);
+    background: color-mix(in srgb, var(--panel-strong) 86%, transparent);
     color: var(--ink);
     padding: 0.68rem 0.82rem;
   }
 
   .meta-pill {
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.82);
+    background: color-mix(in srgb, var(--panel-strong) 82%, transparent);
     color: var(--ink);
     padding: 0.32rem 0.65rem;
     font-size: 0.74rem;
@@ -1549,9 +1549,9 @@
   .panel {
     display: grid;
     gap: 0.7rem;
-    border: 1px solid rgba(83, 61, 42, 0.1);
+    border: 1px solid var(--line);
     border-radius: 1.15rem;
-    background: rgba(255, 255, 255, 0.76);
+    background: color-mix(in srgb, var(--panel-strong) 76%, transparent);
     padding: 0.88rem;
   }
 
@@ -1613,7 +1613,7 @@
     gap: 0.48rem;
     align-items: center;
     border-radius: 1rem;
-    background: rgba(249, 245, 239, 0.75);
+    background: color-mix(in srgb, var(--panel-soft) 82%, transparent);
     padding: 0.54rem 0.62rem;
   }
 
@@ -1698,7 +1698,7 @@
     gap: 0.2rem;
     padding: 0.2rem;
     border-radius: 999px;
-    background: rgba(249, 245, 239, 0.86);
+    background: color-mix(in srgb, var(--panel-soft) 88%, transparent);
   }
 
   .segmented-control__button {
@@ -1716,7 +1716,7 @@
   }
 
   .segmented-control__button--active {
-    background: rgba(255, 255, 255, 0.98);
+    background: color-mix(in srgb, var(--panel-strong) 98%, transparent);
     color: var(--ink-strong);
   }
 
@@ -1725,7 +1725,7 @@
     gap: 0.55rem;
     padding: 0.72rem;
     border-radius: 1rem;
-    background: rgba(249, 245, 239, 0.76);
+    background: color-mix(in srgb, var(--panel-soft) 82%, transparent);
   }
 
   .scm-commit-box__input {
@@ -1733,7 +1733,7 @@
     min-height: 4.85rem;
     border: 1px solid rgba(83, 61, 42, 0.12);
     border-radius: 0.92rem;
-    background: rgba(255, 255, 255, 0.92);
+    background: color-mix(in srgb, var(--panel-strong) 92%, transparent);
     color: var(--ink);
     padding: 0.72rem 0.82rem;
     resize: vertical;
@@ -1793,7 +1793,7 @@
     align-items: center;
     min-width: 0;
     border-radius: 0.85rem;
-    background: rgba(249, 245, 239, 0.68);
+    background: color-mix(in srgb, var(--panel-soft) 78%, transparent);
     padding: 0.38rem 0.46rem;
     padding-inline-start: calc(0.46rem + (var(--scm-depth, 0) * 0.78rem));
     transition: background-color 140ms ease, box-shadow 140ms ease;
@@ -1801,7 +1801,7 @@
 
   .scm-row--file:hover,
   .scm-row--folder:hover {
-    background: rgba(245, 238, 229, 0.94);
+    background: color-mix(in srgb, var(--accent) 8%, var(--panel-soft));
   }
 
   .scm-row--file {
@@ -1886,7 +1886,7 @@
     height: 1.72rem;
     border: 1px solid rgba(83, 61, 42, 0.12);
     border-radius: 0.65rem;
-    background: rgba(255, 255, 255, 0.88);
+    background: color-mix(in srgb, var(--panel-strong) 88%, transparent);
     color: var(--ink);
     padding: 0;
     transition: border-color 140ms ease, background-color 140ms ease, color 140ms ease;
@@ -1894,7 +1894,7 @@
 
   .icon-button:hover:not(:disabled) {
     border-color: rgba(214, 140, 69, 0.24);
-    background: rgba(255, 248, 237, 0.98);
+    background: color-mix(in srgb, var(--accent) 10%, var(--panel-strong));
     color: var(--ink-strong);
   }
 
@@ -1910,7 +1910,7 @@
     min-width: 1.72rem;
     height: 1.72rem;
     border-radius: 0.65rem;
-    background: rgba(255, 255, 255, 0.92);
+    background: color-mix(in srgb, var(--panel-strong) 92%, transparent);
     font-size: 0.7rem;
     font-weight: 800;
     letter-spacing: 0.02em;
@@ -1940,7 +1940,7 @@
 
   .git-markdown-body {
     border-radius: 1rem;
-    background: rgba(249, 245, 239, 0.72);
+    background: color-mix(in srgb, var(--panel-soft) 78%, transparent);
     padding: 0.85rem 0.95rem;
   }
 
@@ -1994,7 +1994,7 @@
     .git-mobile-nav__button {
       border: 1px solid rgba(83, 61, 42, 0.12);
       border-radius: 999px;
-      background: rgba(255, 255, 255, 0.78);
+      background: color-mix(in srgb, var(--panel-strong) 78%, transparent);
       color: var(--muted);
       padding: 0.55rem 0.9rem;
       font-size: 0.76rem;
@@ -2004,7 +2004,7 @@
     }
 
     .git-mobile-nav__button--active {
-      background: rgba(255, 248, 237, 0.96);
+      background: color-mix(in srgb, var(--accent) 10%, var(--panel-strong));
       border-color: rgba(214, 140, 69, 0.28);
       color: var(--ink-strong);
     }

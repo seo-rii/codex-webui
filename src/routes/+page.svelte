@@ -45,9 +45,18 @@
   } from "lucide-svelte";
   import { onMount, tick } from "svelte";
   import { fly, slide } from "svelte/transition";
+  import { portal } from "$lib/actions/portal";
   import { extractAttachmentPaths, stripAttachmentPreamble } from "$lib/attachments";
   import { api } from "$lib/api";
-  import { applyStreamEvent, createConversationState, mergeConversationState, type ConversationState } from "$lib/chat-state";
+  import {
+    applyStreamEvent,
+    createConversationState,
+    mergeConversationState,
+    mergeConversationTurnState,
+    normalizeSessionStateProfileId,
+    sessionStateKey,
+    type ConversationState
+  } from "$lib/chat-state";
   import { CODEX_SLASH_COMMANDS, findCodexSlashCommand, type CodexSlashCommandEntry } from "$lib/codex-commands";
   import AuthLoginOverlay from "$lib/components/AuthLoginOverlay.svelte";
   import FolderBrowserDialog from "$lib/components/FolderBrowserDialog.svelte";
@@ -71,6 +80,7 @@
   import { activeLocale, localeOptions, localeSignal, updateLocale } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
   import { getLocale } from "$lib/paraglide/runtime.js";
+  import { anchoredPopoverStyle } from "$lib/popover-position";
   import {
     applyThemeSettings,
     applyThemeMode,
@@ -185,6 +195,7 @@
   };
   type OptimisticMessageState = {
     sessionId: string;
+    profileId: string | null;
     clientUserMessageId: string;
     prompt: string;
     skills: SelectedSkill[];
@@ -192,6 +203,20 @@
     createdAt: number;
     baselineTurnId: string | null;
     baselineTurnCount: number;
+  };
+  type PendingSteerResumeState = {
+    sessionId: string;
+    profileId: string | null;
+    draft: string;
+    updatedAt: number | null;
+  };
+  type PendingEnqueueState = {
+    sessionId: string;
+    profileId: string | null;
+    optimisticQueueId: string;
+    item: SessionQueueItem;
+    deleted: boolean;
+    edited: boolean;
   };
   type SessionRecoveryPromptState = {
     sessionId: string;
@@ -272,6 +297,7 @@
   let webRole = $state<UserRole | null>(null);
   let loading = $state(true);
   let loadingDetail = $state(false);
+  let manualSessionResyncSessionId = $state<string | null>(null);
   let sessionsBusy = $state(false);
   let sending = $state(false);
   let startingMessage = $state(false);
@@ -379,7 +405,7 @@
   let codeDiffTabs = $state<CodeDiffTab[]>([]);
   let fileTabs = $state<FileTab[]>([]);
   let viewerGitRepoPath = $state<string | null>(null);
-  let pendingSteerResume = $state<{ sessionId: string; draft: string; updatedAt: number | null } | null>(null);
+  let pendingSteerResume = $state<PendingSteerResumeState | null>(null);
   let dismissedQueueResumeBySessionId = $state<Record<string, boolean>>({});
   let draftSaveTimer: ReturnType<typeof setTimeout> | null = null;
   let draftPersistencePaused = $state(false);
@@ -389,7 +415,7 @@
   let optimisticQueuedItemsBySessionId = $state<Record<string, SessionQueueItem[]>>({});
   let sessionQueueSnapshotsBySessionId = $state<Record<string, SessionQueuePayload>>({});
   let queuedMessageRequestCountsBySessionId = $state<Record<string, number>>({});
-  let pendingQueueModeSessionId = $state<string | null>(null);
+  let pendingQueueModeSessionKey = $state<string | null>(null);
   let pendingQueueModeActivatedAt = $state(0);
   let liveTurnCardExpanded = $state(false);
   let sendIntent = $state<"message" | "steer" | "queue" | null>(null);
@@ -508,7 +534,7 @@
   const staleSessionCatchupHiddenThresholdMs = 45_000;
   const staleSessionCatchupEventThreshold = 40;
   const staleSessionCatchupWindowMs = 7_500;
-  const activeSessionStatusPollMs = 5_000;
+  const activeSessionStatusPollMs = 15_000;
   const initialTurnEntryRenderLimit = 80;
   const turnEntryRenderIncrement = 80;
   const largeMarkdownInitialChars = 18_000;
@@ -1335,10 +1361,11 @@
     }, staleSessionCatchupWindowMs);
   }
 
-  function queuePendingSessionEvent(sessionId: string, payload: StreamEvent) {
+  function queuePendingSessionEvent(sessionId: string, profileId: string | null, payload: StreamEvent) {
+    const scopeKey = sessionStateKey(sessionId, profileId);
     pendingSessionEvents = {
       ...pendingSessionEvents,
-      [sessionId]: [...(pendingSessionEvents[sessionId] ?? []), payload]
+      [scopeKey]: [...(pendingSessionEvents[scopeKey] ?? []), payload]
     };
   }
 
@@ -1458,18 +1485,24 @@
       return;
     }
 
+    const requestVersion = showMessage ? ++manualSessionResyncRequestVersion : 0;
     if (showMessage) {
-      errorText = ui.sessionResyncing;
+      manualSessionResyncSessionId = sessionId;
+      errorText = "";
       noticeText = "";
     }
 
-    void refreshSelectedSessionState(sessionId, Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize), true).catch(
-      (error) => {
+    void refreshSelectedSessionState(sessionId, Math.max(conversation?.thread.turns.length ?? 0, olderTurnPageSize), true)
+      .catch((error) => {
         if (selectedSessionId === sessionId) {
           errorText = describeError(error);
         }
-      }
-    );
+      })
+      .finally(() => {
+        if (showMessage && requestVersion === manualSessionResyncRequestVersion) {
+          manualSessionResyncSessionId = null;
+        }
+      });
   }
 
   function ensureSelectedSessionBinding(showMessage = true) {
@@ -1659,6 +1692,8 @@
   let sessionDetailCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionListRequestVersion = 0;
   let sessionSelectionVersion = 0;
+  let accountProfileSwitchGeneration = 0;
+  let accountProfileSwitchQueue: Promise<void> = Promise.resolve();
   const itemDetailRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const lazyWorkspaceLoads = new Map<LazyWorkspaceKind, Promise<void>>();
   let transcriptElement = $state<HTMLDivElement | undefined>(undefined);
@@ -1679,6 +1714,7 @@
   let sessionTurnSearchHighlightTimer: ReturnType<typeof setTimeout> | null = null;
   let staleSessionCatchupTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionTurnSearchRequestVersion = 0;
+  let manualSessionResyncRequestVersion = 0;
   let sessionTurnSearchPopoverStyle = $state("");
   let titleInputElement = $state<HTMLInputElement | undefined>(undefined);
   let composerTextareaElement = $state<HTMLTextAreaElement | undefined>(undefined);
@@ -1705,11 +1741,24 @@
   const recentAttentionNotificationKeys: Record<string, number> = {};
   const recentLiveSessionEvidenceTtlMs = 8_000;
   let recentLiveSessionEvidenceAtBySessionId: Record<string, number> = {};
+  const recentLiveSessionEvidenceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  let lastLiveSessionEvidenceAt = 0;
   const handledResumeDraftKeys = new Set<string>();
   const pendingComposerMutationSignatures = new Set<string>();
+  const pendingEnqueuesByOptimisticId = new Map<string, PendingEnqueueState>();
+  const sessionEventRevisions = new Map<string, number>();
+  const queueStateRevisions = new Map<string, number>();
   let pendingComposerMutationRevision = $state(0);
   let lastLoadedConversationId = $state<string | null>(null);
   let lastActiveLiveTurnId = $state<string | null>(null);
+
+  function selectedSessionStateKey() {
+    return selectedSessionId ? sessionStateKey(selectedSessionId, selectedSessionProfileId) : null;
+  }
+
+  function selectedSessionBindingMatches(sessionId: string, profileId: string | null | undefined) {
+    return selectedSessionStateKey() === sessionStateKey(sessionId, profileId);
+  }
 
   function isLiveConversationStatus(status: string | null | undefined) {
     return status === "running" || status === "active";
@@ -1720,18 +1769,34 @@
       return;
     }
     const seenAt = Date.now();
+    lastLiveSessionEvidenceAt = seenAt;
+    const previousSeenAt = recentLiveSessionEvidenceAtBySessionId[sessionId] ?? 0;
+    if (seenAt - previousSeenAt < 1_000) {
+      return;
+    }
     recentLiveSessionEvidenceAtBySessionId = {
       ...recentLiveSessionEvidenceAtBySessionId,
       [sessionId]: seenAt
     };
-    setTimeout(() => {
+    const previousTimer = recentLiveSessionEvidenceTimers.get(sessionId);
+    if (previousTimer) {
+      clearTimeout(previousTimer);
+    }
+    const timer = setTimeout(() => {
+      recentLiveSessionEvidenceTimers.delete(sessionId);
       if (recentLiveSessionEvidenceAtBySessionId[sessionId] === seenAt) {
         clearRecentLiveSessionEvidence(sessionId);
       }
     }, recentLiveSessionEvidenceTtlMs + 100);
+    recentLiveSessionEvidenceTimers.set(sessionId, timer);
   }
 
   function clearRecentLiveSessionEvidence(sessionId: string) {
+    const timer = recentLiveSessionEvidenceTimers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      recentLiveSessionEvidenceTimers.delete(sessionId);
+    }
     if (!sessionId || recentLiveSessionEvidenceAtBySessionId[sessionId] === undefined) {
       return;
     }
@@ -1846,7 +1911,8 @@
     }
 
     const matchingConversation = currentConversation?.thread.id === sessionId ? currentConversation : null;
-    const cachedQueue = sessionQueueSnapshotsBySessionId[sessionId] ?? null;
+    const scopeKey = sessionStateKey(sessionId, selectedSessionProfileId);
+    const cachedQueue = sessionQueueSnapshotsBySessionId[scopeKey] ?? null;
     const selectedSummaryQueueCount =
       sessions.find(
         (session) =>
@@ -1856,8 +1922,8 @@
     const hasCachedQueuedWork =
       (matchingConversation?.queue.items.length ?? 0) > 0 ||
       (cachedQueue?.items.length ?? 0) > 0 ||
-      (optimisticQueuedItemsBySessionId[sessionId]?.length ?? 0) > 0 ||
-      (queuedMessageRequestCountsBySessionId[sessionId] ?? 0) > 0 ||
+      (optimisticQueuedItemsBySessionId[scopeKey]?.length ?? 0) > 0 ||
+      (queuedMessageRequestCountsBySessionId[scopeKey] ?? 0) > 0 ||
       selectedSummaryQueueCount > 0;
 
     if (hasCachedQueuedWork) {
@@ -1879,23 +1945,26 @@
     return hasQueueableConversationActivity(currentConversation);
   }
 
-  function activatePendingQueueMode(sessionId: string) {
-    pendingQueueModeSessionId = sessionId;
+  function activatePendingQueueMode(sessionId: string, profileId: string | null = profileIdForSession(sessionId)) {
+    pendingQueueModeSessionKey = sessionStateKey(sessionId, profileId);
     pendingQueueModeActivatedAt = Date.now();
   }
 
-  function clearPendingQueueMode(sessionId: string | null = null) {
-    if (sessionId && pendingQueueModeSessionId !== sessionId) {
+  function clearPendingQueueMode(
+    sessionId: string | null = null,
+    profileId: string | null = sessionId ? profileIdForSession(sessionId) : null
+  ) {
+    if (sessionId && pendingQueueModeSessionKey !== sessionStateKey(sessionId, profileId)) {
       return;
     }
 
-    pendingQueueModeSessionId = null;
+    pendingQueueModeSessionKey = null;
     pendingQueueModeActivatedAt = 0;
   }
 
-  function pendingQueueModeWithinGrace(sessionId: string) {
+  function pendingQueueModeWithinGrace(sessionId: string, profileId: string | null = profileIdForSession(sessionId)) {
     return (
-      pendingQueueModeSessionId === sessionId &&
+      pendingQueueModeSessionKey === sessionStateKey(sessionId, profileId) &&
       pendingQueueModeActivatedAt > 0 &&
       Date.now() - pendingQueueModeActivatedAt < LOCAL_QUEUE_MODE_GRACE_MS
     );
@@ -1908,7 +1977,8 @@
 
     return Boolean(
       pendingQueueModeWithinGrace(sessionId) ||
-        optimisticMessage?.sessionId === sessionId ||
+        (optimisticMessage?.sessionId === sessionId &&
+          sessionStateKey(optimisticMessage.sessionId, optimisticMessage.profileId) === selectedSessionStateKey()) ||
         (startingMessage && conversation?.thread.id === sessionId) ||
         (sending && conversation?.thread.id === sessionId)
     );
@@ -1939,15 +2009,36 @@
     return queue && Array.isArray(queue.items) ? queue : null;
   }
 
-  function mergeOptimisticQueueItems(sessionId: string, queueItems: SessionQueueItem[]) {
-    const optimisticItems = optimisticQueuedItemsBySessionId[sessionId] ?? [];
+  function mergeOptimisticQueueItems(sessionId: string, profileId: string | null, queueItems: SessionQueueItem[]) {
+    const scopeKey = sessionStateKey(sessionId, profileId);
+    const deletedOptimisticIds = new Set(
+      [...pendingEnqueuesByOptimisticId.values()]
+        .filter(
+          (pending) =>
+            pending.deleted && sessionStateKey(pending.sessionId, pending.profileId) === scopeKey
+        )
+        .flatMap((pending) =>
+          [
+            pending.optimisticQueueId,
+            pending.item.clientRequestId,
+            pending.item.clientUserMessageId
+          ].filter((value): value is string => Boolean(value))
+        )
+    );
+    const visibleQueueItems = queueItems.filter(
+      (item) =>
+        ![item.id, item.clientRequestId, item.clientUserMessageId].some(
+          (value) => value && deletedOptimisticIds.has(value)
+        )
+    );
+    const optimisticItems = optimisticQueuedItemsBySessionId[scopeKey] ?? [];
     if (optimisticItems.length === 0) {
-      return queueItems;
+      return visibleQueueItems;
     }
 
     const realIds = new Set<string>();
     const realCounts = new Map<string, number>();
-    for (const item of queueItems) {
+    for (const item of visibleQueueItems) {
       for (const value of [item.id, item.clientRequestId, item.clientUserMessageId]) {
         if (value) {
           realIds.add(value);
@@ -1958,6 +2049,20 @@
     }
 
     const visibleOptimisticItems = optimisticItems.filter((item) => {
+      const pendingEnqueue = pendingEnqueuesByOptimisticId.get(item.id);
+      const matchedRealItem = visibleQueueItems.find((candidate) =>
+        [candidate.id, candidate.clientRequestId, candidate.clientUserMessageId].some(
+          (value) => value && [item.id, item.clientRequestId, item.clientUserMessageId].includes(value)
+        )
+      );
+      if (
+        pendingEnqueue &&
+        matchedRealItem &&
+        buildQueueItemSignature(item.prompt, item.skills, item.attachmentIds) !==
+          buildQueueItemSignature(matchedRealItem.prompt, matchedRealItem.skills, matchedRealItem.attachmentIds)
+      ) {
+        return true;
+      }
       if ([item.id, item.clientRequestId, item.clientUserMessageId].some((value) => value && realIds.has(value))) {
         return false;
       }
@@ -1971,7 +2076,20 @@
       return false;
     });
 
-    return [...queueItems, ...visibleOptimisticItems];
+    const optimisticIdentityValues = new Set(
+      visibleOptimisticItems.flatMap((item) =>
+        [item.id, item.clientRequestId, item.clientUserMessageId].filter((value): value is string => Boolean(value))
+      )
+    );
+    return [
+      ...visibleQueueItems.filter(
+        (item) =>
+          ![item.id, item.clientRequestId, item.clientUserMessageId].some(
+            (value) => value && optimisticIdentityValues.has(value)
+          )
+      ),
+      ...visibleOptimisticItems
+    ];
   }
 
   const running = $derived.by(() => {
@@ -2012,7 +2130,7 @@
       return 0;
     }
 
-    return queuedMessageRequestCountsBySessionId[sessionId] ?? 0;
+    return queuedMessageRequestCountsBySessionId[sessionStateKey(sessionId, selectedSessionProfileId)] ?? 0;
   });
   const composerQueueActionDisabled = $derived.by(() => {
     if (readOnlyRole || uploading) {
@@ -2075,12 +2193,12 @@
       return conversation?.queue ?? null;
     }
 
-    return sessionQueueSnapshotsBySessionId[sessionId] ?? conversation?.queue ?? null;
+    return sessionQueueSnapshotsBySessionId[sessionStateKey(sessionId, selectedSessionProfileId)] ?? conversation?.queue ?? null;
   });
   const queuedMessages = $derived.by(() => {
     const sessionId = selectedSessionId ?? conversation?.thread.id ?? null;
     const queueItems = selectedSessionQueue?.items ?? ([] as SessionQueueItem[]);
-    return sessionId ? mergeOptimisticQueueItems(sessionId, queueItems) : queueItems;
+    return sessionId ? mergeOptimisticQueueItems(sessionId, selectedSessionProfileId, queueItems) : queueItems;
   });
   const serverQueuedMessages = $derived(selectedSessionQueue?.items ?? ([] as SessionQueueItem[]));
   const hasPendingQueueRequests = $derived.by(() => selectedSessionQueuedRequestCount > 0);
@@ -2129,7 +2247,11 @@
   const activeLiveTurnDiff = $derived.by(() => (activeLiveTurnId ? conversation?.liveDiffs[activeLiveTurnId] ?? null : null));
   const activeLiveTurnDiffViews = $derived.by(() => (activeLiveTurnDiff ? parseAggregatedDiffViews(activeLiveTurnDiff) : []));
   const visibleOptimisticMessage = $derived.by(() => {
-    if (!optimisticMessage || optimisticMessage.sessionId !== selectedSessionId) {
+    if (
+      !optimisticMessage ||
+      optimisticMessage.sessionId !== selectedSessionId ||
+      sessionStateKey(optimisticMessage.sessionId, optimisticMessage.profileId) !== selectedSessionStateKey()
+    ) {
       return null;
     }
     if (!conversation || conversation.thread.id !== optimisticMessage.sessionId) {
@@ -2166,7 +2288,7 @@
       Boolean(
         selectedSessionId &&
           selectedSessionQueue?.resumeRequired &&
-          !dismissedQueueResumeBySessionId[selectedSessionId]
+          !dismissedQueueResumeBySessionId[sessionStateKey(selectedSessionId, selectedSessionProfileId)]
       )
   );
   const selectedModel = $derived.by(() => {
@@ -2351,18 +2473,31 @@
     if (loadingDetail && !conversation) {
       return ui.loadingSessionBasics;
     }
+    if (conversation && sessionHydrationRemainingTurns > 0) {
+      return ui.sessionResyncing;
+    }
     return "";
   });
-  const showTopLoadBar = $derived(Boolean(topLoadLabel));
+  const sessionSyncLabel = $derived.by(() => {
+    if (manualSessionResyncSessionId === selectedSessionId || staleSessionCatchup?.refreshing) {
+      return ui.sessionResyncing;
+    }
+    if (topLoadKind === "sessionRefresh" || topLoadKind === "sessionDetail" || topLoadKind === "sessionHydration") {
+      return topLoadLabel;
+    }
+    return "";
+  });
+  const showTopLoadBar = $derived(Boolean(topLoadLabel || sessionSyncLabel));
   const showTopLoadPill = $derived(
     Boolean(topLoadLabel) &&
       topLoadKind !== "sessionRefresh" &&
+      topLoadKind !== "sessionDetail" &&
       topLoadKind !== "sessionHydration"
   );
   const showComposerSyncPill = $derived(
     activeWorkspaceTabId === "chat" &&
-      Boolean(conversation) &&
-      (topLoadKind === "sessionRefresh" || topLoadKind === "sessionHydration")
+      Boolean(selectedSessionId) &&
+      Boolean(sessionSyncLabel)
   );
   const topLoadPercent = $derived.by(() => {
     if (topLoadKind === "sessionHydration" && sessionHydrationPercent !== null) {
@@ -2399,13 +2534,6 @@
   const feedbackSnackbar = $derived.by(() => {
     if (authenticated !== true) {
       return null;
-    }
-    if (staleSessionCatchup?.refreshing) {
-      return {
-        tone: "warning" as const,
-        text: ui.sessionResyncing,
-        dismissible: false
-      };
     }
     if (errorText) {
       return {
@@ -3009,6 +3137,8 @@
     }
     window.addEventListener("resize", handleViewportChange);
     window.addEventListener("scroll", handleViewportChange, true);
+    window.visualViewport?.addEventListener("resize", handleViewportChange);
+    window.visualViewport?.addEventListener("scroll", handleViewportChange);
     window.addEventListener("keydown", handleGlobalKeydown, true);
     window.addEventListener("pointerdown", requestNotificationPermissionFromGesture, true);
     window.addEventListener("keydown", requestNotificationPermissionFromGesture, true);
@@ -3077,6 +3207,8 @@
       }
       window.removeEventListener("resize", handleViewportChange);
       window.removeEventListener("scroll", handleViewportChange, true);
+      window.visualViewport?.removeEventListener("resize", handleViewportChange);
+      window.visualViewport?.removeEventListener("scroll", handleViewportChange);
       window.removeEventListener("keydown", handleGlobalKeydown, true);
       window.removeEventListener("pointerdown", requestNotificationPermissionFromGesture, true);
       window.removeEventListener("keydown", requestNotificationPermissionFromGesture, true);
@@ -3210,6 +3342,10 @@
         connectionState !== "connected" ||
         (typeof document !== "undefined" && document.hidden)
       ) {
+        return;
+      }
+
+      if (Date.now() - lastLiveSessionEvidenceAt < activeSessionStatusPollMs) {
         return;
       }
 
@@ -3459,7 +3595,7 @@
     if (!optimisticMessage) {
       return;
     }
-    if (selectedSessionId !== optimisticMessage.sessionId) {
+    if (!selectedSessionBindingMatches(optimisticMessage.sessionId, optimisticMessage.profileId)) {
       optimisticMessage = null;
       return;
     }
@@ -3481,10 +3617,10 @@
   });
 
   $effect(() => {
-    if (!pendingQueueModeSessionId) {
+    if (!pendingQueueModeSessionKey) {
       return;
     }
-    if (conversation?.thread.id !== pendingQueueModeSessionId) {
+    if (!conversation || selectedSessionStateKey() !== pendingQueueModeSessionKey) {
       return;
     }
     if (hasQueueableConversationActivity(conversation)) {
@@ -4623,6 +4759,14 @@
     return summary?.profileId ?? sessionProfileIdsBySessionId[sessionId] ?? activeProfileId;
   }
 
+  function matchesSessionSelection(sessionId: string, profileId: string | null, selectionVersion: number) {
+    return (
+      selectedSessionId === sessionId &&
+      selectedSessionProfileId === profileId &&
+      sessionSelectionVersion === selectionVersion
+    );
+  }
+
   function enrichSessionSummaryContext(summary: SessionSummary): SessionSummary {
     const cachedProfileId = summary.id ? (sessionProfileIdsBySessionId[summary.id] ?? null) : null;
     const summaryProfileId = summary.profileId ?? cachedProfileId ?? null;
@@ -4953,7 +5097,7 @@
     clearSelectedSessionCompletionRefreshes();
     const scheduledSelectionVersion = sessionSelectionVersion;
     const scheduledProfileId = profileIdForSession(sessionId);
-    selectedSessionCompletionRefreshTimers = [180, 900, 2200].map((delay) => {
+    selectedSessionCompletionRefreshTimers = [350, 1800].map((delay) => {
       const timer = setTimeout(() => {
         selectedSessionCompletionRefreshTimers = selectedSessionCompletionRefreshTimers.filter((candidate) => candidate !== timer);
         if (
@@ -4976,7 +5120,11 @@
           false,
           scheduledSelectionVersion,
           scheduledProfileId
-        ).catch(() => {});
+        )
+          .then(() => {
+            clearSelectedSessionCompletionRefreshes();
+          })
+          .catch(() => {});
       }, delay);
       return timer;
     });
@@ -5138,6 +5286,10 @@
     optimisticMessage = null;
     optimisticQueuedItemsBySessionId = {};
     sessionQueueSnapshotsBySessionId = {};
+    queuedMessageRequestCountsBySessionId = {};
+    pendingEnqueuesByOptimisticId.clear();
+    sessionEventRevisions.clear();
+    queueStateRevisions.clear();
     clearPendingQueueMode();
     liveTurnCardExpanded = false;
     sendIntent = null;
@@ -5156,6 +5308,7 @@
     resetWorkspaceState();
     authenticated = false;
     activeProfileId = null;
+    api.setDefaultProfileId(null);
     webRole = null;
     viewerGitRepoPath = null;
     runtime = null;
@@ -5195,6 +5348,7 @@
     try {
       const authSession = await api.getAuthSession();
       activeProfileId = authSession.activeProfileId ?? "default";
+      api.setDefaultProfileId(activeProfileId);
       loginHcaptcha = authSession.hcaptcha ?? { enabled: false, siteKey: null };
       if (!authSession.authenticated) {
         clearWorkspaceForLoggedOut();
@@ -5517,6 +5671,7 @@
       matchingSummaries[0] ??
       null;
     const resolvedProfileId = profileId ?? summaryForSelection?.profileId ?? sessionProfileIdsBySessionId[sessionId] ?? activeProfileId;
+    const selectionScopeKey = sessionStateKey(sessionId, resolvedProfileId);
     const selectionVersion = sessionSelectionVersion + 1;
     sessionSelectionVersion = selectionVersion;
     clearHydrationRefresh();
@@ -5554,7 +5709,7 @@
             selectedSkills: [],
             goal: null,
             attachments: [],
-            queue: sessionQueueSnapshotsBySessionId[sessionId] ?? {
+            queue: sessionQueueSnapshotsBySessionId[selectionScopeKey] ?? {
               sessionId,
               items: [],
               resumeRequired: false,
@@ -5582,7 +5737,7 @@
           })
         : null;
     pendingSessionEvents = {
-      [sessionId]: []
+      [selectionScopeKey]: []
     };
     expandedItems = {};
     expandedFileChangeEntries = {};
@@ -5630,13 +5785,20 @@
       let turnLimit = olderTurnPageSize;
 
       if (detailCacheKey) {
+        const cacheReadEventRevision = sessionEventRevisions.get(selectionScopeKey) ?? 0;
         const cachedEntry = await readSessionDetailCache(detailCacheKey);
         if (selectedSessionId !== sessionId || sessionSelectionVersion !== selectionVersion) {
           return false;
         }
         if (cachedEntry) {
           sessionDetailCacheVersion = cachedEntry.version;
-          applyLoadedSessionDetail(sessionId, cachedEntry.payload);
+          applyLoadedSessionDetail(
+            sessionId,
+            resolvedProfileId,
+            cachedEntry.payload,
+            true,
+            (sessionEventRevisions.get(selectionScopeKey) ?? 0) > cacheReadEventRevision
+          );
           knownVersion =
             cachedEntry.payload.stateHash && cachedEntry.payload.turnVersions
               ? cachedEntry.version
@@ -5710,6 +5872,159 @@
     }
   }
 
+  function rebindSelectedSessionProfile(
+    sessionId: string,
+    sourceProfileId: string | null,
+    targetProfileId: string,
+    movedSummary: SessionSummary | null = null
+  ) {
+    const normalizedTargetProfileId = normalizeSessionStateProfileId(targetProfileId);
+    const normalizedSourceProfileId = normalizeSessionStateProfileId(
+      sourceProfileId ?? selectedSessionProfileId
+    );
+    if (
+      selectedSessionId !== sessionId ||
+      normalizeSessionStateProfileId(selectedSessionProfileId) !== normalizedSourceProfileId ||
+      normalizedSourceProfileId === normalizedTargetProfileId
+    ) {
+      return false;
+    }
+
+    const sourceScopeKey = sessionStateKey(sessionId, normalizedSourceProfileId);
+    const targetScopeKey = sessionStateKey(sessionId, normalizedTargetProfileId);
+    const targetProfile = config?.profiles.find((profile) => profile.id === normalizedTargetProfileId) ?? null;
+    const selectionVersion = sessionSelectionVersion + 1;
+    const previousDraftPersistencePaused = draftPersistencePaused;
+    sessionSelectionVersion = selectionVersion;
+    draftPersistencePaused = true;
+    clearHydrationRefresh();
+    clearStaleSessionCatchup();
+    if (draftSaveTimer) {
+      clearTimeout(draftSaveTimer);
+      draftSaveTimer = null;
+    }
+
+    const nextPendingSessionEvents = { ...pendingSessionEvents };
+    const sourcePendingSessionEvents = nextPendingSessionEvents[sourceScopeKey] ?? [];
+    delete nextPendingSessionEvents[sourceScopeKey];
+    nextPendingSessionEvents[targetScopeKey] = [
+      ...(nextPendingSessionEvents[targetScopeKey] ?? []),
+      ...sourcePendingSessionEvents
+    ];
+    pendingSessionEvents = nextPendingSessionEvents;
+
+    const nextQueueSnapshots = { ...sessionQueueSnapshotsBySessionId };
+    if (nextQueueSnapshots[sourceScopeKey]) {
+      nextQueueSnapshots[targetScopeKey] = nextQueueSnapshots[sourceScopeKey];
+    }
+    delete nextQueueSnapshots[sourceScopeKey];
+    sessionQueueSnapshotsBySessionId = nextQueueSnapshots;
+
+    const nextOptimisticQueueItems = { ...optimisticQueuedItemsBySessionId };
+    if (nextOptimisticQueueItems[sourceScopeKey]) {
+      nextOptimisticQueueItems[targetScopeKey] = nextOptimisticQueueItems[sourceScopeKey];
+    }
+    delete nextOptimisticQueueItems[sourceScopeKey];
+    optimisticQueuedItemsBySessionId = nextOptimisticQueueItems;
+
+    const nextQueuedRequestCounts = { ...queuedMessageRequestCountsBySessionId };
+    if (nextQueuedRequestCounts[sourceScopeKey] !== undefined) {
+      nextQueuedRequestCounts[targetScopeKey] = nextQueuedRequestCounts[sourceScopeKey];
+    }
+    delete nextQueuedRequestCounts[sourceScopeKey];
+    queuedMessageRequestCountsBySessionId = nextQueuedRequestCounts;
+
+    const nextDismissedQueueResume = { ...dismissedQueueResumeBySessionId };
+    if (nextDismissedQueueResume[sourceScopeKey] !== undefined) {
+      nextDismissedQueueResume[targetScopeKey] = nextDismissedQueueResume[sourceScopeKey];
+    }
+    delete nextDismissedQueueResume[sourceScopeKey];
+    dismissedQueueResumeBySessionId = nextDismissedQueueResume;
+
+    const sourceEventRevision = sessionEventRevisions.get(sourceScopeKey) ?? 0;
+    sessionEventRevisions.delete(sourceScopeKey);
+    sessionEventRevisions.set(
+      targetScopeKey,
+      Math.max(sourceEventRevision, sessionEventRevisions.get(targetScopeKey) ?? 0)
+    );
+    const sourceQueueRevision = queueStateRevisions.get(sourceScopeKey) ?? 0;
+    queueStateRevisions.delete(sourceScopeKey);
+    queueStateRevisions.set(
+      targetScopeKey,
+      Math.max(sourceQueueRevision, queueStateRevisions.get(targetScopeKey) ?? 0)
+    );
+
+    for (const pendingEnqueue of pendingEnqueuesByOptimisticId.values()) {
+      if (sessionStateKey(pendingEnqueue.sessionId, pendingEnqueue.profileId) === sourceScopeKey) {
+        pendingEnqueue.profileId = normalizedTargetProfileId;
+      }
+    }
+    if (
+      optimisticMessage &&
+      sessionStateKey(optimisticMessage.sessionId, optimisticMessage.profileId) === sourceScopeKey
+    ) {
+      optimisticMessage = {
+        ...optimisticMessage,
+        profileId: normalizedTargetProfileId
+      };
+    }
+    if (
+      pendingSteerResume &&
+      sessionStateKey(pendingSteerResume.sessionId, pendingSteerResume.profileId) === sourceScopeKey
+    ) {
+      pendingSteerResume = {
+        ...pendingSteerResume,
+        profileId: normalizedTargetProfileId
+      };
+    }
+    if (pendingQueueModeSessionKey === sourceScopeKey) {
+      pendingQueueModeSessionKey = targetScopeKey;
+    }
+
+    selectedSessionProfileId = normalizedTargetProfileId;
+    rememberSessionProfile({ id: sessionId, profileId: normalizedTargetProfileId });
+    if (conversation?.thread.id === sessionId) {
+      conversation = {
+        ...conversation,
+        profileId: normalizedTargetProfileId,
+        profileLabel: movedSummary?.profileLabel ?? targetProfile?.label ?? null,
+        profileCodexHome: movedSummary?.profileCodexHome ?? targetProfile?.codexHome ?? null,
+        accountEmail: movedSummary?.accountEmail ?? null,
+        accountType: movedSummary?.accountType ?? null
+      };
+    }
+    sessionDetailCacheVersion = null;
+    sessionDetailStateHash = null;
+    sessionDetailMetadataVersion = null;
+    sessionTurnVersionsById = {};
+    syncSelectedSessionInUrl(sessionId);
+    draftPersistencePaused = previousDraftPersistencePaused;
+
+    if (!conversation || conversation.thread.id !== sessionId) {
+      void selectSession(sessionId, normalizedTargetProfileId);
+      return true;
+    }
+
+    disconnectStream();
+    connectStream(sessionId, normalizedTargetProfileId, selectionVersion);
+    markConversationCacheDirty();
+    void refreshSelectedSessionState(
+      sessionId,
+      Math.max(conversation.thread.turns.length, olderTurnPageSize),
+      false,
+      null,
+      false,
+      selectionVersion,
+      normalizedTargetProfileId
+    ).catch((error) => {
+      if (matchesSessionSelection(sessionId, normalizedTargetProfileId, selectionVersion)) {
+        errorText = describeError(error);
+        scheduleSelectedSessionStateRefresh(sessionId, 1_500);
+      }
+    });
+    return true;
+  }
+
   function connectStream(sessionId: string, profileId: string | null, selectionVersion: number) {
     disconnectStream();
     releaseSessionStream = api.subscribeSession(sessionId, (payload: StreamEvent) => {
@@ -5720,9 +6035,11 @@
       ) {
         return;
       }
+      const scopeKey = sessionStateKey(sessionId, profileId);
+      sessionEventRevisions.set(scopeKey, (sessionEventRevisions.get(scopeKey) ?? 0) + 1);
       const queuePayload = queuePayloadFromEvent(payload);
       if (queuePayload) {
-        applyQueuePayloadToSession(sessionId, queuePayload);
+        applyQueuePayloadToSession(sessionId, profileId, queuePayload);
       }
 
       if (payload.kind === "notification" && payload.method === "codex-webui/queueDispatchFailed") {
@@ -5772,7 +6089,7 @@
               refreshing: true
             };
             const nextPendingEvents = { ...pendingSessionEvents };
-            delete nextPendingEvents[sessionId];
+            delete nextPendingEvents[scopeKey];
             pendingSessionEvents = nextPendingEvents;
             void refreshSelectedSessionState(
               sessionId,
@@ -5851,7 +6168,7 @@
         );
         markConversationCacheDirty();
         if (
-          pendingQueueModeSessionId === sessionId &&
+          pendingQueueModeSessionKey === scopeKey &&
           payload.kind === "notification" &&
           (payload.method === "turn/started" ||
             payload.method === "turn/completed" ||
@@ -5860,7 +6177,7 @@
                 String(payload.params.status ?? "") === "active" ||
                 !isLiveConversationStatus(String(payload.params.status ?? "")))))
         ) {
-          clearPendingQueueMode(sessionId);
+          clearPendingQueueMode(sessionId, profileId);
         }
 
         if (
@@ -5886,12 +6203,11 @@
 
         if (payload.kind === "notification" && payload.method === "turn/completed") {
           updateManualCompactPrompt(sessionId, conversation);
-          scheduleSelectedSessionStateRefresh(sessionId, 450);
           scheduleSelectedSessionCompletionRefresh(sessionId);
         }
 
         if (isQueueUpdatedEvent(payload)) {
-          applyQueueUpdatedSideEffects(sessionId, conversation);
+          applyQueueUpdatedSideEffects(sessionId, profileId, conversation);
           applySessionSummaryUpdate(buildSessionSummaryFromConversation(conversation));
         }
 
@@ -5920,7 +6236,7 @@
 
         clearHydrationRefresh();
       } else if (selectedSessionId === sessionId) {
-        queuePendingSessionEvent(sessionId, payload);
+        queuePendingSessionEvent(sessionId, profileId, payload);
       }
     }, { includeInitialQueue: false, profileId });
   }
@@ -5973,14 +6289,15 @@
     return true;
   }
 
-  function flushPendingSessionEvents(sessionId: string, nextConversation: ConversationState) {
-    const queued = pendingSessionEvents[sessionId] ?? [];
+  function flushPendingSessionEvents(sessionId: string, profileId: string | null, nextConversation: ConversationState) {
+    const scopeKey = sessionStateKey(sessionId, profileId);
+    const queued = pendingSessionEvents[scopeKey] ?? [];
     if (queued.length === 0) {
       return nextConversation;
     }
 
     const remaining = { ...pendingSessionEvents };
-    delete remaining[sessionId];
+    delete remaining[scopeKey];
     pendingSessionEvents = remaining;
 
     return queued.reduce(
@@ -5993,10 +6310,11 @@
     return event.kind === "notification" && event.method === "codex-webui/queueUpdated";
   }
 
-  function applyQueueUpdatedSideEffects(sessionId: string, currentConversation: ConversationState) {
+  function applyQueueUpdatedSideEffects(sessionId: string, profileId: string | null, currentConversation: ConversationState) {
+    const scopeKey = sessionStateKey(sessionId, profileId);
     dismissedQueueResumeBySessionId = {
       ...dismissedQueueResumeBySessionId,
-      [sessionId]: false
+      [scopeKey]: false
     };
 
     if (!config) {
@@ -6022,17 +6340,21 @@
     };
   }
 
-  function applyQueuePayloadToSession(sessionId: string, queue: SessionQueuePayload) {
-    const existingQueue = sessionQueueSnapshotsBySessionId[sessionId] ?? (conversation?.thread.id === sessionId ? conversation.queue : null);
+  function applyQueuePayloadToSession(sessionId: string, profileId: string | null, queue: SessionQueuePayload) {
+    const scopeKey = sessionStateKey(sessionId, profileId);
+    const existingQueue =
+      sessionQueueSnapshotsBySessionId[scopeKey] ??
+      (conversation?.thread.id === sessionId && selectedSessionBindingMatches(sessionId, profileId) ? conversation.queue : null);
     const nextQueue = mergeQueueSnapshot(existingQueue, queue);
 
     sessionQueueSnapshotsBySessionId = {
       ...sessionQueueSnapshotsBySessionId,
-      [sessionId]: nextQueue
+      [scopeKey]: nextQueue
     };
-    reconcileOptimisticQueuedItems(sessionId, nextQueue.items);
+    queueStateRevisions.set(scopeKey, (queueStateRevisions.get(scopeKey) ?? 0) + 1);
+    reconcileOptimisticQueuedItems(sessionId, profileId, nextQueue.items);
 
-    if (conversation?.thread.id === sessionId) {
+    if (conversation?.thread.id === sessionId && selectedSessionBindingMatches(sessionId, profileId)) {
       conversation = {
         ...conversation,
         queue: nextQueue
@@ -6105,24 +6427,32 @@
 
   function applyLoadedSessionDetail(
     sessionId: string,
+    profileId: string | null,
     detail: SessionDetailPayload,
-    flushPendingEvents = true
+    flushPendingEvents = true,
+    preserveStreamedState = false,
+    replaceTranscriptWindow = false
   ) {
-    const pendingEventsBeforeFlush = pendingSessionEvents[sessionId] ?? [];
+    const scopeKey = sessionStateKey(sessionId, profileId);
+    const pendingEventsBeforeFlush = pendingSessionEvents[scopeKey] ?? [];
     const hadPendingQueueUpdate = flushPendingEvents && pendingEventsBeforeFlush.some(isQueueUpdatedEvent);
+    const currentConversation = conversation;
+    const existingConversationMatches =
+      currentConversation?.thread.id === detail.thread.id &&
+      sessionStateKey(detail.thread.id, currentConversation.profileId ?? selectedSessionProfileId) === scopeKey;
     let nextConversation =
-      conversation && conversation.thread.id === detail.thread.id
-        ? mergeConversationState(conversation, detail)
+      currentConversation && existingConversationMatches && (!replaceTranscriptWindow || preserveStreamedState)
+        ? mergeConversationState(currentConversation, detail, preserveStreamedState)
         : createConversationState(detail);
     if (flushPendingEvents) {
-      nextConversation = flushPendingSessionEvents(sessionId, nextConversation);
+      nextConversation = flushPendingSessionEvents(sessionId, profileId, nextConversation);
     } else if (pendingEventsBeforeFlush.length > 0) {
       const nextPendingEvents = { ...pendingSessionEvents };
-      delete nextPendingEvents[sessionId];
+      delete nextPendingEvents[scopeKey];
       pendingSessionEvents = nextPendingEvents;
     }
     nextConversation = applyLocalComposerPreferencesToConversation(normalizeConversationExecutionState(nextConversation));
-    const mergedQueue = mergeQueueSnapshot(sessionQueueSnapshotsBySessionId[sessionId], nextConversation.queue);
+    const mergedQueue = mergeQueueSnapshot(sessionQueueSnapshotsBySessionId[scopeKey], nextConversation.queue);
     if (mergedQueue !== nextConversation.queue) {
       nextConversation = {
         ...nextConversation,
@@ -6136,17 +6466,17 @@
     updateSessionDetailSyncState(detail);
     sessionQueueSnapshotsBySessionId = {
       ...sessionQueueSnapshotsBySessionId,
-      [sessionId]: nextConversation.queue
+      [scopeKey]: nextConversation.queue
     };
-    reconcileOptimisticQueuedItems(sessionId, nextConversation.queue.items);
+    reconcileOptimisticQueuedItems(sessionId, profileId, nextConversation.queue.items);
     if (hadPendingQueueUpdate) {
-      applyQueueUpdatedSideEffects(sessionId, nextConversation);
+      applyQueueUpdatedSideEffects(sessionId, profileId, nextConversation);
     }
     if (
-      pendingQueueModeSessionId === sessionId &&
+      pendingQueueModeSessionKey === scopeKey &&
       (hasConversationLiveTurn(nextConversation) || !isLiveConversationStatus(nextConversation.thread.status))
     ) {
-      clearPendingQueueMode(sessionId);
+      clearPendingQueueMode(sessionId, profileId);
     }
     titleDraft = getConversationDisplayTitle(nextConversation) ?? "";
     upsertSessionSummary(buildSessionSummaryFromConversation(nextConversation), false);
@@ -6360,6 +6690,8 @@
   ) {
     const requestSelectionVersion = selectionVersion ?? sessionSelectionVersion;
     const sessionProfileId = expectedProfileId ?? profileIdForSession(sessionId);
+    const scopeKey = sessionStateKey(sessionId, sessionProfileId);
+    const requestEventRevision = sessionEventRevisions.get(scopeKey) ?? 0;
     const knownTurnVersions =
       knownVersion && sessionDetailStateHash && conversation?.thread.id === sessionId
         ? boundedVersionHints(sessionTurnVersionsById, SESSION_DETAIL_VERSION_HINT_LIMIT)
@@ -6386,15 +6718,17 @@
       if (selectedSessionId !== sessionId || !conversation || conversation.thread.id !== sessionId) {
         return null;
       }
-      const pendingEventsBeforeValidation = pendingSessionEvents[sessionId] ?? [];
+      const pendingEventsBeforeValidation = pendingSessionEvents[scopeKey] ?? [];
       const hadPendingQueueUpdate = pendingEventsBeforeValidation.some(isQueueUpdatedEvent);
       let nextConversation = conversation;
       if (pendingEventsBeforeValidation.length > 0) {
-        nextConversation = normalizeConversationExecutionState(flushPendingSessionEvents(sessionId, nextConversation));
+        nextConversation = normalizeConversationExecutionState(
+          flushPendingSessionEvents(sessionId, sessionProfileId, nextConversation)
+        );
         conversation = nextConversation;
         markConversationCacheDirty();
         if (hadPendingQueueUpdate) {
-          applyQueueUpdatedSideEffects(sessionId, nextConversation);
+          applyQueueUpdatedSideEffects(sessionId, sessionProfileId, nextConversation);
           applySessionSummaryUpdate(buildSessionSummaryFromConversation(nextConversation));
         }
       }
@@ -6447,8 +6781,11 @@
       }
       const nextConversation = applyLoadedSessionDetail(
         nextDetail.thread.id,
+        sessionProfileId,
         nextDetail,
-        !replaceWithRecentWindow
+        !replaceWithRecentWindow,
+        (sessionEventRevisions.get(scopeKey) ?? 0) > requestEventRevision,
+        replaceWithRecentWindow
       );
       const detailCacheKey = buildSessionDetailBrowserCacheKey(nextDetail.thread.id, sessionProfileId);
       if (detailCacheKey) {
@@ -6499,8 +6836,11 @@
     }
     const nextConversation = applyLoadedSessionDetail(
       detail.thread.id,
+      sessionProfileId,
       detail,
-      !replaceWithRecentWindow
+      !replaceWithRecentWindow,
+      (sessionEventRevisions.get(scopeKey) ?? 0) > requestEventRevision,
+      replaceWithRecentWindow
     );
     const detailCacheKey = buildSessionDetailBrowserCacheKey(detail.thread.id, sessionProfileId);
     if (detailCacheKey) {
@@ -6698,6 +7038,18 @@
     }
 
     if (event.method === "codex-webui/sessionListsInvalidated") {
+      if (event.params.reason === "sessionProfileMoved") {
+        const movedSessionId = String(event.params.sessionId ?? "");
+        const sourceProfileId = String(event.params.sourceProfileId ?? "").trim();
+        const targetProfileId = String(event.params.targetProfileId ?? "").trim();
+        if (movedSessionId && sourceProfileId && targetProfileId) {
+          rebindSelectedSessionProfile(
+            movedSessionId,
+            sourceProfileId,
+            targetProfileId
+          );
+        }
+      }
       scheduleSessionRefresh(60);
       return;
     }
@@ -6830,9 +7182,7 @@
     if (event.method === "codex-webui/accountUpdated") {
       accountLoginFlow = null;
       void refreshAccountState(false);
-      void refreshQuota(true);
-      void refreshProfileAccounts(true);
-      void refreshResetTickets(true);
+      void refreshAccountQuotaSurfaces();
       return;
     }
 
@@ -6846,9 +7196,7 @@
           accountLoginFlow = null;
           noticeText = m.account_updated_notice();
           void refreshAccountState(true);
-          void refreshQuota(true);
-          void refreshProfileAccounts(true);
-          void refreshResetTickets(true);
+          void refreshAccountQuotaSurfaces();
         } else {
           accountLoginFlow = {
             ...accountLoginFlow,
@@ -6861,9 +7209,7 @@
     }
 
     if (event.method === "codex-webui/accountRateLimitsUpdated") {
-      void refreshQuota(true);
-      void refreshProfileAccounts(true);
-      void refreshResetTickets(true);
+      void refreshAccountQuotaSurfaces();
       return;
     }
 
@@ -6898,9 +7244,14 @@
   $effect(() => {
     const selectedBinding = getSelectedSessionBinding();
     const sessionId = selectedBinding?.sessionId ?? null;
+    const profileId = sessionId ? profileIdForSession(sessionId) : null;
+    const scopeKey = sessionId ? sessionStateKey(sessionId, profileId) : null;
     const currentDraft = draft;
     const intent: "message" | "queue" = composerQueueModeActive ? "queue" : "message";
-    const hasPendingSteerResume = pendingSteerResume?.sessionId === sessionId && !currentDraft.trim();
+    const hasPendingSteerResume =
+      pendingSteerResume &&
+      scopeKey === sessionStateKey(pendingSteerResume.sessionId, pendingSteerResume.profileId) &&
+      !currentDraft.trim();
 
     if (!sessionId || draftPersistencePaused || hasPendingSteerResume) {
       return;
@@ -6913,18 +7264,16 @@
     draftSaveTimer = setTimeout(async () => {
       draftSaveTimer = null;
       try {
-        const currentBinding = getSelectedSessionBinding();
-        if (!currentBinding || currentBinding.sessionId !== sessionId) {
+        if (!scopeKey || selectedSessionStateKey() !== scopeKey) {
           return;
         }
-        const sessionProfileId = profileIdForSession(sessionId);
         if (currentDraft.trim()) {
-          await api.saveSessionDraft(sessionId, currentDraft, intent, sessionProfileId);
+          await api.saveSessionDraft(sessionId, currentDraft, intent, profileId);
         } else {
-          await api.clearSessionDraft(sessionId, sessionProfileId);
+          await api.clearSessionDraft(sessionId, profileId);
         }
       } catch (error) {
-        if (selectedSessionId === sessionId) {
+        if (scopeKey && selectedSessionStateKey() === scopeKey) {
           errorText = describeError(error);
         }
       }
@@ -6938,8 +7287,8 @@
     };
   });
 
-  function getResumeDraftKey(sessionId: string, updatedAt: number | null) {
-    return `${sessionId}:${updatedAt ?? 0}`;
+  function getResumeDraftKey(sessionId: string, profileId: string | null, updatedAt: number | null) {
+    return `${sessionStateKey(sessionId, profileId)}:${updatedAt ?? 0}`;
   }
 
   async function loadSavedDraft(
@@ -6974,7 +7323,7 @@
         return;
       }
 
-      const resumeKey = getResumeDraftKey(sessionId, saved.updatedAt);
+      const resumeKey = getResumeDraftKey(sessionId, profileId, saved.updatedAt);
       if (saved.intent === "steer" && activeTurnId) {
         if (resumeMode === "auto" && !handledResumeDraftKeys.has(resumeKey)) {
           handledResumeDraftKeys.add(resumeKey);
@@ -6987,6 +7336,7 @@
         if (!handledResumeDraftKeys.has(resumeKey)) {
           pendingSteerResume = {
             sessionId,
+            profileId,
             draft: saved.draft,
             updatedAt: saved.updatedAt
           };
@@ -7019,11 +7369,16 @@
   }
 
   function keepSavedDraftInComposer() {
-    if (!pendingSteerResume || pendingSteerResume.sessionId !== selectedSessionId) {
+    if (
+      !pendingSteerResume ||
+      !selectedSessionBindingMatches(pendingSteerResume.sessionId, pendingSteerResume.profileId)
+    ) {
       return;
     }
 
-    handledResumeDraftKeys.add(getResumeDraftKey(pendingSteerResume.sessionId, pendingSteerResume.updatedAt));
+    handledResumeDraftKeys.add(
+      getResumeDraftKey(pendingSteerResume.sessionId, pendingSteerResume.profileId, pendingSteerResume.updatedAt)
+    );
     draftPersistencePaused = true;
     draft = pendingSteerResume.draft;
     pendingSteerResume = null;
@@ -7037,8 +7392,14 @@
       return;
     }
 
+    const sessionId = selectedSessionId;
+    const profileId = profileIdForSession(sessionId);
+    const scopeKey = sessionStateKey(sessionId, profileId);
     try {
-      await api.clearSessionDraft(selectedSessionId, profileIdForSession(selectedSessionId));
+      await api.clearSessionDraft(sessionId, profileId);
+      if (selectedSessionStateKey() !== scopeKey) {
+        return;
+      }
       pendingSteerResume = null;
       if (!draft.trim()) {
         draft = "";
@@ -7049,11 +7410,16 @@
   }
 
   async function resumeSavedSteer() {
-    if (!pendingSteerResume || pendingSteerResume.sessionId !== selectedSessionId) {
+    if (
+      !pendingSteerResume ||
+      !selectedSessionBindingMatches(pendingSteerResume.sessionId, pendingSteerResume.profileId)
+    ) {
       return;
     }
 
-    handledResumeDraftKeys.add(getResumeDraftKey(pendingSteerResume.sessionId, pendingSteerResume.updatedAt));
+    handledResumeDraftKeys.add(
+      getResumeDraftKey(pendingSteerResume.sessionId, pendingSteerResume.profileId, pendingSteerResume.updatedAt)
+    );
     draft = pendingSteerResume.draft;
     const steerDraft = pendingSteerResume.draft;
     pendingSteerResume = null;
@@ -8184,7 +8550,15 @@
         startingMessage = false;
         return;
       }
-      setOptimisticMessageState(sessionId, clientUserMessageId, prompt, selectedSkillsSnapshot, attachmentNames, activeConversation);
+      setOptimisticMessageState(
+        sessionId,
+        sessionProfileId,
+        clientUserMessageId,
+        prompt,
+        selectedSkillsSnapshot,
+        attachmentNames,
+        activeConversation
+      );
       activatePendingQueueMode(sessionId);
       recordComposerHistory(prompt);
       rememberLastComposerPromptChip(sessionId, prompt);
@@ -8210,10 +8584,10 @@
         scheduleSelectedSessionStateRefresh(sessionId, 80);
       })
         .catch((error) => {
-          if (pendingQueueModeSessionId === sessionId) {
-            clearPendingQueueMode(sessionId);
+          if (pendingQueueModeSessionKey === sessionStateKey(sessionId, sessionProfileId)) {
+            clearPendingQueueMode(sessionId, sessionProfileId);
           }
-          clearOptimisticMessageState(sessionId, prompt);
+          clearOptimisticMessageState(sessionId, sessionProfileId, prompt);
           if (!preserveComposer && selectedSessionId === sessionId && !draft.trim() && draftAttachments.length === 0) {
             draft = draftText;
             draftAttachments = attachmentSnapshot;
@@ -8279,7 +8653,14 @@
     if (!beginComposerMutation(mutationSignature)) {
       return;
     }
-    const optimisticQueueId = addOptimisticQueuedItem(sessionId, clientUserMessageId, prompt, selectedSkillsSnapshot, attachmentSnapshot);
+    const optimisticQueueId = addOptimisticQueuedItem(
+      sessionId,
+      sessionProfileId,
+      clientUserMessageId,
+      prompt,
+      selectedSkillsSnapshot,
+      attachmentSnapshot
+    );
 
     recordComposerHistory(prompt);
     rememberLastComposerPromptChip(sessionId, prompt);
@@ -8292,9 +8673,11 @@
       void api.clearSessionDraft(sessionId, sessionProfileId).catch(() => {});
     }
 
+    const scopeKey = sessionStateKey(sessionId, sessionProfileId);
+    const enqueueQueueRevision = queueStateRevisions.get(scopeKey) ?? 0;
     queuedMessageRequestCountsBySessionId = {
       ...queuedMessageRequestCountsBySessionId,
-      [sessionId]: (queuedMessageRequestCountsBySessionId[sessionId] ?? 0) + 1
+      [scopeKey]: (queuedMessageRequestCountsBySessionId[scopeKey] ?? 0) + 1
     };
 
     void api
@@ -8306,50 +8689,128 @@
         attachmentIds,
         profileId: sessionProfileId
       })
-      .then((queue) => {
-        applyQueuePayloadToSession(sessionId, queue);
+      .then(async (queue) => {
         const enqueueConfirmed =
           queue.enqueueAccepted === true &&
           typeof queue.enqueueItemId === "string" &&
           queue.enqueueItemId.trim().length > 0;
 
-        if (enqueueConfirmed) {
-          noticeText = m.queue_notice();
+        if (!enqueueConfirmed) {
+          pendingEnqueuesByOptimisticId.delete(optimisticQueueId);
+          removeOptimisticQueuedItem(sessionId, sessionProfileId, optimisticQueueId);
+          if (
+            !preserveComposer &&
+            selectedSessionBindingMatches(sessionId, sessionProfileId) &&
+            !draft.trim() &&
+            draftAttachments.length === 0
+          ) {
+            draft = draftText;
+            draftAttachments = attachmentSnapshot;
+            scheduleComposerTextareaResize();
+          }
+          if (selectedSessionBindingMatches(sessionId, sessionProfileId)) {
+            noticeText = "";
+            errorText = m.queue_enqueue_failed();
+          }
           return;
         }
 
-        removeOptimisticQueuedItem(sessionId, optimisticQueueId);
-        if (!preserveComposer && selectedSessionId === sessionId && !draft.trim() && draftAttachments.length === 0) {
-          draft = draftText;
-          draftAttachments = attachmentSnapshot;
-          scheduleComposerTextareaResize();
+        const pendingEnqueue = pendingEnqueuesByOptimisticId.get(optimisticQueueId);
+        const enqueueItemId = queue.enqueueItemId!.trim();
+        const acknowledgedItem =
+          queue.items.find(
+            (item) =>
+              item.id === enqueueItemId ||
+              item.clientRequestId === optimisticQueueId ||
+              item.clientUserMessageId === clientUserMessageId
+          ) ?? null;
+
+        if (pendingEnqueue?.deleted) {
+          const updatedQueue = await api.removeQueuedMessage(sessionId, enqueueItemId, sessionProfileId);
+          pendingEnqueuesByOptimisticId.delete(optimisticQueueId);
+          applyQueuePayloadToSession(sessionId, sessionProfileId, updatedQueue);
+        } else if (pendingEnqueue?.edited) {
+          const updatedQueue = await api.updateQueuedMessage(sessionId, enqueueItemId, {
+            prompt: pendingEnqueue.item.prompt,
+            skills: pendingEnqueue.item.skills,
+            attachmentIds: pendingEnqueue.item.attachmentIds,
+            profileId: sessionProfileId
+          });
+          pendingEnqueuesByOptimisticId.delete(optimisticQueueId);
+          applyQueuePayloadToSession(sessionId, sessionProfileId, updatedQueue);
+        } else {
+          pendingEnqueuesByOptimisticId.delete(optimisticQueueId);
+          if ((queueStateRevisions.get(scopeKey) ?? 0) > enqueueQueueRevision && acknowledgedItem) {
+            const currentQueue = sessionQueueSnapshotsBySessionId[scopeKey];
+            if (currentQueue) {
+              const acknowledgedIds = new Set(
+                [acknowledgedItem.id, acknowledgedItem.clientRequestId, acknowledgedItem.clientUserMessageId].filter(
+                  (value): value is string => Boolean(value)
+                )
+              );
+              const currentItemIndex = currentQueue.items.findIndex((item) =>
+                [item.id, item.clientRequestId, item.clientUserMessageId].some(
+                  (value) => value && acknowledgedIds.has(value)
+                )
+              );
+              const items = [...currentQueue.items];
+              if (currentItemIndex === -1) {
+                items.push(acknowledgedItem);
+              } else {
+                items[currentItemIndex] = acknowledgedItem;
+              }
+              applyQueuePayloadToSession(sessionId, sessionProfileId, {
+                ...currentQueue,
+                items,
+                updatedAt: Math.max(Number(currentQueue.updatedAt ?? 0), Number(queue.updatedAt ?? 0)) || null,
+                enqueueAccepted: queue.enqueueAccepted,
+                enqueueItemId: queue.enqueueItemId
+              });
+            } else {
+              applyQueuePayloadToSession(sessionId, sessionProfileId, queue);
+            }
+          } else {
+            applyQueuePayloadToSession(sessionId, sessionProfileId, queue);
+          }
         }
-        noticeText = "";
-        errorText = m.queue_enqueue_failed();
+        if (selectedSessionBindingMatches(sessionId, sessionProfileId)) {
+          noticeText = m.queue_notice();
+        }
       })
       .catch((error) => {
-        removeOptimisticQueuedItem(sessionId, optimisticQueueId);
-        if (!preserveComposer && selectedSessionId === sessionId && !draft.trim() && draftAttachments.length === 0) {
+        const pendingEnqueue = pendingEnqueuesByOptimisticId.get(optimisticQueueId);
+        const wasDeleted = pendingEnqueue?.deleted === true;
+        pendingEnqueuesByOptimisticId.delete(optimisticQueueId);
+        removeOptimisticQueuedItem(sessionId, sessionProfileId, optimisticQueueId);
+        if (
+          !wasDeleted &&
+          !preserveComposer &&
+          selectedSessionBindingMatches(sessionId, sessionProfileId) &&
+          !draft.trim() &&
+          draftAttachments.length === 0
+        ) {
           draft = draftText;
           draftAttachments = attachmentSnapshot;
           scheduleComposerTextareaResize();
         }
-        noticeText = "";
-        errorText = describeError(error);
+        if (selectedSessionBindingMatches(sessionId, sessionProfileId)) {
+          noticeText = "";
+          errorText = describeError(error);
+        }
       })
       .finally(() => {
         finishComposerMutation(mutationSignature);
-        const remainingCount = Math.max(0, (queuedMessageRequestCountsBySessionId[sessionId] ?? 1) - 1);
+        const remainingCount = Math.max(0, (queuedMessageRequestCountsBySessionId[scopeKey] ?? 1) - 1);
         if (remainingCount === 0) {
           const remainingRequests = { ...queuedMessageRequestCountsBySessionId };
-          delete remainingRequests[sessionId];
+          delete remainingRequests[scopeKey];
           queuedMessageRequestCountsBySessionId = remainingRequests;
           return;
         }
 
         queuedMessageRequestCountsBySessionId = {
           ...queuedMessageRequestCountsBySessionId,
-          [sessionId]: remainingCount
+          [scopeKey]: remainingCount
         };
       });
   }
@@ -8383,6 +8844,7 @@
     noticeText = "";
     setOptimisticMessageState(
       sessionId,
+      sessionProfileId,
       clientUserMessageId,
       normalizedPrompt,
       selectedSkillsSnapshot,
@@ -8412,7 +8874,7 @@
       }
       pendingSteerResume = null;
     } catch (error) {
-      clearOptimisticMessageState(sessionId, normalizedPrompt);
+      clearOptimisticMessageState(sessionId, sessionProfileId, normalizedPrompt);
       errorText = describeError(error);
     } finally {
       finishComposerMutation(mutationSignature);
@@ -8449,6 +8911,7 @@
     const clientUserMessageId = queuedItem.clientUserMessageId ?? queuedItem.clientRequestId ?? queuedItem.id;
     setOptimisticMessageState(
       sessionId,
+      sessionProfileId,
       clientUserMessageId,
       queuedItem.prompt,
       queuedItem.skills,
@@ -8462,15 +8925,15 @@
           ? selectedBinding.state.activeTurnId ?? getConversationLiveTurn(selectedBinding.state)?.id ?? null
           : null;
       const queue = await api.dispatchQueuedMessage(sessionId, queueId, mode, activeTurnId, sessionProfileId);
-      applyQueuePayloadToSession(sessionId, queue);
+      applyQueuePayloadToSession(sessionId, sessionProfileId, queue);
       scheduleSessionRefresh(80);
       scheduleSelectedSessionStateRefresh(sessionId, 80);
       dismissedQueueResumeBySessionId = {
         ...dismissedQueueResumeBySessionId,
-        [sessionId]: false
+        [sessionStateKey(sessionId, sessionProfileId)]: false
       };
     } catch (error) {
-      clearOptimisticMessageState(sessionId, queuedItem.prompt);
+      clearOptimisticMessageState(sessionId, sessionProfileId, queuedItem.prompt);
       errorText = describeError(error);
     } finally {
       sending = false;
@@ -8581,7 +9044,7 @@
     noticeText = "";
     try {
       const queue = await api.reorderQueuedMessages(sessionId, nextQueueIds, sessionProfileId);
-      applyQueuePayloadToSession(sessionId, queue);
+      applyQueuePayloadToSession(sessionId, sessionProfileId, queue);
     } catch (error) {
       errorText = describeError(error);
     } finally {
@@ -8617,7 +9080,7 @@
     const sessionId = selectedBinding.sessionId;
     const sessionProfileId = profileIdForSession(sessionId);
     if (isOptimisticQueueItem({ id: queueId } as SessionQueueItem)) {
-      removeOptimisticQueuedItem(sessionId, queueId);
+      removeOptimisticQueuedItem(sessionId, sessionProfileId, queueId, true);
       if (editingQueueId === queueId) {
         editingQueueId = null;
         editingQueuePrompt = "";
@@ -8627,7 +9090,7 @@
 
     try {
       const queue = await api.removeQueuedMessage(sessionId, queueId, sessionProfileId);
-      applyQueuePayloadToSession(sessionId, queue);
+      applyQueuePayloadToSession(sessionId, sessionProfileId, queue);
       if (editingQueueId === queueId) {
         editingQueueId = null;
         editingQueuePrompt = "";
@@ -8673,18 +9136,22 @@
     errorText = "";
     noticeText = "";
     if (isOptimisticQueueItem(queuedItem)) {
-      const existing = optimisticQueuedItemsBySessionId[selectedBinding.sessionId] ?? [];
+      const profileId = profileIdForSession(selectedBinding.sessionId);
+      const scopeKey = sessionStateKey(selectedBinding.sessionId, profileId);
+      const existing = optimisticQueuedItemsBySessionId[scopeKey] ?? [];
+      const nextItem = {
+        ...queuedItem,
+        prompt: nextPrompt.trim()
+      };
       optimisticQueuedItemsBySessionId = {
         ...optimisticQueuedItemsBySessionId,
-        [selectedBinding.sessionId]: existing.map((item) =>
-          item.id === queueId
-            ? {
-                ...item,
-                prompt: nextPrompt.trim()
-              }
-            : item
-        )
+        [scopeKey]: existing.map((item) => (item.id === queueId ? nextItem : item))
       };
+      const pendingEnqueue = pendingEnqueuesByOptimisticId.get(queueId);
+      if (pendingEnqueue) {
+        pendingEnqueue.item = nextItem;
+        pendingEnqueue.edited = true;
+      }
       cancelQueuedMessageEdit();
       return;
     }
@@ -8696,7 +9163,11 @@
         attachmentIds: queuedItem.attachmentIds,
         profileId: profileIdForSession(selectedBinding.sessionId)
       });
-      applyQueuePayloadToSession(selectedBinding.sessionId, queue);
+      applyQueuePayloadToSession(
+        selectedBinding.sessionId,
+        profileIdForSession(selectedBinding.sessionId),
+        queue
+      );
       noticeText = m.queued_followup_updated();
       cancelQueuedMessageEdit();
     } catch (error) {
@@ -8725,10 +9196,10 @@
 
     try {
       const queue = await api.resumeSessionQueue(sessionId, sessionProfileId);
-      applyQueuePayloadToSession(sessionId, queue);
+      applyQueuePayloadToSession(sessionId, sessionProfileId, queue);
       dismissedQueueResumeBySessionId = {
         ...dismissedQueueResumeBySessionId,
-        [sessionId]: false
+        [sessionStateKey(sessionId, sessionProfileId)]: false
       };
     } catch (error) {
       errorText = describeError(error);
@@ -8903,27 +9374,68 @@
     if (!trimmedTargetProfileId) {
       return;
     }
+    const sourceSummaryKey = sessionSummaryKey(session);
+    const requestedSourceProfileId = session.profileId ?? profileIdForSession(session.id);
+    const selectedSessionMoveRequested =
+      selectedSessionId === session.id &&
+      (!selectedSessionProfileId || !requestedSourceProfileId || selectedSessionProfileId === requestedSourceProfileId);
+    const previousDraftPersistencePaused = draftPersistencePaused;
     try {
+      if (selectedSessionMoveRequested) {
+        draftPersistencePaused = true;
+        if (draftSaveTimer) {
+          clearTimeout(draftSaveTimer);
+          draftSaveTimer = null;
+        }
+        if (draft.trim()) {
+          await api.saveSessionDraft(
+            session.id,
+            draft,
+            composerQueueModeActive ? "queue" : "message",
+            requestedSourceProfileId
+          );
+        }
+      }
       const response = await api.moveSessionProfile(
         session.id,
         trimmedTargetProfileId,
-        session.profileId ?? null
+        requestedSourceProfileId
       );
-      sessions = sessions.filter((entry) => entry.id !== session.id);
-      if (selectedSessionId === session.id) {
-        resetWorkspaceState();
-        if (response.targetProfileId) {
-          await selectAccountProfile(response.targetProfileId);
-          await selectSession(session.id);
-        }
-      } else {
-        await refreshSessions();
+      const sourceProfileId = response.sourceProfileId || session.profileId || null;
+      const targetProfile = config?.profiles.find((profile) => profile.id === response.targetProfileId) ?? null;
+      const movedSummary: SessionSummary = {
+        ...(response.session ?? session),
+        profileId: response.targetProfileId,
+        profileLabel: response.targetProfileLabel || targetProfile?.label || null,
+        profileCodexHome: response.session?.profileCodexHome ?? targetProfile?.codexHome ?? null,
+        accountEmail: response.session?.accountEmail ?? null,
+        accountType: response.session?.accountType ?? null
+      };
+      const selectedSessionMoved =
+        selectedSessionId === session.id &&
+        (!selectedSessionProfileId || !sourceProfileId || selectedSessionProfileId === sourceProfileId);
+
+      setSessionsStable(sessions.filter((entry) => sessionSummaryKey(entry) !== sourceSummaryKey));
+      applySessionSummaryUpdate(movedSummary);
+
+      if (selectedSessionMoved) {
+        rebindSelectedSessionProfile(
+          session.id,
+          sourceProfileId,
+          response.targetProfileId,
+          movedSummary
+        );
       }
+      scheduleSessionRefresh(60);
       noticeText = getLocale().startsWith("ko")
         ? `세션을 ${response.targetProfileLabel || response.targetProfileId} 계정으로 이동했습니다.`
         : `Moved the session to ${response.targetProfileLabel || response.targetProfileId}.`;
     } catch (error) {
       errorText = describeError(error);
+    } finally {
+      if (selectedSessionMoveRequested && selectedSessionId === session.id) {
+        draftPersistencePaused = previousDraftPersistencePaused;
+      }
     }
   }
 
@@ -9225,14 +9737,36 @@
       return;
     }
 
+    const switchGeneration = ++accountProfileSwitchGeneration;
     try {
-      await api.selectAuthProfile(profileId);
-      resetRealtimeConnectionForAuthChange();
-      resetWorkspaceState();
-      authenticated = true;
-      await bootstrap();
+      const switchRequest = accountProfileSwitchQueue
+        .catch(() => undefined)
+        .then(() => api.selectAuthProfile(profileId));
+      accountProfileSwitchQueue = switchRequest.then(
+        () => undefined,
+        () => undefined
+      );
+      const response = await switchRequest;
+      if (switchGeneration !== accountProfileSwitchGeneration) {
+        return;
+      }
+      activeProfileId = response.activeProfileId;
+      const nextConfig = await api.getConfig();
+      if (switchGeneration !== accountProfileSwitchGeneration) {
+        return;
+      }
+      config = applyLocalComposerPreferencesToConfig(nextConfig);
+      syncConfiguredTheme(config);
+      syncStartupAlertModal(config);
+      void refreshRuntimeStatus(true, { silent: true });
+      void refreshQuota(true);
+      void refreshResetTickets(true);
+      void refreshAccountState(true);
+      void refreshProfileAccounts(true);
     } catch (error) {
-      errorText = describeError(error);
+      if (switchGeneration === accountProfileSwitchGeneration) {
+        errorText = describeError(error);
+      }
     }
   }
 
@@ -9362,6 +9896,13 @@
         void refreshQuota(true);
       }
     }
+  }
+
+  async function refreshAccountQuotaSurfaces() {
+    // Refresh the active quota first. Otherwise the profile list can race the
+    // same single-flight request and persist a temporary `refreshing` payload.
+    await refreshQuota(true);
+    await Promise.all([refreshProfileAccounts(true), refreshResetTickets(true)]);
   }
 
   async function refreshProfileAccounts(force = false) {
@@ -10456,6 +10997,7 @@
 
   function setOptimisticMessageState(
     sessionId: string,
+    profileId: string | null,
     clientUserMessageId: string,
     prompt: string,
     skills: SelectedSkill[],
@@ -10470,6 +11012,7 @@
 
     optimisticMessage = {
       sessionId,
+      profileId,
       clientUserMessageId,
       prompt: normalizedPrompt,
       skills: normalizeSelectedSkills(skills),
@@ -10481,8 +11024,11 @@
     requestTranscriptBottomScroll(true);
   }
 
-  function clearOptimisticMessageState(sessionId: string, prompt: string | null = null) {
-    if (!optimisticMessage || optimisticMessage.sessionId !== sessionId) {
+  function clearOptimisticMessageState(sessionId: string, profileId: string | null, prompt: string | null = null) {
+    if (
+      !optimisticMessage ||
+      sessionStateKey(optimisticMessage.sessionId, optimisticMessage.profileId) !== sessionStateKey(sessionId, profileId)
+    ) {
       return;
     }
     if (prompt !== null && normalizeMessageForComparison(optimisticMessage.prompt) !== normalizeMessageForComparison(prompt)) {
@@ -10502,7 +11048,7 @@
     skills: SelectedSkill[],
     attachmentIds: string[]
   ) {
-    return `${mode}\u0000${sessionId}\u0000${buildQueueItemSignature(prompt, skills, attachmentIds)}`;
+    return `${mode}\u0000${sessionStateKey(sessionId, profileIdForSession(sessionId))}\u0000${buildQueueItemSignature(prompt, skills, attachmentIds)}`;
   }
 
   function composerCurrentDraftHasPendingMutation(sessionId: string, state: ConversationState) {
@@ -10537,12 +11083,14 @@
 
   function addOptimisticQueuedItem(
     sessionId: string,
+    profileId: string | null,
     clientUserMessageId: string,
     prompt: string,
     skills: SelectedSkill[],
     attachments: AttachmentRecord[]
   ) {
-    const optimisticId = `optimistic:${sessionId}:${clientUserMessageId}`;
+    const scopeKey = sessionStateKey(sessionId, profileId);
+    const optimisticId = `optimistic:${normalizeSessionStateProfileId(profileId)}:${sessionId}:${clientUserMessageId}`;
     const item: SessionQueueItem = {
       id: optimisticId,
       prompt,
@@ -10556,14 +11104,34 @@
 
     optimisticQueuedItemsBySessionId = {
       ...optimisticQueuedItemsBySessionId,
-      [sessionId]: [...(optimisticQueuedItemsBySessionId[sessionId] ?? []), item]
+      [scopeKey]: [...(optimisticQueuedItemsBySessionId[scopeKey] ?? []), item]
     };
+    pendingEnqueuesByOptimisticId.set(optimisticId, {
+      sessionId,
+      profileId,
+      optimisticQueueId: optimisticId,
+      item,
+      deleted: false,
+      edited: false
+    });
 
     return optimisticId;
   }
 
-  function removeOptimisticQueuedItem(sessionId: string, queueId: string) {
-    const existing = optimisticQueuedItemsBySessionId[sessionId] ?? [];
+  function removeOptimisticQueuedItem(
+    sessionId: string,
+    profileId: string | null,
+    queueId: string,
+    markDeleted = false
+  ) {
+    const scopeKey = sessionStateKey(sessionId, profileId);
+    const existing = optimisticQueuedItemsBySessionId[scopeKey] ?? [];
+    if (markDeleted) {
+      const pendingEnqueue = pendingEnqueuesByOptimisticId.get(queueId);
+      if (pendingEnqueue) {
+        pendingEnqueue.deleted = true;
+      }
+    }
     if (existing.length === 0) {
       return;
     }
@@ -10575,19 +11143,20 @@
 
     if (nextItems.length === 0) {
       const remaining = { ...optimisticQueuedItemsBySessionId };
-      delete remaining[sessionId];
+      delete remaining[scopeKey];
       optimisticQueuedItemsBySessionId = remaining;
       return;
     }
 
     optimisticQueuedItemsBySessionId = {
       ...optimisticQueuedItemsBySessionId,
-      [sessionId]: nextItems
+      [scopeKey]: nextItems
     };
   }
 
-  function reconcileOptimisticQueuedItems(sessionId: string, queueItems: SessionQueueItem[]) {
-    const optimisticItems = optimisticQueuedItemsBySessionId[sessionId] ?? [];
+  function reconcileOptimisticQueuedItems(sessionId: string, profileId: string | null, queueItems: SessionQueueItem[]) {
+    const scopeKey = sessionStateKey(sessionId, profileId);
+    const optimisticItems = optimisticQueuedItemsBySessionId[scopeKey] ?? [];
     if (optimisticItems.length === 0) {
       return;
     }
@@ -10610,6 +11179,20 @@
     }
 
     const nextItems = optimisticItems.filter((item) => {
+      const pendingEnqueue = pendingEnqueuesByOptimisticId.get(item.id);
+      const matchedRealItem = queueItems.find((candidate) =>
+        [candidate.id, candidate.clientRequestId, candidate.clientUserMessageId].some(
+          (value) => value && [item.id, item.clientRequestId, item.clientUserMessageId].includes(value)
+        )
+      );
+      if (
+        pendingEnqueue &&
+        matchedRealItem &&
+        buildQueueItemSignature(item.prompt, item.skills, item.attachmentIds) !==
+          buildQueueItemSignature(matchedRealItem.prompt, matchedRealItem.skills, matchedRealItem.attachmentIds)
+      ) {
+        return true;
+      }
       const clientUserMessageId = item.clientUserMessageId ?? item.clientRequestId;
       if (
         (clientUserMessageId && realClientIds.has(clientUserMessageId)) ||
@@ -10633,14 +11216,14 @@
 
     if (nextItems.length === 0) {
       const remaining = { ...optimisticQueuedItemsBySessionId };
-      delete remaining[sessionId];
+      delete remaining[scopeKey];
       optimisticQueuedItemsBySessionId = remaining;
       return;
     }
 
     optimisticQueuedItemsBySessionId = {
       ...optimisticQueuedItemsBySessionId,
-      [sessionId]: nextItems
+      [scopeKey]: nextItems
     };
   }
 
@@ -11976,13 +12559,13 @@
       return m.web_search();
     }
     if (item.type === "imageView") {
-      return "Image";
+      return m.image_label();
     }
     if (item.type === "enteredReviewMode") {
-      return "Review started";
+      return m.review_started();
     }
     if (item.type === "exitedReviewMode") {
-      return "Review completed";
+      return m.done();
     }
     if (item.type === "contextCompaction") {
       return ui.contextCompression;
@@ -12068,10 +12651,10 @@
         turns: conversation.thread.turns.map((turn) =>
           turn.id !== turnId
             ? turn
-            : {
+            : mergeConversationTurnState(turn, {
                 ...turn,
-                items: turn.items.map((item) => (item.id !== itemId ? item : { ...item, ...nextItem, detailState: "loaded" }))
-              }
+                items: [{ ...nextItem, id: itemId, detailState: "loaded" }]
+              })
         )
       }
     };
@@ -12087,7 +12670,9 @@
       ...conversation,
       thread: {
         ...conversation.thread,
-        turns: conversation.thread.turns.map((turn) => (turn.id === turnId ? nextTurn : turn))
+        turns: conversation.thread.turns.map((turn) =>
+          turn.id === turnId ? mergeConversationTurnState(turn, nextTurn) : turn
+        )
       }
     };
     markConversationCacheDirty();
@@ -12107,8 +12692,11 @@
     }
 
     const sessionId = selectedSessionId;
+    const sessionProfileId = profileIdForSession(sessionId);
+    const selectionVersion = sessionSelectionVersion;
     const turn = conversation.thread.turns.find((candidate) => candidate.id === turnId);
-    if (!turn || turn.detailState === "full" || loadingTurns[turnId]) {
+    const hasDeferredItems = Number(turn?.hiddenItemCount ?? 0) > 0;
+    if (!turn || (turn.detailState === "full" && !hasDeferredItems) || loadingTurns[turnId]) {
       return;
     }
 
@@ -12122,14 +12710,14 @@
     };
 
     try {
-      const response = await api.getSessionTurn(sessionId, turnId, profileIdForSession(sessionId));
-      if (!conversation || conversation.thread.id !== sessionId) {
+      const response = await api.getSessionTurn(sessionId, turnId, sessionProfileId);
+      if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion) || !conversation) {
         return;
       }
 
       replaceConversationTurn(turnId, response.turn);
     } catch (error) {
-      if (!conversation || conversation.thread.id !== sessionId) {
+      if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion) || !conversation) {
         return;
       }
       turnLoadErrors = {
@@ -12137,7 +12725,7 @@
         [turnId]: describeError(error)
       };
     } finally {
-      if (!conversation || conversation.thread.id !== sessionId) {
+      if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion) || !conversation) {
         return;
       }
       loadingTurns = {
@@ -12194,6 +12782,9 @@
       return;
     }
 
+    const sessionId = selectedSessionId;
+    const sessionProfileId = profileIdForSession(sessionId);
+    const selectionVersion = sessionSelectionVersion;
     const beforeTurnId = conversation.thread.turns[0]?.id;
     if (!beforeTurnId) {
       return;
@@ -12209,18 +12800,26 @@
     }
 
     try {
-      const response = await api.getSessionOlderTurns(selectedSessionId, beforeTurnId, olderTurnPageSize, profileIdForSession(selectedSessionId));
-      if (!conversation || conversation.thread.id !== selectedSessionId) {
+      const response = await api.getSessionOlderTurns(sessionId, beforeTurnId, olderTurnPageSize, sessionProfileId);
+      if (
+        !matchesSessionSelection(sessionId, sessionProfileId, selectionVersion) ||
+        !conversation ||
+        conversation.thread.id !== sessionId
+      ) {
         return;
       }
 
       await applyOlderTurnPage(response, previousHeight, previousTop);
     } catch (error) {
-      errorText = describeError(error);
-      olderTurnsAutoLoadPaused = true;
-      olderTurnsAutoLoadEnabled = false;
+      if (matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
+        errorText = describeError(error);
+        olderTurnsAutoLoadPaused = true;
+        olderTurnsAutoLoadEnabled = false;
+      }
     } finally {
-      loadingOlderTurns = false;
+      if (matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
+        loadingOlderTurns = false;
+      }
     }
   }
 
@@ -12252,11 +12851,14 @@
       return;
     }
 
+    const sessionId = selectedSessionId;
+    const sessionProfileId = profileIdForSession(sessionId);
+    const selectionVersion = sessionSelectionVersion;
     sessionTurnSearchJumpingTurnId = match.turnId;
     sessionTurnSearchError = "";
 
     try {
-      while (conversation && conversation.thread.id === selectedSessionId && !conversation.thread.turns.some((turn) => turn.id === match.turnId)) {
+      while (conversation && conversation.thread.id === sessionId && !conversation.thread.turns.some((turn) => turn.id === match.turnId)) {
         if (conversation.hydration.remainingTurns <= 0) {
           break;
         }
@@ -12276,19 +12878,34 @@
         const previousTop = transcriptElement?.scrollTop ?? 0;
         loadingOlderTurns = true;
         const response = await api.getSessionOlderTurns(
-          selectedSessionId,
+          sessionId,
           beforeTurnId,
           Math.min(100, Math.max(olderTurnPageSize, loadedStartIndex - match.turnIndex)),
-          profileIdForSession(selectedSessionId)
+          sessionProfileId
         );
-        if (!conversation || conversation.thread.id !== selectedSessionId) {
+        if (
+          !matchesSessionSelection(sessionId, sessionProfileId, selectionVersion) ||
+          !conversation ||
+          conversation.thread.id !== sessionId
+        ) {
           return;
         }
         await applyOlderTurnPage(response, previousHeight, previousTop);
+        if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
+          return;
+        }
         loadingOlderTurns = false;
       }
 
-      if (!conversation || !conversation.thread.turns.some((turn) => turn.id === match.turnId)) {
+      if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
+        return;
+      }
+
+      if (
+        !conversation ||
+        conversation.thread.id !== sessionId ||
+        !conversation.thread.turns.some((turn) => turn.id === match.turnId)
+      ) {
         sessionTurnSearchError = describeUiError({
           code: "SESSION_SEARCH_RESULT_UNAVAILABLE",
           message: "Search result could not be located."
@@ -12298,6 +12915,9 @@
 
       if (match.requiresFullTurn) {
         await loadTurnDetails(match.turnId);
+        if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
+          return;
+        }
         expandedTurnLogs = {
           ...expandedTurnLogs,
           [match.turnId]: true
@@ -12310,9 +12930,15 @@
           [getItemKey(match.turnId, match.itemId)]: true
         };
         await loadItemDetail(match.turnId, match.itemId);
+        if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
+          return;
+        }
       }
 
       await tick();
+      if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
+        return;
+      }
       const escapedTurnId =
         typeof CSS !== "undefined" && typeof CSS.escape === "function"
           ? CSS.escape(match.turnId)
@@ -12341,11 +12967,15 @@
         }
       }, 2200);
     } catch (error) {
-      sessionTurnSearchError = describeError(error);
+      if (matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
+        sessionTurnSearchError = describeError(error);
+      }
     } finally {
-      loadingOlderTurns = false;
-      if (sessionTurnSearchJumpingTurnId === match.turnId) {
-        sessionTurnSearchJumpingTurnId = null;
+      if (matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
+        loadingOlderTurns = false;
+        if (sessionTurnSearchJumpingTurnId === match.turnId) {
+          sessionTurnSearchJumpingTurnId = null;
+        }
       }
     }
   }
@@ -12356,6 +12986,8 @@
     }
 
     const sessionId = selectedSessionId;
+    const sessionProfileId = profileIdForSession(sessionId);
+    const selectionVersion = sessionSelectionVersion;
     const itemKey = getItemKey(turnId, itemId);
     const turn = conversation.thread.turns.find((candidate) => candidate.id === turnId);
     const item = turn?.items.find((candidate) => candidate.id === itemId);
@@ -12377,8 +13009,8 @@
     };
 
     try {
-        const response = await api.getSessionItemDetail(sessionId, turnId, itemId, profileIdForSession(sessionId));
-      if (!conversation || conversation.thread.id !== sessionId) {
+      const response = await api.getSessionItemDetail(sessionId, turnId, itemId, sessionProfileId);
+      if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion) || !conversation) {
         return;
       }
       updateConversationItem(turnId, itemId, response.item);
@@ -12388,11 +13020,11 @@
       if (
         message.includes("Transcript item detail not found.") &&
         conversation &&
-        conversation.thread.id === sessionId
+        matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)
       ) {
         try {
-          const response = await api.getSessionTurn(sessionId, turnId, profileIdForSession(sessionId));
-          if (!conversation || conversation.thread.id !== sessionId) {
+          const response = await api.getSessionTurn(sessionId, turnId, sessionProfileId);
+          if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion) || !conversation) {
             return;
           }
           replaceConversationTurn(turnId, response.turn);
@@ -12410,7 +13042,7 @@
         }
       }
 
-      if (!conversation || conversation.thread.id !== sessionId) {
+      if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion) || !conversation) {
         return;
       }
       itemDetailErrors = {
@@ -12418,7 +13050,7 @@
         [itemKey]: describeError(error)
       };
     } finally {
-      if (!conversation || conversation.thread.id !== sessionId) {
+      if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion) || !conversation) {
         return;
       }
       loadingItemDetails = {
@@ -12760,32 +13392,14 @@
     }
 
     await tick();
-    const margin = 12;
-    const triggerRect = triggerElement.getBoundingClientRect();
-    const popoverRect = composerSettingsPopoverElement.getBoundingClientRect();
-    const preferredWidth = popoverRect.width || 304;
-    const width =
-      window.innerWidth <= 760
-        ? Math.min(window.innerWidth - margin * 2, preferredWidth)
-        : Math.min(Math.max(preferredWidth, Math.min(triggerRect.width + 24, 360)), window.innerWidth - margin * 2);
-    let left = triggerRect.left;
-    if (left + width > window.innerWidth - margin) {
-      left = window.innerWidth - width - margin;
-    }
-    if (left < margin) {
-      left = margin;
-    }
-
-    let top = triggerRect.top - popoverRect.height - 12;
-    if (top < margin) {
-      top = triggerRect.bottom + 12;
-    }
-    if (top + popoverRect.height > window.innerHeight - margin) {
-      top = Math.max(margin, window.innerHeight - popoverRect.height - margin);
-    }
-
-    const maxHeight = Math.max(120, window.innerHeight - margin * 2);
-    composerSettingsPopoverStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${maxHeight}px;opacity:1;pointer-events:auto;`;
+    composerSettingsPopoverStyle = anchoredPopoverStyle(triggerElement, composerSettingsPopoverElement, {
+      align: "start",
+      maxWidth: 360,
+      minHeight: 96,
+      minWidth: 272,
+      placement: "above",
+      preferredWidth: 304
+    });
   }
 
   async function updateSessionTurnSearchPopoverPosition() {
@@ -12794,31 +13408,14 @@
     }
 
     await tick();
-    const margin = 12;
-    const triggerRect = sessionTurnSearchTriggerElement.getBoundingClientRect();
-    const popoverRect = sessionTurnSearchPopoverElement.getBoundingClientRect();
-    const width =
-      window.innerWidth <= 760
-        ? Math.min(window.innerWidth - margin * 2, 440)
-        : Math.min(Math.max(popoverRect.width || 420, 360), window.innerWidth - margin * 2);
-
-    let left = triggerRect.right - width;
-    if (left < margin) {
-      left = margin;
-    }
-    if (left + width > window.innerWidth - margin) {
-      left = window.innerWidth - width - margin;
-    }
-
-    let top = triggerRect.bottom + 10;
-    if (top + popoverRect.height > window.innerHeight - margin) {
-      top = triggerRect.top - popoverRect.height - 10;
-    }
-    if (top < margin) {
-      top = Math.max(margin, window.innerHeight - popoverRect.height - margin);
-    }
-
-    sessionTurnSearchPopoverStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.max(220, window.innerHeight - margin * 2)}px;opacity:1;pointer-events:auto;`;
+    sessionTurnSearchPopoverStyle = anchoredPopoverStyle(sessionTurnSearchTriggerElement, sessionTurnSearchPopoverElement, {
+      align: "end",
+      maxWidth: 440,
+      minHeight: 96,
+      minWidth: 280,
+      placement: "below",
+      preferredWidth: 420
+    });
   }
 
   function getComposerSettingsSummary() {
@@ -13774,9 +14371,9 @@
                           {#if request.method.includes('Approval')}
                             <p class="text-sm text-gray-700 leading-relaxed font-medium">{String(request.params.reason ?? "Codex is requesting approval.")}</p>
                             <div class="flex flex-wrap gap-2">
-                              <button class="flex-1 px-4 py-2 bg-amber-600 text-white rounded-xl text-xs font-bold hover:bg-amber-700 shadow-sm transition-all" onclick={() => void resolvePendingRequest(request, { decision: "accept" })}>Approve</button>
-                              <button class="flex-1 px-4 py-2 bg-amber-100 text-amber-700 border border-amber-200 rounded-xl text-xs font-bold hover:bg-amber-200 transition-all" onclick={() => void resolvePendingRequest(request, { decision: "acceptForSession" })}>Session</button>
-                              <button class="flex-1 px-4 py-2 bg-gray-100 text-gray-600 rounded-xl text-xs font-bold hover:bg-gray-200 transition-all" onclick={() => void resolvePendingRequest(request, { decision: "decline" })}>Decline</button>
+                              <button class="flex-1 px-4 py-2 bg-amber-600 text-white rounded-xl text-xs font-bold hover:bg-amber-700 shadow-sm transition-all" onclick={() => void resolvePendingRequest(request, { decision: "accept" })}>{m.approve()}</button>
+                              <button class="flex-1 px-4 py-2 bg-amber-100 text-amber-700 border border-amber-200 rounded-xl text-xs font-bold hover:bg-amber-200 transition-all" onclick={() => void resolvePendingRequest(request, { decision: "acceptForSession" })}>{m.session()}</button>
+                              <button class="flex-1 px-4 py-2 bg-gray-100 text-gray-600 rounded-xl text-xs font-bold hover:bg-gray-200 transition-all" onclick={() => void resolvePendingRequest(request, { decision: "decline" })}>{m.decline()}</button>
                             </div>
                           {:else if request.method === "item/tool/requestUserInput"}
                             <div class="space-y-4">
@@ -13856,13 +14453,13 @@
                 <div class="-translate-y-[calc(100%+0.5rem)]">
                   <div class="dock-sync-pill" transition:fly={{ y: 8, duration: 180 }}>
                     <RefreshCw size={12} class={topLoadKind === "sessionHydration" ? "" : "animate-spin"} />
-                    <span>{topLoadLabel}</span>
+                    <span>{sessionSyncLabel}</span>
                   </div>
                 </div>
               </div>
             {/if}
             <div class="pointer-events-auto max-w-3xl mx-auto w-full space-y-4">
-              {#if pendingSteerResume && pendingSteerResume.sessionId === selectedSessionId}
+              {#if pendingSteerResume && selectedSessionBindingMatches(pendingSteerResume.sessionId, pendingSteerResume.profileId)}
                 <div class="p-4 bg-amber-600 text-white rounded-2xl shadow-xl flex flex-col md:flex-row items-center gap-4 animate-in slide-in-from-bottom-8 duration-500">
                   <div class="flex-1"><p class="text-sm font-bold flex items-center gap-2"><Clock size={16} /> {ui.savedDraftFound}</p><p class="text-xs opacity-90 mt-0.5">{ui.resumeSavedSteeringPrompt}</p></div>
                   <div class="flex gap-2"><button class="px-4 py-1.5 bg-white text-amber-700 rounded-lg text-xs font-bold hover:bg-amber-50 shadow-sm" onclick={() => void resumeSavedSteer()}>{ui.resume}</button><button class="px-4 py-1.5 bg-amber-700/50 hover:bg-amber-700 text-white rounded-lg text-xs font-bold transition-colors" onclick={keepSavedDraftInComposer}>{ui.keepDraft}</button><button class="p-1.5 text-white/70 hover:text-white rounded-lg transition-colors" onclick={() => void discardSavedDraft()}><X size={16} /></button></div>
@@ -13872,7 +14469,7 @@
               {#if showQueueResumeBanner && selectedSessionQueue}
                 <div class="queue-resume-banner flex flex-col items-center gap-3 rounded-xl bg-gray-900 p-3 text-white shadow-xl animate-in slide-in-from-bottom-8 duration-500 md:flex-row">
                   <div class="flex-1"><p class="flex items-center gap-2 text-[13px] font-bold"><RefreshCw size={15} /> {ui.queuedWorkPaused}</p><p class="mt-0.5 text-[11px] opacity-80">{m.tasks_waiting({ count: String(selectedSessionQueue.items.length) })}</p></div>
-                  <div class="flex gap-1.5"><button class="rounded-lg bg-amber-600 px-3 py-1.25 text-[11px] font-bold text-white shadow-sm hover:bg-amber-700" onclick={() => void resumeQueuedMessages()}>{ui.resumeQueue}</button><button class="queue-resume-ignore rounded-lg bg-gray-800 px-3 py-1.25 text-[11px] font-bold text-white transition-colors hover:bg-gray-700" onclick={() => { if (!selectedSessionId) return; dismissedQueueResumeBySessionId = { ...dismissedQueueResumeBySessionId, [selectedSessionId]: true }; }}>{ui.ignore}</button></div>
+                  <div class="flex gap-1.5"><button class="rounded-lg bg-amber-600 px-3 py-1.25 text-[11px] font-bold text-white shadow-sm hover:bg-amber-700" onclick={() => void resumeQueuedMessages()}>{ui.resumeQueue}</button><button class="queue-resume-ignore rounded-lg bg-gray-800 px-3 py-1.25 text-[11px] font-bold text-white transition-colors hover:bg-gray-700" onclick={() => { if (!selectedSessionId) return; dismissedQueueResumeBySessionId = { ...dismissedQueueResumeBySessionId, [sessionStateKey(selectedSessionId, selectedSessionProfileId)]: true }; }}>{ui.ignore}</button></div>
                 </div>
               {/if}
 
@@ -14332,7 +14929,9 @@
                 {#if composerSettingsOpen && conversation}
                   <div
                     bind:this={composerSettingsPopoverElement}
-                    class="composer-popover composer-settings-popover fixed z-[104] w-[19rem] max-w-[calc(100vw-1rem)] overflow-y-auto overscroll-contain rounded-xl border border-gray-200 bg-white p-2.5 shadow-2xl sm:rounded-2xl sm:p-3.5"
+                    use:portal
+                    class="floating-popover composer-popover composer-settings-popover w-[19rem] max-w-[calc(100vw-1rem)] overflow-y-auto overscroll-contain rounded-xl border p-2.5 sm:rounded-2xl sm:p-3.5"
+                    data-positioned={composerSettingsPopoverStyle.includes("top:")}
                     style={composerSettingsPopoverStyle || "opacity:0;pointer-events:none;"}
                   >
                     <div class="composer-settings-popover__header mb-2 flex items-center justify-between border-b border-gray-100 pb-2 sm:mb-2.5 sm:pb-2.5">
@@ -15114,7 +15713,7 @@
 
 {#if profileMoveDialogSession}
   {@const profileMoveOptions = profileMoveOptionsForSession(profileMoveDialogSession)}
-  <div class="fixed inset-0 z-[220] flex items-center justify-center px-4 py-6">
+  <div aria-modal="true" class="fixed inset-0 flex items-center justify-center px-4 py-6" role="dialog" style="z-index:var(--z-modal);">
     <button
       aria-label={ui.close}
       class="absolute inset-0 bg-slate-950/45 backdrop-blur-sm"
@@ -15123,7 +15722,7 @@
     ></button>
     <section
       aria-labelledby="session-profile-move-title"
-      class="relative z-[221] w-full max-w-md overflow-hidden rounded-3xl border shadow-2xl"
+      class="relative w-full max-w-md overflow-hidden rounded-3xl border shadow-2xl"
       style="border-color: var(--line); background: var(--panel-strong); color: var(--ink-strong);"
     >
       <div class="flex items-start justify-between gap-4 border-b px-5 py-4" style="border-color: var(--line);">
@@ -15229,14 +15828,14 @@
 {#if browserOpen}
   <FolderBrowserDialog
     busy={browserBusy}
-    closeLabel="Close folder picker"
+    closeLabel={m.close_folder_picker()}
     confirmLabel={ui.selectFolder}
     {directoryPayload}
-    loadingLabel="Scanning..."
+    loadingLabel={m.scanning_folders()}
     onBrowse={browseTo}
     onClose={() => (browserOpen = false)}
-    subtitle="Allowed root paths"
-    title="Select working folder"
+    subtitle={m.allowed_root_paths()}
+    title={m.select_working_folder()}
   />
 {/if}
 {/if}
@@ -15389,7 +15988,8 @@
   .top-load-pill {
     position: absolute;
     top: 0.75rem;
-    right: 1rem;
+    left: 50%;
+    translate: -50% 0;
     display: inline-flex;
     max-width: min(22rem, calc(100vw - 2rem));
     align-items: center;
@@ -15494,7 +16094,7 @@
       color 160ms ease;
   }
 
-  .composer-popover {
+  .composer-popover[data-positioned="true"] {
     transform-origin: bottom left;
     animation: composer-popover-enter 220ms cubic-bezier(0.22, 1, 0.36, 1);
     will-change: transform, opacity;
@@ -15531,7 +16131,7 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .composer-popover {
+    .composer-popover[data-positioned="true"] {
       animation: none;
     }
   }
@@ -16162,25 +16762,25 @@
   <div class="space-y-3 p-3">
     <div class="grid gap-2 sm:grid-cols-2">
       <div class="rounded-xl border border-gray-100 bg-gray-50 px-3 py-2 dark:border-white/10 dark:bg-white/5">
-        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Status</p>
+        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">{m.status_label()}</p>
         <p class="mt-1 text-xs font-semibold text-gray-700 dark:text-gray-200">{getWebSearchStatus(item)}</p>
       </div>
       {#if actionType}
         <div class="rounded-xl border border-gray-100 bg-gray-50 px-3 py-2 dark:border-white/10 dark:bg-white/5">
-          <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Action</p>
+          <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">{m.action_label()}</p>
           <p class="mt-1 text-xs font-semibold text-gray-700 dark:text-gray-200">{actionType}</p>
         </div>
       {/if}
     </div>
     {#if resultSummary}
       <div class="rounded-xl border border-blue-100 bg-blue-50/80 px-3 py-2.5 dark:border-blue-300/20 dark:bg-blue-400/10">
-        <p class="text-[9px] font-bold uppercase tracking-widest text-blue-500 dark:text-blue-300">Summary</p>
+        <p class="text-[9px] font-bold uppercase tracking-widest text-blue-500 dark:text-blue-300">{m.summary_label()}</p>
         <p class="mt-1 text-xs leading-relaxed text-blue-950 dark:text-blue-100">{resultSummary}</p>
       </div>
     {/if}
     {#if queries.length > 0}
       <div class="rounded-xl border border-gray-100 bg-white px-3 py-2.5 dark:border-white/10 dark:bg-white/[0.03]">
-        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Queries</p>
+        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">{m.queries_label()}</p>
         <ul class="mt-2 space-y-1.5">
           {#each queries as query (`${item.id}:query:${query}`)}
             <li class="rounded-lg bg-gray-50 px-2.5 py-1.5 text-xs font-medium text-gray-700 dark:bg-white/5 dark:text-gray-200">{query}</li>
@@ -16190,7 +16790,7 @@
     {/if}
     {#if results.length > 0}
       <div class="rounded-xl border border-gray-100 bg-white px-3 py-2.5 dark:border-white/10 dark:bg-white/[0.03]">
-        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Results</p>
+        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">{m.results_label()}</p>
         <ul class="mt-2 space-y-2">
           {#each results as result, index (`${item.id}:result:${result.url || result.title || index}`)}
             <li class="rounded-xl bg-gray-50 px-3 py-2 dark:bg-white/5">
@@ -16209,7 +16809,7 @@
     {/if}
     {#if sources.length > 0}
       <div class="rounded-xl border border-gray-100 bg-white px-3 py-2.5 dark:border-white/10 dark:bg-white/[0.03]">
-        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">Sources</p>
+        <p class="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">{m.sources_label()}</p>
         <div class="mt-2 flex flex-wrap gap-1.5">
           {#each sources as source, index (`${item.id}:source:${source.url || source.title || index}`)}
             {#if source.url}
@@ -16300,7 +16900,7 @@
             <Layout size={15} />
           </div>
           <div class="min-w-0">
-            <h4 class="truncate text-[10px] font-bold uppercase tracking-widest text-sky-700">{item.title ?? "Generated image"}</h4>
+            <h4 class="truncate text-[10px] font-bold uppercase tracking-widest text-sky-700">{item.title ?? m.generated_image()}</h4>
             {#if imagePrompt}
               <p class="mt-1 truncate text-xs text-gray-500">{imagePrompt}</p>
             {:else if formatValue(item.status)}
@@ -16332,7 +16932,7 @@
       <div class="space-y-3 bg-sky-50/40 p-3">
         {#if imageSrc}
           <div class="overflow-hidden rounded-2xl border border-sky-100 bg-white">
-            <img alt={imagePrompt ?? "Generated image"} class="block h-auto max-h-[34rem] w-full object-contain" loading="lazy" src={imageSrc} />
+            <img alt={imagePrompt ?? m.generated_image()} class="block h-auto max-h-[34rem] w-full object-contain" loading="lazy" src={imageSrc} />
           </div>
         {:else if item.detailState === "deferred" || item.resultOmitted}
           <div class="rounded-xl border border-dashed border-sky-200 bg-white px-4 py-5 text-center text-xs text-gray-500">
@@ -16481,7 +17081,7 @@
         </div>
         <div class="flex shrink-0 items-center gap-2">
           {#if item.type === "commandExecution" && item.exitCode !== null}
-            <span class="px-1.5 py-0.5 bg-gray-100 text-[9px] font-bold text-gray-500 rounded uppercase tracking-tighter">Exit {item.exitCode}</span>
+            <span class="px-1.5 py-0.5 bg-gray-100 text-[9px] font-bold text-gray-500 rounded uppercase tracking-tighter">{m.exit_label()} {item.exitCode}</span>
           {/if}
           <ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, item.id) ? 'rotate-180' : ''} transition-transform" />
         </div>
@@ -16533,13 +17133,13 @@
       <button class="turn-card-header turn-card-header--neutral flex w-full items-center justify-between gap-2.5 px-3 py-2.25 hover:bg-gray-50 transition-colors" data-sticky-level={stickyLevel} onclick={() => void toggleReadOnlyCommandGroup(turnId, entry.key, entry.items)}><div class="flex min-w-0 flex-1 items-center gap-2.5"><div class="shrink-0 rounded-lg bg-gray-100 p-1.5 text-gray-400">{#if getReadOnlyCommandGroupKind(entry.items) === "git"}<GitBranch size={14} />{:else}<Search size={14} />{/if}</div><div class="min-w-0 flex-1 text-left"><h4 class="truncate text-[11px] font-bold leading-tight text-gray-900">{getReadOnlyCommandGroupLabel(entry.items)}</h4><p class="mt-0.5 truncate text-[10px] font-medium text-gray-500">{summarizeReadOnlyCommandGroup(entry.items)}</p></div></div><div class="flex shrink-0 items-center gap-2"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{ui.opsCount(entry.items.length)}</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
       {#if isItemExpanded(turnId, entry.key)}
         <div class="turn-card-expand border-t border-gray-100 bg-gray-50/30" transition:slide|local={{ duration: 220 }}>{#if isItemDetailLoading(turnId, entry.key)}<div class="flex justify-center p-5 text-xs italic text-gray-400 animate-pulse">{ui.readingFileData}</div>
-          {:else}<div class="p-0">{#each entry.items as commandItem}<div class="border-b border-gray-100 p-3 last:border-0"><div class="mb-1.5 flex items-center justify-between"><span class="text-[10px] font-bold uppercase tracking-widest text-gray-500">{summarizeCommand(commandItem)}</span>{#if commandItem.exitCode !== null}<span class="text-[9px] font-mono text-gray-400">Exit {commandItem.exitCode}</span>{/if}</div>{@render renderCappedOutput(String(commandItem.aggregatedOutput ?? ""), getOutputPreviewKey(turnId, `${entry.key}:${commandItem.id}`), true)}</div>{/each}</div>{/if}</div>
+          {:else}<div class="p-0">{#each entry.items as commandItem}<div class="border-b border-gray-100 p-3 last:border-0"><div class="mb-1.5 flex items-center justify-between"><span class="text-[10px] font-bold uppercase tracking-widest text-gray-500">{summarizeCommand(commandItem)}</span>{#if commandItem.exitCode !== null}<span class="text-[9px] font-mono text-gray-400">{m.exit_label()} {commandItem.exitCode}</span>{/if}</div>{@render renderCappedOutput(String(commandItem.aggregatedOutput ?? ""), getOutputPreviewKey(turnId, `${entry.key}:${commandItem.id}`), true)}</div>{/each}</div>{/if}</div>
       {/if}
     </div>
   {:else}
     <div class="turn-card-shell border border-gray-200 rounded-2xl bg-white overflow-hidden shadow-sm">
       <div class="turn-card-header turn-card-header--neutral flex items-center gap-2 pr-3" data-sticky-level={stickyLevel}>
-        <button class="min-w-0 flex-1 flex items-center justify-between px-3 py-2.25 hover:bg-gray-50 transition-colors" onclick={() => void toggleFileChangeGroup(turnId, entry.key, entry.items)} type="button"><div class="flex min-w-0 items-center gap-2.5"><div class="shrink-0 rounded-lg bg-gray-100 p-1.5 text-gray-400"><FileDiff size={14} /></div><div class="min-w-0 text-left"><h4 class="text-[11px] font-bold leading-tight text-gray-900">{getFileChangeGroupLabel(entry.items)}</h4><p class="mt-0.5 truncate text-[10px] font-medium text-gray-500">{summarizeFileChangeGroup(entry.items)}</p></div></div><div class="flex shrink-0 items-center gap-2"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{getFileChangeGroupSummaryEntries(entry.items).length} Files</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
+        <button class="min-w-0 flex-1 flex items-center justify-between px-3 py-2.25 hover:bg-gray-50 transition-colors" onclick={() => void toggleFileChangeGroup(turnId, entry.key, entry.items)} type="button"><div class="flex min-w-0 items-center gap-2.5"><div class="shrink-0 rounded-lg bg-gray-100 p-1.5 text-gray-400"><FileDiff size={14} /></div><div class="min-w-0 text-left"><h4 class="text-[11px] font-bold leading-tight text-gray-900">{getFileChangeGroupLabel(entry.items)}</h4><p class="mt-0.5 truncate text-[10px] font-medium text-gray-500">{summarizeFileChangeGroup(entry.items)}</p></div></div><div class="flex shrink-0 items-center gap-2"><span class="px-1.5 py-0.5 bg-gray-50 text-[9px] font-bold text-gray-400 rounded uppercase tracking-tighter">{getFileChangeGroupSummaryEntries(entry.items).length} {m.files_count_label()}</span><ChevronDown size={14} class="text-gray-400 {isItemExpanded(turnId, entry.key) ? 'rotate-180' : ''} transition-transform" /></div></button>
         {#if getFileChangeGroupViews(entry.items).length > 0}
           <button
             class="shrink-0 rounded-md border border-gray-200 bg-white px-2.5 py-1 text-[10px] font-bold text-gray-700 transition-colors hover:bg-gray-50"

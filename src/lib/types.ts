@@ -986,20 +986,41 @@ export type GatewayRestartPayload = {
 };
 
 export type CodexQuotaWindow = {
+  id?: string;
+  kind?: "primary" | "secondary" | string;
+  label?: string | null;
+  limitId?: string | null;
+  limitName?: string | null;
   usedPercent: number;
   remainingPercent: number;
+  windowDurationMinutes?: number | null;
   resetAfterSeconds: number | null;
   resetAt: number | null;
 };
 
+export type CodexQuotaLimit = {
+  id: string;
+  name: string;
+  windows: CodexQuotaWindow[];
+  credits?: unknown;
+  individualLimit?: unknown;
+  rateLimitReachedType?: string | null;
+};
+
 export type CodexQuotaStatus = {
   available: boolean;
-  source: "backend-api" | null;
+  source: "backend-api" | "cached" | string | null;
   fetchedAt: number | null;
   account: string | null;
   plan: string | null;
+  limits?: CodexQuotaLimit[];
+  windows?: CodexQuotaWindow[];
   fiveHour: CodexQuotaWindow | null;
   weekly: CodexQuotaWindow | null;
+  credits?: unknown;
+  individualLimit?: unknown;
+  rateLimitReachedType?: string | null;
+  refreshing?: boolean;
   error: string | null;
 };
 
@@ -1050,9 +1071,11 @@ export type CodexResetTicket = {
   label: string | null;
   limitId: string | null;
   limitName: string | null;
-  expiresAt: string | null;
-  createdAt: string | null;
-  usedAt: string | null;
+  resetType?: string | null;
+  status?: string | null;
+  expiresAt: string | number | null;
+  createdAt: string | number | null;
+  usedAt: string | number | null;
   available: boolean;
   raw?: unknown;
 };

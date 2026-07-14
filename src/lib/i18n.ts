@@ -7,7 +7,7 @@ export const localeSignal = writable(0);
 export const activeLocale = writable<Locale>("en");
 
 export const localeOptions = [
-  { value: "en", label: "english" },
+  { value: "en", label: "English" },
   { value: "ko", label: "한국어" },
   { value: "zh-Hans", label: "简体中文" },
   { value: "zh-Hant", label: "繁體中文" },

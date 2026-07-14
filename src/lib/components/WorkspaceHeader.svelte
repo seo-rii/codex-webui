@@ -20,8 +20,11 @@
     User,
     UserCog
   } from "lucide-svelte";
+  import { onMount, tick } from "svelte";
 
+  import { portal } from "$lib/actions/portal";
   import { m } from "$lib/paraglide/messages.js";
+  import { anchoredPopoverStyle } from "$lib/popover-position";
   import type { SessionSummary } from "$lib/types";
 
   type UiCopy = {
@@ -120,6 +123,62 @@
     onOpenSettingsTab: () => void;
     onCreateTerminalTab: () => void | Promise<void>;
   } = $props();
+
+  let workspaceMenuTriggerElement = $state<HTMLButtonElement>();
+  let workspaceMenuElement = $state<HTMLDivElement>();
+  let workspaceMenuStyle = $state("");
+
+  async function updateWorkspaceMenuPosition() {
+    if (!workspaceMenuOpen || !workspaceMenuTriggerElement || !workspaceMenuElement) {
+      return;
+    }
+    await tick();
+    workspaceMenuStyle = anchoredPopoverStyle(workspaceMenuTriggerElement, workspaceMenuElement, {
+      align: "end",
+      maxWidth: 256,
+      minHeight: 96,
+      minWidth: 224,
+      placement: "below",
+      preferredWidth: 224
+    });
+  }
+
+  $effect(() => {
+    if (!workspaceMenuOpen) {
+      workspaceMenuStyle = "";
+      return;
+    }
+    void updateWorkspaceMenuPosition();
+  });
+
+  onMount(() => {
+    const update = () => void updateWorkspaceMenuPosition();
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && !workspaceMenuElement?.contains(target) && !workspaceMenuTriggerElement?.contains(target)) {
+        workspaceMenuOpen = false;
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        workspaceMenuOpen = false;
+      }
+    };
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    window.visualViewport?.addEventListener("resize", update);
+    window.visualViewport?.addEventListener("scroll", update);
+    window.addEventListener("pointerdown", closeOnOutsidePointer);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+      window.visualViewport?.removeEventListener("resize", update);
+      window.visualViewport?.removeEventListener("scroll", update);
+      window.removeEventListener("pointerdown", closeOnOutsidePointer);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  });
 
   function selectedSessionAccountLabel() {
     const profileLabel = (selectedSessionSummary?.profileLabel ?? "").trim();
@@ -309,6 +368,7 @@
 
     <div class="relative">
       <button
+        bind:this={workspaceMenuTriggerElement}
         class="workspace-open-trigger surface-contrast-button ui-animated-button ui-animated-button--strong flex h-8 shrink-0 items-center gap-1 whitespace-nowrap rounded-lg px-2.5 text-[11px] font-bold shadow-sm transition-all active:scale-95 sm:h-9 sm:px-3 sm:text-xs"
         onclick={() => (workspaceMenuOpen = !workspaceMenuOpen)}
         title={ui.open}
@@ -320,7 +380,13 @@
       </button>
 
       {#if workspaceMenuOpen}
-        <div class="workspace-open-menu absolute right-0 top-10 z-[72] w-56 rounded-xl border p-1 shadow-2xl">
+        <div
+          bind:this={workspaceMenuElement}
+          use:portal
+          class="floating-popover workspace-open-menu w-56 overflow-y-auto rounded-xl border p-1"
+          data-positioned={workspaceMenuStyle.includes("top:")}
+          style={workspaceMenuStyle || "opacity:0;pointer-events:none;"}
+        >
           {#if isMobileLayout}
             <button
               class="workspace-open-menu__item ui-animated-button ui-animated-button--soft group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50"

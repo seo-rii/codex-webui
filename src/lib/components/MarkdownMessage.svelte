@@ -1,7 +1,12 @@
+<script module lang="ts">
+  import { createLowlight, common } from "lowlight";
+
+  const sharedLowlight = createLowlight(common);
+</script>
+
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
   import { Marked, Renderer } from "marked";
-  import { createLowlight, common } from "lowlight";
   import { toHtml } from "hast-util-to-html";
   import { m } from "$lib/paraglide/messages.js";
 
@@ -25,7 +30,6 @@
   let rootElement = $state<HTMLDivElement | null>(null);
   let expanded = $state(false);
 
-  const lowlight = createLowlight(common);
   const codeCopyResetTimers = new WeakMap<HTMLButtonElement, number>();
   const markdownAllowedTags = new Set([
     "a",
@@ -108,9 +112,9 @@
 
   renderer.code = function ({ text: code, lang }) {
     const normalizedLanguage = lang?.trim().toLowerCase() ?? "";
-    const tree = normalizedLanguage && lowlight.registered(normalizedLanguage)
-      ? lowlight.highlight(normalizedLanguage, code)
-      : lowlight.highlightAuto(code);
+    const tree = normalizedLanguage && sharedLowlight.registered(normalizedLanguage)
+      ? sharedLowlight.highlight(normalizedLanguage, code)
+      : sharedLowlight.highlightAuto(code);
     const highlighted = toHtml(tree);
     const languageClass = normalizedLanguage ? ` language-${escapeAttribute(normalizedLanguage)}` : "";
     const languageLabel = normalizedLanguage || (tree as any).data?.language || "text";

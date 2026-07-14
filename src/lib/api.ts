@@ -205,7 +205,12 @@ export const api = {
   async selectAuthProfile(profileId: string) {
     const response = await ws.request<CodexProfileSelectPayload>("account/profile/select", { profileId });
     writeProfileCookie(response);
+    ws.setDefaultProfileId(response.activeProfileId);
     return response;
+  },
+
+  setDefaultProfileId(profileId: string | null) {
+    ws.setDefaultProfileId(profileId);
   },
 
   disconnect() {

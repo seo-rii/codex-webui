@@ -65,13 +65,24 @@ type SessionSubscriptionOptions = {
   includeInitialQueue?: boolean;
   profileId?: string | null;
 };
+type SessionSubscriptionState = {
+  sessionId: string;
+  options: Required<SessionSubscriptionOptions>;
+  desired: boolean;
+  syncedGeneration: number | null;
+  syncing: boolean;
+  retryAttempt: number;
+  retryTimer: ReturnType<typeof setTimeout> | null;
+};
 
 const HEARTBEAT_MS = 20_000;
 const CONNECT_TIMEOUT_MS = 12_000;
 const PONG_TIMEOUT_MS = 10_000;
 const FOREGROUND_STALE_MS = HEARTBEAT_MS + PONG_TIMEOUT_MS;
 const REQUEST_TIMEOUT_MS = 720_000;
+const SUBSCRIPTION_REQUEST_TIMEOUT_MS = 15_000;
 const RECONNECT_DELAYS = [250, 500, 1000, 2000, 4000];
+const SUBSCRIPTION_RETRY_DELAYS = [500, 1000, 2000, 5000, 10_000, 30_000];
 const DEDUPED_READ_METHODS = new Set([
   "arena/list",
   "audit/list",
@@ -215,19 +226,30 @@ export class WebSocketRpcClient {
   private inflightReadRequests = new Map<string, Promise<unknown>>();
   private sessionHandlers = new Map<string, Set<SessionEventHandler>>();
   private sessionSubscriptionOptions = new Map<string, Required<SessionSubscriptionOptions>>();
+  private sessionSubscriptionStates = new Map<string, SessionSubscriptionState>();
   private terminalHandlers = new Map<string, Set<TerminalEventHandler>>();
   private globalHandlers = new Set<(event: GlobalStreamEvent) => void>();
   private reconnectListeners = new Set<() => void>();
   private resyncRequiredListeners = new Set<(reason: string) => void>();
   private connectionState: WsConnectionState = "idle";
   private connectionStateListeners = new Set<(state: WsConnectionState) => void>();
+  private defaultProfileId: string | null = null;
 
-  request<T>(method: string, params: unknown = {}): Promise<T> {
+  setDefaultProfileId(profileId: string | null | undefined) {
+    const normalized = typeof profileId === "string" && profileId.trim() ? profileId.trim() : null;
+    this.defaultProfileId = normalized;
+  }
+
+  request<T>(method: string, params: unknown = {}, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
     if (typeof window === "undefined") {
       return Promise.reject(new Error("WebSocket requests are only available in the browser."));
     }
 
-    const dedupeKey = dedupeKeyForRequest(method, params);
+    const scopedParams =
+      this.defaultProfileId && params && typeof params === "object" && !Array.isArray(params) && !("requestProfileId" in params)
+        ? { ...(params as Record<string, unknown>), requestProfileId: this.defaultProfileId }
+        : params;
+    const dedupeKey = dedupeKeyForRequest(method, scopedParams);
     if (dedupeKey) {
       const existing = this.inflightReadRequests.get(dedupeKey);
       if (existing) {
@@ -240,7 +262,7 @@ export class WebSocketRpcClient {
       kind: "request",
       id,
       method,
-      params
+      params: scopedParams
     };
 
     const promise = new Promise<T>((resolve, reject) => {
@@ -253,13 +275,13 @@ export class WebSocketRpcClient {
         this.pending.delete(id);
         pending.reject(new Error("WebSocket request timed out."));
         this.sendPing(true);
-      }, REQUEST_TIMEOUT_MS);
+      }, timeoutMs);
 
       this.pending.set(id, {
         message,
         resolve: resolve as (value: unknown) => void,
         reject,
-        replayable: requestCanReplayAfterReconnect(method, params),
+        replayable: requestCanReplayAfterReconnect(method, scopedParams),
         sentGeneration: null,
         timeoutTimer
       });
@@ -285,14 +307,28 @@ export class WebSocketRpcClient {
     current.add(handler);
     this.sessionHandlers.set(subscriptionKey, current);
     if (shouldSubscribe) {
-      this.sessionSubscriptionOptions.set(subscriptionKey, {
+      const normalizedOptions = {
         includeInitialQueue: options.includeInitialQueue ?? true,
         profileId: normalizeSubscriptionProfileId(options.profileId ?? null)
-      });
+      };
+      this.sessionSubscriptionOptions.set(subscriptionKey, normalizedOptions);
+      const state = this.sessionSubscriptionStates.get(subscriptionKey) ?? {
+        sessionId,
+        options: normalizedOptions,
+        desired: true,
+        syncedGeneration: null,
+        syncing: false,
+        retryAttempt: 0,
+        retryTimer: null
+      };
+      this.clearSessionSubscriptionRetry(state);
+      state.options = normalizedOptions;
+      state.desired = true;
+      this.sessionSubscriptionStates.set(subscriptionKey, state);
     }
     this.ensureConnected();
     if (shouldSubscribe) {
-      this.sendSessionSubscribe(subscriptionKey, sessionId);
+      void this.syncSessionSubscription(subscriptionKey);
     }
 
     return () => {
@@ -308,11 +344,22 @@ export class WebSocketRpcClient {
 
       const options = this.sessionSubscriptionOptions.get(subscriptionKey);
       this.sessionHandlers.delete(subscriptionKey);
-      this.sessionSubscriptionOptions.delete(subscriptionKey);
-      this.sendTransient("session/unsubscribe", {
+      const state = this.sessionSubscriptionStates.get(subscriptionKey) ?? {
         sessionId,
-        profileId: options?.profileId ?? null
-      });
+        options: options ?? {
+          includeInitialQueue: true,
+          profileId: normalizeSubscriptionProfileId(null)
+        },
+        desired: false,
+        syncedGeneration: null,
+        syncing: false,
+        retryAttempt: 0,
+        retryTimer: null
+      };
+      this.clearSessionSubscriptionRetry(state);
+      state.desired = false;
+      this.sessionSubscriptionStates.set(subscriptionKey, state);
+      void this.syncSessionSubscription(subscriptionKey);
     };
   }
 
@@ -437,6 +484,9 @@ export class WebSocketRpcClient {
     }
     this.pending.clear();
     this.inflightReadRequests.clear();
+    for (const state of this.sessionSubscriptionStates.values()) {
+      this.clearSessionSubscriptionRetry(state);
+    }
   }
 
   private ensureConnected() {
@@ -641,9 +691,12 @@ export class WebSocketRpcClient {
       this.sendTransient("events/subscribe", {});
     }
 
-    for (const [subscriptionKey, options] of this.sessionSubscriptionOptions.entries()) {
-      const sessionId = subscriptionKey.slice(subscriptionKey.indexOf(":") + 1);
-      this.sendSessionSubscribe(subscriptionKey, sessionId, options);
+    for (const [subscriptionKey, state] of this.sessionSubscriptionStates.entries()) {
+      this.clearSessionSubscriptionRetry(state);
+      state.syncedGeneration = null;
+      if (state.desired) {
+        void this.syncSessionSubscription(subscriptionKey);
+      }
     }
 
     for (const terminalId of this.terminalHandlers.keys()) {
@@ -656,28 +709,121 @@ export class WebSocketRpcClient {
       return;
     }
 
+    const scopedParams =
+      this.defaultProfileId && params && typeof params === "object" && !Array.isArray(params) && !("requestProfileId" in params)
+        ? { ...(params as Record<string, unknown>), requestProfileId: this.defaultProfileId }
+        : params;
     const payload: ClientEnvelope = {
       kind: "request",
       id: makeRequestId(),
       method,
-      params
+      params: scopedParams
     };
     this.socket.send(JSON.stringify(payload));
   }
 
-  private sendSessionSubscribe(
+  private async syncSessionSubscription(subscriptionKey: string) {
+    const state = this.sessionSubscriptionStates.get(subscriptionKey);
+    if (!state || state.syncing) {
+      return;
+    }
+
+    state.syncing = true;
+    try {
+      while (this.sessionSubscriptionStates.get(subscriptionKey) === state) {
+        const socketOpen = this.socket?.readyState === WebSocket.OPEN;
+        const subscribed = state.syncedGeneration === this.connectionGeneration;
+        if (!socketOpen) {
+          if (!state.desired) {
+            this.sessionSubscriptionStates.delete(subscriptionKey);
+            this.sessionSubscriptionOptions.delete(subscriptionKey);
+          }
+          return;
+        }
+        if (state.desired === subscribed) {
+          if (!state.desired) {
+            this.sessionSubscriptionStates.delete(subscriptionKey);
+            this.sessionSubscriptionOptions.delete(subscriptionKey);
+          }
+          return;
+        }
+
+        const generation = this.connectionGeneration;
+        const subscribing = state.desired;
+        try {
+          await this.request(
+            subscribing ? "session/subscribe" : "session/unsubscribe",
+            subscribing
+              ? {
+                  sessionId: state.sessionId,
+                  includeInitialQueue: state.options.includeInitialQueue,
+                  profileId: state.options.profileId
+                }
+              : {
+                  sessionId: state.sessionId,
+                  profileId: state.options.profileId
+                },
+            SUBSCRIPTION_REQUEST_TIMEOUT_MS
+          );
+        } catch {
+          state.syncedGeneration = subscribing ? null : generation;
+          this.scheduleSessionSubscriptionRetry(subscriptionKey, state, generation);
+          return;
+        }
+
+        if (generation !== this.connectionGeneration) {
+          state.syncedGeneration = null;
+          continue;
+        }
+        state.retryAttempt = 0;
+        state.syncedGeneration = subscribing ? generation : null;
+      }
+    } finally {
+      state.syncing = false;
+      const latest = this.sessionSubscriptionStates.get(subscriptionKey);
+      const subscribed = latest?.syncedGeneration === this.connectionGeneration;
+      if (
+        latest &&
+        !latest.retryTimer &&
+        this.socket?.readyState === WebSocket.OPEN &&
+        latest.desired !== subscribed
+      ) {
+        queueMicrotask(() => {
+          void this.syncSessionSubscription(subscriptionKey);
+        });
+      }
+    }
+  }
+
+  private clearSessionSubscriptionRetry(state: SessionSubscriptionState) {
+    if (state.retryTimer) {
+      clearTimeout(state.retryTimer);
+      state.retryTimer = null;
+    }
+    state.retryAttempt = 0;
+  }
+
+  private scheduleSessionSubscriptionRetry(
     subscriptionKey: string,
-    sessionId: string,
-    subscriptionOptions: Required<SessionSubscriptionOptions> | null = null
+    state: SessionSubscriptionState,
+    generation: number
   ) {
-    const options =
-      subscriptionOptions ??
-      this.sessionSubscriptionOptions.get(subscriptionKey) ?? { includeInitialQueue: true, profileId: null };
-    this.sendTransient("session/subscribe", {
-      sessionId,
-      includeInitialQueue: options.includeInitialQueue,
-      profileId: options.profileId ?? null
-    });
+    if (state.retryTimer || this.sessionSubscriptionStates.get(subscriptionKey) !== state) {
+      return;
+    }
+    const delay = SUBSCRIPTION_RETRY_DELAYS[Math.min(state.retryAttempt, SUBSCRIPTION_RETRY_DELAYS.length - 1)];
+    state.retryAttempt += 1;
+    state.retryTimer = setTimeout(() => {
+      state.retryTimer = null;
+      if (
+        this.sessionSubscriptionStates.get(subscriptionKey) !== state ||
+        generation !== this.connectionGeneration ||
+        this.socket?.readyState !== WebSocket.OPEN
+      ) {
+        return;
+      }
+      void this.syncSessionSubscription(subscriptionKey);
+    }, delay);
   }
 
   private startHeartbeat() {

@@ -2600,9 +2600,9 @@
     align-items: center;
     gap: 0.55rem;
     min-height: 2.9rem;
-    border: 1px solid rgba(83, 61, 42, 0.1);
+    border: 1px solid var(--line);
     border-radius: 1rem;
-    background: rgba(255, 255, 255, 0.82);
+    background: color-mix(in srgb, var(--panel-strong) 82%, transparent);
     color: var(--ink);
     padding: 0.7rem 0.9rem;
     white-space: nowrap;
@@ -2616,14 +2616,14 @@
 
   .settings-tab:hover {
     border-color: rgba(245, 158, 11, 0.22);
-    background: rgba(255, 251, 235, 0.82);
+    background: color-mix(in srgb, var(--accent) 9%, var(--panel-strong));
     color: var(--ink-strong);
     transform: translateY(-1px);
   }
 
   .settings-tab--active {
     border-color: rgba(245, 158, 11, 0.34);
-    background: linear-gradient(180deg, rgba(255, 251, 235, 0.96), rgba(255, 247, 237, 0.92));
+    background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 12%, var(--panel-strong)), var(--panel-strong));
     color: var(--ink-strong);
     box-shadow: 0 14px 26px rgba(58, 39, 20, 0.08);
   }
@@ -2698,10 +2698,10 @@
   }
 
   .settings-shell__header {
-    border: 1px solid rgba(83, 61, 42, 0.1);
+    border: 1px solid var(--line);
     border-radius: 1.4rem;
     background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(255, 250, 244, 0.92)),
+      linear-gradient(180deg, color-mix(in srgb, var(--panel-strong) 96%, transparent), color-mix(in srgb, var(--accent) 5%, var(--panel-strong))),
       var(--panel);
     padding: 1.1rem 1.25rem;
     box-shadow: 0 20px 36px rgba(58, 39, 20, 0.08);
@@ -2759,7 +2759,7 @@
     width: 100%;
     border: 1px solid rgba(148, 163, 184, 0.28);
     border-radius: 0.95rem;
-    background: rgba(255, 255, 255, 0.92);
+    background: color-mix(in srgb, var(--panel-strong) 92%, transparent);
     color: var(--ink-strong);
     padding: 0.75rem 0.9rem;
     font: inherit;
@@ -2770,7 +2770,7 @@
   .field-input:focus {
     border-color: rgba(245, 158, 11, 0.65);
     box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.12);
-    background: rgba(255, 255, 255, 1);
+    background: var(--panel-strong);
   }
 
   .field-textarea {
@@ -2781,7 +2781,7 @@
   .field-note--read-only {
     border: 1px solid rgba(245, 158, 11, 0.18);
     border-radius: 0.95rem;
-    background: rgba(255, 247, 237, 0.88);
+    background: color-mix(in srgb, var(--accent) 10%, var(--panel-strong));
     color: #9a6700;
     padding: 0.8rem 0.95rem;
   }
@@ -2789,9 +2789,9 @@
   .panel {
     display: grid;
     gap: 0.9rem;
-    border: 1px solid rgba(83, 61, 42, 0.1);
+    border: 1px solid var(--line);
     border-radius: 1.35rem;
-    background: rgba(255, 255, 255, 0.88);
+    background: color-mix(in srgb, var(--panel-strong) 88%, transparent);
     padding: 1.05rem;
     box-shadow: 0 16px 30px rgba(58, 39, 20, 0.07);
   }
@@ -2809,7 +2809,7 @@
     gap: 0.45rem;
     border: 1px solid rgba(148, 163, 184, 0.18);
     border-radius: 1rem;
-    background: rgba(248, 250, 252, 0.8);
+    background: color-mix(in srgb, var(--panel-soft) 80%, transparent);
     padding: 0.8rem 0.9rem;
   }
 
@@ -2881,7 +2881,7 @@
     display: grid;
     gap: 0.35rem;
     border-radius: 1rem;
-    background: rgba(249, 245, 239, 0.75);
+    background: color-mix(in srgb, var(--panel-soft) 84%, transparent);
     padding: 0.85rem 1rem;
   }
 
@@ -3226,7 +3226,7 @@
     display: grid;
     gap: 0.55rem;
     border-radius: 1rem;
-    background: rgba(249, 245, 239, 0.75);
+    background: color-mix(in srgb, var(--panel-soft) 82%, transparent);
     padding: 0.9rem 1rem;
   }
 
@@ -3239,13 +3239,13 @@
 
   .catalog-card--button:hover {
     border-color: rgba(245, 158, 11, 0.2);
-    background: rgba(255, 255, 255, 0.95);
+    background: color-mix(in srgb, var(--panel-strong) 95%, transparent);
     transform: translateY(-1px);
   }
 
   .catalog-card--active {
     border-color: rgba(245, 158, 11, 0.35);
-    background: rgba(255, 251, 235, 0.9);
+    background: color-mix(in srgb, var(--accent) 10%, var(--panel-strong));
   }
 
   .catalog-card__header {
@@ -3508,7 +3508,7 @@
     min-width: 0;
     border: 1px solid rgba(148, 163, 184, 0.24);
     border-radius: 0.9rem;
-    background: rgba(255, 255, 255, 0.9);
+    background: color-mix(in srgb, var(--panel-strong) 90%, transparent);
     padding: 0.45rem 0.6rem;
   }
 

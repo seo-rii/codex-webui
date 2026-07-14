@@ -103,8 +103,11 @@
     }
 
     pollingTimer = setInterval(() => {
+      if (document.hidden) {
+        return;
+      }
       void refreshRuns(true);
-    }, 2500);
+    }, 5000);
 
     return () => {
       if (pollingTimer) {
@@ -315,8 +318,8 @@
     gap: 0.9rem;
     padding: 1rem;
     border-radius: 1.5rem;
-    border: 1px solid rgba(83, 61, 42, 0.1);
-    background: rgba(255, 255, 255, 0.8);
+    border: 1px solid var(--line);
+    background: color-mix(in srgb, var(--panel-strong) 80%, transparent);
   }
 
   .arena-header,
@@ -362,8 +365,8 @@
     display: grid;
     gap: 0.7rem;
     border-radius: 1.2rem;
-    border: 1px solid rgba(83, 61, 42, 0.1);
-    background: rgba(249, 245, 239, 0.72);
+    border: 1px solid var(--line);
+    background: color-mix(in srgb, var(--panel-soft) 78%, transparent);
     padding: 0.9rem;
   }
 
@@ -395,7 +398,7 @@
     max-height: 18rem;
     overflow: auto;
     border-radius: 1rem;
-    background: rgba(255, 255, 255, 0.85);
+    background: color-mix(in srgb, var(--panel-strong) 85%, transparent);
     padding: 0.8rem 0.9rem;
   }
 
@@ -407,9 +410,9 @@
     width: 100%;
     min-height: 6.5rem;
     resize: vertical;
-    border: 1px solid rgba(83, 61, 42, 0.14);
+    border: 1px solid var(--line);
     border-radius: 1.1rem;
-    background: rgba(255, 255, 255, 0.86);
+    background: color-mix(in srgb, var(--panel-strong) 86%, transparent);
     color: var(--ink);
     padding: 0.82rem 0.92rem;
   }

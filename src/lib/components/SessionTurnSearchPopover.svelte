@@ -1,6 +1,7 @@
 <script lang="ts">
   import { ChevronDown, RefreshCw, Search, X } from "lucide-svelte";
 
+  import { portal } from "$lib/actions/portal";
   import { m } from "$lib/paraglide/messages.js";
   import type { SessionTurnSearchMatch } from "$lib/types";
 
@@ -58,7 +59,9 @@
 
 <div
   bind:this={popoverElement}
-  class="composer-popover search-popover fixed z-[72] overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl"
+  use:portal
+  class="floating-popover composer-popover search-popover overflow-hidden rounded-2xl border"
+  data-positioned={style.includes("top:")}
   style={style || "opacity:0;pointer-events:none;"}
 >
   <div class="search-popover__header flex items-center gap-2 border-b border-gray-100 px-3 py-2.5">
@@ -120,9 +123,9 @@
                 </span>
                 <span class="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-amber-700">
                   {result.itemType === "userMessage"
-                    ? "User"
+                    ? m.role_user_label()
                     : result.itemType === "agentMessage"
-                      ? "Assistant"
+                      ? m.role_assistant_label()
                       : result.itemType === "reasoning"
                         ? m.reasoning()
                         : result.itemType === "plan"
@@ -139,7 +142,7 @@
                                     ? m.tool_call()
                                     : result.itemType === "contextCompaction"
                                       ? contextCompressionLabel
-                                      : result.itemType ?? "Item"}
+                                      : result.itemType ?? m.generic_item()}
                 </span>
               </div>
               <p class="mt-2 line-clamp-2 text-sm leading-5 text-gray-700">{result.preview}</p>

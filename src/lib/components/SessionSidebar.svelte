@@ -35,15 +35,19 @@
   } from "lucide-svelte";
 
   import { describeUiError } from "$lib/ui-errors";
+  import { portal } from "$lib/actions/portal";
   import { activeLocale, localeOptions, localeSignal, updateLocale } from "$lib/i18n";
   import { m } from "$lib/paraglide/messages.js";
   import { getLocale } from "$lib/paraglide/runtime.js";
+  import { anchoredPopoverStyle } from "$lib/popover-position";
   import type { ResolvedTheme, ThemeMode } from "$lib/theme";
   import type {
     AppNotification,
     CodexAccountLoginFlow,
     CodexProfileAccountSummary,
+    CodexQuotaLimit,
     CodexQuotaStatus,
+    CodexQuotaWindow,
     CodexResetTicket,
     CodexResetTicketsPayload,
     CodexRuntimeStatus,
@@ -399,9 +403,10 @@
 
   const selectedSession = $derived(sessions.find((session) => session.id === selectedId) ?? null);
   const runningSessionCount = $derived(sessions.filter((session) => isSessionRunning(session)).length);
+  const displayedQuotaLimits = $derived(quotaLimitsForDisplay(quota));
 
   function getDateLocale() {
-    return getLocale() === "ko" ? "ko-KR" : "en-US";
+    return getLocale();
   }
 
   function formatUpdated(value: number) {
@@ -527,10 +532,83 @@
     return m.reset_at({ value: formatted });
   }
 
+  function quotaLimitsForDisplay(status: CodexQuotaStatus | null | undefined): CodexQuotaLimit[] {
+    const normalizedLimits = (status?.limits ?? []).filter((limit) => Array.isArray(limit.windows) && limit.windows.length > 0);
+    if (normalizedLimits.length > 0) {
+      return normalizedLimits;
+    }
+
+    const normalizedWindows = (status?.windows ?? []).filter(Boolean);
+    if (normalizedWindows.length > 0) {
+      return [{ id: "codex", name: "Codex", windows: normalizedWindows }];
+    }
+
+    const legacyWindows: CodexQuotaWindow[] = [];
+    if (status?.fiveHour) {
+      legacyWindows.push({
+        ...status.fiveHour,
+        id: status.fiveHour.id ?? "codex:legacy-5h",
+        kind: status.fiveHour.kind ?? "primary",
+        label: status.fiveHour.label ?? ui.quota5h,
+        windowDurationMinutes: status.fiveHour.windowDurationMinutes ?? 5 * 60
+      });
+    }
+    if (status?.weekly) {
+      legacyWindows.push({
+        ...status.weekly,
+        id: status.weekly.id ?? "codex:legacy-weekly",
+        kind: status.weekly.kind ?? "secondary",
+        label: status.weekly.label ?? ui.quotaWeekly,
+        windowDurationMinutes: status.weekly.windowDurationMinutes ?? 7 * 24 * 60
+      });
+    }
+    return legacyWindows.length > 0 ? [{ id: "codex", name: "Codex", windows: legacyWindows }] : [];
+  }
+
+  function quotaWindowsForDisplay(status: CodexQuotaStatus | null | undefined) {
+    return quotaLimitsForDisplay(status).flatMap((limit) => limit.windows);
+  }
+
+  function quotaWindowLabel(window: CodexQuotaWindow, index: number) {
+    const duration = window.windowDurationMinutes;
+    if (typeof duration === "number" && Number.isFinite(duration)) {
+      if (Math.abs(duration - 5 * 60) <= 15) {
+        return ui.quota5h;
+      }
+      if (Math.abs(duration - 7 * 24 * 60) <= 7 * 24 * 60 * 0.05) {
+        return ui.quotaWeekly;
+      }
+    }
+    const label = window.label?.trim();
+    if (label) {
+      return label;
+    }
+    return index === 0 ? ui.quotaUsage : `${ui.quotaUsage} ${index + 1}`;
+  }
+
+  function formatResetTicketDate(value: string | number | null | undefined) {
+    if (value == null || value === "") {
+      return null;
+    }
+    const numericValue = typeof value === "number" ? value : Number(value);
+    const date = Number.isFinite(numericValue)
+      ? new Date(numericValue >= 1_000_000_000_000 ? numericValue : numericValue * 1000)
+      : new Date(value);
+    if (!Number.isFinite(date.getTime())) {
+      return String(value);
+    }
+    return new Intl.DateTimeFormat(getDateLocale(), {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit"
+    }).format(date);
+  }
+
   function compactQuotaLabel() {
-    const candidates = [quota?.fiveHour?.remainingPercent, quota?.weekly?.remainingPercent].filter(
-      (value): value is number => typeof value === "number" && Number.isFinite(value)
-    );
+    const candidates = quotaWindowsForDisplay(quota)
+      .map((window) => window.remainingPercent)
+      .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
     if (candidates.length === 0) {
       return null;
     }
@@ -856,27 +934,14 @@
     }
 
     await tick();
-    const margin = 12;
-    const triggerRect = accountButtonElement.getBoundingClientRect();
-    const popoverRect = accountPopoverElement.getBoundingClientRect();
-    const width = Math.min(Math.max(popoverRect.width || 320, 320), window.innerWidth - margin * 2);
-    let left = triggerRect.left;
-    if (left + width > window.innerWidth - margin) {
-      left = window.innerWidth - width - margin;
-    }
-    if (left < margin) {
-      left = margin;
-    }
-
-    let top = triggerRect.top - popoverRect.height - 12;
-    if (top < margin) {
-      top = triggerRect.bottom + 12;
-    }
-    if (top + popoverRect.height > window.innerHeight - margin) {
-      top = Math.max(margin, window.innerHeight - popoverRect.height - margin);
-    }
-
-    accountPopoverStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.max(120, window.innerHeight - margin * 2)}px;opacity:1;pointer-events:auto;`;
+    accountPopoverStyle = anchoredPopoverStyle(accountButtonElement, accountPopoverElement, {
+      align: "start",
+      maxWidth: 352,
+      minHeight: 96,
+      minWidth: 288,
+      placement: "above",
+      preferredWidth: 320
+    });
   }
 
   async function updateNotificationPanelPosition() {
@@ -885,31 +950,14 @@
     }
 
     await tick();
-    const margin = 12;
-    const compactViewport = window.innerWidth < 640;
-    const triggerRect = notificationButtonElement.getBoundingClientRect();
-    const panelRect = notificationPanelElement.getBoundingClientRect();
-    const width = compactViewport
-      ? Math.min(352, Math.max(240, window.innerWidth - margin * 2))
-      : Math.min(Math.max(panelRect.width || 352, 320), window.innerWidth - margin * 2);
-    let left = compactViewport ? margin : triggerRect.right - width;
-    if (left + width > window.innerWidth - margin) {
-      left = window.innerWidth - width - margin;
-    }
-    if (left < margin) {
-      left = margin;
-    }
-
-    let top = compactViewport ? margin : triggerRect.bottom + 10;
-    if (!compactViewport && top + panelRect.height > window.innerHeight - margin) {
-      top = triggerRect.top - panelRect.height - 10;
-    }
-    if (top < margin) {
-      top = margin;
-    }
-
-    const maxHeight = Math.max(240, window.innerHeight - top - margin);
-    notificationPanelStyle = `top:${Math.round(top)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.round(maxHeight)}px;opacity:1;pointer-events:auto;`;
+    notificationPanelStyle = anchoredPopoverStyle(notificationButtonElement, notificationPanelElement, {
+      align: "end",
+      maxWidth: 352,
+      minHeight: 96,
+      minWidth: 272,
+      placement: "below",
+      preferredWidth: 352
+    });
   }
 
   $effect(() => {
@@ -982,12 +1030,16 @@
 
     window.addEventListener("resize", update);
     window.addEventListener("scroll", update, true);
+    window.visualViewport?.addEventListener("resize", update);
+    window.visualViewport?.addEventListener("scroll", update);
     window.addEventListener("mousedown", handlePointerDown);
     window.addEventListener("keydown", handleKeyDown);
 
     return () => {
       window.removeEventListener("resize", update);
       window.removeEventListener("scroll", update, true);
+      window.visualViewport?.removeEventListener("resize", update);
+      window.visualViewport?.removeEventListener("scroll", update);
       window.removeEventListener("mousedown", handlePointerDown);
       window.removeEventListener("keydown", handleKeyDown);
     };
@@ -1026,7 +1078,9 @@
       {#if notificationsOpen}
         <div
           bind:this={notificationPanelElement}
-          class="sidebar-flyout sidebar-notification-panel fixed z-50 grid grid-rows-[auto_auto_minmax(0,1fr)] gap-3 rounded-2xl border border-gray-200 bg-white p-3 opacity-0 pointer-events-none shadow-[0_24px_54px_-28px_rgba(15,23,42,0.35)]"
+          use:portal
+          class="floating-popover sidebar-flyout sidebar-notification-panel grid grid-rows-[auto_auto_minmax(0,1fr)] gap-3 rounded-2xl border p-3 opacity-0 pointer-events-none"
+          data-positioned={notificationPanelStyle.includes("top:")}
           style={notificationPanelStyle}
         >
           <div class="flex items-center justify-between gap-3">
@@ -1798,7 +1852,9 @@
     {#if accountMenuOpen}
       <div
         bind:this={accountPopoverElement}
-        class="sidebar-flyout sidebar-account-popover fixed z-[105] grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] bg-white border border-gray-200 rounded-2xl shadow-2xl overflow-hidden opacity-0 pointer-events-none p-2 w-80 max-w-[calc(100vw-1rem)]"
+        use:portal
+        class="floating-popover sidebar-flyout sidebar-account-popover grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] border rounded-2xl overflow-hidden opacity-0 pointer-events-none p-2 w-80 max-w-[calc(100vw-1rem)]"
+        data-positioned={accountPopoverStyle.includes("top:")}
         style={accountPopoverStyle}
       >
         <div class="sidebar-flyout-header p-4 border-b border-gray-100 flex items-center justify-between">
@@ -1864,8 +1920,9 @@
                       </p>
                       {#if profileAccountState}
                         <div class="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[9px] font-semibold text-gray-500">
-                          <span>{ui.quota5h} {formatQuotaPercent(profileAccountState.quota.fiveHour?.remainingPercent)}</span>
-                          <span>{ui.quotaWeekly} {formatQuotaPercent(profileAccountState.quota.weekly?.remainingPercent)}</span>
+                          {#each quotaWindowsForDisplay(profileAccountState.quota).slice(0, 2) as window, windowIndex (window.id ?? `${profile.id}:${windowIndex}`)}
+                            <span>{quotaWindowLabel(window, windowIndex)} {formatQuotaPercent(window.remainingPercent)}</span>
+                          {/each}
                         </div>
                       {/if}
                     </button>
@@ -2045,30 +2102,37 @@
             <h4 class="text-[10px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
               <Zap size={10} /> {ui.quotaUsage}
             </h4>
-            
-            <div class="space-y-4">
-              <div class="space-y-1.5">
-                <div class="flex justify-between text-xs">
-                  <span class="font-medium text-gray-600">{ui.quota5h}</span>
-                  <span class="font-bold text-gray-900">{formatQuotaPercent(quota?.fiveHour?.remainingPercent)}</span>
-                </div>
-                <div class="sidebar-flyout-meter h-1.5 w-full rounded-full bg-gray-100 overflow-hidden">
-                  <div class="h-full bg-amber-500 rounded-full" style={`width: ${Math.max(0, Math.min(100, quota?.fiveHour?.remainingPercent ?? 0))}%`}></div>
-                </div>
-                <p class="text-[10px] text-gray-400 italic">Reset {formatQuotaReset(quota?.fiveHour?.resetAt)}</p>
-              </div>
 
-              <div class="space-y-1.5">
-                <div class="flex justify-between text-xs">
-                  <span class="font-medium text-gray-600">{ui.quotaWeekly}</span>
-                  <span class="font-bold text-gray-900">{formatQuotaPercent(quota?.weekly?.remainingPercent)}</span>
-                </div>
-                <div class="sidebar-flyout-meter h-1.5 w-full rounded-full bg-gray-100 overflow-hidden">
-                  <div class="h-full bg-amber-500 rounded-full" style={`width: ${Math.max(0, Math.min(100, quota?.weekly?.remainingPercent ?? 0))}%`}></div>
-                </div>
-                <p class="text-[10px] text-gray-400 italic">Reset {formatQuotaReset(quota?.weekly?.resetAt)}</p>
+            {#if displayedQuotaLimits.length > 0}
+              <div class="space-y-4">
+                {#each displayedQuotaLimits as limit (limit.id)}
+                  <div class="space-y-3">
+                    {#if displayedQuotaLimits.length > 1}
+                      <p class="truncate text-[10px] font-bold uppercase tracking-wide text-gray-500">{limit.name}</p>
+                    {/if}
+                    {#each limit.windows as window, windowIndex (window.id ?? `${limit.id}:${windowIndex}`)}
+                      <div class="space-y-1.5">
+                        <div class="flex justify-between gap-3 text-xs">
+                          <span class="min-w-0 truncate font-medium text-gray-600">{quotaWindowLabel(window, windowIndex)}</span>
+                          <span class="shrink-0 font-bold text-gray-900">{formatQuotaPercent(window.remainingPercent)}</span>
+                        </div>
+                        <div class="sidebar-flyout-meter h-1.5 w-full overflow-hidden rounded-full bg-gray-100">
+                          <div
+                            class="h-full rounded-full bg-amber-500"
+                            style={`width: ${Math.max(0, Math.min(100, window.remainingPercent ?? 0))}%`}
+                          ></div>
+                        </div>
+                        <p class="text-[10px] italic text-gray-400">{formatQuotaReset(window.resetAt)}</p>
+                      </div>
+                    {/each}
+                  </div>
+                {/each}
               </div>
-            </div>
+            {:else if quota?.error}
+              <p class="text-[11px] leading-snug text-red-500">{quota.error}</p>
+            {:else}
+              <p class="text-[11px] leading-snug text-gray-500">{formatQuotaPercent(null)}</p>
+            {/if}
           </div>
 
           {#if shouldShowResetTickets()}
@@ -2119,7 +2183,7 @@
                               {ticket.label ?? ticket.limitName ?? ticket.limitId ?? ticket.id}
                             </div>
                             <div class="truncate text-[10px] text-gray-400">
-                              {ticket.expiresAt ? `Expires ${ticket.expiresAt}` : ticket.id}
+                              {ticket.expiresAt ? (formatResetTicketDate(ticket.expiresAt) ?? ticket.id) : ticket.id}
                             </div>
                           </div>
                           <button

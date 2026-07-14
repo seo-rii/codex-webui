@@ -516,7 +516,7 @@
   <div
     class:terminal-shell__mobile-controls--loading={loading}
     class="terminal-shell__mobile-keys"
-    aria-label="Terminal mobile shortcuts"
+    aria-label={m.terminal_mobile_shortcuts()}
   >
     {#each mobileTerminalKeyRows as row, rowIndex (`row-${rowIndex}`)}
       <div class="terminal-shell__mobile-key-row">

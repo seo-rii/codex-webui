@@ -26,7 +26,7 @@
   } = $props();
 </script>
 
-<div class="fixed inset-0 z-[100] flex items-center justify-center p-6">
+<div aria-modal="true" class="fixed inset-0 flex items-center justify-center p-4 sm:p-6" role="dialog" style="z-index:var(--z-modal);">
   <button
     aria-label={closeLabel}
     class="ui-scrim ui-scrim--strong absolute inset-0"

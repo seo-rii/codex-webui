@@ -44,15 +44,29 @@ function shortCommit(commit) {
 
 export function createBuildMetadata(projectRoot, env = process.env) {
   const packageVersion = sanitizeVersionPart(env.CODEX_WEBUI_PACKAGE_VERSION) || readPackageVersion(projectRoot);
-  const commit = sanitizeVersionPart(env.CODEX_WEBUI_BUILD_COMMIT) || gitOutput(projectRoot, ["rev-parse", "HEAD"]) || "unknown";
-  const commitShort = sanitizeVersionPart(env.CODEX_WEBUI_BUILD_COMMIT_SHORT) || shortCommit(commit);
-  const dirty =
-    env.CODEX_WEBUI_BUILD_DIRTY === "true" || env.CODEX_WEBUI_BUILD_DIRTY === "false"
+  const repositoryCommit = gitOutput(projectRoot, ["rev-parse", "HEAD"]);
+  const inheritedCommit = sanitizeVersionPart(env.CODEX_WEBUI_BUILD_COMMIT);
+  const inheritedMetadataMatches = !repositoryCommit || !inheritedCommit || inheritedCommit === repositoryCommit;
+  const commit = repositoryCommit || inheritedCommit || "unknown";
+  const commitShort =
+    inheritedMetadataMatches && sanitizeVersionPart(env.CODEX_WEBUI_BUILD_COMMIT_SHORT)
+      ? sanitizeVersionPart(env.CODEX_WEBUI_BUILD_COMMIT_SHORT)
+      : shortCommit(commit);
+  const dirty = repositoryCommit
+    ? isGitDirty(projectRoot)
+    : env.CODEX_WEBUI_BUILD_DIRTY === "true" || env.CODEX_WEBUI_BUILD_DIRTY === "false"
       ? env.CODEX_WEBUI_BUILD_DIRTY === "true"
       : isGitDirty(projectRoot);
-  const epochMs = sanitizeVersionPart(env.CODEX_WEBUI_BUILD_EPOCH_MS) || String(Date.now());
-  const timestamp = String(env.CODEX_WEBUI_BUILD_TIMESTAMP ?? new Date(Number(epochMs)).toISOString());
-  const requestedVersion = sanitizeVersionPart(env.CODEX_WEBUI_BUILD_VERSION);
+  const epochMs =
+    inheritedMetadataMatches && sanitizeVersionPart(env.CODEX_WEBUI_BUILD_EPOCH_MS)
+      ? sanitizeVersionPart(env.CODEX_WEBUI_BUILD_EPOCH_MS)
+      : String(Date.now());
+  const timestamp = String(
+    inheritedMetadataMatches && env.CODEX_WEBUI_BUILD_TIMESTAMP
+      ? env.CODEX_WEBUI_BUILD_TIMESTAMP
+      : new Date(Number(epochMs)).toISOString()
+  );
+  const requestedVersion = inheritedMetadataMatches ? sanitizeVersionPart(env.CODEX_WEBUI_BUILD_VERSION) : "";
   const version =
     requestedVersion && requestedVersion.includes(commitShort)
       ? requestedVersion

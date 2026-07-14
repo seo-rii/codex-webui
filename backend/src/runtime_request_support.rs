@@ -272,6 +272,14 @@ pub(crate) async fn handle_profile_server_request(
         .and_then(Value::as_str)
         .map(str::to_string)
     else {
+        if let Ok(client) = app_server_client_by_key(state, profile_id, client_key).await {
+            let _ = client
+                .reject(
+                    request.id.clone(),
+                    "The app-server request did not identify a session.".to_string(),
+                )
+                .await;
+        }
         return;
     };
 
@@ -361,11 +369,11 @@ pub(crate) async fn handle_profile_server_request(
     }
 
     let created_at_ms = now_unix_ms();
-    let request_was_new = {
+    let (request_was_new, evicted_requests) = {
         let mut pending_requests = state.pending_server_requests.lock().await;
         let entries = pending_requests.entry(runtime_key).or_default();
         if entries.contains_key(&request_id) {
-            false
+            (false, Vec::new())
         } else {
             entries.insert(
                 request_id.clone(),
@@ -378,6 +386,7 @@ pub(crate) async fn handle_profile_server_request(
                     created_at_ms,
                 },
             );
+            let mut evicted_requests = Vec::new();
             if entries.len() > PENDING_SERVER_REQUEST_MAX_PER_SESSION {
                 let mut ordered = entries
                     .iter()
@@ -389,14 +398,26 @@ pub(crate) async fn handle_profile_server_request(
                     if entries.len() <= PENDING_SERVER_REQUEST_MAX_PER_SESSION {
                         break;
                     }
-                    entries.remove(&id);
+                    if let Some(evicted) = entries.remove(&id) {
+                        evicted_requests.push((evicted.raw_id, evicted.client_key));
+                    }
                 }
             }
-            true
+            (true, evicted_requests)
         }
     };
     if !request_was_new {
         return;
+    }
+    for (raw_id, evicted_client_key) in evicted_requests {
+        if let Ok(client) = app_server_client_by_key(state, profile_id, &evicted_client_key).await {
+            let _ = client
+                .reject(
+                    raw_id,
+                    "Too many pending app-server requests for this session.".to_string(),
+                )
+                .await;
+        }
     }
 
     emit_session_notification(

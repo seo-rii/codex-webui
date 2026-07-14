@@ -195,8 +195,13 @@ fn main() -> Result<()> {
     let gateway_log_dir = runtime_logs_dir(&config);
     fs::create_dir_all(&gateway_log_dir)
         .with_context(|| format!("failed to create {}", gateway_log_dir.display()))?;
-    let gateway_log_path = gateway_log_dir.join("codex-webui-gateway.log");
-    let gateway_log = tracing_appender::rolling::never(&gateway_log_dir, "codex-webui-gateway.log");
+    let gateway_log_path = gateway_log_dir.join("codex-webui-gateway.log.YYYY-MM-DD-HH");
+    let gateway_log = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::HOURLY)
+        .filename_prefix("codex-webui-gateway.log")
+        .max_log_files(72)
+        .build(&gateway_log_dir)
+        .context("failed to initialize rotating gateway log")?;
     let (gateway_log_writer, _gateway_log_guard) =
         tracing_appender::non_blocking::NonBlockingBuilder::default()
             .lossy(true)
@@ -312,15 +317,18 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             quota_cache: Arc::new(Mutex::new(HashMap::new())),
             quota_refreshes: Arc::new(Mutex::new(HashSet::new())),
             attachment_storage_usage_cache: Arc::new(Mutex::new(HashMap::new())),
+            attachment_storage_locks: Arc::new(Mutex::new(HashMap::new())),
             relays: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),
             session_summary_update_tasks: Arc::new(Mutex::new(HashMap::new())),
             runtime_config_update_tasks: Arc::new(Mutex::new(HashMap::new())),
             ui_state_locks: Arc::new(Mutex::new(HashMap::new())),
             ui_state_cache: Arc::new(Mutex::new(HashMap::new())),
+            ui_state_persistence: Arc::new(Mutex::new(HashMap::new())),
             automation_timers: Arc::new(Mutex::new(HashMap::new())),
             queue_dispatching: Arc::new(Mutex::new(HashSet::new())),
             queue_drain_retries: Arc::new(Mutex::new(HashMap::new())),
+            session_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             session_app_server_assignments: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             pending_turn_starts: Arc::new(Mutex::new(HashSet::new())),
@@ -334,8 +342,54 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             restart_plan: Arc::new(Mutex::new(None)),
         };
 
+        let address: SocketAddr = format!("{}:{}", config.public_host, config.public_port)
+            .parse()
+            .context("invalid public listen address")?;
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .context("failed to bind public listener")?;
+        info!("Rust gateway listening on http://{address}");
+
+        let stale_state_root = config.data_dir.join("profiles");
+        tokio::task::spawn_blocking(move || {
+            let mut pending = vec![stale_state_root];
+            let stale_before = std::time::SystemTime::now()
+                .checked_sub(Duration::from_secs(60 * 60))
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            while let Some(directory) = pending.pop() {
+                let Ok(entries) = fs::read_dir(directory) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
+                    if file_type.is_dir() {
+                        pending.push(path);
+                        continue;
+                    }
+                    let is_stale_atomic_temp = file_type.is_file()
+                        && entry.file_name().to_str().is_some_and(|name| {
+                            name.starts_with(".codex-webui-state-") && name.ends_with(".tmp")
+                        })
+                        && entry
+                            .metadata()
+                            .ok()
+                            .and_then(|metadata| metadata.modified().ok())
+                            .is_some_and(|modified| modified < stale_before);
+                    if is_stale_atomic_temp {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
+        });
+
         tokio::spawn(restore_automation_schedules(state.clone()));
         spawn_terminal_cleanup_loop(state.clone(), Duration::from_secs(60));
+        state
+            .app_servers
+            .spawn_idle_cleanup_loop(Duration::from_secs(60));
         for profile_id in runtime_profiles_snapshot(&state.config)
             .1
             .keys()
@@ -350,15 +404,6 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             .route("/", any(handle_http))
             .route("/{*path}", any(handle_http))
             .with_state(state.clone());
-
-        let address: SocketAddr = format!("{}:{}", config.public_host, config.public_port)
-            .parse()
-            .context("invalid public listen address")?;
-        info!("Rust gateway listening on http://{address}");
-
-        let listener = tokio::net::TcpListener::bind(address)
-            .await
-            .context("failed to bind public listener")?;
 
         let server_result = axum::serve(
             listener,
@@ -376,6 +421,7 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
         } else {
             let _ = state.app_servers.close_all().await;
         }
+        flush_pending_ui_state_writes(&state).await;
         if let Some(plan) = restart_plan {
             spawn_gateway_restart(&config, plan)
                 .await

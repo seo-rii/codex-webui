@@ -2,12 +2,20 @@ use super::*;
 
 pub(crate) async fn get_git_status_payload(state: &AppState, repo_path: &str) -> ApiResult<Value> {
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    // GitHub checkout calls this while already holding the operation lock.
+    get_git_status_payload_for_root(state, &repo_root).await
+}
+
+pub(crate) async fn get_git_status_payload_for_root(
+    state: &AppState,
+    repo_root: &str,
+) -> ApiResult<Value> {
     let allowed_roots = resolved_allowed_roots(&state.config).await;
     let repository =
-        build_git_repository_payload(state, Path::new(&repo_root), &allowed_roots).await?;
+        build_git_repository_payload(state, Path::new(repo_root), &allowed_roots).await?;
     let output = run_git_text_payload(
         state,
-        &repo_root,
+        repo_root,
         vec![
             "status".to_string(),
             "--porcelain=v1".to_string(),
@@ -92,7 +100,7 @@ pub(crate) async fn get_git_status_payload(state: &AppState, repo_path: &str) ->
 
     let branches_output = run_git_text_payload(
         state,
-        &repo_root,
+        repo_root,
         vec![
             "for-each-ref".to_string(),
             "refs/heads".to_string(),
@@ -119,7 +127,7 @@ pub(crate) async fn get_git_status_payload(state: &AppState, repo_path: &str) ->
 
     let commits_output = run_git_text_payload(
         state,
-        &repo_root,
+        repo_root,
         vec![
             "log".to_string(),
             "--max-count=12".to_string(),
@@ -145,7 +153,7 @@ pub(crate) async fn get_git_status_payload(state: &AppState, repo_path: &str) ->
 
     Ok(json!({
         "repo": {
-            "path": repository.get("path").cloned().unwrap_or(Value::String(repo_root.clone())),
+            "path": repository.get("path").cloned().unwrap_or(Value::String(repo_root.to_string())),
             "name": repository.get("name").cloned().unwrap_or(Value::Null),
             "rootPath": repository.get("rootPath").cloned().unwrap_or(Value::Null),
             "relativePath": repository.get("relativePath").cloned().unwrap_or(Value::Null),
@@ -167,7 +175,17 @@ pub(crate) async fn get_git_file_payload(
     file_path: &str,
 ) -> ApiResult<Value> {
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
-    let status_payload = get_git_status_payload(state, &repo_root).await?;
+    let repo_lock = git_operation_lock(state, &repo_root).await;
+    let _repo_guard = repo_lock.lock().await;
+    get_git_file_payload_for_root(state, &repo_root, file_path).await
+}
+
+pub(crate) async fn get_git_file_payload_for_root(
+    state: &AppState,
+    repo_root: &str,
+    file_path: &str,
+) -> ApiResult<Value> {
+    let status_payload = get_git_status_payload_for_root(state, repo_root).await?;
     let status = status_payload
         .get("files")
         .and_then(Value::as_array)
@@ -179,9 +197,53 @@ pub(crate) async fn get_git_file_payload(
         .cloned()
         .unwrap_or(Value::Null);
 
-    let candidate_path = resolve_git_repository_file_path(&repo_root, file_path).await?;
-    ensure_text_file_preview_size(&candidate_path).await?;
-    let modified_bytes = tokio_fs::read(&candidate_path).await.unwrap_or_default();
+    let candidate_path = resolve_git_repository_file_path(repo_root, file_path).await?;
+    let modified_bytes = match tokio_fs::File::open(&candidate_path).await {
+        Ok(file) => {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::fd::AsRawFd;
+                let opened_path =
+                    tokio_fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                        .await
+                        .map_err(|error| {
+                            api_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to validate the opened Git file: {error}"),
+                            )
+                        })?;
+                let canonical_repo_root = tokio_fs::canonicalize(repo_root)
+                    .await
+                    .unwrap_or_else(|_| PathBuf::from(repo_root));
+                ensure_not_sensitive_file_path(&opened_path)?;
+                if !path_is_within(&canonical_repo_root, &opened_path) {
+                    return Err(api_error(
+                        StatusCode::FORBIDDEN,
+                        "The opened file is outside the repository root.",
+                    ));
+                }
+            }
+            let mut bytes = Vec::new();
+            file.take(TEXT_FILE_PREVIEW_LIMIT_BYTES.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            if bytes.len() as u64 > TEXT_FILE_PREVIEW_LIMIT_BYTES {
+                return Err(api_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "The selected file is too large to preview.",
+                ));
+            }
+            bytes
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.to_string(),
+            ));
+        }
+    };
     let modified_is_binary = modified_bytes.contains(&0);
     let modified_content = if modified_is_binary {
         String::new()
@@ -198,7 +260,7 @@ pub(crate) async fn get_git_file_payload(
         "git",
         vec![
             "-C".to_string(),
-            repo_root.clone(),
+            repo_root.to_string(),
             "show".to_string(),
             format!("HEAD:{}", head_path.replace('\\', "/")),
         ],
@@ -294,6 +356,8 @@ pub(crate) async fn get_git_commit_diff_payload(
     commit_hash: &str,
 ) -> ApiResult<Value> {
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let repo_lock = git_operation_lock(state, &repo_root).await;
+    let _repo_guard = repo_lock.lock().await;
     let normalized_commit_hash = commit_hash.trim();
     if normalized_commit_hash.is_empty() {
         return Err(api_error(

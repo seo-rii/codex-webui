@@ -16,16 +16,16 @@ pub(crate) struct LocalRolloutTurnWindow {
     pub(crate) modified_at_ms: Option<u64>,
 }
 
-struct RolloutRecord {
-    value: Value,
-    absolute_offset: u64,
+pub(crate) struct RolloutRecord {
+    pub(crate) value: Value,
+    pub(crate) absolute_offset: u64,
 }
 
-struct RolloutRecordWindow {
-    records: Vec<RolloutRecord>,
-    truncated: bool,
-    corruption_detected: bool,
-    modified_at_ms: Option<u64>,
+pub(crate) struct RolloutRecordWindow {
+    pub(crate) records: Vec<RolloutRecord>,
+    pub(crate) truncated: bool,
+    pub(crate) corruption_detected: bool,
+    pub(crate) modified_at_ms: Option<u64>,
 }
 
 async fn clear_completed_session_highlight_on_open(
@@ -92,7 +92,7 @@ async fn session_pending_requests_payload(
     requests
 }
 
-fn summarize_session_turn_for_detail_payload(
+pub(crate) fn summarize_session_turn_for_detail_payload(
     turn: &Value,
     turn_index: usize,
     compact_completed_process: bool,
@@ -158,10 +158,16 @@ fn summarize_session_turn_for_detail_payload(
                 hidden_item_count = hidden_item_count.saturating_add(1);
                 return None;
             }
-            Some(match item_type.as_str() {
-                "commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall"
-                | "webSearch" => prepare_session_deferred_item_payload(item, &turn_id, item_index),
-                _ => normalized,
+            Some(if compact_completed_process {
+                match item_type.as_str() {
+                    "commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall"
+                    | "webSearch" => {
+                        prepare_session_deferred_item_payload(item, &turn_id, item_index)
+                    }
+                    _ => normalized,
+                }
+            } else {
+                normalized
             })
         })
         .collect::<Vec<_>>();
@@ -180,7 +186,17 @@ fn summarize_session_turn_for_detail_payload(
     summarized
         .entry("durationMs".to_string())
         .or_insert_with(|| Value::Null);
-    summarized.insert("detailState".to_string(), Value::String("full".to_string()));
+    summarized.insert(
+        "detailState".to_string(),
+        Value::String(
+            if hidden_item_count > 0 {
+                "summary"
+            } else {
+                "full"
+            }
+            .to_string(),
+        ),
+    );
     summarized.insert(
         "hiddenItemCount".to_string(),
         Value::from(hidden_item_count),
@@ -369,9 +385,44 @@ fn update_rollout_item(turn: &mut Value, item_id: &str, update: impl FnOnce(&mut
 fn parse_function_call_arguments(payload: &Value) -> Value {
     payload
         .get("arguments")
+        .or_else(|| payload.get("input"))
         .and_then(Value::as_str)
         .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+        .or_else(|| payload.get("arguments").cloned())
+        .or_else(|| payload.get("input").cloned())
         .unwrap_or_else(|| json!({}))
+}
+
+fn copy_rollout_item_metadata(payload: &Value, item: &mut serde_json::Map<String, Value>) {
+    for (target_key, source_keys) in [
+        ("annotations", ["annotations", "annotations"]),
+        (
+            "internalChatMessageMetadataPassthrough",
+            [
+                "internalChatMessageMetadataPassthrough",
+                "internal_chat_message_metadata_passthrough",
+            ],
+        ),
+        ("metadata", ["metadata", "metadata"]),
+        ("_meta", ["_meta", "_meta"]),
+    ] {
+        if let Some(value) = source_keys
+            .iter()
+            .find_map(|source_key| payload.get(*source_key))
+            .filter(|value| !value.is_null())
+        {
+            if let (Some(existing), Some(incoming)) = (
+                item.get_mut(target_key).and_then(Value::as_object_mut),
+                value.as_object(),
+            ) {
+                for (key, value) in incoming {
+                    existing.insert(key.clone(), value.clone());
+                }
+            } else {
+                item.insert(target_key.to_string(), value.clone());
+            }
+        }
+    }
 }
 
 fn command_item_from_rollout_function_call(payload: &Value) -> Value {
@@ -384,27 +435,83 @@ fn command_item_from_rollout_function_call(payload: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("tool");
     let arguments = parse_function_call_arguments(payload);
-    if name == "exec_command" || name == "write_stdin" {
+    let mut item = if matches!(name, "exec" | "exec_command" | "write_stdin") {
         json!({
             "id": call_id,
             "type": "commandExecution",
             "command": arguments
                 .get("cmd")
                 .or_else(|| arguments.get("chars"))
+                .or_else(|| arguments.get("command"))
                 .cloned()
-                .unwrap_or_else(|| Value::String(name.to_string())),
+                .unwrap_or_else(|| payload.get("input").cloned().unwrap_or_else(|| Value::String(name.to_string()))),
             "cwd": arguments.get("workdir").cloned().unwrap_or(Value::Null),
             "exitCode": Value::Null,
-            "status": "running"
+            "status": payload.get("status").cloned().unwrap_or_else(|| json!("running")),
+            "arguments": arguments.clone(),
+            "input": payload.get("input").cloned().unwrap_or(Value::Null),
+            "invocation": {
+                "tool": name,
+                "arguments": arguments
+            }
         })
     } else {
         json!({
             "id": call_id,
             "type": "dynamicToolCall",
             "tool": name,
-            "status": "running"
+            "status": payload.get("status").cloned().unwrap_or_else(|| json!("running")),
+            "arguments": arguments.clone(),
+            "input": payload.get("input").cloned().unwrap_or(Value::Null),
+            "invocation": {
+                "tool": name,
+                "arguments": arguments
+            }
         })
+    };
+    if let Some(item_object) = item.as_object_mut() {
+        copy_rollout_item_metadata(payload, item_object);
     }
+    item
+}
+
+fn mcp_tool_call_item_from_rollout_payload(payload: &Value, status: &str) -> Value {
+    let invocation = payload
+        .get("invocation")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let raw_result = payload.get("result").cloned().unwrap_or(Value::Null);
+    let failed = raw_result.get("Err").is_some() || payload.get("error").is_some();
+    let result = raw_result.get("Ok").cloned().unwrap_or_else(|| {
+        (!failed)
+            .then_some(raw_result.clone())
+            .unwrap_or(Value::Null)
+    });
+    let error = raw_result
+        .get("Err")
+        .cloned()
+        .or_else(|| payload.get("error").cloned())
+        .unwrap_or(Value::Null);
+    let mut item = json!({
+        "id": payload
+            .get("call_id")
+            .or_else(|| payload.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("mcp-tool"),
+        "type": "mcpToolCall",
+        "server": invocation.get("server").cloned().unwrap_or(Value::Null),
+        "tool": invocation.get("tool").cloned().unwrap_or(Value::Null),
+        "arguments": invocation.get("arguments").cloned().unwrap_or_else(|| json!({})),
+        "invocation": invocation,
+        "status": if failed { "failed" } else { status },
+        "result": result,
+        "error": error,
+        "duration": payload.get("duration").cloned().unwrap_or(Value::Null)
+    });
+    if let Some(item_object) = item.as_object_mut() {
+        copy_rollout_item_metadata(payload, item_object);
+    }
+    item
 }
 
 fn context_compaction_item_from_rollout_payload(
@@ -612,12 +719,13 @@ fn rollout_tail_records(
                 .iter()
                 .position(|byte| *byte == b'\n')
                 .map(|relative| cursor.saturating_add(relative));
-            let Some(line_end) = next_newline else {
-                // A writer may be appending the final JSONL record. Do not classify a
-                // partial trailing line as corruption until its newline is durable.
-                break;
+            let trailing_without_newline = next_newline.is_none();
+            let line_end = next_newline.unwrap_or(buffer.len());
+            cursor = if trailing_without_newline {
+                buffer.len()
+            } else {
+                line_end.saturating_add(1)
             };
-            cursor = line_end.saturating_add(1);
             let mut line = &buffer[line_start..line_end];
             if line.last() == Some(&b'\r') {
                 line = &line[..line.len().saturating_sub(1)];
@@ -626,12 +734,19 @@ fn rollout_tail_records(
                 continue;
             }
             let Ok(text) = std::str::from_utf8(line) else {
-                corruption_detected = true;
+                if !trailing_without_newline {
+                    corruption_detected = true;
+                }
                 continue;
             };
             let trimmed = text.trim();
             let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-                corruption_detected = true;
+                // Codex may currently be appending this final record. Ignore an
+                // incomplete trailing line, but accept a complete JSON value even
+                // when the process exited before writing its final newline.
+                if !trailing_without_newline {
+                    corruption_detected = true;
+                }
                 continue;
             };
             if rollout_tail_line_may_affect_detail(trimmed) {
@@ -672,6 +787,12 @@ fn rollout_tail_line_may_affect_detail(line: &str) -> bool {
         || line.contains(r#""type": "function_call""#)
         || line.contains(r#""type":"custom_tool_call""#)
         || line.contains(r#""type": "custom_tool_call""#)
+        || line.contains(r#""type":"function_call_output""#)
+        || line.contains(r#""type": "function_call_output""#)
+        || line.contains(r#""type":"custom_tool_call_output""#)
+        || line.contains(r#""type": "custom_tool_call_output""#)
+        || line.contains(r#""type":"mcp_tool_call_""#)
+        || line.contains(r#""type": "mcp_tool_call_""#)
         || line.contains(r#""type":"reasoning""#)
         || line.contains(r#""type": "reasoning""#)
         || line.contains(r#""type":"context_compaction""#)
@@ -692,7 +813,7 @@ fn rollout_tail_line_may_affect_detail(line: &str) -> bool {
         || line.contains(r#""type": "thread_rolled_back""#)
 }
 
-fn build_turn_window_from_rollout_records(
+pub(crate) fn build_turn_window_from_rollout_records(
     record_window: RolloutRecordWindow,
     limit: usize,
 ) -> LocalRolloutTurnWindow {
@@ -969,7 +1090,12 @@ fn build_turn_window_from_rollout_records(
                             "id": format!("{turn_item_prefix}:agent:{record_identity}"),
                             "type": "agentMessage",
                             "text": message,
-                            "phase": payload.get("phase").cloned().unwrap_or(Value::Null)
+                            "phase": payload.get("phase").cloned().unwrap_or(Value::Null),
+                            "memoryCitation": payload
+                                .get("memory_citation")
+                                .or_else(|| payload.get("memoryCitation"))
+                                .cloned()
+                                .unwrap_or(Value::Null)
                         }),
                     );
                 }
@@ -1200,6 +1326,43 @@ fn build_turn_window_from_rollout_records(
                     file_change_item_from_patch_apply_payload(payload),
                 );
             }
+            ("event_msg", "mcp_tool_call_begin") | ("event_msg", "mcp_tool_call_end") => {
+                let turn_id = payload.get("turn_id").and_then(Value::as_str);
+                let index = ensure_rollout_turn_index(
+                    &mut turns,
+                    &mut current_index,
+                    turn_id,
+                    timestamp_ms,
+                );
+                let status = if payload_type == "mcp_tool_call_begin" {
+                    "inProgress"
+                } else {
+                    "completed"
+                };
+                let item = mcp_tool_call_item_from_rollout_payload(payload, status);
+                let item_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if item_id.is_empty() {
+                    continue;
+                }
+                let updated = update_rollout_item(&mut turns[index], &item_id, |existing| {
+                    if let (Some(existing), Some(incoming)) =
+                        (existing.as_object_mut(), item.as_object())
+                    {
+                        for (key, value) in incoming {
+                            if !value.is_null() {
+                                existing.insert(key.clone(), value.clone());
+                            }
+                        }
+                    }
+                });
+                if !updated {
+                    push_rollout_item(&mut turns[index], item);
+                }
+            }
             ("response_item", "function_call") | ("response_item", "custom_tool_call") => {
                 let index =
                     ensure_rollout_turn_index(&mut turns, &mut current_index, None, timestamp_ms);
@@ -1218,6 +1381,14 @@ fn build_turn_window_from_rollout_records(
                     update_rollout_item(&mut turns[index], call_id, |item| {
                         if let Some(object) = item.as_object_mut() {
                             object.insert("status".to_string(), json!("completed"));
+                            if let Some(result) = payload
+                                .get("output")
+                                .or_else(|| payload.get("result"))
+                                .filter(|value| !value.is_null())
+                            {
+                                object.insert("result".to_string(), result.clone());
+                            }
+                            copy_rollout_item_metadata(payload, object);
                         }
                     });
                 }
@@ -1337,9 +1508,8 @@ async fn read_local_rollout_turn_window_with_max(
         let corruption_detected = record_window.corruption_detected;
         let mut turn_window = build_turn_window_from_rollout_records(record_window, limit);
         if corruption_detected {
-            let rollout_buffer = fs::read(&rollout_path)
+            let recovery = inspect_rollout_recovery_file(&rollout_path)
                 .map_err(|error| format!("failed to inspect corrupted rollout file: {error}"))?;
-            let recovery = inspect_rollout_recovery_content(&rollout_buffer).info;
             if recovery.available {
                 turn_window.recovery = Some(recovery);
             }
@@ -1775,14 +1945,13 @@ pub(crate) async fn session_detail_payload(
                         .map_err(|_| error.clone())?;
                     let rollout_path = resolve_rollout_path(state, profile_id, session_id, &thread)
                         .ok_or_else(|| error.clone())?;
-                    let rollout_buffer = tokio_fs::read(&rollout_path)
-                        .await
-                        .map_err(|_| error.clone())?;
-                    let plan = inspect_rollout_recovery_content(&rollout_buffer);
-                    if !plan.info.available
-                        || plan.info.recoverable_lines == 0
-                        || plan.recovered_content.trim().is_empty()
-                    {
+                    let recovery_info = tokio::task::spawn_blocking(move || {
+                        inspect_rollout_recovery_file(&rollout_path)
+                    })
+                    .await
+                    .map_err(|_| error.clone())?
+                    .map_err(|_| error.clone())?;
+                    if !recovery_info.available || recovery_info.recoverable_lines == 0 {
                         return Err(error);
                     }
 
@@ -1812,7 +1981,7 @@ pub(crate) async fn session_detail_payload(
                         start,
                         "error",
                         Value::String(error.message),
-                        json!(plan.info),
+                        json!(recovery_info),
                     )
                 }
             }
@@ -2458,7 +2627,9 @@ pub(crate) async fn session_turn_payload(
             .find(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id))
             .cloned()
         {
-            return Ok(json!({ "turn": turn }));
+            return Ok(json!({
+                "turn": summarize_session_turn_for_detail_payload(&turn, 0, false)
+            }));
         }
     }
 
@@ -2473,7 +2644,9 @@ pub(crate) async fn session_turn_payload(
         })
         .cloned()
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Turn not found."))?;
-    Ok(json!({ "turn": turn }))
+    Ok(json!({
+        "turn": summarize_session_turn_for_detail_payload(&turn, 0, false)
+    }))
 }
 
 pub(crate) async fn session_item_detail_payload(

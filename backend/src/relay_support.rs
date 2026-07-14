@@ -49,7 +49,12 @@ pub(crate) async fn subscribe_session(
         let mut pending_delta_key = String::new();
         let mut pending_delta_started_at: Option<Instant> = None;
         loop {
-            match tokio::time::timeout(RELAY_DELTA_IDLE_FLUSH_TIMEOUT, receiver.recv()).await {
+            let received = if pending_delta_event.is_some() {
+                tokio::time::timeout(RELAY_DELTA_IDLE_FLUSH_TIMEOUT, receiver.recv()).await
+            } else {
+                Ok(receiver.recv().await)
+            };
+            match received {
                 Err(_) => {
                     if let Some(event) = pending_delta_event.take() {
                         if !send_relay_envelope(
@@ -608,67 +613,7 @@ pub(crate) async fn ensure_global_relay(
 
     let (sender, _) = broadcast::channel(256);
     relays.insert(relay_key, sender.clone());
-
-    let state = state.clone();
-    let profile_id = profile_id.to_string();
-    let relay_sender = sender.clone();
-    tokio::spawn(bridge_app_server_global_notifications(
-        state.clone(),
-        relay_sender.clone(),
-        profile_id.clone(),
-    ));
-
     Ok(sender)
-}
-
-async fn bridge_app_server_global_notifications(
-    state: AppState,
-    sender: broadcast::Sender<Value>,
-    profile_id: String,
-) {
-    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, &profile_id)
-        .0
-        .to_string();
-    let client = match app_server_client(&state, &profile_id).await {
-        Ok(client) => client,
-        Err(error) => {
-            warn!("failed to create app-server bridge for {profile_id}: {error:#}");
-            return;
-        }
-    };
-    let mut notifications = client.subscribe_notifications();
-
-    loop {
-        match notifications.recv().await {
-            Ok(notification) => {
-                if matches!(
-                    notification.method.as_str(),
-                    "account/updated" | "account/rateLimits/updated"
-                ) {
-                    state.quota_cache.lock().await.remove(&resolved_profile_id);
-                }
-
-                if let Some(event) = map_app_server_global_notification(&notification) {
-                    let _ = sender.send(event);
-                }
-            }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!(
-                    "global app-server relay lagged for {profile_id}: skipped {skipped} messages"
-                );
-                let _ = sender.send(json!({
-                    "kind": "notification",
-                    "method": "codex-webui/resyncRequired",
-                    "params": {
-                        "reason": format!(
-                            "global app-server relay lagged for {profile_id}; skipped {skipped} messages"
-                        )
-                    }
-                }));
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
-        }
-    }
 }
 
 pub(crate) async fn emit_global_notification(state: &AppState, event: Value) {

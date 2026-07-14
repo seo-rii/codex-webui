@@ -1047,6 +1047,112 @@ async fn codex_apps_list_routes_by_thread_profile_when_request_profile_is_stale(
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[test]
+fn quota_normalization_uses_server_window_durations_and_additional_limits() {
+    let payload: UsageResponseShape = serde_json::from_value(json!({
+        "email": "quota@example.com",
+        "plan_type": "pro",
+        "rate_limit": {
+            "primary_window": {
+                "used_percent": 38,
+                "limit_window_seconds": 2_592_000,
+                "reset_at": 1_800_000_000
+            }
+        },
+        "additional_rate_limits": [{
+            "limit_name": "Code review",
+            "metered_feature": "review",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 20,
+                    "limit_window_seconds": 86_400,
+                    "reset_at": 1_800_086_400
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    let normalized = normalize_quota_payload(payload);
+    assert_eq!(normalized["available"].as_bool(), Some(true));
+    assert_eq!(normalized["limits"].as_array().map(Vec::len), Some(2));
+    assert_eq!(normalized["windows"][0]["label"].as_str(), Some("Monthly"));
+    assert_eq!(
+        normalized["windows"][0]["windowDurationMinutes"].as_i64(),
+        Some(43_200)
+    );
+    assert_eq!(
+        normalized["windows"][0]["resetAt"].as_u64(),
+        Some(1_800_000_000_000)
+    );
+    assert!(normalized["fiveHour"].is_null());
+    assert!(normalized["weekly"].is_null());
+    assert_eq!(
+        normalized["limits"][1]["windows"][0]["label"].as_str(),
+        Some("Daily")
+    );
+}
+
+#[test]
+fn quota_normalization_finds_legacy_aliases_by_duration_not_window_position() {
+    let payload: UsageResponseShape = serde_json::from_value(json!({
+        "rate_limit": {
+            "primary_window": {
+                "used_percent": 10,
+                "limit_window_seconds": 604_800,
+                "reset_at": 1_800_000_000
+            },
+            "secondary_window": {
+                "used_percent": 25,
+                "limit_window_seconds": 18_000,
+                "reset_at": 1_799_000_000
+            }
+        }
+    }))
+    .unwrap();
+
+    let normalized = normalize_quota_payload(payload);
+    assert_eq!(normalized["weekly"]["kind"].as_str(), Some("primary"));
+    assert_eq!(normalized["weekly"]["label"].as_str(), Some("Weekly"));
+    assert_eq!(normalized["fiveHour"]["kind"].as_str(), Some("secondary"));
+    assert_eq!(normalized["fiveHour"]["label"].as_str(), Some("5h"));
+}
+
+#[tokio::test]
+async fn rate_limit_notification_invalidates_quota_before_client_refresh() {
+    let sandbox = unique_test_dir("quota-notification-cache-invalidation");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    state.quota_cache.lock().await.insert(
+        "default".to_string(),
+        CachedQuota {
+            created_at: Instant::now(),
+            payload: json!({ "available": true, "windows": [] }),
+        },
+    );
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "account/rateLimits/updated".to_string(),
+            params: json!({
+                "rateLimits": {
+                    "primary": { "usedPercent": 50 }
+                }
+            }),
+        },
+    )
+    .await;
+
+    assert!(!state.quota_cache.lock().await.contains_key("default"));
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_quota_status_reuses_recent_cache_for_forced_refresh() {
     let sandbox = unique_test_dir("runtime-quota-cache");
@@ -1338,7 +1444,16 @@ async fn codex_reset_tickets_payload_supports_latest_reset_credit_summary() {
                         }
                     },
                     "rateLimitResetCredits": {
-                        "availableCount": 2
+                        "availableCount": 1,
+                        "credits": [{
+                            "id": "credit-latest-1",
+                            "resetType": "codex",
+                            "status": "available",
+                            "grantedAt": 1_800_000_000,
+                            "expiresAt": 1_800_086_400,
+                            "title": "Event reset credit",
+                            "description": "One temporary reset"
+                        }]
                     }
                 }
             }),
@@ -1355,20 +1470,24 @@ async fn codex_reset_tickets_payload_supports_latest_reset_credit_summary() {
     );
     assert_eq!(
         payload.get("availableCount").and_then(Value::as_i64),
-        Some(2)
+        Some(1)
     );
     let tickets = payload
         .get("tickets")
         .and_then(Value::as_array)
         .expect("latest reset credits should materialize usable entries");
-    assert_eq!(tickets.len(), 2);
+    assert_eq!(tickets.len(), 1);
     assert_eq!(
         tickets
             .first()
             .and_then(|ticket| ticket.get("id"))
             .and_then(Value::as_str),
-        Some("rate-limit-reset-credit-1")
+        Some("credit-latest-1")
     );
+    assert_eq!(tickets[0]["status"].as_str(), Some("available"));
+    assert_eq!(tickets[0]["resetType"].as_str(), Some("codex"));
+    assert_eq!(tickets[0]["createdAt"].as_u64(), Some(1_800_000_000_000));
+    assert_eq!(tickets[0]["expiresAt"].as_u64(), Some(1_800_086_400_000));
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -2738,6 +2857,80 @@ async fn terminal_status_does_not_override_app_server_active_turn() {
         ui_state["runtimeStatusByThreadId"][session_id]["status"].as_str(),
         Some("running")
     );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_status_timeout_preserves_cached_active_turn() {
+    let sandbox = unique_test_dir("terminal-status-timeout-keeps-live-turn");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-terminal-timeout-keeps-live";
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "A slow read must not stop a live turn",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 20,
+                    "status": "running",
+                    "isSubagent": false,
+                    "readDelayMs": 1_500,
+                    "turns": [{
+                        "id": "turn-live",
+                        "status": "inProgress",
+                        "items": []
+                    }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-live".to_string());
+    set_runtime_session_status(&state, "default", session_id, "running").await;
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "thread/status/changed".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "status": "failed"
+            }),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        state.active_turns.lock().await.get(&runtime_key).cloned(),
+        Some("turn-live".to_string())
+    );
+    let status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][session_id]["status"].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.as_str(), Some("running"));
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -4755,6 +4948,10 @@ async fn queue_write_helpers_mutate_queue_state() {
     fs::create_dir_all(&codex_home).unwrap();
 
     let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    state.active_turns.lock().await.insert(
+        runtime_session_key("default", "thread-1"),
+        "turn-queue-helper-test".to_string(),
+    );
 
     let queue_skills = json!([
         {
@@ -4986,6 +5183,148 @@ async fn dispatch_queue_item_returns_current_queue_when_dispatch_is_busy() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test]
+async fn queue_mutations_reject_only_the_item_claimed_for_dispatch() {
+    let sandbox = unique_test_dir("queue-item-dispatch-claim");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["queuesByThreadId"]["thread-1"] = json!({
+            "items": [
+                { "id": "queue-dispatching", "prompt": "first", "createdAt": 1 },
+                { "id": "queue-second", "prompt": "second", "createdAt": 2 },
+                { "id": "queue-third", "prompt": "third", "createdAt": 3 },
+                { "id": "queue-fourth", "prompt": "fourth", "createdAt": 4 }
+            ],
+            "resumePending": false,
+            "updatedAt": 5
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let claimed =
+        claim_session_queue_item_for_dispatch(&state, "default", "thread-1", "queue-dispatching")
+            .await
+            .unwrap();
+    assert_eq!(
+        claimed.get("status").and_then(Value::as_str),
+        Some("dispatching")
+    );
+    assert!(
+        claimed
+            .get("dispatchingAt")
+            .and_then(Value::as_u64)
+            .is_some()
+    );
+
+    let update_error = update_session_queue_item_payload(
+        &state,
+        "default",
+        "thread-1",
+        "queue-dispatching",
+        Some("stale edit"),
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(update_error.status, StatusCode::CONFLICT);
+    assert_eq!(update_error.message, "QUEUE_ALREADY_DISPATCHING");
+
+    let remove_error =
+        remove_session_queue_item_payload(&state, "default", "thread-1", "queue-dispatching")
+            .await
+            .unwrap_err();
+    assert_eq!(remove_error.status, StatusCode::CONFLICT);
+    assert_eq!(remove_error.message, "QUEUE_ALREADY_DISPATCHING");
+
+    let move_dispatching_error = reorder_session_queue_payload(
+        &state,
+        "default",
+        "thread-1",
+        &[
+            "queue-second".to_string(),
+            "queue-dispatching".to_string(),
+            "queue-third".to_string(),
+            "queue-fourth".to_string(),
+        ],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(move_dispatching_error.status, StatusCode::CONFLICT);
+    assert_eq!(move_dispatching_error.message, "QUEUE_ALREADY_DISPATCHING");
+
+    let reordered = reorder_session_queue_payload(
+        &state,
+        "default",
+        "thread-1",
+        &[
+            "queue-dispatching".to_string(),
+            "queue-fourth".to_string(),
+            "queue-second".to_string(),
+            "queue-third".to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+    let reordered_ids = reordered
+        .get("items")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reordered_ids,
+        vec![
+            "queue-dispatching",
+            "queue-fourth",
+            "queue-second",
+            "queue-third"
+        ]
+    );
+
+    let updated = update_session_queue_item_payload(
+        &state,
+        "default",
+        "thread-1",
+        "queue-second",
+        Some("second updated while first dispatches"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        updated
+            .get("items")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item.get("id").and_then(Value::as_str) == Some("queue-second")
+                    && item.get("prompt").and_then(Value::as_str)
+                        == Some("second updated while first dispatches")
+            })
+    );
+
+    let removed = remove_session_queue_item_payload(&state, "default", "thread-1", "queue-third")
+        .await
+        .unwrap();
+    assert_eq!(
+        removed.get("items").and_then(Value::as_array).map(Vec::len),
+        Some(3)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_queue_dispatch_resumes_remaining_items_after_turn_completion() {
     let sandbox = unique_test_dir("queue-manual-dispatch-resumes");
@@ -5119,6 +5458,137 @@ async fn manual_queue_dispatch_resumes_remaining_items_after_turn_completion() {
     assert_eq!(
         queue.get("items").and_then(Value::as_array).map(Vec::len),
         Some(0)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_drain_recovers_orphaned_dispatch_claim_without_manual_resume() {
+    let sandbox = unique_test_dir("queue-recovers-orphaned-dispatch-claim");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5.4"
+        }),
+        None,
+        Some("Recover orphaned queue dispatch"),
+    )
+    .await
+    .unwrap();
+    let session_id = created.get("id").and_then(Value::as_str).unwrap();
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["queuesByThreadId"][session_id] = json!({
+            "items": [
+                {
+                    "id": "queue-orphaned",
+                    "prompt": "Continue without requiring Resume queue.",
+                    "attachmentIds": [],
+                    "attachmentNames": [],
+                    "status": "dispatching",
+                    "dispatchingAt": 10,
+                    "createdAt": 10
+                },
+                {
+                    "id": "queue-follow-up",
+                    "prompt": "Send the next item automatically.",
+                    "attachmentIds": [],
+                    "attachmentNames": [],
+                    "createdAt": 11
+                }
+            ],
+            "resumePending": true,
+            "updatedAt": 20
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    maybe_drain_queue(&state, "default", session_id).await;
+
+    let active_turn_id = state
+        .active_turns
+        .lock()
+        .await
+        .get(&runtime_session_key("default", session_id))
+        .cloned()
+        .expect("the recovered first queue item should start a turn");
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Recover orphaned queue dispatch",
+                    "preview": "Continue without requiring Resume queue.",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "completed",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": [{
+                        "id": active_turn_id,
+                        "status": "completed",
+                        "items": []
+                    }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..80 {
+        let queue = get_session_queue_payload(&state, "default", session_id)
+            .await
+            .unwrap();
+        if queue
+            .get("items")
+            .and_then(Value::as_array)
+            .is_none_or(|items| items.is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let queue = get_session_queue_payload(&state, "default", session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.get("items").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        queue.get("resumeRequired").and_then(Value::as_bool),
+        Some(false)
+    );
+    let thread = read_thread_payload(&state, "default", session_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        thread
+            .get("lastTurnStart")
+            .and_then(|value| value.get("input"))
+            .and_then(Value::as_array)
+            .and_then(|input| input.first())
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str),
+        Some("Send the next item automatically.")
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -6574,6 +7044,7 @@ async fn queue_drain_persists_dispatch_failure_on_item() {
         .expect("failed queue item should remain visible");
     assert_eq!(item.get("id").and_then(Value::as_str), Some("queue-failed"));
     assert_eq!(item.get("status").and_then(Value::as_str), Some("failed"));
+    assert!(item.get("dispatchingAt").is_none());
     assert!(item.get("failedAt").and_then(Value::as_u64).is_some());
     assert!(
         item.get("error")
@@ -6856,7 +7327,7 @@ async fn idle_reconciliation_completes_instead_of_failing_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deltas_and_goal_usage_replays_do_not_rewrite_runtime_state() {
+async fn live_delta_recovers_runtime_without_cancelling_scheduled_shutdown() {
     let sandbox = unique_test_dir("non-live-runtime-events");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -6872,8 +7343,34 @@ async fn deltas_and_goal_usage_replays_do_not_rewrite_runtime_state() {
         Some(json!({ "kind": "attention", "reason": "approval", "at": 1 })),
     )
     .await;
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "item/agentMessage/delta".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "delta": "first"
+            }),
+        },
+    )
+    .await;
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["global"]["scheduledShutdown"] = json!({
+            "scheduledFor": now_unix_ms() + 60_000,
+            "reason": "test"
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
     let before = with_ui_state_read(&state, "default", |ui_state| {
-        Ok(ui_state["runtimeStatusByThreadId"][session_id].clone())
+        Ok(json!({
+            "runtime": ui_state["runtimeStatusByThreadId"][session_id].clone(),
+            "scheduledShutdown": ui_state["global"]["scheduledShutdown"].clone()
+        }))
     })
     .await
     .unwrap();
@@ -6881,7 +7378,12 @@ async fn deltas_and_goal_usage_replays_do_not_rewrite_runtime_state() {
     for notification in [
         AppServerNotification {
             method: "item/agentMessage/delta".to_string(),
-            params: json!({ "threadId": session_id, "turnId": "turn-1", "delta": "x" }),
+            params: json!({
+                "threadId": session_id,
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "delta": "second"
+            }),
         },
         AppServerNotification {
             method: "thread/tokenUsage/updated".to_string(),
@@ -6901,12 +7403,14 @@ async fn deltas_and_goal_usage_replays_do_not_rewrite_runtime_state() {
     let after = with_ui_state_read(&state, "default", |ui_state| {
         Ok(json!({
             "runtime": ui_state["runtimeStatusByThreadId"][session_id].clone(),
-            "highlight": ui_state["highlightsByThreadId"][session_id].clone()
+            "highlight": ui_state["highlightsByThreadId"][session_id].clone(),
+            "scheduledShutdown": ui_state["global"]["scheduledShutdown"].clone()
         }))
     })
     .await
     .unwrap();
-    assert_eq!(after["runtime"], before);
+    assert_eq!(after["runtime"]["status"].as_str(), Some("running"));
+    assert_eq!(after["scheduledShutdown"], before["scheduledShutdown"]);
     assert_eq!(after["highlight"]["reason"].as_str(), Some("approval"));
 
     let _ = fs::remove_dir_all(sandbox);

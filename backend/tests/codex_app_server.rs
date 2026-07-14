@@ -119,6 +119,68 @@ async fn client_handles_requests_notifications_and_server_requests() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_turn_prevents_probe_timeout_from_killing_app_server() -> Result<()> {
+    let codex_home = temp_dir("active-turn-timeout-guard")?;
+    let client = AppServerClient::new(
+        AppServerProfile {
+            id: "default".to_string(),
+            codex_home: codex_home.clone(),
+        },
+        AppServerClientConfig {
+            request_timeout: Duration::from_secs(2),
+            ..test_client_config()
+        },
+    );
+
+    let started = client
+        .request(
+            "turn/start",
+            json!({
+                "threadId": "thread-active-timeout-guard",
+                "input": [{ "type": "text", "text": "keep running" }],
+                "cwd": codex_home.display().to_string()
+            }),
+        )
+        .await?;
+    let turn_id = started["turn"]["id"]
+        .as_str()
+        .context("turn/start should return a turn id")?;
+    assert!(client.has_active_turn_id(turn_id).await);
+
+    let timeout_error = client
+        .request_with_timeout(
+            "fake/sleep",
+            json!({ "sleepMs": 200 }),
+            Duration::from_millis(25),
+            true,
+        )
+        .await
+        .expect_err("the maintenance probe should time out");
+    assert!(app_server_request_timed_out(&timeout_error));
+    assert!(
+        !app_server_timeout_recovered(&timeout_error),
+        "a background timeout must not discard an app-server that owns an active turn"
+    );
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let thread = client
+        .request(
+            "thread/read",
+            json!({
+                "threadId": "thread-active-timeout-guard",
+                "includeTurns": true
+            }),
+        )
+        .await?;
+    assert_eq!(thread["thread"]["status"].as_str(), Some("running"));
+    assert_eq!(thread["thread"]["turns"][0]["id"].as_str(), Some(turn_id));
+
+    client.close().await?;
+    fs::remove_dir_all(codex_home)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manager_reuses_one_process_per_profile() -> Result<()> {
     let temp = temp_dir("manager")?;
     let start_log = temp.join("starts.log");
@@ -141,7 +203,7 @@ async fn manager_reuses_one_process_per_profile() -> Result<()> {
     let client_a1 = manager
         .get_or_create(AppServerProfile {
             id: "profile-a".to_string(),
-            codex_home: profile_a_home,
+            codex_home: profile_a_home.clone(),
         })
         .await;
     client_a1
@@ -151,7 +213,7 @@ async fn manager_reuses_one_process_per_profile() -> Result<()> {
     let client_a2 = manager
         .get_or_create(AppServerProfile {
             id: "profile-a".to_string(),
-            codex_home: temp.join("ignored-profile-a"),
+            codex_home: profile_a_home,
         })
         .await;
     client_a2
@@ -222,6 +284,48 @@ async fn manager_reclaims_idle_process_when_cap_is_full() -> Result<()> {
     assert_eq!(manager.client_count().await, 1);
 
     manager.close_all().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manager_replaces_client_when_profile_home_changes() -> Result<()> {
+    let temp = temp_dir("manager-profile-home-change")?;
+    let first_home = temp.join("first");
+    let second_home = temp.join("second");
+    fs::create_dir_all(&first_home)?;
+    fs::create_dir_all(&second_home)?;
+    let manager = AppServerManager::new(test_client_config());
+    let first = manager
+        .get_or_create_with_key(
+            "profile-key".to_string(),
+            AppServerProfile {
+                id: "profile".to_string(),
+                codex_home: first_home,
+            },
+        )
+        .await;
+    first.request("echo", json!({ "home": "first" })).await?;
+
+    let second = manager
+        .get_or_create_with_key(
+            "profile-key".to_string(),
+            AppServerProfile {
+                id: "profile".to_string(),
+                codex_home: second_home.clone(),
+            },
+        )
+        .await;
+    let mut notifications = second.subscribe_notifications();
+    second.request("echo", json!({ "home": "second" })).await?;
+    let ready = recv_notification(&mut notifications, "fake/ready").await?;
+    assert_eq!(
+        ready.params.get("codexHome").and_then(Value::as_str),
+        Some(second_home.to_string_lossy().as_ref())
+    );
+    assert_eq!(manager.client_count().await, 1);
+
+    manager.close_all().await?;
+    let _ = fs::remove_dir_all(temp);
     Ok(())
 }
 

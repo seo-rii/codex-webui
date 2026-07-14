@@ -10,7 +10,11 @@ use crate::thread_read_support::{
 const DUPLICATE_TURN_START_ACTIVE_GRACE_MS: u64 = 30_000;
 const RECENT_CLIENT_USER_MESSAGE_TTL: Duration = Duration::from_secs(60 * 30);
 const LANGUAGE_BRIDGE_TRANSLATION_TIMEOUT: Duration = Duration::from_secs(180);
-const LANGUAGE_BRIDGE_TRANSLATION_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SESSION_TITLE_GENERATION_TIMEOUT: Duration = Duration::from_secs(120);
+static SESSION_TITLE_GENERATION_SLOTS: Semaphore = Semaphore::const_new(2);
+const SESSION_TITLE_GENERATION_RETRY_AFTER_MS: u64 = 5 * 60 * 1_000;
+const SESSION_TITLE_GENERATION_MAX_SOURCE_CHARS: usize = 4_000;
+const SESSION_TITLE_MAX_CHARS: usize = 60;
 const CODEX_PERMISSION_PROFILE_READ_ONLY: &str = ":read-only";
 const CODEX_PERMISSION_PROFILE_WORKSPACE: &str = ":workspace";
 const CODEX_PERMISSION_PROFILE_DANGER_FULL_ACCESS: &str = ":danger-full-access";
@@ -429,6 +433,499 @@ fn extract_agent_message_text(thread: &Value) -> Option<String> {
     None
 }
 
+async fn wait_for_ephemeral_thread_answer(
+    client: &AppServerClient,
+    notifications: &mut broadcast::Receiver<AppServerNotification>,
+    thread_id: &str,
+    timeout_duration: Duration,
+    operation: &str,
+) -> ApiResult<String> {
+    async fn read_answer(
+        client: &AppServerClient,
+        thread_id: &str,
+        request_timeout: Duration,
+    ) -> std::result::Result<Option<String>, String> {
+        let response = client
+            .request_with_timeout(
+                "thread/read",
+                json!({
+                    "threadId": thread_id,
+                    "includeTurns": true
+                }),
+                request_timeout.max(Duration::from_millis(1)),
+                false,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(response.get("thread").and_then(extract_agent_message_text))
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+    let mut probe_delay = Duration::from_secs(2);
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let probe_at = (now + probe_delay).min(deadline);
+        tokio::select! {
+            notification = notifications.recv() => {
+                match notification {
+                    Ok(notification) => {
+                        let notification_thread_id = notification
+                            .params
+                            .get("threadId")
+                            .or_else(|| notification.params.get("thread_id"))
+                            .and_then(Value::as_str);
+                        if notification_thread_id != Some(thread_id)
+                            || notification.method != "turn/completed"
+                        {
+                            continue;
+                        }
+                        if let Some(answer) = notification
+                            .params
+                            .get("turn")
+                            .and_then(extract_agent_message_item_from_turn)
+                            .map(|(_, text)| text)
+                        {
+                            return Ok(answer);
+                        }
+                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if let Ok(Some(answer)) = read_answer(client, thread_id, remaining.min(Duration::from_secs(10))).await {
+                            return Ok(answer);
+                        }
+                        return Err(api_error(
+                            StatusCode::BAD_GATEWAY,
+                            format!("{operation} completed without an answer."),
+                        ));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if let Ok(Some(answer)) = read_answer(client, thread_id, remaining.min(Duration::from_secs(10))).await {
+                            return Ok(answer);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = tokio::time::sleep_until(probe_at) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if let Ok(Some(answer)) = read_answer(client, thread_id, remaining.min(Duration::from_secs(10))).await {
+                    return Ok(answer);
+                }
+                probe_delay = probe_delay.saturating_mul(2).min(Duration::from_secs(30));
+            }
+        }
+    }
+
+    if let Ok(Some(answer)) = read_answer(client, thread_id, Duration::from_secs(10)).await {
+        return Ok(answer);
+    }
+    Err(api_error(
+        StatusCode::GATEWAY_TIMEOUT,
+        format!("Timed out while waiting for {operation}."),
+    ))
+}
+
+fn truncate_session_title_source(value: &str) -> String {
+    let mut truncated = value
+        .chars()
+        .take(SESSION_TITLE_GENERATION_MAX_SOURCE_CHARS)
+        .collect::<String>();
+    if value.chars().count() > SESSION_TITLE_GENERATION_MAX_SOURCE_CHARS {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+fn generated_session_title_prompt(user_message: &str, answer: Option<&str>) -> String {
+    let user_message = truncate_session_title_source(user_message);
+    let answer = answer
+        .map(truncate_session_title_source)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default();
+    format!(
+        "Generate one concise title for this coding conversation.\n\
+         Use the same natural language as the user's message. Capture the actual project or task, not generic wording.\n\
+         Use at most 60 characters and normally 2-8 words. Return only the title with no quotes, label, Markdown, or ending punctuation.\n\n\
+         <user_message>\n{user_message}\n</user_message>\n\n\
+         <assistant_answer>\n{answer}\n</assistant_answer>"
+    )
+}
+
+fn normalize_generated_session_title(value: &str) -> Option<String> {
+    let stripped = strip_json_code_fence(value).trim();
+    let candidate = serde_json::from_str::<Value>(stripped)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("title")
+                .or_else(|| value.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            stripped
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_string)
+        })?;
+    let candidate = ["Title:", "title:"]
+        .iter()
+        .find_map(|prefix| candidate.strip_prefix(prefix))
+        .unwrap_or(candidate.as_str())
+        .trim()
+        .trim_matches(['\'', '"', '`', '*', '#'])
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .trim();
+    let normalized = normalize_session_title_source(candidate)
+        .chars()
+        .take(SESSION_TITLE_MAX_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    (!normalized.is_empty() && normalized != "New thread").then_some(normalized)
+}
+
+async fn claim_session_title_generation(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    preview: &str,
+) -> ApiResult<Option<Value>> {
+    let now = now_unix_ms();
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(preferences) = ui_state
+            .get("preferencesByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get(session_id))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(session_meta_by_thread_id) = ui_state
+            .get_mut("sessionMetaByThreadId")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session metadata state is missing",
+            ));
+        };
+        let current = session_meta_by_thread_id
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| json!({ "pinned": false, "tags": [] }));
+        let mut meta = current.as_object().cloned().unwrap_or_default();
+        if meta
+            .get("nameSource")
+            .and_then(Value::as_str)
+            .is_some_and(|source| matches!(source, "manual" | "generated"))
+        {
+            return Ok(None);
+        }
+        if let Some(name) = meta
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            && !thread_name_is_preview_fallback(Some(name), preview)
+        {
+            return Ok(None);
+        }
+        let last_attempt = meta
+            .get("nameGenerationStartedAt")
+            .or_else(|| meta.get("nameGenerationAttemptedAt"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if last_attempt > 0
+            && now.saturating_sub(last_attempt) < SESSION_TITLE_GENERATION_RETRY_AFTER_MS
+        {
+            return Ok(None);
+        }
+        meta.entry("pinned".to_string())
+            .or_insert_with(|| json!(false));
+        meta.entry("tags".to_string()).or_insert_with(|| json!([]));
+        meta.insert(
+            "nameGenerationStatus".to_string(),
+            Value::String("running".to_string()),
+        );
+        meta.insert("nameGenerationStartedAt".to_string(), json!(now));
+        meta.remove("nameGenerationAttemptedAt");
+        session_meta_by_thread_id.insert(session_id.to_string(), Value::Object(meta));
+        Ok(Some(preferences))
+    })
+    .await
+}
+
+async fn mark_session_title_generation_failed(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) {
+    let _ = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(meta) = ui_state
+            .get_mut("sessionMetaByThreadId")
+            .and_then(Value::as_object_mut)
+            .and_then(|entries| entries.get_mut(session_id))
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(());
+        };
+        if meta.get("nameGenerationStatus").and_then(Value::as_str) != Some("running") {
+            return Ok(());
+        }
+        meta.insert(
+            "nameGenerationStatus".to_string(),
+            Value::String("failed".to_string()),
+        );
+        meta.remove("nameGenerationStartedAt");
+        meta.insert(
+            "nameGenerationAttemptedAt".to_string(),
+            json!(now_unix_ms()),
+        );
+        Ok(())
+    })
+    .await;
+}
+
+async fn generate_session_title(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    answer: Option<&str>,
+) -> ApiResult<()> {
+    let _generation_slot = SESSION_TITLE_GENERATION_SLOTS
+        .acquire()
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Session title generation is unavailable.",
+            )
+        })?;
+    let client = app_server_client_for_session(state, profile_id, session_id)
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to Codex for title generation: {error}"),
+            )
+        })?;
+    let thread = match read_local_thread_metadata_payload(state, profile_id, session_id).await? {
+        Some(thread) => thread,
+        None => client
+            .request_with_timeout(
+                "thread/read",
+                json!({
+                    "threadId": session_id,
+                    "includeTurns": false
+                }),
+                Duration::from_secs(30),
+                false,
+            )
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to read the session for title generation: {error}"),
+                )
+            })?
+            .get("thread")
+            .cloned()
+            .unwrap_or(Value::Null),
+    };
+    if thread.get("isSubagent").and_then(Value::as_bool) == Some(true)
+        || thread_agent_nickname(&thread).is_some()
+        || thread_agent_role(&thread).is_some()
+    {
+        return Ok(());
+    }
+    let preview = thread
+        .get("preview")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Session title source is empty."))?
+        .to_string();
+    if !thread_name_is_preview_fallback(thread.get("name").and_then(Value::as_str), &preview) {
+        return Ok(());
+    }
+    let Some(preferences) =
+        claim_session_title_generation(state, profile_id, session_id, &preview).await?
+    else {
+        return Ok(());
+    };
+
+    let result = async {
+        let cwd = preferences
+            .get("cwd")
+            .and_then(Value::as_str)
+            .or_else(|| thread.get("cwd").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string();
+        let model = preferences.get("model").cloned().unwrap_or(Value::Null);
+        let start_response = client
+            .request(
+                "thread/start",
+                json!({
+                    "cwd": cwd,
+                    "model": model,
+                    "permissions": CODEX_PERMISSION_PROFILE_READ_ONLY,
+                    "developerInstructions": "You generate short conversation titles for Codex Web UI. Return only the requested title. Do not call tools or answer the task.",
+                    "ephemeral": true,
+                    "personality": "none"
+                }),
+            )
+            .await
+            .map_err(|error| language_bridge_start_error("Failed to start session title worker", error))?;
+        let temp_thread_id = start_response
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "Session title worker did not return a thread id.",
+                )
+            })?;
+        let prompt = generated_session_title_prompt(&preview, answer);
+        let (input, _) = build_turn_input_payload(&prompt, &[], &[]);
+        let mut title_notifications = client.subscribe_notifications();
+        client
+            .request(
+                "turn/start",
+                json!({
+                    "threadId": temp_thread_id,
+                    "input": input,
+                    "cwd": cwd,
+                    "model": model,
+                    "approvalPolicy": "never",
+                    "permissions": CODEX_PERMISSION_PROFILE_READ_ONLY,
+                    "runtimeWorkspaceRoots": [cwd],
+                    "effort": "low"
+                }),
+            )
+            .await
+            .map_err(|error| language_bridge_start_error("Failed to start session title generation", error))?;
+
+        let raw_title = wait_for_ephemeral_thread_answer(
+            &client,
+            &mut title_notifications,
+            temp_thread_id,
+            SESSION_TITLE_GENERATION_TIMEOUT,
+            "session title worker",
+        )
+        .await?;
+        let generated_title = normalize_generated_session_title(&raw_title).ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "Session title worker returned an invalid title.",
+            )
+        })?;
+
+        let latest = client
+            .request(
+                "thread/read",
+                json!({
+                    "threadId": session_id,
+                    "includeTurns": false
+                }),
+            )
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to verify the session title: {error}"),
+                )
+            })?;
+        let latest_thread = latest.get("thread").unwrap_or(&Value::Null);
+        if !thread_name_is_preview_fallback(
+            latest_thread.get("name").and_then(Value::as_str),
+            latest_thread
+                .get("preview")
+                .and_then(Value::as_str)
+                .unwrap_or(&preview),
+        ) {
+            return Ok(());
+        }
+        let title_still_available = with_ui_state_read(state, profile_id, |ui_state| {
+            let meta = ui_state
+                .get("sessionMetaByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(session_id));
+            Ok(!meta
+                .and_then(|meta| meta.get("nameSource"))
+                .and_then(Value::as_str)
+                .is_some_and(|source| matches!(source, "manual" | "generated")))
+        })
+        .await?;
+        if !title_still_available {
+            return Ok(());
+        }
+
+        client
+            .request(
+                "thread/name/set",
+                json!({
+                    "threadId": session_id,
+                    "name": generated_title
+                }),
+            )
+            .await
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to save the generated session title: {error}"),
+                )
+            })?;
+        save_session_title_metadata_with_source(
+            state,
+            profile_id,
+            session_id,
+            Some(&generated_title),
+            Some("generated"),
+        )
+        .await?;
+        emit_session_summary_updated(state, profile_id, session_id, None, None).await;
+        Ok(())
+    }
+    .await;
+
+    if result.is_err() {
+        mark_session_title_generation_failed(state, profile_id, session_id).await;
+    }
+    result
+}
+
+pub(crate) async fn spawn_generated_session_title_for_completed_turn(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    turn: Option<&Value>,
+) {
+    let answer = turn
+        .and_then(extract_agent_message_item_from_turn)
+        .map(|(_, text)| text);
+    let state = state.clone();
+    let profile_id = profile_id.to_string();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) =
+            generate_session_title(&state, &profile_id, &session_id, answer.as_deref()).await
+        {
+            warn!(
+                profile_id,
+                session_id,
+                error = %error,
+                "failed to generate session title"
+            );
+        }
+    });
+}
+
 fn ensure_language_bridge_thread_state<'a>(
     ui_state: &'a mut Value,
     session_id: &str,
@@ -521,6 +1018,7 @@ async fn translate_prompt_with_language_bridge(
         })?;
     let translation_prompt = language_bridge_translation_prompt(prompt);
     let (input, _) = build_turn_input_payload(&translation_prompt, &[], &[]);
+    let mut translation_notifications = client.subscribe_notifications();
     client
         .request(
             "turn/start",
@@ -539,42 +1037,23 @@ async fn translate_prompt_with_language_bridge(
             language_bridge_start_error("Failed to start language bridge translation", error)
         })?;
 
-    let deadline = tokio::time::Instant::now() + LANGUAGE_BRIDGE_TRANSLATION_TIMEOUT;
-    loop {
-        let response = client
-            .request(
-                "thread/read",
-                json!({
-                    "threadId": temp_thread_id,
-                    "includeTurns": true
-                }),
-            )
-            .await
-            .map_err(|error| {
-                api_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("Failed to read language bridge translation: {error}"),
-                )
-            })?;
-        if let Some(raw_text) = response.get("thread").and_then(extract_agent_message_text) {
-            let (english, detected_language) =
-                parse_language_bridge_translation_response(&raw_text, &fallback_language)
-                    .unwrap_or_else(|| (raw_text, fallback_language.clone()));
-            let output_language = if requested_output_language.eq_ignore_ascii_case("auto") {
-                detected_language
-            } else {
-                requested_output_language
-            };
-            return Ok((english, output_language));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(api_error(
-                StatusCode::GATEWAY_TIMEOUT,
-                "Timed out while translating the prompt with language bridge.",
-            ));
-        }
-        tokio::time::sleep(LANGUAGE_BRIDGE_TRANSLATION_POLL_INTERVAL).await;
-    }
+    let raw_text = wait_for_ephemeral_thread_answer(
+        client,
+        &mut translation_notifications,
+        temp_thread_id,
+        LANGUAGE_BRIDGE_TRANSLATION_TIMEOUT,
+        "language bridge prompt translation",
+    )
+    .await?;
+    let (english, detected_language) =
+        parse_language_bridge_translation_response(&raw_text, &fallback_language)
+            .unwrap_or_else(|| (raw_text, fallback_language.clone()));
+    let output_language = if requested_output_language.eq_ignore_ascii_case("auto") {
+        detected_language
+    } else {
+        requested_output_language
+    };
+    Ok((english, output_language))
 }
 
 pub(crate) async fn apply_language_bridge_translations_to_turns(
@@ -765,6 +1244,7 @@ pub(crate) async fn spawn_language_bridge_response_translation_for_completed_tur
              <codex_answer>\n{answer_text}\n</codex_answer>"
         );
         let (input, _) = build_turn_input_payload(&prompt, &[], &[]);
+        let mut translation_notifications = client.subscribe_notifications();
         if let Err(error) = client
             .request(
                 "turn/start",
@@ -789,43 +1269,35 @@ pub(crate) async fn spawn_language_bridge_response_translation_for_completed_tur
             return;
         }
 
-        let deadline = tokio::time::Instant::now() + LANGUAGE_BRIDGE_TRANSLATION_TIMEOUT;
-        let translated_text = loop {
-            let response = match client
-                .request(
-                    "thread/read",
-                    json!({
-                        "threadId": temp_thread_id,
-                        "includeTurns": true
-                    }),
-                )
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
+        let translated_text = match wait_for_ephemeral_thread_answer(
+            &client,
+            &mut translation_notifications,
+            &temp_thread_id,
+            LANGUAGE_BRIDGE_TRANSLATION_TIMEOUT,
+            "language bridge response translation",
+        )
+        .await
+        {
+            Ok(raw_text) => {
+                let stripped = strip_json_code_fence(&raw_text).trim().to_string();
+                if stripped.is_empty() {
                     warn!(
                         profile_id,
-                        session_id,
-                        error = %error,
-                        "failed to read language bridge response translation"
+                        session_id, "language bridge response translation returned an empty answer"
                     );
                     return;
                 }
-            };
-            if let Some(raw_text) = response.get("thread").and_then(extract_agent_message_text) {
-                let stripped = strip_json_code_fence(&raw_text).trim().to_string();
-                if !stripped.is_empty() {
-                    break stripped;
-                }
+                stripped
             }
-            if tokio::time::Instant::now() >= deadline {
+            Err(error) => {
                 warn!(
                     profile_id,
-                    session_id, "timed out while translating language bridge response"
+                    session_id,
+                    error = %error,
+                    "failed to read language bridge response translation"
                 );
                 return;
             }
-            tokio::time::sleep(LANGUAGE_BRIDGE_TRANSLATION_POLL_INTERVAL).await;
         };
         let translated_at = now_unix_ms();
         if let Err(error) = with_ui_state_write(&state, &profile_id, |ui_state| {
@@ -942,7 +1414,7 @@ async fn resume_thread_before_app_server_turn(
         #[cfg(not(test))]
         let resume_timeout = client.request_timeout();
         #[cfg(test)]
-        let resume_timeout = Duration::from_millis(100);
+        let resume_timeout = Duration::from_secs(1);
         let result = client
             .request_with_timeout(
                 "thread/resume",
@@ -1031,15 +1503,13 @@ async fn session_rollout_recovery_required_error(
                 {
                     continue;
                 }
-                let Ok(buffer) = tokio_fs::read(path).await else {
+                let Ok(Ok(info)) =
+                    tokio::task::spawn_blocking(move || inspect_rollout_recovery_file(&path)).await
+                else {
                     continue;
                 };
-                let plan = inspect_rollout_recovery_content(&buffer);
-                if plan.info.available
-                    && plan.info.recoverable_lines > 0
-                    && !plan.recovered_content.trim().is_empty()
-                {
-                    recovered = Some(json!(plan.info));
+                if info.available && info.recoverable_lines > 0 {
+                    recovered = Some(json!(info));
                     break;
                 }
             }
@@ -1112,10 +1582,8 @@ pub(crate) async fn send_turn_payload(
 ) -> ApiResult<Value> {
     let trimmed_prompt = prompt.trim();
     let client_user_message_id = normalize_client_user_message_id(client_user_message_id);
-    let runtime_key = runtime_session_key(
-        &resolve_runtime_profile_entry(&state.config, profile_id).0,
-        session_id,
-    );
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
     if let Some(client_id) = client_user_message_id.as_deref() {
         if recently_sent_client_user_message(state, &runtime_key, client_id).await {
             return Ok(json!({
@@ -1146,6 +1614,8 @@ pub(crate) async fn send_turn_payload(
             ));
         }
     }
+    let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
+    let _session_guard = session_lock.lock().await;
 
     let result = async {
         let attachments =
@@ -1484,10 +1954,8 @@ pub(crate) async fn start_session_compaction_payload(
     profile_id: &str,
     session_id: &str,
 ) -> ApiResult<Value> {
-    let runtime_key = runtime_session_key(
-        &resolve_runtime_profile_entry(&state.config, profile_id).0,
-        session_id,
-    );
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
     clear_stale_session_runtime_activity_if_app_server_missing(
         state,
         profile_id,
@@ -1509,6 +1977,8 @@ pub(crate) async fn start_session_compaction_payload(
             ));
         }
     }
+    let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
+    let _session_guard = session_lock.lock().await;
 
     let result = async {
         if state.active_turns.lock().await.contains_key(&runtime_key) {
@@ -1699,6 +2169,19 @@ pub(crate) async fn steer_turn_payload(
 ) -> ApiResult<Value> {
     let trimmed_prompt = prompt.trim();
     let client_user_message_id = normalize_client_user_message_id(client_user_message_id);
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
+    let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
+    let _session_guard = session_lock.lock().await;
+    if let Some(client_id) = client_user_message_id.as_deref() {
+        if recently_sent_client_user_message(state, &runtime_key, client_id).await {
+            return Ok(json!({
+                "ok": true,
+                "duplicate": true,
+                "clientUserMessageId": client_id
+            }));
+        }
+    }
     if trimmed_prompt.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "EMPTY_MESSAGE"));
     }
@@ -1767,6 +2250,19 @@ pub(crate) async fn steer_turn_payload(
         .unwrap_or(Value::Null);
     let responsesapi_client_metadata =
         responsesapi_client_metadata_for_user_message(client_user_message_id.as_deref());
+    if let Some(client_id) = client_user_message_id.as_deref() {
+        let key = client_user_message_key(&runtime_key, client_id);
+        let now = Instant::now();
+        let mut recent = state.recent_client_user_messages.lock().await;
+        recent.retain(|_, sent_at| now.duration_since(*sent_at) <= RECENT_CLIENT_USER_MESSAGE_TTL);
+        if recent.insert(key, now).is_some() {
+            return Ok(json!({
+                "ok": true,
+                "duplicate": true,
+                "clientUserMessageId": client_id
+            }));
+        }
+    }
     if let Err(error) = client
         .request(
             "turn/steer",
@@ -1780,6 +2276,13 @@ pub(crate) async fn steer_turn_payload(
         )
         .await
     {
+        if let Some(client_id) = client_user_message_id.as_deref() {
+            state
+                .recent_client_user_messages
+                .lock()
+                .await
+                .remove(&client_user_message_key(&runtime_key, client_id));
+        }
         return Err(turn_app_server_error(
             state,
             profile_id,
@@ -1794,10 +2297,6 @@ pub(crate) async fn steer_turn_payload(
         remember_language_bridge_output_language(state, profile_id, session_id, output_language)
             .await?;
     }
-    let runtime_key = runtime_session_key(
-        &resolve_runtime_profile_entry(&state.config, profile_id).0,
-        session_id,
-    );
     state
         .active_turns
         .lock()

@@ -281,6 +281,11 @@ profiles:
         .find(|profile| profile["id"].as_str() == Some("work"))
         .unwrap();
     assert_eq!(work_profile["label"].as_str(), Some("Renamed Work"));
+    let (_, profiles) = runtime_profiles_snapshot(&state.config);
+    assert_eq!(
+        profiles.get("work").map(|profile| profile.label.as_str()),
+        Some("Renamed Work")
+    );
 
     let delete = delete_account_profile_payload(
         &state,
@@ -306,6 +311,8 @@ profiles:
             .iter()
             .all(|profile| profile["id"].as_str() != Some("work"))
     );
+    let (_, profiles) = runtime_profiles_snapshot(&state.config);
+    assert!(!profiles.contains_key("work"));
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -696,6 +703,22 @@ async fn owner_config_blocks_admin_from_owner_only_websocket_methods() {
     assert!(ws_method_requires_owner(
         "system/shutdown/force",
         &json!({})
+    ));
+    assert!(ws_method_requires_owner(
+        "account/login/start",
+        &json!({ "authJsonFile": "/tmp/auth.json" })
+    ));
+    assert!(ws_method_requires_owner(
+        "account/login/start",
+        &json!({ "createProfile": true })
+    ));
+    assert!(ws_method_requires_owner(
+        "account/profile/delete",
+        &json!({})
+    ));
+    assert!(!ws_method_requires_owner(
+        "account/login/start",
+        &json!({ "type": "chatgpt" })
     ));
     assert!(!ws_method_requires_owner(
         "git/worktrees/remove",
@@ -1335,6 +1358,14 @@ fn websocket_origin_allows_same_origin_and_configured_cors_only() {
         Some(loopback_peer)
     ));
 
+    let mut null_origin_headers = same_origin_headers.clone();
+    null_origin_headers.insert(header::ORIGIN, HeaderValue::from_static("null"));
+    assert!(!websocket_origin_allowed(
+        &state.config,
+        &null_origin_headers,
+        Some(loopback_peer)
+    ));
+
     let mut config = (*state.config).clone();
     config.cors_allowed_origins = vec!["https://attacker.example".to_string()];
     state.config = Arc::new(config);
@@ -1364,6 +1395,16 @@ async fn unsafe_http_api_mutations_reject_cross_origin_requests() {
         .body(Body::from("{}"))
         .unwrap();
     let response = handle_http(State(state.clone()), CookieJar::new(), rejected).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let null_origin = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/login")
+        .header(header::HOST, "127.0.0.1:4173")
+        .header(header::ORIGIN, "null")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = handle_http(State(state.clone()), CookieJar::new(), null_origin).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     let same_origin = Request::builder()
@@ -3254,6 +3295,123 @@ async fn git_mutations_share_repo_operation_lock() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn linked_worktree_mutations_share_common_directory_lock() {
+    let sandbox = unique_test_dir("git-linked-worktree-lock");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let repo = workspace.join("repo");
+    let linked_worktree = workspace.join("linked");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    init_test_git_repo(&repo);
+    let worktree = std::process::Command::new("git")
+        .args([
+            "-C",
+            repo.to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "linked-test",
+            linked_worktree.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(worktree.status.success(), "git worktree add failed");
+    fs::write(linked_worktree.join("queued.txt"), "queued\n").unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let main_lock = git_operation_lock(&state, repo.to_str().unwrap()).await;
+    let linked_lock = git_operation_lock(&state, linked_worktree.to_str().unwrap()).await;
+    assert!(Arc::ptr_eq(&main_lock, &linked_lock));
+
+    let guard = main_lock.lock().await;
+    let state_for_task = state.clone();
+    let linked_for_task = linked_worktree.clone();
+    let handle = tokio::spawn(async move {
+        stage_git_changes_payload(
+            &state_for_task,
+            linked_for_task.to_str().unwrap(),
+            Some("queued.txt"),
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!handle.is_finished());
+    drop(guard);
+
+    let staged = handle.await.unwrap().unwrap();
+    assert!(
+        staged
+            .get("files")
+            .and_then(Value::as_array)
+            .is_some_and(|files| files.iter().any(|entry| {
+                entry.get("path").and_then(Value::as_str) == Some("queued.txt")
+                    && entry.get("hasStagedChanges").and_then(Value::as_bool) == Some(true)
+            }))
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coherent_git_reads_wait_for_common_directory_lock() {
+    let sandbox = unique_test_dir("git-coherent-read-lock");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    let repo = workspace.join("repo");
+    let linked_worktree = workspace.join("linked");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    init_test_git_repo(&repo);
+    let worktree = std::process::Command::new("git")
+        .args([
+            "-C",
+            repo.to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "linked-read-test",
+            linked_worktree.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(worktree.status.success(), "git worktree add failed");
+
+    let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
+    let common_lock = git_operation_lock(&state, repo.to_str().unwrap()).await;
+    let guard = common_lock.lock().await;
+
+    let file_state = state.clone();
+    let file_repo = linked_worktree.clone();
+    let file_handle = tokio::spawn(async move {
+        get_git_file_payload(&file_state, file_repo.to_str().unwrap(), "README.md").await
+    });
+    let diff_state = state.clone();
+    let diff_repo = linked_worktree.clone();
+    let diff_handle = tokio::spawn(async move {
+        get_git_commit_diff_payload(&diff_state, diff_repo.to_str().unwrap(), "HEAD").await
+    });
+    let worktrees_state = state.clone();
+    let worktrees_repo = linked_worktree.clone();
+    let worktrees_handle = tokio::spawn(async move {
+        list_git_worktrees_payload(&worktrees_state, worktrees_repo.to_str().unwrap()).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!file_handle.is_finished());
+    assert!(!diff_handle.is_finished());
+    assert!(!worktrees_handle.is_finished());
+    drop(guard);
+
+    file_handle.await.unwrap().unwrap();
+    diff_handle.await.unwrap().unwrap();
+    worktrees_handle.await.unwrap().unwrap();
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn destructive_git_mutations_reject_active_codex_work() {
     let sandbox = unique_test_dir("git-busy-active-turn");
     let workspace = sandbox.join("workspace");
@@ -3262,6 +3420,20 @@ async fn destructive_git_mutations_reject_active_codex_work() {
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
     init_test_git_repo(&repo);
+    let linked_worktree = workspace.join("linked-busy-worktree");
+    let linked = std::process::Command::new("git")
+        .args([
+            "-C",
+            repo.to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "linked-busy-base",
+            linked_worktree.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(linked.status.success(), "git worktree add failed");
 
     let state = test_state(workspace.clone(), vec![workspace.clone()], codex_home);
     with_ui_state_write(&state, "default", |ui_state| {
@@ -3299,6 +3471,16 @@ async fn destructive_git_mutations_reject_active_codex_work() {
         error.message,
         "Refusing to mutate this repository while a Codex turn is active."
     );
+
+    let error = checkout_git_branch_payload(
+        &state,
+        linked_worktree.to_str().unwrap(),
+        "linked-busy-test",
+        true,
+    )
+    .await
+    .expect_err("linked worktree mutation should reject active Codex work");
+    assert_eq!(error.status, StatusCode::CONFLICT);
 
     let error = save_git_file_payload(&state, repo.to_str().unwrap(), "busy.txt", "busy\n")
         .await

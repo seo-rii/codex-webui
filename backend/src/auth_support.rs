@@ -494,23 +494,43 @@ pub(crate) fn auth_context_from_headers(
 }
 
 fn strongest_auth_role(config: &Config, jar: &CookieJar, headers: &HeaderMap) -> Option<UserRole> {
-    let mut selected = jar
-        .get(AUTH_COOKIE)
-        .and_then(|cookie| valid_auth_cookie_role(config, cookie.value()));
+    strongest_auth_session(config, jar, headers).map(|(role, _)| role)
+}
+
+pub(crate) fn strongest_auth_token(
+    config: &Config,
+    jar: &CookieJar,
+    headers: &HeaderMap,
+) -> Option<String> {
+    strongest_auth_session(config, jar, headers).map(|(_, token)| token)
+}
+
+fn strongest_auth_session(
+    config: &Config,
+    jar: &CookieJar,
+    headers: &HeaderMap,
+) -> Option<(UserRole, String)> {
+    let mut selected = jar.get(AUTH_COOKIE).and_then(|cookie| {
+        valid_auth_cookie_role(config, cookie.value())
+            .map(|role| (role, cookie.value().to_string()))
+    });
 
     for token in auth_cookie_values_from_headers(headers) {
         let Some(role) = valid_auth_cookie_role(config, &token) else {
             continue;
         };
-        if selected.is_none_or(|current| user_role_strength(role) > user_role_strength(current)) {
-            selected = Some(role);
+        if selected
+            .as_ref()
+            .is_none_or(|(current, _)| user_role_strength(role) > user_role_strength(*current))
+        {
+            selected = Some((role, token));
         }
     }
 
     selected
 }
 
-fn valid_auth_cookie_role(config: &Config, token: &str) -> Option<UserRole> {
+pub(crate) fn valid_auth_cookie_role(config: &Config, token: &str) -> Option<UserRole> {
     let (role, nonce, expires) = parse_auth_token(config, token)?;
     if auth_session_is_revoked(config, &nonce, expires) {
         return None;
@@ -621,8 +641,13 @@ pub(crate) fn request_origin_allowed(
     headers: &HeaderMap,
     peer_addr: Option<SocketAddr>,
 ) -> bool {
-    let Some(origin) = extract_origin(headers) else {
+    let Some(raw_origin) = headers.get(header::ORIGIN) else {
         return !config.require_origin_header && public_host_is_loopback(config);
+    };
+    let Some(origin) = raw_origin.to_str().ok().and_then(normalize_origin) else {
+        // `Origin: null` and malformed values are explicit untrusted origins,
+        // not equivalent to a non-browser request that omitted the header.
+        return false;
     };
     if allowed_cors_origin(config, &Some(origin.clone())).is_some() {
         return true;

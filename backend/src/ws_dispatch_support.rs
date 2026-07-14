@@ -1,9 +1,40 @@
 use super::*;
 
-fn ws_request_profile_id(config: &Config, auth: &AuthContext, params: &Value) -> Result<String> {
+pub(crate) fn ws_request_profile_id(
+    config: &Config,
+    auth: &AuthContext,
+    params: &Value,
+) -> Result<String> {
     let Some(raw_profile_id) = params
         .get("profileId")
         .or_else(|| params.get("profile_id"))
+        .and_then(Value::as_str)
+        .map(sanitize_profile_id)
+        .filter(|value| !value.is_empty())
+    else {
+        return ws_request_default_profile_id(config, auth, params);
+    };
+
+    if runtime_profiles_snapshot(config)
+        .1
+        .contains_key(&raw_profile_id)
+    {
+        return Ok(raw_profile_id);
+    }
+
+    anyhow::bail!(
+        "{{\"code\":\"PROFILE_NOT_FOUND\",\"message\":\"The requested profile was not found.\"}}"
+    );
+}
+
+pub(crate) fn ws_request_default_profile_id(
+    config: &Config,
+    auth: &AuthContext,
+    params: &Value,
+) -> Result<String> {
+    let Some(raw_profile_id) = params
+        .get("requestProfileId")
+        .or_else(|| params.get("request_profile_id"))
         .and_then(Value::as_str)
         .map(sanitize_profile_id)
         .filter(|value| !value.is_empty())
@@ -51,6 +82,12 @@ pub(crate) async fn execute_ws_method(
     params: Value,
 ) -> Result<Value> {
     authorize_ws_method(&state.config, auth.role, method, &params)?;
+    let effective_profile_id = ws_request_default_profile_id(&state.config, auth, &params)?;
+    let effective_auth = AuthContext {
+        role: auth.role,
+        profile_id: effective_profile_id,
+    };
+    let auth = &effective_auth;
 
     match method {
         "config/get" => get_config_payload(state, &auth.profile_id)
@@ -580,6 +617,25 @@ pub(crate) async fn execute_ws_method(
             let session_id = require_session_id(&params, "sessionId")?;
             let profile_id =
                 ws_request_profile_id_for_session(state, auth, &params, &session_id).await?;
+            let session_lock = session_operation_lock(state, &profile_id, &session_id).await;
+            let _session_guard = session_lock.lock().await;
+            let runtime_key = runtime_session_key(&profile_id, &session_id);
+            if state.active_turns.lock().await.contains_key(&runtime_key)
+                || state
+                    .pending_turn_starts
+                    .lock()
+                    .await
+                    .contains(&runtime_key)
+                || state.queue_dispatching.lock().await.contains(&runtime_key)
+            {
+                return Err(anyhow!(
+                    json!({
+                        "code": "SESSION_ACTIVE",
+                        "message": "Stop the active session before rolling it back."
+                    })
+                    .to_string()
+                ));
+            }
             let num_turns = params
                 .get("numTurns")
                 .and_then(Value::as_u64)
@@ -1360,8 +1416,10 @@ pub(crate) async fn execute_ws_method(
         }
         "session/unsubscribe" => {
             let session_id = require_session_id(&params, "sessionId")?;
-            let profile_id =
-                ws_request_profile_id_for_session(state, auth, &params, &session_id).await?;
+            // A session may have moved since this connection installed its
+            // subscription. Unsubscribe the exact requested relay instead of
+            // rediscovering current ownership and removing the new relay.
+            let profile_id = ws_request_profile_id(&state.config, auth, &params)?;
             let relay_key = session_relay_key(&profile_id, &session_id);
             let handle = {
                 let mut current = subscriptions.lock().await;

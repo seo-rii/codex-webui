@@ -190,6 +190,16 @@ pub(crate) async fn move_session_profile_payload(
         }
     }
 
+    let source_session_lock = session_operation_lock(state, &source_profile_id, session_id).await;
+    let target_session_lock = session_operation_lock(state, &target_profile_id, session_id).await;
+    let (first_session_lock, second_session_lock) = if source_profile_id < target_profile_id {
+        (&source_session_lock, &target_session_lock)
+    } else {
+        (&target_session_lock, &source_session_lock)
+    };
+    let _first_session_guard = first_session_lock.lock().await;
+    let _second_session_guard = second_session_lock.lock().await;
+
     let runtime_key = runtime_session_key(&source_profile_id, session_id);
     if state.active_turns.lock().await.contains_key(&runtime_key)
         || state
@@ -518,7 +528,12 @@ pub(crate) async fn move_session_profile_payload(
         json!({
             "kind": "notification",
             "method": "codex-webui/sessionListsInvalidated",
-            "params": { "reason": "sessionProfileMoved", "sessionId": session_id }
+            "params": {
+                "reason": "sessionProfileMoved",
+                "sessionId": session_id,
+                "sourceProfileId": source_profile_id,
+                "targetProfileId": target_profile_id
+            }
         }),
     )
     .await;
@@ -528,7 +543,12 @@ pub(crate) async fn move_session_profile_payload(
         json!({
             "kind": "notification",
             "method": "codex-webui/sessionListsInvalidated",
-            "params": { "reason": "sessionProfileMoved", "sessionId": session_id }
+            "params": {
+                "reason": "sessionProfileMoved",
+                "sessionId": session_id,
+                "sourceProfileId": source_profile_id,
+                "targetProfileId": target_profile_id
+            }
         }),
     )
     .await;
@@ -718,10 +738,23 @@ pub(crate) async fn save_session_title_metadata(
     session_id: &str,
     name: Option<&str>,
 ) -> ApiResult<()> {
+    save_session_title_metadata_with_source(state, profile_id, session_id, name, None).await
+}
+
+pub(crate) async fn save_session_title_metadata_with_source(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    name: Option<&str>,
+    source: Option<&str>,
+) -> ApiResult<()> {
     let next_name = name
         .map(str::trim)
         .filter(|value| !value.is_empty() && *value != "New thread")
         .map(str::to_string);
+    let source = source
+        .map(str::trim)
+        .filter(|value| matches!(*value, "manual" | "generated"));
 
     with_ui_state_write(state, profile_id, |ui_state| {
         let Some(session_meta_by_thread_id) = ui_state
@@ -742,9 +775,19 @@ pub(crate) async fn save_session_title_metadata(
         if let Some(next_name) = &next_name {
             meta_object.insert("name".to_string(), Value::String(next_name.clone()));
             meta_object.insert("nameUpdatedAt".to_string(), json!(now_unix_ms()));
+            if let Some(source) = source {
+                meta_object.insert("nameSource".to_string(), Value::String(source.to_string()));
+            }
+            meta_object.remove("nameGenerationStatus");
+            meta_object.remove("nameGenerationStartedAt");
+            meta_object.remove("nameGenerationAttemptedAt");
         } else {
             meta_object.remove("name");
             meta_object.remove("nameUpdatedAt");
+            meta_object.remove("nameSource");
+            meta_object.remove("nameGenerationStatus");
+            meta_object.remove("nameGenerationStartedAt");
+            meta_object.remove("nameGenerationAttemptedAt");
         }
 
         let pinned = meta_object
@@ -914,7 +957,14 @@ pub(crate) async fn rename_session_payload(
             )
         })?;
 
-    save_session_title_metadata(state, profile_id, session_id, Some(trimmed_name)).await?;
+    save_session_title_metadata_with_source(
+        state,
+        profile_id,
+        session_id,
+        Some(trimmed_name),
+        Some("manual"),
+    )
+    .await?;
     emit_session_notification(
         state,
         profile_id,
@@ -942,6 +992,23 @@ pub(crate) async fn archive_session_payload(
     profile_id: &str,
     session_id: &str,
 ) -> ApiResult<Value> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
+    let _session_guard = session_lock.lock().await;
+    let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
+    if state.active_turns.lock().await.contains_key(&runtime_key)
+        || state
+            .pending_turn_starts
+            .lock()
+            .await
+            .contains(&runtime_key)
+        || state.queue_dispatching.lock().await.contains(&runtime_key)
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "Stop the running session before archiving it.",
+        ));
+    }
     app_server_client_for_session(state, profile_id, session_id)
         .await
         .map_err(|error| {
@@ -973,6 +1040,9 @@ pub(crate) async fn unarchive_session_payload(
     profile_id: &str,
     session_id: &str,
 ) -> ApiResult<Value> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
+    let _session_guard = session_lock.lock().await;
     app_server_client_for_session(state, profile_id, session_id)
         .await
         .map_err(|error| {

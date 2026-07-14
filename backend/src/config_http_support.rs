@@ -276,7 +276,7 @@ async fn config_app_server_request(
             method.to_string(),
             params.clone(),
             CONFIG_APP_SERVER_REQUEST_TIMEOUT,
-            true,
+            false,
         )
         .await
     {

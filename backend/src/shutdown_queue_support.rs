@@ -37,6 +37,8 @@ pub(crate) async fn has_active_work_across_threads(state: &AppState, profile_id:
         Err(_) => return true,
     };
     let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    let mut page_count = 0usize;
     loop {
         let payload = match client
             .request(
@@ -52,6 +54,7 @@ pub(crate) async fn has_active_work_across_threads(state: &AppState, profile_id:
             Ok(payload) => payload,
             Err(_) => return true,
         };
+        page_count += 1;
         if payload
             .get("data")
             .and_then(Value::as_array)
@@ -67,12 +70,15 @@ pub(crate) async fn has_active_work_across_threads(state: &AppState, profile_id:
             return true;
         }
 
-        cursor = payload
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
+        cursor = match bounded_pagination_cursor(
+            &mut seen_cursors,
+            payload.get("nextCursor").and_then(Value::as_str),
+            page_count,
+            32,
+        ) {
+            Ok(cursor) => cursor,
+            Err(_) => return true,
+        };
         if cursor.is_none() {
             break;
         }

@@ -3,6 +3,7 @@ use std::{
     env, fs,
     io::{self, BufRead, Write},
     path::Path,
+    time::Duration,
 };
 
 use serde_json::{Value, json};
@@ -414,6 +415,18 @@ fn main() {
                     "result": payload.get("params").cloned().unwrap_or_else(|| json!({}))
                 }));
             }
+            Some("fake/sleep") => {
+                let sleep_ms = payload
+                    .get("params")
+                    .and_then(|params| params.get("sleepMs"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                std::thread::sleep(Duration::from_millis(sleep_ms));
+                print_message(&json!({
+                    "id": id,
+                    "result": { "sleptMs": sleep_ms }
+                }));
+            }
             Some("emitNotification") => {
                 print_message(&json!({
                     "method": "fake/custom",
@@ -485,6 +498,13 @@ fn main() {
                     "id": id,
                     "result": {
                         "ok": true
+                    }
+                }));
+                print_message(&json!({
+                    "method": "thread/name/updated",
+                    "params": {
+                        "threadId": thread_id,
+                        "threadName": name
                     }
                 }));
             }
@@ -1013,12 +1033,11 @@ fn main() {
                     thread_object.insert("updatedAt".to_string(), Value::from(timestamp_counter));
                     thread_object.insert("lastReviewStart".to_string(), params.clone());
                 }
-                if review_thread_id != thread_id {
-                    if let Some(thread_object) =
+                if review_thread_id != thread_id
+                    && let Some(thread_object) =
                         threads.get_mut(&thread_id).and_then(Value::as_object_mut)
-                    {
-                        thread_object.insert("lastReviewStart".to_string(), params.clone());
-                    }
+                {
+                    thread_object.insert("lastReviewStart".to_string(), params.clone());
                 }
                 print_message(&json!({
                     "id": id,
@@ -1105,7 +1124,11 @@ fn main() {
                 }
                 let mut items = vec![user_item];
                 if is_ephemeral {
-                    let agent_text = if text.contains("Translate the following Codex answer") {
+                    let agent_text = if text
+                        .contains("Generate one concise title for this coding conversation")
+                    {
+                        "Repair generated session titles".to_string()
+                    } else if text.contains("Translate the following Codex answer") {
                         "번역된 응답입니다.".to_string()
                     } else {
                         let language = if text
@@ -1148,7 +1171,7 @@ fn main() {
                         .entry("turns".to_string())
                         .or_insert_with(|| Value::Array(Vec::new()));
                     if let Some(turns) = turns.as_array_mut() {
-                        turns.push(turn);
+                        turns.push(turn.clone());
                     }
                     thread_object.insert(
                         "preview".to_string(),
@@ -1170,6 +1193,15 @@ fn main() {
                         }
                     }
                 }));
+                if is_ephemeral {
+                    print_message(&json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": thread_id,
+                            "turn": turn
+                        }
+                    }));
+                }
             }
             Some("turn/steer") => {
                 let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));

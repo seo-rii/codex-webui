@@ -116,9 +116,15 @@ pub(crate) async fn list_git_worktrees_payload(
     repo_path: &str,
 ) -> ApiResult<Value> {
     let repo_root = resolve_git_repo_root(state, repo_path).await?;
+    let repo_lock = git_operation_lock(state, &repo_root).await;
+    let _repo_guard = repo_lock.lock().await;
+    list_git_worktrees_for_root(state, &repo_root).await
+}
+
+async fn list_git_worktrees_for_root(state: &AppState, repo_root: &str) -> ApiResult<Value> {
     let output = run_git_text_payload(
         state,
-        &repo_root,
+        repo_root,
         vec![
             "worktree".to_string(),
             "list".to_string(),
@@ -128,7 +134,7 @@ pub(crate) async fn list_git_worktrees_payload(
     .await?;
     Ok(json!({
         "repoPath": repo_root,
-        "worktrees": parse_git_worktrees_payload(&repo_root, &output)
+        "worktrees": parse_git_worktrees_payload(repo_root, &output)
     }))
 }
 
@@ -195,7 +201,7 @@ pub(crate) async fn create_git_worktree_payload(
             .await
             .insert(resolved_worktree_path.clone(), repository);
     }
-    list_git_worktrees_payload(state, &repo_root).await
+    list_git_worktrees_for_root(state, &repo_root).await
 }
 
 pub(crate) async fn remove_git_worktree_payload(
@@ -257,5 +263,5 @@ pub(crate) async fn remove_git_worktree_payload(
         .lock()
         .await
         .remove(&resolved_worktree_path);
-    list_git_worktrees_payload(state, &repo_root).await
+    list_git_worktrees_for_root(state, &repo_root).await
 }

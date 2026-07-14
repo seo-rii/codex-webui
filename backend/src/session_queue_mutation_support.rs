@@ -77,7 +77,11 @@ pub(crate) async fn enqueue_session_queue_payload(
                     .unwrap_or(&accepted_queue_item_id)
                     .to_string();
                 if let Some(existing_item_object) = existing_item.as_object_mut() {
-                    clear_queue_item_dispatch_error(existing_item_object);
+                    if existing_item_object.get("status").and_then(Value::as_str)
+                        != Some("dispatching")
+                    {
+                        clear_queue_item_dispatch_error(existing_item_object);
+                    }
                 }
                 queue.insert("resumePending".to_string(), json!(false));
                 queue.insert("updatedAt".to_string(), json!(updated_at));
@@ -159,11 +163,16 @@ pub(crate) async fn remove_session_queue_item_payload(
             ));
         };
 
-        let previous_len = items.len();
-        items.retain(|item| item.get("id").and_then(Value::as_str) != Some(queue_id));
-        if items.len() == previous_len {
+        let Some(item_index) = items
+            .iter()
+            .position(|item| item.get("id").and_then(Value::as_str) == Some(queue_id))
+        else {
             return Ok(false);
+        };
+        if queue_item_is_dispatching(&items[item_index]) {
+            return Err(api_error(StatusCode::CONFLICT, "QUEUE_ALREADY_DISPATCHING"));
         }
+        items.remove(item_index);
 
         if items.is_empty() {
             queues_by_thread_id.remove(session_id);
@@ -203,6 +212,9 @@ pub(crate) async fn update_session_queue_item_payload(
                 .cloned()
         })
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "QUEUE_ITEM_NOT_FOUND"))?;
+    if queue_item_is_dispatching(&queued_item) {
+        return Err(api_error(StatusCode::CONFLICT, "QUEUE_ALREADY_DISPATCHING"));
+    }
 
     let next_prompt = prompt.map(str::to_string).unwrap_or_else(|| {
         queued_item
@@ -259,6 +271,9 @@ pub(crate) async fn update_session_queue_item_payload(
         else {
             return Ok(false);
         };
+        if queue_item_is_dispatching(item) {
+            return Err(api_error(StatusCode::CONFLICT, "QUEUE_ALREADY_DISPATCHING"));
+        }
         let Some(item_object) = item.as_object_mut() else {
             return Err(api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -319,6 +334,27 @@ pub(crate) async fn reorder_session_queue_payload(
         };
         if ordered_ids.len() != items.len() {
             return Ok(false);
+        }
+
+        let dispatching_positions = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                queue_item_is_dispatching(item).then(|| {
+                    (
+                        index,
+                        item.get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if dispatching_positions.iter().any(|(index, queue_id)| {
+            ordered_ids.get(*index).map(String::as_str) != Some(queue_id.as_str())
+        }) {
+            return Err(api_error(StatusCode::CONFLICT, "QUEUE_ALREADY_DISPATCHING"));
         }
 
         let items_by_id = items

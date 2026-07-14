@@ -3,6 +3,11 @@ use super::*;
 const SESSION_THREAD_CACHE_TTL: Duration = Duration::from_secs(3);
 const SESSION_SEARCH_TEXT_CACHE_TTL: Duration = Duration::from_secs(45);
 
+#[cfg(test)]
+pub(crate) static ROLLOUT_LISTING_HYDRATIONS_BY_PROJECT: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 fn session_thread_cache_key(
     profile_id: &str,
     archived: bool,
@@ -91,17 +96,13 @@ pub(crate) fn build_session_summary_from_thread_payload(
         .unwrap_or_default()
         .to_string();
     let thread_name = thread.get("name").and_then(Value::as_str);
-    let inferred_preview_title = infer_session_display_title(&preview);
     let meta_name = meta
         .get("name")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty() && *value != "New thread");
     let display_name = if let Some(meta_name) = meta_name {
-        let thread_name_trimmed = thread_name.map(str::trim).unwrap_or_default();
-        if !is_placeholder_thread_name(thread_name)
-            && inferred_preview_title.as_deref() != Some(thread_name_trimmed)
-        {
+        if !thread_name_is_preview_fallback(thread_name, &preview) {
             display_thread_name(thread_name, Some(preview.as_str()))
         } else {
             Some(meta_name.to_string())
@@ -323,13 +324,30 @@ async fn list_app_server_threads(
 ) -> ApiResult<Vec<Value>> {
     let mut cursor: Option<String> = None;
     let mut threads = Vec::new();
+    let mut seen_cursors = HashSet::new();
+    let mut page_count = 0usize;
 
     loop {
         let (batch, next_cursor) =
             list_app_server_thread_batch(state, profile_id, archived, cursor.as_deref(), 200)
                 .await?;
+        page_count += 1;
         threads.extend(batch);
-        cursor = next_cursor;
+        cursor = match bounded_pagination_cursor(
+            &mut seen_cursors,
+            next_cursor.as_deref(),
+            page_count,
+            32,
+        ) {
+            Ok(cursor) => cursor,
+            Err(reason) => {
+                warn!(
+                    profile_id,
+                    archived, reason, "stopped cyclic app-server thread pagination"
+                );
+                None
+            }
+        };
         if cursor.is_none() {
             break;
         }
@@ -580,6 +598,14 @@ async fn collect_rollout_session_summaries_payload(
             continue;
         }
 
+        #[cfg(test)]
+        {
+            let project_key = state.config.project_root.display().to_string();
+            let mut hydration_counts = ROLLOUT_LISTING_HYDRATIONS_BY_PROJECT
+                .lock()
+                .expect("rollout listing hydration counter should not be poisoned");
+            *hydration_counts.entry(project_key).or_default() += hydrated_candidates.len();
+        }
         let hydrated_threads = hydrate_rollout_candidates_to_threads_payload(
             state,
             profile_id,
@@ -843,7 +869,7 @@ async fn scan_rollout_sessions_with_query_payload(
     profile_id: &str,
     archived: bool,
     cursor: Option<&str>,
-    limit: u64,
+    window_size: usize,
     filter: &SessionFilterCriteria,
     needle: Option<&str>,
     include_full_text: bool,
@@ -900,7 +926,7 @@ async fn scan_rollout_sessions_with_query_payload(
     let start = cursor
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(0);
-    let window_size = limit.clamp(1, 200) as usize;
+    let window_size = window_size.max(1);
     let mut page = Vec::new();
     let mut matched_count = 0usize;
     let matched_state_ids = match needle {
@@ -931,6 +957,14 @@ async fn scan_rollout_sessions_with_query_payload(
             continue;
         }
 
+        #[cfg(test)]
+        {
+            let project_key = state.config.project_root.display().to_string();
+            let mut hydration_counts = ROLLOUT_LISTING_HYDRATIONS_BY_PROJECT
+                .lock()
+                .expect("rollout listing hydration counter should not be poisoned");
+            *hydration_counts.entry(project_key).or_default() += hydrated_candidates.len();
+        }
         let hydrated_threads = hydrate_rollout_candidates_to_threads_payload(
             state,
             profile_id,
@@ -1003,10 +1037,73 @@ pub(crate) async fn list_sessions_payload(
 ) -> ApiResult<Value> {
     let listing_profile_ids = session_listing_profile_ids(state, profile_id, filter);
     if listing_profile_ids.len() != 1 {
-        let sessions = collect_session_summaries_for_listing_payload(
-            state, profile_id, archived, filter, None, false,
-        )
-        .await?;
+        let window_size = limit.clamp(1, 200) as usize;
+        let start = cursor
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let profile_window_size = start.saturating_add(window_size).saturating_add(1);
+        let mut sessions = Vec::new();
+
+        for listing_profile_id in listing_profile_ids {
+            let mut profile_sessions = if let Some(payload) =
+                scan_rollout_sessions_with_query_payload(
+                    state,
+                    &listing_profile_id,
+                    archived,
+                    None,
+                    profile_window_size,
+                    filter,
+                    None,
+                    false,
+                )
+                .await?
+            {
+                payload
+                    .get("sessions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                collect_session_summaries_with_query_payload(
+                    state,
+                    &listing_profile_id,
+                    archived,
+                    filter,
+                    None,
+                    false,
+                )
+                .await?
+            };
+
+            if !archived {
+                merge_missing_runtime_session_summaries(
+                    state,
+                    &listing_profile_id,
+                    filter,
+                    &mut profile_sessions,
+                )
+                .await?;
+            }
+            sort_session_summaries(&mut profile_sessions);
+            profile_sessions.truncate(profile_window_size);
+            sessions.extend(profile_sessions);
+        }
+
+        sessions.sort_by(|left, right| {
+            if left.get("id").and_then(Value::as_str) == right.get("id").and_then(Value::as_str) {
+                let left_profile = left
+                    .get("profileId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let right_profile = right
+                    .get("profileId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                return left_profile.cmp(right_profile);
+            }
+            std::cmp::Ordering::Equal
+        });
+        sort_session_summaries(&mut sessions);
         return Ok(session_summary_page(sessions, cursor, limit));
     }
     let profile_id = listing_profile_ids
@@ -1015,7 +1112,14 @@ pub(crate) async fn list_sessions_payload(
         .unwrap_or(profile_id);
 
     if let Some(payload) = scan_rollout_sessions_with_query_payload(
-        state, profile_id, archived, cursor, limit, filter, None, false,
+        state,
+        profile_id,
+        archived,
+        cursor,
+        limit.clamp(1, 200) as usize,
+        filter,
+        None,
+        false,
     )
     .await?
     {
@@ -1065,7 +1169,7 @@ pub(crate) async fn search_sessions_payload(
         profile_id,
         archived,
         cursor,
-        limit,
+        limit.clamp(1, 200) as usize,
         filter,
         Some(&needle),
         include_full_text,

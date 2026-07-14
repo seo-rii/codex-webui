@@ -133,15 +133,18 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
         quota_cache: Arc::new(Mutex::new(HashMap::new())),
         quota_refreshes: Arc::new(Mutex::new(HashSet::new())),
         attachment_storage_usage_cache: Arc::new(Mutex::new(HashMap::new())),
+        attachment_storage_locks: Arc::new(Mutex::new(HashMap::new())),
         relays: Arc::new(Mutex::new(HashMap::new())),
         terminals: Arc::new(Mutex::new(HashMap::new())),
         session_summary_update_tasks: Arc::new(Mutex::new(HashMap::new())),
         runtime_config_update_tasks: Arc::new(Mutex::new(HashMap::new())),
         ui_state_locks: Arc::new(Mutex::new(HashMap::new())),
         ui_state_cache: Arc::new(Mutex::new(HashMap::new())),
+        ui_state_persistence: Arc::new(Mutex::new(HashMap::new())),
         automation_timers: Arc::new(Mutex::new(HashMap::new())),
         queue_dispatching: Arc::new(Mutex::new(HashSet::new())),
         queue_drain_retries: Arc::new(Mutex::new(HashMap::new())),
+        session_operation_locks: Arc::new(Mutex::new(HashMap::new())),
         session_app_server_assignments: Arc::new(Mutex::new(HashMap::new())),
         active_turns: Arc::new(Mutex::new(HashMap::new())),
         pending_turn_starts: Arc::new(Mutex::new(HashSet::new())),
@@ -604,6 +607,13 @@ for raw_line in sys.stdin:
             "id": request_id,
             "result": {
                 "ok": True
+            }
+        })
+        write({
+            "method": "thread/name/updated",
+            "params": {
+                "threadId": thread_id,
+                "threadName": params.get("name", "")
             }
         })
     elif method == "thread/goal/get":
@@ -1080,7 +1090,9 @@ for raw_line in sys.stdin:
         is_ephemeral = bool(thread.get("ephemeral", False))
         agent_items = []
         if is_ephemeral:
-            if "Translate the following Codex answer" in text_value:
+            if "Generate one concise title for this coding conversation" in text_value:
+                agent_text = "Repair generated session titles"
+            elif "Translate the following Codex answer" in text_value:
                 agent_text = "번역된 응답입니다."
             else:
                 language = "Korean" if any("\uac00" <= ch <= "\ud7af" for ch in text_value) else "English"
@@ -1125,6 +1137,14 @@ for raw_line in sys.stdin:
                 }
             }
         })
+        if is_ephemeral:
+            write({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": turn
+                }
+            })
     elif method == "thread/compact/start":
         thread_id = params.get("threadId", "")
         turn_counter += 1
@@ -1284,6 +1304,7 @@ for raw_line in sys.stdin:
 
 mod attachments_and_recovery;
 mod auth_git_static;
+mod residual_safety;
 mod runtime_queue_and_catalog;
 mod session_flow;
 mod settings_and_automation;

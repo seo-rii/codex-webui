@@ -58,7 +58,7 @@ pub(crate) async fn enqueue_profile_notification(
         Value::Null
     };
 
-    let notification = json!({
+    let mut notification = json!({
         "id": Uuid::new_v4().to_string(),
         "type": notification_type,
         "createdAt": now_unix_ms(),
@@ -67,6 +67,7 @@ pub(crate) async fn enqueue_profile_notification(
         "sessionName": session_name,
         "payload": payload
     });
+    compact_stored_notification(&mut notification);
 
     let unread_count = match with_ui_state_write(state, profile_id, |ui_state| {
         let Some(items) = ui_state
@@ -81,6 +82,9 @@ pub(crate) async fn enqueue_profile_notification(
             ));
         };
 
+        for existing in items.iter_mut() {
+            compact_stored_notification(existing);
+        }
         items.insert(0, notification.clone());
         if items.len() > 200 {
             items.truncate(200);
@@ -440,6 +444,18 @@ fn notification_method_carries_live_turn_activity(method: &str) -> bool {
     )
 }
 
+fn notification_method_is_stream_delta(method: &str) -> bool {
+    matches!(
+        method,
+        "item/agentMessage/delta"
+            | "item/plan/delta"
+            | "item/reasoning/textDelta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/commandExecution/outputDelta"
+            | "thread/realtime/transcript/delta"
+    )
+}
+
 pub(crate) fn runtime_status_from_codex_thread_status(status: &str) -> &str {
     match status {
         "active" | "running" => "running",
@@ -631,7 +647,7 @@ pub(crate) async fn clear_profile_runtime_activity_after_app_server_exit(
         }
     }
 
-    let runtime_status_session_ids = with_ui_state_write(state, profile_id, |ui_state| {
+    let runtime_status_session_ids = with_ui_state_write_debounced(state, profile_id, |ui_state| {
         let Some(runtime_status_by_thread_id) = ui_state
             .get_mut("runtimeStatusByThreadId")
             .and_then(Value::as_object_mut)
@@ -654,7 +670,8 @@ pub(crate) async fn clear_profile_runtime_activity_after_app_server_exit(
             });
             changed_session_ids.push(session_id.clone());
         }
-        Ok(changed_session_ids)
+        let changed = !changed_session_ids.is_empty();
+        Ok((changed_session_ids, changed))
     })
     .await
     .unwrap_or_default();
@@ -920,7 +937,7 @@ async fn mark_runtime_session_terminal_after_reconcile(
     );
     state.active_turns.lock().await.remove(&runtime_key);
     state.pending_turn_starts.lock().await.remove(&runtime_key);
-    let _ = with_ui_state_write(state, profile_id, |ui_state| {
+    let status_changed = with_ui_state_write_debounced(state, profile_id, |ui_state| {
         let Some(runtime_status_by_thread_id) = ui_state
             .get_mut("runtimeStatusByThreadId")
             .and_then(Value::as_object_mut)
@@ -930,6 +947,14 @@ async fn mark_runtime_session_terminal_after_reconcile(
                 "runtime status state is missing",
             ));
         };
+        if runtime_status_by_thread_id
+            .get(session_id)
+            .and_then(|entry| normalized_thread_status(Some(entry)))
+            .as_deref()
+            == Some(status)
+        {
+            return Ok((false, false));
+        }
         runtime_status_by_thread_id.insert(
             session_id.to_string(),
             json!({
@@ -938,9 +963,13 @@ async fn mark_runtime_session_terminal_after_reconcile(
                 "reason": reason
             }),
         );
-        Ok(())
+        Ok((true, true))
     })
-    .await;
+    .await
+    .unwrap_or(false);
+    if !status_changed {
+        return;
+    }
     if matches!(
         status,
         "completed" | "failed" | "error" | "cancelled" | "canceled" | "aborted"
@@ -1034,6 +1063,21 @@ pub(crate) async fn reconcile_lost_runtime_activity_for_profile(
             Ok(client) => client,
             Err(_) => continue,
         };
+        let runtime_key = runtime_session_key(&resolved_profile_id, &session_id);
+        if state
+            .pending_turn_starts
+            .lock()
+            .await
+            .contains(&runtime_key)
+        {
+            continue;
+        }
+        let cached_active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
+        if let Some(turn_id) = cached_active_turn_id.as_deref()
+            && client.has_active_turn_id(turn_id).await
+        {
+            continue;
+        }
         let response = client
             .request_with_timeout(
                 "thread/read",
@@ -1055,6 +1099,11 @@ pub(crate) async fn reconcile_lost_runtime_activity_for_profile(
             normalized_thread_status(thread.get("status")).unwrap_or_else(|| "unknown".to_string());
         let status = runtime_status_from_codex_thread_status(&codex_status);
         if status == "running" {
+            continue;
+        }
+        if let Some(turn_id) = state.active_turns.lock().await.get(&runtime_key).cloned()
+            && client.has_active_turn_id(&turn_id).await
+        {
             continue;
         }
         let reason = match status {
@@ -1110,7 +1159,7 @@ async fn persist_runtime_session_status(
             return;
         }
     }
-    let _ = with_ui_state_write(state, profile_id, |ui_state| {
+    let _ = with_ui_state_write_debounced(state, profile_id, |ui_state| {
         let Some(runtime_status_by_thread_id) = ui_state
             .get_mut("runtimeStatusByThreadId")
             .and_then(Value::as_object_mut)
@@ -1120,6 +1169,14 @@ async fn persist_runtime_session_status(
                 "runtime status state is missing",
             ));
         };
+        if runtime_status_by_thread_id
+            .get(session_id)
+            .and_then(|entry| normalized_thread_status(Some(entry)))
+            .as_deref()
+            == Some(status)
+        {
+            return Ok(((), false));
+        }
         runtime_status_by_thread_id.insert(
             session_id.to_string(),
             json!({
@@ -1127,7 +1184,7 @@ async fn persist_runtime_session_status(
                 "updatedAt": now_unix_ms()
             }),
         );
-        Ok(())
+        Ok(((), true))
     })
     .await;
 }
@@ -1199,7 +1256,12 @@ async fn terminal_status_conflicts_with_live_turn(
         .await
     {
         Ok(response) => response,
-        Err(error) => return is_unmaterialized_thread_error_message(&error.to_string()),
+        Err(error) => {
+            return is_unmaterialized_thread_error_message(&error.to_string())
+                || (has_cached_active_turn
+                    && (app_server_request_timed_out(&error)
+                        || app_server_request_interrupted(&error)));
+        }
     };
     let active_turn_id = response
         .get("thread")
@@ -1225,6 +1287,17 @@ pub(crate) async fn handle_profile_runtime_notification(
 ) {
     let Some(session_id) = notification_thread_id(&notification.method, &notification.params)
     else {
+        if matches!(
+            notification.method.as_str(),
+            "account/updated" | "account/rateLimits/updated"
+        ) {
+            let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+                .0
+                .to_string();
+            // Invalidate before publishing the event so a client refresh cannot
+            // race the relay and receive the previous quota snapshot.
+            state.quota_cache.lock().await.remove(&resolved_profile_id);
+        }
         if let Some(event) = map_app_server_global_notification(notification) {
             emit_profile_global_notification(state, profile_id, event).await;
         }
@@ -1363,17 +1436,33 @@ pub(crate) async fn handle_profile_runtime_notification(
                 )
                 .await;
             }
+            spawn_generated_session_title_for_completed_turn(
+                state,
+                profile_id,
+                &session_id,
+                notification.params.get("turn"),
+            )
+            .await;
         }
         method if notification_method_carries_live_turn_activity(method) => {
             state.pending_turn_starts.lock().await.remove(&runtime_key);
-            if let Some(turn_id) = notification_turn_id(&notification.params) {
-                state
-                    .active_turns
-                    .lock()
-                    .await
-                    .insert(runtime_key.clone(), turn_id);
+            let newly_observed_turn =
+                if let Some(turn_id) = notification_turn_id(&notification.params) {
+                    state
+                        .active_turns
+                        .lock()
+                        .await
+                        .insert(runtime_key.clone(), turn_id.clone())
+                        .as_deref()
+                        != Some(turn_id.as_str())
+                } else {
+                    false
+                };
+            if newly_observed_turn {
+                set_authoritative_runtime_session_status(state, profile_id, &session_id, "running")
+                    .await;
+                cancel_scheduled_shutdown_for_activity(state, profile_id).await;
             }
-            cancel_scheduled_shutdown_for_activity(state, profile_id).await;
         }
         "thread/name/updated" => {
             let thread_name = notification_thread_name(&notification.params);
@@ -1465,6 +1554,12 @@ pub(crate) async fn handle_profile_runtime_notification(
             .await;
         }
         _ => {}
+    }
+
+    if notification_method_is_stream_delta(&notification.method)
+        && !session_stream_has_subscribers(state, profile_id, &session_id).await
+    {
+        return;
     }
 
     if let Some(mut event) = map_app_server_session_notification(notification) {
@@ -1762,8 +1857,9 @@ pub(crate) fn register_runtime_profile_monitor(
                         .await;
                         if !reconciled.is_empty() {
                             warn!(
+                                session_ids = ?reconciled,
                                 "reconciled {} lost runtime session(s) for {maintenance_profile_id}",
-                                reconciled.len()
+                                reconciled.len(),
                             );
                         }
                     },
@@ -1813,11 +1909,24 @@ pub(crate) fn register_runtime_profile_monitor(
                         warn!(
                             "runtime app-server relay lagged for {monitor_profile_id}: skipped {skipped} messages"
                         );
-                        // The global relay already asks connected clients to resync after a
-                        // broadcast gap. Running native thread/read calls here creates a
-                        // feedback loop when the app-server is busy: more reads cause more
-                        // lag, and short reconciliation deadlines can interfere with user RPCs.
-                        // The single per-profile maintenance task performs the bounded repair.
+                        // This receiver can lag independently of the lightweight global
+                        // receiver, so it must publish its own gap signal. Reconciliation stays
+                        // in the bounded maintenance task to avoid adding more app-server RPCs
+                        // while the notification path is already overloaded.
+                        emit_profile_global_notification(
+                            &monitor_state,
+                            &monitor_profile_id,
+                            json!({
+                                "kind": "notification",
+                                "method": "codex-webui/resyncRequired",
+                                "params": {
+                                    "reason": format!(
+                                        "runtime app-server relay lagged for {monitor_profile_id}; skipped {skipped} messages"
+                                    )
+                                }
+                            }),
+                        )
+                        .await;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 },

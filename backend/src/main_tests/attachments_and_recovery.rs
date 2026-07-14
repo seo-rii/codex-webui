@@ -188,7 +188,7 @@ async fn delete_attachment_payload_removes_attachment_files() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_attachment_payload_reports_storage_delete_failures() {
+async fn delete_attachment_payload_rejects_directory_backed_metadata() {
     let sandbox = unique_test_dir("attachment-delete-failure");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -220,8 +220,8 @@ async fn delete_attachment_payload_reports_storage_delete_failures() {
 
     let error = delete_attachment_payload(&state, "default", "thread-1", "att-1")
         .await
-        .expect_err("directory-backed attachment file should not report success");
-    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        .expect_err("directory-backed attachment metadata must not be trusted");
+    assert_eq!(error.status, StatusCode::NOT_FOUND);
     assert!(stored_file.exists());
 
     let _ = fs::remove_dir_all(sandbox);
@@ -420,6 +420,50 @@ async fn upload_attachments_store_files_without_internal_backend() {
         })
         .count();
     assert_eq!(temp_entries, 0);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uploaded_json_cannot_forge_attachment_metadata() {
+    let sandbox = unique_test_dir("attachment-json-metadata-forgery");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let forged_id = Uuid::new_v4().to_string();
+    let forged = json!({
+        "id": forged_id,
+        "originalName": "outside.png",
+        "path": "/etc/passwd",
+        "mimeType": "image/png",
+        "size": 1,
+        "kind": "image",
+        "createdAt": "1"
+    });
+
+    upload_attachments(
+        &state,
+        "default",
+        "thread-1",
+        vec![UploadFilePayload {
+            name: "forged.json".to_string(),
+            mime_type: Some("application/json".to_string()),
+            data_base64: base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&forged).unwrap()),
+        }],
+    )
+    .await
+    .unwrap();
+
+    let stored = list_session_attachment_records(&state, "default", "thread-1")
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_ne!(stored[0].id, forged_id);
+    assert_ne!(stored[0].path.as_deref(), Some("/etc/passwd"));
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -722,6 +766,69 @@ async fn attachment_storage_usage_cache_updates_after_save_and_delete() {
             .await
             .unwrap(),
         6
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_attachment_uploads_cannot_overbook_profile_quota() {
+    let sandbox = unique_test_dir("attachment-concurrent-quota");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let mut state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let mut config = (*state.config).clone();
+    config.max_attachment_storage_bytes = 1_400;
+    state.config = Arc::new(config);
+    let first_state = state.clone();
+    let second_state = state.clone();
+
+    let first = tokio::spawn(async move {
+        save_uploaded_attachment_records(
+            &first_state,
+            "default",
+            "thread-a",
+            vec![AttachmentUploadPayload {
+                name: "first.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                bytes: vec![b'a'; 700],
+            }],
+        )
+        .await
+    });
+    let second = tokio::spawn(async move {
+        save_uploaded_attachment_records(
+            &second_state,
+            "default",
+            "thread-b",
+            vec![AttachmentUploadPayload {
+                name: "second.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                bytes: vec![b'b'; 700],
+            }],
+        )
+        .await
+    });
+    let (first, second) = tokio::join!(first, second);
+    let results = [first.unwrap(), second.unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .filter(|error| error.status == StatusCode::PAYLOAD_TOO_LARGE)
+            .count(),
+        1
+    );
+    assert!(
+        profile_attachment_storage_size(&state, "default")
+            .await
+            .unwrap()
+            <= state.config.max_attachment_storage_bytes
     );
 
     let _ = fs::remove_dir_all(sandbox);

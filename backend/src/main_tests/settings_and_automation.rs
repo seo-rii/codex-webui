@@ -1420,6 +1420,170 @@ async fn corrupt_ui_state_recovers_from_previous_snapshot() {
 }
 
 #[tokio::test]
+async fn coalesced_ui_state_writes_persist_only_the_latest_cached_value() {
+    let sandbox = unique_test_dir("ui-state-coalesced-writes");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+
+    for index in 0..32 {
+        with_ui_state_write_debounced(&state, "default", |ui_state| {
+            ui_state["runtimeStatusByThreadId"]["thread"] = json!({
+                "status": "running",
+                "updatedAt": index
+            });
+            Ok(((), true))
+        })
+        .await
+        .expect("cached ui-state mutation should succeed");
+    }
+    let revision = state
+        .ui_state_persistence
+        .lock()
+        .await
+        .get("default")
+        .map(|entry| entry.revision)
+        .unwrap_or_default();
+    assert_eq!(revision, 32);
+
+    flush_pending_ui_state_writes(&state).await;
+    let raw = fs::read_to_string(profile_ui_state_path(&state.config, "default"))
+        .expect("coalesced ui-state should be persisted");
+    let persisted: Value = serde_json::from_str(&raw).expect("ui-state should remain valid JSON");
+    assert_eq!(
+        persisted["runtimeStatusByThreadId"]["thread"]["updatedAt"],
+        json!(31)
+    );
+    assert!(!raw.contains("\n  \""), "ui-state should use compact JSON");
+    let persistence = state.ui_state_persistence.lock().await;
+    let entry = persistence.get("default").unwrap();
+    assert_eq!(entry.persisted_revision, entry.revision);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn failed_ui_state_mutations_remain_dirty_until_persisted() {
+    let sandbox = unique_test_dir("ui-state-failed-mutation");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+
+    let error = with_ui_state_write_debounced(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"]["thread"] = json!({ "status": "failed" });
+        Err::<((), bool), _>(api_error(StatusCode::CONFLICT, "mutation failed"))
+    })
+    .await
+    .expect_err("the caller should still receive the mutation error");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+
+    flush_pending_ui_state_writes(&state).await;
+    state.ui_state_cache.lock().await.clear();
+    let status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"]["thread"]["status"]
+            .as_str()
+            .map(str::to_string))
+    })
+    .await
+    .expect("persisted state should remain readable");
+    assert_eq!(status.as_deref(), Some("failed"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn identical_goal_updates_do_not_schedule_redundant_ui_state_writes() {
+    let sandbox = unique_test_dir("ui-state-goal-deduplication");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let goal = json!({
+        "threadId": "thread-goal",
+        "objective": "Keep working",
+        "status": "active",
+        "updatedAt": 42
+    });
+
+    cache_session_goal_payload(&state, "default", "thread-goal", &goal).await;
+    let first_revision = state
+        .ui_state_persistence
+        .lock()
+        .await
+        .get("default")
+        .map(|entry| entry.revision)
+        .unwrap_or_default();
+    cache_session_goal_payload(&state, "default", "thread-goal", &goal).await;
+    let second_revision = state
+        .ui_state_persistence
+        .lock()
+        .await
+        .get("default")
+        .map(|entry| entry.revision)
+        .unwrap_or_default();
+
+    assert_eq!(first_revision, 1);
+    assert_eq!(second_revision, first_revision);
+    flush_pending_ui_state_writes(&state).await;
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[test]
+fn stored_notifications_bound_untrusted_names_and_payloads() {
+    let mut notification = json!({
+        "sessionName": "x".repeat(100_000),
+        "payload": { "message": "y".repeat(100_000) }
+    });
+
+    compact_stored_notification(&mut notification);
+
+    let session_name = notification
+        .get("sessionName")
+        .and_then(Value::as_str)
+        .expect("session name should remain a string");
+    assert!(session_name.chars().count() <= 163);
+    assert_eq!(
+        notification
+            .get("payload")
+            .and_then(|payload| payload.get("truncated"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+#[test]
+fn pagination_cursor_rejects_cycles_and_page_overflow() {
+    let mut seen = HashSet::new();
+    assert_eq!(
+        bounded_pagination_cursor(&mut seen, Some("cursor-a"), 1, 3),
+        Ok(Some("cursor-a".to_string()))
+    );
+    assert_eq!(
+        bounded_pagination_cursor(&mut seen, Some("cursor-b"), 2, 3),
+        Ok(Some("cursor-b".to_string()))
+    );
+    assert_eq!(
+        bounded_pagination_cursor(&mut seen, Some("cursor-a"), 3, 3),
+        Err("pagination page limit reached")
+    );
+
+    let mut seen = HashSet::new();
+    assert_eq!(
+        bounded_pagination_cursor(&mut seen, Some("cursor-a"), 1, 4),
+        Ok(Some("cursor-a".to_string()))
+    );
+    assert_eq!(
+        bounded_pagination_cursor(&mut seen, Some("cursor-a"), 2, 4),
+        Err("pagination cursor cycle detected")
+    );
+}
+
+#[tokio::test]
 async fn ui_state_cache_is_bounded_across_profiles() {
     let sandbox = unique_test_dir("ui-state-cache-cap");
     let workspace = sandbox.join("workspace");

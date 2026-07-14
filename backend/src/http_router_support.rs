@@ -17,6 +17,20 @@ pub(crate) async fn handle_account_api_http(
                     Ok(payload) => payload,
                     Err(error) => return json_error(error.status, &error.message),
                 };
+            let imports_server_credentials = payload
+                .get("authJsonFile")
+                .and_then(Value::as_str)
+                .is_some_and(|path| !path.trim().is_empty())
+                || payload
+                    .get("createProfile")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            if imports_server_credentials && !role_has_owner_access(&state.config, auth.role) {
+                return json_error(
+                    StatusCode::FORBIDDEN,
+                    "This action requires the owner role.",
+                );
+            }
             start_account_login(&state, &auth.profile_id, &payload).await
         }
         (Method::POST, "/api/account/login/cancel") => {

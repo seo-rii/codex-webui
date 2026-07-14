@@ -58,11 +58,28 @@ pub(crate) fn infer_session_display_title(prompt: &str) -> Option<String> {
     }
 }
 
+pub(crate) fn thread_name_is_preview_fallback(name: Option<&str>, preview: &str) -> bool {
+    if is_placeholder_thread_name(name) {
+        return true;
+    }
+
+    let normalized_name = normalize_session_title_source(name.unwrap_or_default());
+    let normalized_preview = normalize_session_title_source(preview);
+    if normalized_name == normalized_preview {
+        return true;
+    }
+
+    infer_session_display_title(preview)
+        .as_deref()
+        .is_some_and(|inferred| inferred == normalized_name)
+}
+
 pub(crate) fn display_thread_name(name: Option<&str>, preview: Option<&str>) -> Option<String> {
-    if !is_placeholder_thread_name(name) {
+    let preview = preview.unwrap_or_default();
+    if !thread_name_is_preview_fallback(name, preview) {
         name.map(str::trim).map(str::to_string)
     } else {
-        infer_session_display_title(preview.unwrap_or_default())
+        infer_session_display_title(preview)
     }
 }
 

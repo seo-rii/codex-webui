@@ -186,7 +186,13 @@ fn merge_candidate_metadata_into_thread(thread: &mut Value, candidate: &Value, a
     {
         thread_object.insert("rolloutPath".to_string(), Value::String(path.to_string()));
     }
-    if is_placeholder_thread_name(thread_object.get("name").and_then(Value::as_str)) {
+    if thread_name_is_preview_fallback(
+        thread_object.get("name").and_then(Value::as_str),
+        thread_object
+            .get("preview")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    ) {
         if let Some(indexed_name) = candidate_indexed_name(candidate) {
             thread_object.insert("name".to_string(), Value::String(indexed_name));
         }

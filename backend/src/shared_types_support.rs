@@ -36,6 +36,7 @@ pub(crate) struct AppState {
     pub(crate) quota_refreshes: Arc<Mutex<HashSet<String>>>,
     pub(crate) attachment_storage_usage_cache:
         Arc<Mutex<HashMap<String, CachedAttachmentStorageUsage>>>,
+    pub(crate) attachment_storage_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub(crate) relays: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
     pub(crate) terminals: Arc<Mutex<HashMap<String, Arc<TerminalSession>>>>,
     pub(crate) session_summary_update_tasks:
@@ -43,10 +44,12 @@ pub(crate) struct AppState {
     pub(crate) runtime_config_update_tasks:
         Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(crate) ui_state_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    pub(crate) ui_state_cache: Arc<Mutex<HashMap<String, Value>>>,
+    pub(crate) ui_state_cache: Arc<Mutex<HashMap<String, Arc<Mutex<Value>>>>>,
+    pub(crate) ui_state_persistence: Arc<Mutex<HashMap<String, UiStatePersistenceState>>>,
     pub(crate) automation_timers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(crate) queue_dispatching: Arc<Mutex<HashSet<String>>>,
     pub(crate) queue_drain_retries: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    pub(crate) session_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub(crate) session_app_server_assignments: Arc<Mutex<HashMap<String, String>>>,
     pub(crate) active_turns: Arc<Mutex<HashMap<String, String>>>,
     pub(crate) pending_turn_starts: Arc<Mutex<HashSet<String>>>,
@@ -60,6 +63,13 @@ pub(crate) struct AppState {
     pub(crate) preserve_app_servers_on_shutdown: Arc<AtomicBool>,
     pub(crate) shutdown_notify: Arc<Notify>,
     pub(crate) restart_plan: Arc<Mutex<Option<RestartPlan>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct UiStatePersistenceState {
+    pub(crate) revision: u64,
+    pub(crate) persisted_revision: u64,
+    pub(crate) writer_running: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -201,6 +211,13 @@ pub(crate) struct UsageResponseShape {
     pub(crate) plan_type: Option<String>,
     #[serde(alias = "rateLimit")]
     pub(crate) rate_limit: Option<UsageRateLimitShape>,
+    #[serde(alias = "additionalRateLimits")]
+    pub(crate) additional_rate_limits: Option<Vec<UsageAdditionalRateLimitShape>>,
+    pub(crate) credits: Option<Value>,
+    #[serde(alias = "spendControl")]
+    pub(crate) spend_control: Option<Value>,
+    #[serde(alias = "rateLimitReachedType")]
+    pub(crate) rate_limit_reached_type: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,11 +229,27 @@ pub(crate) struct UsageRateLimitShape {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct UsageAdditionalRateLimitShape {
+    #[serde(alias = "limitName")]
+    pub(crate) limit_name: Option<String>,
+    #[serde(alias = "meteredFeature")]
+    pub(crate) metered_feature: Option<String>,
+    #[serde(alias = "rateLimit")]
+    pub(crate) rate_limit: Option<UsageRateLimitShape>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct UsageWindowShape {
     #[serde(alias = "usedPercent")]
     pub(crate) used_percent: Option<f64>,
     #[serde(alias = "resetAfterSeconds")]
     pub(crate) reset_after_seconds: Option<i64>,
+    #[serde(alias = "resetAt", alias = "resetsAt")]
+    pub(crate) reset_at: Option<i64>,
+    #[serde(alias = "limitWindowSeconds")]
+    pub(crate) limit_window_seconds: Option<i64>,
+    #[serde(alias = "windowDurationMins", alias = "windowMinutes")]
+    pub(crate) window_duration_mins: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,7 +317,7 @@ pub(crate) struct AttachmentUploadPayload {
     pub(crate) bytes: Vec<u8>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StoredAttachmentRecord {
     pub(crate) id: String,

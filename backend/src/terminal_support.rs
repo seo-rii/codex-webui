@@ -234,7 +234,12 @@ pub(crate) async fn create_terminal(
         let mut buffer = [0_u8; 4096];
         let mut pending_output = String::new();
         loop {
-            match tokio::time::timeout(Duration::from_millis(50), reader.read(&mut buffer)).await {
+            let read_result = if pending_output.is_empty() {
+                Ok(reader.read(&mut buffer).await)
+            } else {
+                tokio::time::timeout(Duration::from_millis(50), reader.read(&mut buffer)).await
+            };
+            match read_result {
                 Ok(Ok(0)) => {
                     if !pending_output.is_empty() {
                         output_session.append_output(&pending_output).await;

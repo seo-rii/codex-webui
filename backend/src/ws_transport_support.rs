@@ -95,16 +95,22 @@ pub(crate) async fn handle_ws(
         apply_security_headers(response.headers_mut());
         return response;
     };
+    let auth_token = strongest_auth_token(&state.config, &jar, &headers);
 
     let mut response = ws
         .max_message_size(WS_MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| websocket_session(socket, state, auth))
+        .on_upgrade(move |socket| websocket_session(socket, state, auth, auth_token))
         .into_response();
     apply_security_headers(response.headers_mut());
     response
 }
 
-async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext) {
+async fn websocket_session(
+    socket: WebSocket,
+    state: AppState,
+    auth: AuthContext,
+    auth_token: Option<String>,
+) {
     let (mut sender, mut receiver) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<ServerEnvelope>(WS_OUTBOUND_QUEUE_CAPACITY);
     let connection_id = Uuid::new_v4().to_string();
@@ -147,6 +153,16 @@ async fn websocket_session(socket: WebSocket, state: AppState, auth: AuthContext
     );
 
     while let Some(Ok(message)) = receiver.next().await {
+        if auth_token
+            .as_deref()
+            .is_some_and(|token| valid_auth_cookie_role(&state.config, token) != Some(auth.role))
+        {
+            warn!(
+                role = user_role_label(auth.role),
+                "closing websocket connection after its authentication session expired or was revoked"
+            );
+            break;
+        }
         match message {
             Message::Text(text) => {
                 let payload = match serde_json::from_str::<ClientEnvelope>(&text) {
@@ -314,8 +330,26 @@ async fn handle_ws_message(
                 return Ok(());
             }
 
+            let request_profile_id =
+                match ws_request_default_profile_id(&state.config, auth, &params) {
+                    Ok(profile_id) => profile_id,
+                    Err(error) => {
+                        let _ = queue_ws_envelope(
+                            out_tx,
+                            ServerEnvelope::Response {
+                                id,
+                                ok: false,
+                                result: None,
+                                error: Some(redact_user_facing_error(&error.to_string())),
+                            },
+                            "profile-resolution-error",
+                        );
+                        return Ok(());
+                    }
+                };
+
             let params_hash = request_params_hash(&params);
-            let request_key = request_cache_key(&auth.profile_id, &id, auth.role);
+            let request_key = request_cache_key(&request_profile_id, &id, auth.role);
             let use_request_replay = ws_method_uses_request_replay(&method);
 
             if use_request_replay {
@@ -381,7 +415,7 @@ async fn handle_ws_message(
             }
 
             let Some(_profile_permit) =
-                try_acquire_profile_ws_request_slot(state, &auth.profile_id).await
+                try_acquire_profile_ws_request_slot(state, &request_profile_id).await
             else {
                 let message = ServerEnvelope::Response {
                     id,
@@ -448,7 +482,7 @@ async fn handle_ws_message(
                             slow_log_state.max_response_bytes = 0;
                             warn!(
                                 method = %method,
-                                profile_id = %auth.profile_id,
+                                profile_id = %request_profile_id,
                                 elapsed_ms = elapsed.as_millis(),
                                 response_bytes = response_size,
                                 suppressed_count,
@@ -468,7 +502,7 @@ async fn handle_ws_message(
                     Err(_) => {
                         warn!(
                             method = %method,
-                            profile_id = %auth.profile_id,
+                            profile_id = %request_profile_id,
                             elapsed_ms = elapsed.as_millis(),
                             response_bytes = response_size,
                             "slow websocket request"

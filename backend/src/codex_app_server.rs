@@ -23,7 +23,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
     runtime::{Builder as TokioRuntimeBuilder, Handle as TokioRuntimeHandle},
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast, oneshot},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, broadcast, oneshot},
     task::JoinHandle,
     time::{Instant as TokioInstant, timeout, timeout_at},
 };
@@ -36,6 +36,7 @@ const APP_SERVER_REQUEST_TIMEOUT_MAX_SECONDS: u64 = 7_200;
 const APP_SERVER_DEFAULT_CPU_SUB: usize = 2;
 const APP_SERVER_DEFAULT_CPU_DIVISOR: usize = 1;
 const APP_SERVER_DEFAULT_MEMORY_BYTES_PER_PROCESS: u64 = 2 * 1024 * 1024 * 1024;
+const APP_SERVER_GATEWAY_MEMORY_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 const APP_SERVER_DEFAULT_MAX_PROCESSES_CAP: usize = 4;
 const APP_SERVER_MAX_PROCESSES_HARD_CAP: usize = 512;
 const APP_SERVER_DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 300;
@@ -144,6 +145,7 @@ struct AppServerClientInner {
     config: AppServerClientConfig,
     controller: Arc<AppServerControllerRuntime>,
     clients_registry: Option<Weak<Mutex<HashMap<String, AppServerClient>>>>,
+    lifecycle: RwLock<()>,
     start_lock: Mutex<()>,
     process: Mutex<Option<ProcessState>>,
     pending: Mutex<HashMap<u64, PendingRequest>>,
@@ -355,8 +357,11 @@ impl AppServerClient {
         controller: Arc<AppServerControllerRuntime>,
         clients_registry: Option<Weak<Mutex<HashMap<String, AppServerClient>>>>,
     ) -> Self {
-        let (notifications_tx, _) = broadcast::channel(8192);
-        let (requests_tx, _) = broadcast::channel(1024);
+        // Native payloads can contain complete turns and images. Keeping
+        // thousands of them retains gigabytes when one relay falls behind;
+        // lagged consumers already receive an explicit resync signal.
+        let (notifications_tx, _) = broadcast::channel(512);
+        let (requests_tx, _) = broadcast::channel(128);
 
         Self {
             inner: Arc::new(AppServerClientInner {
@@ -365,6 +370,7 @@ impl AppServerClient {
                 config,
                 controller,
                 clients_registry,
+                lifecycle: RwLock::new(()),
                 start_lock: Mutex::new(()),
                 process: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
@@ -460,7 +466,12 @@ impl AppServerClient {
             .context("codex app-server controller task failed")?
     }
 
+    pub async fn has_active_turn_id(&self, turn_id: &str) -> bool {
+        self.inner.active_turn_ids.lock().await.contains(turn_id)
+    }
+
     async fn request_on_controller(&self, method: String, params: Value) -> Result<Value> {
+        let _lifecycle = self.inner.lifecycle.read().await;
         self.touch_activity();
         self.ensure_started().await?;
         self.request_started(method, params).await
@@ -473,29 +484,30 @@ impl AppServerClient {
         request_timeout: Duration,
         recover_handoff_on_timeout: bool,
     ) -> Result<Value> {
+        let _lifecycle = self.inner.lifecycle.read().await;
         self.touch_activity();
         let deadline = TokioInstant::now() + request_timeout;
-        match timeout_at(deadline, self.ensure_started()).await {
-            Ok(result) => result?,
+        // Starting Codex mutates shared process state. Keep that work alive when a
+        // short caller deadline expires so a catalog or account probe cannot leave
+        // a half-initialized process behind or repeatedly kill healthy startups.
+        let startup_client = self.clone();
+        let startup_task = self
+            .inner
+            .controller
+            .handle
+            .spawn(async move { startup_client.ensure_started().await });
+        match timeout_at(deadline, startup_task).await {
+            Ok(result) => result.context("codex app-server startup task failed")??,
             Err(_) => {
                 self.inner
                     .pending
                     .lock()
                     .await
                     .retain(|_, pending| !pending.sender.is_closed());
-                let recovered = if recover_handoff_on_timeout {
-                    self.recover_process_after_request_timeout(
-                        None,
-                        "codex app-server initialization timed out",
-                    )
-                    .await
-                } else {
-                    false
-                };
                 return Err(AppServerRequestTimeoutError {
                     method,
                     request_timeout,
-                    recovered,
+                    recovered: false,
                 }
                 .into());
             }
@@ -506,9 +518,19 @@ impl AppServerClient {
     }
 
     async fn respond_on_controller(&self, id: Value, result: Value) -> Result<()> {
+        let _lifecycle = self.inner.lifecycle.read().await;
         self.touch_activity();
         let request_id_key = server_request_id_key(&id);
-        self.ensure_started().await?;
+        if !self
+            .inner
+            .process
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(process_state_is_usable)
+        {
+            anyhow::bail!("codex app-server request expired after its process exited");
+        }
         self.write_message(&json!({
             "id": id,
             "result": result
@@ -523,9 +545,19 @@ impl AppServerClient {
     }
 
     async fn reject_on_controller(&self, id: Value, message: String) -> Result<()> {
+        let _lifecycle = self.inner.lifecycle.read().await;
         self.touch_activity();
         let request_id_key = server_request_id_key(&id);
-        self.ensure_started().await?;
+        if !self
+            .inner
+            .process
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(process_state_is_usable)
+        {
+            anyhow::bail!("codex app-server request expired after its process exited");
+        }
         self.write_message(&json!({
             "id": id,
             "error": {
@@ -780,7 +812,10 @@ impl AppServerClient {
                 .into())
             }
             Ok(result) => match result {
-                Ok(Ok(value)) => Ok(value),
+                Ok(Ok(value)) => {
+                    record_response_activity(&self.inner, &method_name, &value).await;
+                    Ok(value)
+                }
                 Ok(Err(message)) => Err(anyhow!(message)),
                 Err(_) => Err(anyhow!(
                     "codex app-server request channel closed before a response arrived"
@@ -794,6 +829,20 @@ impl AppServerClient {
         expected_generation: Option<u64>,
         reason: &str,
     ) -> bool {
+        let active_turn_count = self.inner.active_turn_ids.lock().await.len();
+        let pending_request_count = self.inner.pending.lock().await.len();
+        let pending_server_request_count = self.inner.pending_server_request_ids.lock().await.len();
+        if active_turn_count > 0 || pending_request_count > 0 || pending_server_request_count > 0 {
+            warn!(
+                profile_id = %self.inner.profile.id,
+                client_key = %self.inner.client_key,
+                active_turn_count,
+                pending_request_count,
+                pending_server_request_count,
+                "{reason}; preserving app-server because it still owns live work"
+            );
+            return false;
+        }
         let process = {
             let mut process = self.inner.process.lock().await;
             if process.as_ref().is_some_and(|process| {
@@ -812,6 +861,7 @@ impl AppServerClient {
 
         warn!(
             profile_id = %self.inner.profile.id,
+            client_key = %self.inner.client_key,
             handoff_proxy = was_handoff_proxy,
             "{reason}; discarding poisoned app-server process"
         );
@@ -835,6 +885,7 @@ impl AppServerClient {
     async fn terminate_unresponsive_process_state(&self, mut process: ProcessState, reason: &str) {
         warn!(
             profile_id = %self.inner.profile.id,
+            client_key = %self.inner.client_key,
             pid = ?process.pid,
             "{reason}; terminating codex app-server process group"
         );
@@ -848,6 +899,7 @@ impl AppServerClient {
             Err(_) => {
                 warn!(
                     profile_id = %self.inner.profile.id,
+                    client_key = %self.inner.client_key,
                     "timed out while waiting for unresponsive codex app-server supervisor to exit"
                 );
                 join_handle.abort();
@@ -882,16 +934,16 @@ impl AppServerClient {
     }
 
     async fn spawn_process(&self) -> Result<ProcessState> {
-        if self.inner.controller.process_slots.available_permits() == 0 {
-            if let Some(clients) = self.inner.clients_registry.as_ref().and_then(Weak::upgrade) {
-                let _ = evict_idle_clients_from_registry(
-                    &clients,
-                    self.inner.config.idle_client_timeout,
-                    1,
-                    Some(self.inner.client_key.as_str()),
-                )
-                .await;
-            }
+        if self.inner.controller.process_slots.available_permits() == 0
+            && let Some(clients) = self.inner.clients_registry.as_ref().and_then(Weak::upgrade)
+        {
+            let _ = evict_idle_clients_from_registry(
+                &clients,
+                self.inner.config.idle_client_timeout,
+                1,
+                Some(self.inner.client_key.as_str()),
+            )
+            .await;
         }
         let process_slot = match timeout(
             self.inner.config.startup_timeout,
@@ -1071,6 +1123,7 @@ impl AppServerClient {
             }
             let _ = tokio::fs::remove_file(&paths.socket_path).await;
 
+            rotate_text_log_if_needed(&paths.log_path, 8 * 1024 * 1024, 3);
             let log = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -1179,7 +1232,6 @@ impl AppServerManager {
         client_key: String,
         profile: AppServerProfile,
     ) -> AppServerClient {
-        let existing = self.clients.lock().await.get(&client_key).cloned();
         if self.controller.process_slots.available_permits() == 0 {
             let _ = self
                 .evict_idle_clients_except(
@@ -1189,25 +1241,38 @@ impl AppServerManager {
                 )
                 .await;
         }
-        if let Some(existing) = existing {
-            existing.touch_activity();
-            return existing;
-        }
 
-        let mut clients = self.clients.lock().await;
-        if let Some(existing) = clients.get(&client_key) {
-            existing.touch_activity();
-            return existing.clone();
+        loop {
+            let mut clients = self.clients.lock().await;
+            if let Some(existing) = clients.get(&client_key) {
+                if existing.inner.profile == profile {
+                    existing.touch_activity();
+                    return existing.clone();
+                }
+                let stale_client = clients
+                    .remove(&client_key)
+                    .expect("existing app-server client should be removable");
+                drop(clients);
+                warn!(
+                    client_key,
+                    old_codex_home = %stale_client.inner.profile.codex_home.display(),
+                    new_codex_home = %profile.codex_home.display(),
+                    "replacing codex app-server client after runtime profile changed"
+                );
+                let _ = stale_client.close().await;
+                continue;
+            }
+
+            let client = AppServerClient::with_controller(
+                client_key.clone(),
+                profile.clone(),
+                self.config.clone(),
+                Arc::clone(&self.controller),
+                Some(Arc::downgrade(&self.clients)),
+            );
+            clients.insert(client_key.clone(), client.clone());
+            return client;
         }
-        let client = AppServerClient::with_controller(
-            client_key.clone(),
-            profile.clone(),
-            self.config.clone(),
-            Arc::clone(&self.controller),
-            Some(Arc::downgrade(&self.clients)),
-        );
-        clients.insert(client_key, client.clone());
-        client
     }
 
     pub async fn evict_idle_clients(
@@ -1217,6 +1282,33 @@ impl AppServerManager {
     ) -> Result<Vec<String>> {
         self.evict_idle_clients_except(idle_for, max_to_evict, None)
             .await
+    }
+
+    pub fn spawn_idle_cleanup_loop(&self, interval: Duration) -> JoinHandle<()> {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(interval);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            timer.tick().await;
+            loop {
+                timer.tick().await;
+                match manager
+                    .evict_idle_clients(manager.config.idle_client_timeout, usize::MAX)
+                    .await
+                {
+                    Ok(evicted) if !evicted.is_empty() => {
+                        info!(
+                            count = evicted.len(),
+                            "evicted idle codex app-server clients"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!("failed to evict idle codex app-server clients: {error:#}");
+                    }
+                }
+            }
+        })
     }
 
     async fn evict_idle_clients_except(
@@ -1234,9 +1326,8 @@ impl AppServerManager {
             let mut clients = self.clients.lock().await;
             let keys = clients
                 .iter()
-                .filter_map(|(key, client)| {
-                    (client.inner.profile.id == profile_id).then(|| key.clone())
-                })
+                .filter(|(_, client)| client.inner.profile.id == profile_id)
+                .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
             keys.into_iter()
                 .filter_map(|key| clients.remove(&key).map(|client| (key, client)))
@@ -1489,22 +1580,20 @@ impl AppServerManager {
             if let Some(snapshot) = self
                 .handoff_process_snapshot_for_client_key(&client.inner.profile, client_key)
                 .await
+                && snapshot.pid == pid
             {
-                if snapshot.pid == pid {
-                    stop_handoff_server(&self.config, client_key, &client.inner.profile).await?;
-                    return Ok(snapshot);
-                }
+                stop_handoff_server(&self.config, client_key, &client.inner.profile).await?;
+                return Ok(snapshot);
             }
         }
 
         if let Some(snapshot) = self
             .handoff_process_snapshot_for_client_key(&profile, &profile.id)
             .await
+            && snapshot.pid == pid
         {
-            if snapshot.pid == pid {
-                stop_handoff_server(&self.config, &profile.id, &profile).await?;
-                return Ok(snapshot);
-            }
+            stop_handoff_server(&self.config, &profile.id, &profile).await?;
+            return Ok(snapshot);
         }
 
         anyhow::bail!("Codex process was not found or is no longer managed by this WebUI.")
@@ -1621,29 +1710,30 @@ async fn evict_idle_clients_from_registry(
     candidates.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.3.cmp(&right.3)));
 
     let mut evicted = Vec::new();
-    for (client_key, client, _, _) in candidates {
-        if evicted.len() >= max_to_evict || !client.is_idle_for(idle_for).await {
+    for (client_key, client, has_process, _) in candidates {
+        if evicted.len() >= max_to_evict || !has_process {
             continue;
         }
-        let removed = {
-            let mut clients = clients.lock().await;
-            if clients
+        // Never wait on another client's active RPC while the caller may itself
+        // hold a lifecycle read lock and be trying to free a process slot.
+        let Ok(_lifecycle) = client.inner.lifecycle.try_write() else {
+            continue;
+        };
+        if !client.is_idle_for(idle_for).await {
+            continue;
+        }
+        let is_current = {
+            let clients = clients.lock().await;
+            clients
                 .get(&client_key)
                 .is_some_and(|current| Arc::ptr_eq(&current.inner, &client.inner))
-            {
-                clients.remove(&client_key)
-            } else {
-                None
-            }
         };
-        let Some(removed) = removed else {
-            continue;
-        };
-        if !removed.is_idle_for(idle_for).await {
-            clients.lock().await.insert(client_key, removed);
+        if !is_current {
             continue;
         }
-        removed.close().await?;
+        // Keep the client registered. A request that was queued before cleanup
+        // resumes after this write lock and starts a fresh tracked process.
+        client.close().await?;
         evicted.push(client_key);
     }
     Ok(evicted)
@@ -1723,11 +1813,17 @@ async fn terminate_managed_process_group(
     if !managed_process_can_signal_group(pid, identity) {
         return;
     }
+    #[cfg(target_os = "linux")]
     let process_group = format!("-{pid}");
     let pid_target = pid.to_string();
+    #[cfg(target_os = "linux")]
     let _ = signal_managed_process_target("-TERM", &process_group).await;
     let _ = signal_managed_process_target("-TERM", &pid_target).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
+    if !managed_process_can_signal_group(pid, identity) {
+        return;
+    }
+    #[cfg(target_os = "linux")]
     if signal_managed_process_target("-0", &process_group).await {
         let _ = signal_managed_process_target("-KILL", &process_group).await;
     }
@@ -1914,7 +2010,7 @@ async fn stop_handoff_server(
 impl AppServerControllerRuntime {
     fn new(worker_threads: usize, max_processes: usize) -> Arc<Self> {
         let worker_threads = worker_threads.clamp(1, 4);
-        let blocking_threads = worker_threads.saturating_mul(4).max(4).min(32);
+        let blocking_threads = worker_threads.saturating_mul(4).clamp(4, 32);
         let max_processes = max_processes.clamp(1, APP_SERVER_MAX_PROCESSES_HARD_CAP);
         let (handle_tx, handle_rx) = std_mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -1952,10 +2048,10 @@ impl AppServerControllerRuntime {
 
 impl Drop for AppServerControllerRuntime {
     fn drop(&mut self) {
-        if let Ok(mut shutdown_tx) = self.shutdown_tx.lock() {
-            if let Some(shutdown_tx) = shutdown_tx.take() {
-                let _ = shutdown_tx.send(());
-            }
+        if let Ok(mut shutdown_tx) = self.shutdown_tx.lock()
+            && let Some(shutdown_tx) = shutdown_tx.take()
+        {
+            let _ = shutdown_tx.send(());
         }
     }
 }
@@ -1969,8 +2065,7 @@ fn default_controller_thread_count() -> usize {
             std::thread::available_parallelism()
                 .map(usize::from)
                 .unwrap_or(1)
-                .min(2)
-                .max(1)
+                .clamp(1, 2)
         })
         .clamp(1, 4)
 }
@@ -1991,8 +2086,11 @@ fn default_max_process_count() -> usize {
 }
 
 fn parse_max_process_count_override(value: &str) -> Option<usize> {
-    if value.eq_ignore_ascii_case("unlimited") || value.trim() == "0" {
+    if value.eq_ignore_ascii_case("unlimited") {
         return Some(APP_SERVER_MAX_PROCESSES_HARD_CAP);
+    }
+    if value.eq_ignore_ascii_case("auto") || value.trim() == "0" {
+        return None;
     }
     value
         .trim()
@@ -2009,7 +2107,11 @@ fn auto_max_process_count(available_cpus: usize, memory_limit_bytes: Option<u64>
         .unwrap_or(1)
         .max(1);
     let memory_limit = memory_limit_bytes
-        .map(|bytes| (bytes / APP_SERVER_DEFAULT_MEMORY_BYTES_PER_PROCESS).max(1) as usize)
+        .map(|bytes| {
+            (bytes.saturating_sub(APP_SERVER_GATEWAY_MEMORY_RESERVE_BYTES)
+                / APP_SERVER_DEFAULT_MEMORY_BYTES_PER_PROCESS)
+                .max(1) as usize
+        })
         .unwrap_or(APP_SERVER_DEFAULT_MAX_PROCESSES_CAP);
     cpu_limit
         .min(memory_limit)
@@ -2021,23 +2123,52 @@ fn detected_memory_limit_bytes() -> Option<u64> {
 }
 
 fn cgroup_memory_limit_bytes() -> Option<u64> {
-    for path in [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ] {
-        let Ok(value) = fs::read_to_string(path) else {
+    let mut paths = vec![
+        PathBuf::from("/sys/fs/cgroup/memory.max"),
+        PathBuf::from("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ];
+    if let Ok(cgroup) = fs::read_to_string("/proc/self/cgroup") {
+        for line in cgroup.lines() {
+            let mut fields = line.splitn(3, ':');
+            let hierarchy = fields.next().unwrap_or_default();
+            let controllers = fields.next().unwrap_or_default();
+            let relative = fields.next().unwrap_or_default().trim_start_matches('/');
+            if hierarchy == "0" && controllers.is_empty() {
+                paths.push(
+                    Path::new("/sys/fs/cgroup")
+                        .join(relative)
+                        .join("memory.max"),
+                );
+            } else if controllers
+                .split(',')
+                .any(|controller| controller == "memory")
+            {
+                paths.push(
+                    Path::new("/sys/fs/cgroup/memory")
+                        .join(relative)
+                        .join("memory.limit_in_bytes"),
+                );
+            }
+        }
+    }
+
+    let mut detected = None;
+    for path in paths {
+        let Ok(value) = fs::read_to_string(&path) else {
             continue;
         };
         let trimmed = value.trim();
         if trimmed.eq_ignore_ascii_case("max") || trimmed.is_empty() {
             continue;
         }
-        let bytes = trimmed.parse::<u64>().ok()?;
+        let Ok(bytes) = trimmed.parse::<u64>() else {
+            continue;
+        };
         if bytes > 0 && bytes < i64::MAX as u64 {
-            return Some(bytes);
+            detected = Some(detected.map_or(bytes, |current: u64| current.min(bytes)));
         }
     }
-    None
+    detected
 }
 
 fn proc_mem_total_bytes() -> Option<u64> {
@@ -2124,23 +2255,45 @@ async fn supervise_process(
         let _ = child.wait().await;
         return;
     }
-    let stdout_task = tokio::spawn(read_stdout(inner.clone(), stdout));
+    let mut stdout_task = tokio::spawn(read_stdout(inner.clone(), stdout));
     let stderr_task = tokio::spawn(read_stderr(stderr, inner.config.stderr_log_path.clone()));
+    let pid = child.id();
+    let process_identity = read_managed_process_identity(pid);
+    let mut stdout_finished = false;
 
-    let exit_result = tokio::select! {
+    let (exit_result, reader_failure) = tokio::select! {
         _ = &mut shutdown_rx => {
             let _ = child.kill().await;
-            child.wait().await
+            (child.wait().await, None)
         }
-        result = child.wait() => result,
+        result = child.wait() => (result, None),
+        result = &mut stdout_task => {
+            stdout_finished = true;
+            let reason = match result {
+                Ok(Ok(())) => "codex app-server stdout closed unexpectedly".to_string(),
+                Ok(Err(error)) => format!("codex app-server stdout reader failed: {error:#}"),
+                Err(error) => format!("codex app-server stdout reader task failed: {error}"),
+            };
+            terminate_managed_process_group(pid, process_identity).await;
+            let _ = child.kill().await;
+            (child.wait().await, Some(reason))
+        }
     };
 
-    let (reason, exit_code) = match exit_result {
-        Ok(status) => (
+    let (reason, exit_code) = match (reader_failure, exit_result) {
+        (Some(reason), Ok(status)) => (
+            format!("{reason}; process exited ({status})"),
+            status.code().map(Value::from).unwrap_or(Value::Null),
+        ),
+        (Some(reason), Err(error)) => (
+            format!("{reason}; failed to wait for process exit: {error}"),
+            Value::Null,
+        ),
+        (None, Ok(status)) => (
             format!("codex app-server exited ({status})"),
             status.code().map(Value::from).unwrap_or(Value::Null),
         ),
-        Err(error) => (
+        (None, Err(error)) => (
             format!("failed to wait for codex app-server exit: {error}"),
             Value::Null,
         ),
@@ -2178,11 +2331,13 @@ async fn supervise_process(
         });
     }
 
-    finish_reader_task(stdout_task, "stdout", &inner.profile.id).await;
+    if !stdout_finished {
+        finish_reader_task(stdout_task, "stdout", &inner.profile.id).await;
+    }
     finish_reader_task(stderr_task, "stderr", &inner.profile.id).await;
 }
 
-async fn finish_reader_task(mut task: JoinHandle<()>, stream: &str, profile_id: &str) {
+async fn finish_reader_task<T>(mut task: JoinHandle<T>, stream: &str, profile_id: &str) {
     if timeout(APP_SERVER_READER_CLEANUP_TIMEOUT, &mut task)
         .await
         .is_err()
@@ -2195,9 +2350,14 @@ async fn finish_reader_task(mut task: JoinHandle<()>, stream: &str, profile_id: 
     }
 }
 
-async fn read_stdout(inner: Arc<AppServerClientInner>, stdout: ChildStdout) {
+async fn read_stdout(inner: Arc<AppServerClientInner>, stdout: ChildStdout) -> Result<()> {
     let mut reader = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = reader.next_line().await {
+    loop {
+        let line = reader
+            .next_line()
+            .await
+            .context("failed to read codex app-server stdout")?
+            .ok_or_else(|| anyhow!("codex app-server stdout reached EOF"))?;
         inner
             .last_activity_at_ms
             .store(unix_time_ms(), Ordering::Relaxed);
@@ -2237,13 +2397,7 @@ async fn record_notification_activity(
     inner: &Arc<AppServerClientInner>,
     notification: &AppServerNotification,
 ) {
-    let turn_id = notification
-        .params
-        .get("turn")
-        .and_then(Value::as_object)
-        .and_then(|turn| turn.get("id"))
-        .and_then(Value::as_str)
-        .or_else(|| notification.params.get("turnId").and_then(Value::as_str));
+    let turn_id = activity_turn_id(&notification.params);
     match notification.method.as_str() {
         "turn/started" => {
             if let Some(turn_id) = turn_id {
@@ -2261,6 +2415,35 @@ async fn record_notification_activity(
         }
         _ => {}
     }
+}
+
+async fn record_response_activity(
+    inner: &Arc<AppServerClientInner>,
+    method: &str,
+    response: &Value,
+) {
+    if !matches!(
+        method,
+        "turn/start" | "thread/compact/start" | "review/start"
+    ) {
+        return;
+    }
+    if let Some(turn_id) = activity_turn_id(response) {
+        inner
+            .active_turn_ids
+            .lock()
+            .await
+            .insert(turn_id.to_string());
+    }
+}
+
+fn activity_turn_id(payload: &Value) -> Option<&str> {
+    payload
+        .get("turn")
+        .and_then(Value::as_object)
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("turnId").and_then(Value::as_str))
 }
 
 fn server_request_id_key(id: &Value) -> String {
@@ -2349,10 +2532,38 @@ fn append_text_log_line(path: &Path, message: &str) {
         let _ = fs::create_dir_all(parent);
     }
 
+    static LOG_WRITE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    let _guard = LOG_WRITE_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    rotate_text_log_if_needed(path, 8 * 1024 * 1024, 3);
     let line = format!("{trimmed}\n");
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = std::io::Write::write_all(&mut file, line.as_bytes());
     }
+}
+
+fn rotate_text_log_if_needed(path: &Path, max_bytes: u64, backup_count: usize) {
+    if backup_count == 0
+        || fs::metadata(path)
+            .map(|metadata| metadata.len() < max_bytes)
+            .unwrap_or(true)
+    {
+        return;
+    }
+
+    let oldest = PathBuf::from(format!("{}.{}", path.display(), backup_count));
+    let _ = fs::remove_file(oldest);
+    for index in (1..backup_count).rev() {
+        let from = PathBuf::from(format!("{}.{}", path.display(), index));
+        let to = PathBuf::from(format!("{}.{}", path.display(), index + 1));
+        if from.exists() {
+            let _ = fs::rename(from, to);
+        }
+    }
+    let first = PathBuf::from(format!("{}.1", path.display()));
+    let _ = fs::rename(path, first);
 }
 
 async fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -2469,12 +2680,43 @@ mod tests {
         AppServerClient, AppServerClientConfig, AppServerManager, AppServerNotification,
         AppServerProfile, AppServerRequest, IncomingMessage, app_server_request_timed_out,
         app_server_timeout_recovered, classify_incoming_message, handoff_paths,
-        write_bytes_atomically,
+        rotate_text_log_if_needed, write_bytes_atomically,
     };
     use serde_json::json;
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    #[test]
+    fn text_log_rotation_keeps_a_bounded_backup_chain() {
+        let directory =
+            std::env::temp_dir().join(format!("codex-webui-log-rotation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("app-server.log");
+        std::fs::write(&path, vec![b'x'; 32]).unwrap();
+
+        rotate_text_log_if_needed(&path, 16, 2);
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(path.with_extension("log.1")).unwrap().len(),
+            32
+        );
+
+        std::fs::write(&path, vec![b'y'; 32]).unwrap();
+        rotate_text_log_if_needed(&path, 16, 2);
+        assert_eq!(
+            std::fs::read(path.with_extension("log.1")).unwrap()[0],
+            b'y'
+        );
+        assert_eq!(
+            std::fs::read(path.with_extension("log.2")).unwrap()[0],
+            b'x'
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -2670,11 +2912,11 @@ mod tests {
         );
         assert_eq!(
             super::auto_max_process_count(4, Some(4 * 1024 * 1024 * 1024)),
-            2
+            1
         );
         assert_eq!(
             super::auto_max_process_count(16, Some(8 * 1024 * 1024 * 1024)),
-            4
+            3
         );
         assert_eq!(
             super::auto_max_process_count(16, Some(1024 * 1024 * 1024)),
@@ -2684,11 +2926,9 @@ mod tests {
     }
 
     #[test]
-    fn app_server_process_count_override_accepts_unlimited_and_large_values() {
-        assert_eq!(
-            super::parse_max_process_count_override("0"),
-            Some(super::APP_SERVER_MAX_PROCESSES_HARD_CAP)
-        );
+    fn app_server_process_count_override_distinguishes_auto_and_unlimited() {
+        assert_eq!(super::parse_max_process_count_override("0"), None);
+        assert_eq!(super::parse_max_process_count_override("auto"), None);
         assert_eq!(
             super::parse_max_process_count_override("unlimited"),
             Some(super::APP_SERVER_MAX_PROCESSES_HARD_CAP)
@@ -2946,14 +3186,187 @@ if "app-server" in args and "--listen" in args and args[args.index("--listen") +
                 .expect("second profile should evict the idle first client"),
             json!({ "profile": "other" })
         );
-        assert_eq!(manager.client_count().await, 1);
+        assert_eq!(manager.active_process_count().await, 1);
+        assert_eq!(manager.client_count().await, 2);
         second.close().await.expect("second client should close");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn request_timeout_uses_one_deadline_across_startup_and_rpc() {
+    async fn manager_periodically_evicts_idle_clients_with_free_process_slots() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "codex-webui-periodic-idle-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script_path = dir.join("fake-codex.py");
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+import time
+
+for raw_line in sys.stdin:
+    payload = json.loads(raw_line)
+    method = payload.get("method")
+    request_id = payload.get("id")
+    if method == "initialized":
+        continue
+    if method == "slow":
+        time.sleep(0.2)
+    print(json.dumps({"id": request_id, "result": payload.get("params") or {}}), flush=True)
+"#,
+        )
+        .expect("fake codex should be written");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("fake codex metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("fake codex should be executable");
+
+        let manager = AppServerManager::new(AppServerClientConfig {
+            codex_bin: script_path.display().to_string(),
+            max_processes: 8,
+            startup_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(1),
+            idle_client_timeout: Duration::from_millis(1),
+            ..AppServerClientConfig::default()
+        });
+        let client = manager
+            .get_or_create(AppServerProfile {
+                id: "default".to_string(),
+                codex_home: dir.join("codex-home"),
+            })
+            .await;
+        let in_flight_client = client.clone();
+        let in_flight = tokio::spawn(async move {
+            in_flight_client
+                .request("slow", json!({ "inFlight": true }))
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while manager.active_process_count().await == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("slow request should start an app-server process");
+
+        let cleanup = manager.spawn_idle_cleanup_loop(Duration::from_millis(10));
+        assert_eq!(
+            in_flight
+                .await
+                .expect("request task should not panic")
+                .expect("idle cleanup must not terminate an in-flight request"),
+            json!({ "inFlight": true })
+        );
+        timeout(Duration::from_secs(1), async {
+            while manager.active_process_count().await != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle client should be evicted without exhausting process slots");
+        cleanup.abort();
+        assert_eq!(manager.client_count().await, 1);
+        assert_eq!(
+            client
+                .request("echo", json!({ "restarted": true }))
+                .await
+                .expect("an evicted client should restart as the same tracked client"),
+            json!({ "restarted": true })
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_reader_failure_stops_and_restarts_the_managed_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "codex-webui-stdout-reader-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script_path = dir.join("fake-codex.py");
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+import time
+
+for raw_line in sys.stdin:
+    payload = json.loads(raw_line)
+    method = payload.get("method")
+    request_id = payload.get("id")
+    if method == "initialized":
+        continue
+    if method == "poison":
+        sys.stdout.buffer.write(b"\xff\n")
+        sys.stdout.buffer.flush()
+        time.sleep(60)
+        continue
+    print(json.dumps({"id": request_id, "result": payload.get("params") or {}}), flush=True)
+"#,
+        )
+        .expect("fake codex should be written");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("fake codex metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("fake codex should be executable");
+
+        let client = AppServerClient::new(
+            AppServerProfile {
+                id: "default".to_string(),
+                codex_home: dir.join("codex-home"),
+            },
+            AppServerClientConfig {
+                codex_bin: script_path.display().to_string(),
+                startup_timeout: Duration::from_secs(1),
+                request_timeout: Duration::from_secs(3),
+                ..AppServerClientConfig::default()
+            },
+        );
+
+        let error = timeout(Duration::from_secs(2), client.request("poison", json!({})))
+            .await
+            .expect("stdout failure should fail the pending request promptly")
+            .expect_err("invalid stdout must not leave the request pending");
+        assert!(
+            error.to_string().contains("stdout reader failed"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            client
+                .request("echo", json!({ "restarted": true }))
+                .await
+                .expect("the next request should start a fresh process"),
+            json!({ "restarted": true })
+        );
+
+        client.close().await.expect("client should close");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_timeout_does_not_cancel_shared_startup() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!(
@@ -2977,19 +3390,22 @@ def respond(payload, result=None):
 
 args = sys.argv[1:]
 if "app-server" in args and "--listen" in args and args[args.index("--listen") + 1] == "stdio://":
+    initialized = False
     for raw_line in sys.stdin:
         payload = json.loads(raw_line)
         method = payload.get("method")
         if method == "initialize":
-            time.sleep(0.35)
+            time.sleep(0.7)
             respond(payload, {"serverInfo": {"name": "fake"}})
         elif method == "initialized":
-            pass
+            initialized = True
         elif method == "config/batchWrite":
             respond(payload, {})
         elif method == "echo":
-            time.sleep(0.35)
-            respond(payload, payload.get("params") or {})
+            if initialized:
+                respond(payload, payload.get("params") or {})
+            else:
+                print(json.dumps({"id": payload.get("id"), "error": {"message": "not initialized"}}), flush=True)
         else:
             print(json.dumps({"id": payload.get("id"), "error": {"message": "unknown method"}}), flush=True)
 "#,
@@ -3020,15 +3436,23 @@ if "app-server" in args and "--listen" in args and args[args.index("--listen") +
             .request_with_timeout(
                 "echo",
                 json!({ "request": "single-deadline" }),
-                std::time::Duration::from_millis(500),
+                std::time::Duration::from_millis(200),
                 false,
             )
             .await
-            .expect_err("startup and RPC must share one request deadline");
+            .expect_err("short request should time out while startup continues");
         assert!(app_server_request_timed_out(&error));
+        assert!(!app_server_timeout_recovered(&error));
         assert!(
-            started_at.elapsed() < std::time::Duration::from_millis(900),
-            "request took too long for a single shared deadline"
+            started_at.elapsed() < std::time::Duration::from_millis(600),
+            "short request did not honor its deadline"
+        );
+        assert_eq!(
+            client
+                .request("echo", json!({ "request": "after-startup" }))
+                .await
+                .expect("shared startup should finish after the short caller leaves"),
+            json!({ "request": "after-startup" })
         );
 
         client.close().await.expect("client should close");

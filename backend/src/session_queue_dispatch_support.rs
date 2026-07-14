@@ -5,6 +5,13 @@ pub(crate) async fn resume_session_queue_payload(
     profile_id: &str,
     session_id: &str,
 ) -> ApiResult<Value> {
+    let runtime_key = runtime_session_key(
+        &resolve_runtime_profile_entry(&state.config, profile_id).0,
+        session_id,
+    );
+    if state.queue_dispatching.lock().await.contains(&runtime_key) {
+        return Err(api_error(StatusCode::CONFLICT, "QUEUE_ALREADY_DISPATCHING"));
+    }
     with_ui_state_write(state, profile_id, |ui_state| {
         let Some(queues_by_thread_id) = ui_state
             .get_mut("queuesByThreadId")
@@ -58,6 +65,7 @@ pub(crate) async fn dispatch_session_queue_item_payload(
     }
 
     let queue = with_queue_dispatch_guard(state, profile_id, session_id, async {
+        recover_orphaned_session_queue_dispatch_claims(state, profile_id, session_id).await?;
         let stored_queue = get_session_queue_payload(state, profile_id, session_id).await?;
         let queued_item = stored_queue
             .get("items")
@@ -81,8 +89,18 @@ pub(crate) async fn dispatch_session_queue_item_payload(
         )
         .await?;
         let next_queue =
-            remove_session_queue_item_after_dispatch(state, profile_id, session_id, queue_id)
-                .await?;
+            match remove_session_queue_item_after_dispatch(state, profile_id, session_id, queue_id)
+                .await
+            {
+                Ok(queue) => queue,
+                Err(error) => {
+                    release_session_queue_item_dispatch_claim(
+                        state, profile_id, session_id, queue_id,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
         let should_continue = next_queue
             .get("items")
             .and_then(Value::as_array)

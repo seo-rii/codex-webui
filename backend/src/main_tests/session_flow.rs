@@ -56,6 +56,223 @@ fn append_session_index_fixture(
     .unwrap();
 }
 
+#[test]
+fn generated_title_metadata_wins_over_full_first_message_fallback() {
+    let preview = "Inspect the websocket synchronization pipeline and determine why the generated title is repeatedly replaced by the complete first user message after session list refreshes.";
+    let mut snapshot = SessionSummaryUiSnapshot {
+        profile_id: "default".to_string(),
+        profile_label: "Default".to_string(),
+        profile_codex_home: "/tmp/codex-home".to_string(),
+        ..Default::default()
+    };
+    snapshot.session_meta_by_thread_id.insert(
+        "thread-title".to_string(),
+        json!({
+            "name": "Repair generated session titles",
+            "nameSource": "generated",
+            "pinned": false,
+            "tags": []
+        }),
+    );
+    let summary = build_session_summary_from_thread_payload(
+        &json!({
+            "id": "thread-title",
+            "name": preview,
+            "preview": preview,
+            "cwd": "/tmp/workspace",
+            "archived": false,
+            "createdAt": 1,
+            "updatedAt": 2,
+            "status": "completed"
+        }),
+        &snapshot,
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        summary.get("name").and_then(Value::as_str),
+        Some("Repair generated session titles")
+    );
+}
+
+#[test]
+fn completed_turn_summary_marks_hidden_tool_items_as_deferred() {
+    let summarized = summarize_session_turn_for_detail_payload(
+        &json!({
+            "id": "turn-tools",
+            "status": "completed",
+            "items": [
+                { "id": "user-1", "type": "userMessage", "text": "inspect it" },
+                {
+                    "id": "tool-1",
+                    "type": "mcpToolCall",
+                    "server": "docs",
+                    "tool": "search",
+                    "annotations": { "readOnlyHint": true },
+                    "status": "completed"
+                },
+                { "id": "agent-1", "type": "agentMessage", "text": "finished" }
+            ]
+        }),
+        0,
+        true,
+    );
+
+    assert_eq!(
+        summarized.get("detailState").and_then(Value::as_str),
+        Some("summary")
+    );
+    assert_eq!(
+        summarized.get("hiddenItemCount").and_then(Value::as_u64),
+        Some(1)
+    );
+}
+
+#[test]
+fn rollout_parser_preserves_tool_output_and_message_annotations() {
+    let records = vec![
+        RolloutRecord {
+            absolute_offset: 1,
+            value: json!({
+                "timestamp": "2026-07-14T00:00:00.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-tools" }
+            }),
+        },
+        RolloutRecord {
+            absolute_offset: 2,
+            value: json!({
+                "timestamp": "2026-07-14T00:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "tool-1",
+                    "name": "lookup",
+                    "input": "{\"query\":\"sync\"}",
+                    "annotations": { "readOnlyHint": true },
+                    "internal_chat_message_metadata_passthrough": { "source": "app" }
+                }
+            }),
+        },
+        RolloutRecord {
+            absolute_offset: 3,
+            value: json!({
+                "timestamp": "2026-07-14T00:00:02.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "tool-1",
+                    "output": { "content": [{ "type": "text", "text": "result" }] },
+                    "internal_chat_message_metadata_passthrough": { "completedBy": "app" }
+                }
+            }),
+        },
+        RolloutRecord {
+            absolute_offset: 4,
+            value: json!({
+                "timestamp": "2026-07-14T00:00:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "mcp_tool_call_end",
+                    "call_id": "mcp-1",
+                    "invocation": {
+                        "server": "docs",
+                        "tool": "search",
+                        "arguments": { "query": "sync" }
+                    },
+                    "result": { "Ok": { "content": [{ "type": "text", "text": "docs" }] } },
+                    "duration": { "secs": 1, "nanos": 0 },
+                    "annotations": { "readOnlyHint": true }
+                }
+            }),
+        },
+        RolloutRecord {
+            absolute_offset: 5,
+            value: json!({
+                "timestamp": "2026-07-14T00:00:04.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "finished",
+                    "phase": "final_answer",
+                    "memory_citation": { "id": "memory-1", "label": "Saved note" }
+                }
+            }),
+        },
+        RolloutRecord {
+            absolute_offset: 6,
+            value: json!({
+                "timestamp": "2026-07-14T00:00:05.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "turn-tools" }
+            }),
+        },
+    ];
+    let window = build_turn_window_from_rollout_records(
+        RolloutRecordWindow {
+            records,
+            truncated: false,
+            corruption_detected: false,
+            modified_at_ms: Some(1),
+        },
+        20,
+    );
+    let items = window.turns[0]
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("parsed turn items");
+
+    let tool = items
+        .iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some("tool-1"))
+        .expect("custom tool item");
+    assert_eq!(
+        tool.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert_eq!(
+        tool.get("annotations")
+            .and_then(|value| value.get("readOnlyHint"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(tool.get("result").is_some_and(|value| !value.is_null()));
+    assert_eq!(
+        tool.get("internalChatMessageMetadataPassthrough")
+            .and_then(|value| value.get("completedBy"))
+            .and_then(Value::as_str),
+        Some("app")
+    );
+
+    let mcp = items
+        .iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some("mcp-1"))
+        .expect("MCP tool item");
+    assert_eq!(mcp.get("type").and_then(Value::as_str), Some("mcpToolCall"));
+    assert_eq!(mcp.get("server").and_then(Value::as_str), Some("docs"));
+    assert_eq!(mcp.get("tool").and_then(Value::as_str), Some("search"));
+    assert_eq!(
+        mcp.get("annotations")
+            .and_then(|value| value.get("readOnlyHint"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let message = items
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+        .expect("agent message");
+    assert_eq!(
+        message
+            .get("memoryCitation")
+            .and_then(|value| value.get("id"))
+            .and_then(Value::as_str),
+        Some("memory-1")
+    );
+}
+
 #[tokio::test]
 async fn move_session_profile_moves_rollout_and_ui_state() {
     let sandbox = unique_test_dir("session-profile-move");
@@ -449,6 +666,86 @@ async fn move_session_profile_discovers_source_when_current_profile_is_target() 
             .join(format!("rollout-2026-06-24T00-03-00-{session_id}.jsonl"))
             .exists()
     );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn session_unsubscribe_uses_the_requested_profile_after_a_move() {
+    let sandbox = unique_test_dir("session-unsubscribe-after-profile-move");
+    let workspace = sandbox.join("workspace");
+    let source_codex_home = sandbox.join("codex-source");
+    let target_codex_home = sandbox.join("codex-target");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&source_codex_home).unwrap();
+    fs::create_dir_all(&target_codex_home).unwrap();
+    let mut state = test_state(
+        workspace.clone(),
+        vec![workspace.clone()],
+        source_codex_home,
+    );
+    let mut config = (*state.config).clone();
+    config.profiles.insert(
+        "second".to_string(),
+        RuntimeProfile {
+            label: "Second".to_string(),
+            codex_home: target_codex_home.clone(),
+            data_dir: sandbox.join(".data").join("profiles").join("second"),
+        },
+    );
+    state.config = Arc::new(config);
+
+    let session_id = "019f0000-0000-7000-8000-000000000103";
+    write_rollout_fixture(
+        &target_codex_home,
+        false,
+        "2026/06/24",
+        "2026-06-24T00-04-00",
+        session_id,
+        &workspace,
+        "The session now belongs to the second profile",
+        &[],
+        None,
+    );
+
+    let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    subscriptions.lock().await.insert(
+        session_relay_key("default", session_id),
+        tokio::spawn(std::future::pending::<()>()),
+    );
+    subscriptions.lock().await.insert(
+        session_relay_key("second", session_id),
+        tokio::spawn(std::future::pending::<()>()),
+    );
+    let (out_tx, _out_rx) = mpsc::channel(4);
+    let payload = execute_ws_method(
+        &state,
+        &out_tx,
+        &subscriptions,
+        &AuthContext {
+            role: UserRole::Admin,
+            profile_id: "default".to_string(),
+        },
+        "session/unsubscribe",
+        json!({
+            "sessionId": session_id,
+            "profileId": "default"
+        }),
+    )
+    .await
+    .expect("source subscription should be removed without rediscovering target ownership");
+
+    assert_eq!(
+        payload.get("profileId").and_then(Value::as_str),
+        Some("default")
+    );
+    let mut remaining = subscriptions.lock().await;
+    assert!(!remaining.contains_key(&session_relay_key("default", session_id)));
+    let target_handle = remaining
+        .remove(&session_relay_key("second", session_id))
+        .expect("target subscription must remain installed");
+    drop(remaining);
+    target_handle.abort();
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -1043,6 +1340,187 @@ async fn list_sessions_payload_includes_all_profiles_unless_profile_filtered() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn combined_profile_listing_hydrates_only_the_requested_page_prefix() {
+    let sandbox = unique_test_dir("session-list-bounded-profile-hydration");
+    let workspace = sandbox.join("workspace");
+    let default_codex_home = sandbox.join("codex-default");
+    let second_codex_home = sandbox.join("codex-second");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&default_codex_home).unwrap();
+    fs::create_dir_all(&second_codex_home).unwrap();
+
+    let mut state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        default_codex_home.clone(),
+    );
+    let mut config = (*state.config).clone();
+    config.config_file_path = Some(sandbox.join("isolated-codex-webui.yml"));
+    config.profiles.insert(
+        "second".to_string(),
+        RuntimeProfile {
+            label: "Second".to_string(),
+            codex_home: second_codex_home.clone(),
+            data_dir: sandbox.join(".data").join("profiles").join("second"),
+        },
+    );
+    state.config = Arc::new(config);
+
+    let pinned_id = "019f1000-0000-7000-8000-000000000001";
+    let running_id = "019f2000-0000-7000-8000-000000000001";
+    write_rollout_fixture(
+        &default_codex_home,
+        false,
+        "2026/06/25",
+        "2026-06-25T00-00-00",
+        pinned_id,
+        &workspace,
+        "Old pinned session",
+        &[],
+        None,
+    );
+    write_rollout_fixture(
+        &second_codex_home,
+        false,
+        "2026/06/25",
+        "2026-06-25T00-00-00",
+        running_id,
+        &workspace,
+        "Old running session",
+        &[],
+        None,
+    );
+    for index in 0..79 {
+        let default_id = format!("019f1100-0000-7000-8000-{index:012x}");
+        write_rollout_fixture(
+            &default_codex_home,
+            false,
+            "2026/06/25",
+            "2026-06-25T00-01-00",
+            &default_id,
+            &workspace,
+            "Default profile corpus session",
+            &[],
+            None,
+        );
+        let second_id = format!("019f2100-0000-7000-8000-{index:012x}");
+        write_rollout_fixture(
+            &second_codex_home,
+            false,
+            "2026/06/25",
+            "2026-06-25T00-01-00",
+            &second_id,
+            &workspace,
+            "Second profile corpus session",
+            &[],
+            None,
+        );
+    }
+
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state
+            .get_mut("sessionMetaByThreadId")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(pinned_id.to_string(), json!({ "pinned": true, "tags": [] }));
+        Ok(())
+    })
+    .await
+    .unwrap();
+    state.active_turns.lock().await.insert(
+        runtime_session_key("second", running_id),
+        "turn-running".to_string(),
+    );
+
+    let hydration_key = state.config.project_root.display().to_string();
+    ROLLOUT_LISTING_HYDRATIONS_BY_PROJECT
+        .lock()
+        .unwrap()
+        .remove(&hydration_key);
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+
+    let sessions = payload.get("sessions").and_then(Value::as_array).unwrap();
+    assert_eq!(sessions.len(), 20);
+    assert_eq!(
+        sessions
+            .first()
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some(pinned_id)
+    );
+    assert_eq!(
+        sessions
+            .get(1)
+            .and_then(|session| session.get("id"))
+            .and_then(Value::as_str),
+        Some(running_id)
+    );
+    assert_eq!(
+        payload.get("nextCursor").and_then(Value::as_str),
+        Some("20")
+    );
+
+    let hydrated_candidates = ROLLOUT_LISTING_HYDRATIONS_BY_PROJECT
+        .lock()
+        .unwrap()
+        .remove(&hydration_key)
+        .unwrap_or_default();
+    assert!(
+        hydrated_candidates <= 84,
+        "limit=20 should hydrate only a bounded prefix per profile, hydrated {hydrated_candidates}"
+    );
+    assert!(
+        hydrated_candidates < 160,
+        "limit=20 must not hydrate the full multi-profile corpus"
+    );
+
+    let first_page_ids = sessions
+        .iter()
+        .filter_map(|session| session.get("id").and_then(Value::as_str))
+        .collect::<HashSet<_>>();
+    let second_page = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        payload.get("nextCursor").and_then(Value::as_str),
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let second_page_sessions = second_page
+        .get("sessions")
+        .and_then(Value::as_array)
+        .unwrap();
+    assert_eq!(second_page_sessions.len(), 20);
+    assert!(second_page_sessions.iter().all(|session| {
+        session
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|session_id| !first_page_ids.contains(session_id))
+    }));
+    assert_eq!(
+        second_page.get("nextCursor").and_then(Value::as_str),
+        Some("40")
+    );
+    ROLLOUT_LISTING_HYDRATIONS_BY_PROJECT
+        .lock()
+        .unwrap()
+        .remove(&hydration_key);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_turn_send_routes_by_session_profile_when_request_profile_is_stale() {
     let sandbox = unique_test_dir("session-send-profile-routing");
     let workspace = sandbox.join("workspace");
@@ -1279,6 +1757,9 @@ async fn ws_approval_resolve_routes_by_actual_session_profile() {
     );
     let resolved_second_profile_id = resolve_runtime_profile_entry(&state.config, "second").0;
     app_server_client(&state, &resolved_second_profile_id)
+        .await
+        .unwrap()
+        .request("thread/list", json!({ "limit": 1 }))
         .await
         .unwrap();
     state
@@ -1796,6 +2277,75 @@ async fn rollout_file_listing_hydrates_visible_entries_from_state_metadata() {
     assert_eq!(
         session.get("updatedAt").and_then(Value::as_i64),
         Some(1_713_920_005_000)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollout_listing_prefers_indexed_title_over_state_first_message_fallback() {
+    let sandbox = unique_test_dir("session-index-title-over-state-fallback");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let session_id = "019e0000-0000-7000-8000-000000000039";
+    let first_message = "Inspect the session title synchronization path and explain why a long first user message remains visible after an explicit generated title has already been indexed.";
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-20-30",
+        session_id,
+        &workspace,
+        first_message,
+        &[],
+        None,
+    );
+    append_session_index_fixture(
+        &codex_home,
+        session_id,
+        "Repair indexed session titles",
+        "2026-04-24T01:20:35.000Z",
+    );
+    write_state_thread_fixture(
+        &codex_home,
+        session_id,
+        first_message,
+        first_message,
+        &workspace,
+        false,
+        1_713_920_030_000,
+        1_713_920_035_000,
+        None,
+        None,
+        false,
+    );
+
+    let payload = list_sessions_payload(
+        &state,
+        "default",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    let session = payload
+        .get("sessions")
+        .and_then(Value::as_array)
+        .and_then(|sessions| sessions.first())
+        .unwrap();
+    assert_eq!(
+        session.get("name").and_then(Value::as_str),
+        Some("Repair indexed session titles")
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -4245,6 +4795,85 @@ async fn runtime_reconcile_completes_session_when_app_server_becomes_idle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_reconcile_preserves_turn_owned_by_live_app_server() {
+    let sandbox = unique_test_dir("runtime-reconcile-live-process-turn");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-live-process-turn";
+    let runtime_key = runtime_session_key("default", session_id);
+    let client = app_server_client(&state, "default").await.unwrap();
+    let started = client
+        .request(
+            "turn/start",
+            json!({
+                "threadId": session_id,
+                "input": [{ "type": "text", "text": "keep this turn alive" }],
+                "cwd": workspace.display().to_string()
+            }),
+        )
+        .await
+        .unwrap();
+    let turn_id = started["turn"]["id"].as_str().unwrap().to_string();
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), turn_id.clone());
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][session_id] = json!({
+            "status": "running",
+            "updatedAt": now_unix_ms().saturating_sub(60_000)
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Transient idle snapshot",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let reconciled = reconcile_lost_runtime_activity_for_profile(&state, "default").await;
+
+    assert!(reconciled.is_empty());
+    assert_eq!(
+        state.active_turns.lock().await.get(&runtime_key),
+        Some(&turn_id)
+    );
+    let ui_state = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ui_state["runtimeStatusByThreadId"][session_id]["status"].as_str(),
+        Some("running")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn truncated_local_session_detail_exposes_idle_history_state() {
     let sandbox = unique_test_dir("session-detail-truncated-idle");
     let workspace = sandbox.join("workspace");
@@ -4847,8 +5476,9 @@ async fn local_session_detail_parses_rich_transcript_items_and_rollbacks() {
         .join("04")
         .join("24");
     fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join(format!("rollout-2026-04-24T01-09-00-{session_id}.jsonl"));
     fs::write(
-        rollout_dir.join(format!("rollout-2026-04-24T01-09-00-{session_id}.jsonl")),
+        &rollout_path,
         format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             json!({
@@ -4969,6 +5599,43 @@ async fn local_session_detail_parses_rich_transcript_items_and_rollbacks() {
         ),
     )
     .unwrap();
+    {
+        use std::io::Write;
+        let mut rollout = fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .unwrap();
+        writeln!(
+            rollout,
+            "{}",
+            json!({
+                "timestamp": "2026-04-24T01:09:14.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "custom-1",
+                    "name": "lookup",
+                    "input": "{\"query\":\"annotations\"}",
+                    "annotations": { "readOnlyHint": true }
+                }
+            })
+        )
+        .unwrap();
+        writeln!(
+            rollout,
+            "{}",
+            json!({
+                "timestamp": "2026-04-24T01:09:15.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "custom-1",
+                    "output": { "content": [{ "type": "text", "text": "kept" }] }
+                }
+            })
+        )
+        .unwrap();
+    }
 
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
@@ -4987,6 +5654,11 @@ async fn local_session_detail_parses_rich_transcript_items_and_rollbacks() {
         .get("turn")
         .cloned()
         .unwrap_or(Value::Null);
+    assert_eq!(
+        turn.get("detailState").and_then(Value::as_str),
+        Some("full")
+    );
+    assert_eq!(turn.get("hiddenItemCount").and_then(Value::as_u64), Some(0));
     let item_types = turn
         .get("items")
         .and_then(Value::as_array)
@@ -4999,6 +5671,7 @@ async fn local_session_detail_parses_rich_transcript_items_and_rollbacks() {
     assert!(item_types.contains(&"imageView"));
     assert!(item_types.contains(&"enteredReviewMode"));
     assert!(item_types.contains(&"exitedReviewMode"));
+    assert!(item_types.contains(&"dynamicToolCall"));
     let web_search = turn
         .get("items")
         .and_then(Value::as_array)
@@ -5016,6 +5689,29 @@ async fn local_session_detail_parses_rich_transcript_items_and_rollbacks() {
             .and_then(Value::as_array)
             .map(Vec::len),
         Some(1)
+    );
+    let custom_tool = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some("custom-1"))
+        .expect("custom tool item should be parsed");
+    assert_eq!(
+        custom_tool.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert_eq!(
+        custom_tool
+            .get("annotations")
+            .and_then(|value| value.get("readOnlyHint"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        custom_tool
+            .get("result")
+            .is_some_and(|value| !value.is_null())
     );
     assert_eq!(
         web_search
@@ -5580,42 +6276,29 @@ async fn send_turn_payload_uses_app_server_and_updates_session_state() {
 
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
-    let runtime_profile = resolve_runtime_profile(&state.config, "default");
-    let uploads_dir = runtime_profile.data_dir.join("uploads").join("thread-1");
-    fs::create_dir_all(&uploads_dir).unwrap();
-
-    let text_attachment_path = workspace.join("notes.md");
-    let image_attachment_path = workspace.join("diagram.png");
-    fs::write(&text_attachment_path, "attachment").unwrap();
-    fs::write(&image_attachment_path, "png").unwrap();
-    fs::write(
-        uploads_dir.join("att-file.json"),
-        serde_json::to_vec(&json!({
-            "id": "att-file",
-            "originalName": "notes.md",
-            "path": text_attachment_path.display().to_string(),
-            "mimeType": "text/markdown",
-            "size": 10,
-            "kind": "file",
-            "createdAt": "2026-04-20T00:00:00Z"
-        }))
-        .unwrap(),
+    let stored_attachments = save_uploaded_attachment_records(
+        &state,
+        "default",
+        "thread-1",
+        vec![
+            AttachmentUploadPayload {
+                name: "notes.md".to_string(),
+                mime_type: Some("text/markdown".to_string()),
+                bytes: b"attachment".to_vec(),
+            },
+            AttachmentUploadPayload {
+                name: "diagram.png".to_string(),
+                mime_type: Some("image/png".to_string()),
+                bytes: b"png".to_vec(),
+            },
+        ],
     )
+    .await
     .unwrap();
-    fs::write(
-        uploads_dir.join("att-image.json"),
-        serde_json::to_vec(&json!({
-            "id": "att-image",
-            "originalName": "diagram.png",
-            "path": image_attachment_path.display().to_string(),
-            "mimeType": "image/png",
-            "size": 12,
-            "kind": "image",
-            "createdAt": "2026-04-20T00:00:01Z"
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    let text_attachment = &stored_attachments[0];
+    let image_attachment = &stored_attachments[1];
+    let text_attachment_path = PathBuf::from(text_attachment.path.as_deref().unwrap());
+    let image_attachment_path = PathBuf::from(image_attachment.path.as_deref().unwrap());
 
     app_server_client(&state, "default")
         .await
@@ -5659,7 +6342,10 @@ async fn send_turn_payload_uses_app_server_and_updates_session_state() {
         "default",
         "thread-1",
         prompt,
-        Some(&json!(["att-file", "att-image"])),
+        Some(&json!([
+            text_attachment.id.clone(),
+            image_attachment.id.clone()
+        ])),
         Some(&selected_skills),
         json!({
             "cwd": workspace.display().to_string(),
@@ -6468,7 +7154,7 @@ async fn live_item_notification_uses_volatile_activity_over_stale_failed_status(
     .unwrap();
     assert_eq!(
         runtime_status.get("status").and_then(Value::as_str),
-        Some("failed")
+        Some("running")
     );
     assert_eq!(
         state.active_turns.lock().await.get(&runtime_key).cloned(),
@@ -6719,7 +7405,7 @@ async fn send_turn_payload_bounds_resume_timeout_and_preserves_profile_routing()
             "debug/setDelay",
             json!({
                 "method": "thread/resume",
-                "delayMs": 500
+                "delayMs": 1_500
             }),
         )
         .await
@@ -6742,7 +7428,7 @@ async fn send_turn_payload_bounds_resume_timeout_and_preserves_profile_routing()
     .await
     .unwrap();
 
-    assert!(started_at.elapsed() < Duration::from_secs(2));
+    assert!(started_at.elapsed() < Duration::from_secs(3));
     assert_eq!(
         payload.get("turnId").and_then(Value::as_str),
         Some("turn-1")
@@ -6942,6 +7628,151 @@ async fn send_turn_payload_surfaces_rollout_recovery_when_resume_fails() {
         turn_start_count.get("count").and_then(Value::as_u64),
         Some(0)
     );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_first_turn_generates_and_persists_session_title_once() {
+    let sandbox = unique_test_dir("turn-generated-title");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let prompt = "Inspect the websocket synchronization pipeline and determine why the generated title is repeatedly replaced by the complete first user message after session list refreshes.";
+    send_turn_payload(
+        &state,
+        "default",
+        &session_id,
+        prompt,
+        None,
+        None,
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        Some("generated-title-message"),
+    )
+    .await
+    .unwrap();
+    let completed_turn = json!({
+        "id": "turn-1",
+        "status": "completed",
+        "items": [
+            {
+                "id": "turn-1:user:0",
+                "type": "userMessage",
+                "text": prompt
+            },
+            {
+                "id": "turn-1:agent:0",
+                "type": "agentMessage",
+                "text": "The native title is the full first message, so the generated metadata must take precedence."
+            }
+        ]
+    });
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "turn/completed".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "turn": completed_turn
+            }),
+        },
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let generated = with_ui_state_read(&state, "default", |ui_state| {
+                Ok(ui_state
+                    .get("sessionMetaByThreadId")
+                    .and_then(Value::as_object)
+                    .and_then(|entries| entries.get(&session_id))
+                    .cloned()
+                    .unwrap_or(Value::Null))
+            })
+            .await
+            .unwrap();
+            if generated.get("name").and_then(Value::as_str)
+                == Some("Repair generated session titles")
+            {
+                assert_eq!(
+                    generated.get("nameSource").and_then(Value::as_str),
+                    Some("generated")
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("session title generation should complete");
+
+    let summary = build_session_summary_payload(&state, "default", &session_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.get("name").and_then(Value::as_str),
+        Some("Repair generated session titles")
+    );
+    let client = app_server_client_for_session(&state, "default", &session_id)
+        .await
+        .unwrap();
+    let starts_before = client
+        .request("debug/requestCount", json!({ "target": "thread/start" }))
+        .await
+        .unwrap()
+        .get("count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "turn/completed".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "turn": {
+                    "id": "turn-2",
+                    "status": "completed",
+                    "items": []
+                }
+            }),
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let starts_after = client
+        .request("debug/requestCount", json!({ "target": "thread/start" }))
+        .await
+        .unwrap()
+        .get("count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    assert_eq!(starts_after, starts_before);
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -7287,26 +8118,20 @@ async fn steer_turn_payload_uses_active_turn_from_thread_reads() {
 
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
-    let runtime_profile = resolve_runtime_profile(&state.config, "default");
-    let uploads_dir = runtime_profile.data_dir.join("uploads").join("thread-1");
-    fs::create_dir_all(&uploads_dir).unwrap();
-
-    let text_attachment_path = workspace.join("handoff.md");
-    fs::write(&text_attachment_path, "handoff").unwrap();
-    fs::write(
-        uploads_dir.join("att-file.json"),
-        serde_json::to_vec(&json!({
-            "id": "att-file",
-            "originalName": "handoff.md",
-            "path": text_attachment_path.display().to_string(),
-            "mimeType": "text/markdown",
-            "size": 7,
-            "kind": "file",
-            "createdAt": "2026-04-20T00:00:00Z"
-        }))
-        .unwrap(),
+    let stored_attachment = save_uploaded_attachment_records(
+        &state,
+        "default",
+        "thread-1",
+        vec![AttachmentUploadPayload {
+            name: "handoff.md".to_string(),
+            mime_type: Some("text/markdown".to_string()),
+            bytes: b"handoff".to_vec(),
+        }],
     )
-    .unwrap();
+    .await
+    .unwrap()
+    .remove(0);
+    let text_attachment_path = PathBuf::from(stored_attachment.path.as_deref().unwrap());
 
     app_server_client(&state, "default")
         .await
@@ -7361,7 +8186,7 @@ async fn steer_turn_payload_uses_active_turn_from_thread_reads() {
         "default",
         "thread-1",
         "Focus on the queue deduplication race first.",
-        Some(&json!(["att-file"])),
+        Some(&json!([stored_attachment.id.clone()])),
         None,
         None,
         Some("client-steer-1"),
@@ -7374,6 +8199,29 @@ async fn steer_turn_payload_uses_active_turn_from_thread_reads() {
         payload.get("turnId").and_then(Value::as_str),
         Some("turn-2")
     );
+    let duplicate = steer_turn_payload(
+        &state,
+        "default",
+        "thread-1",
+        "Focus on the queue deduplication race first.",
+        Some(&json!([stored_attachment.id.clone()])),
+        None,
+        Some("turn-2"),
+        Some("client-steer-1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        duplicate.get("duplicate").and_then(Value::as_bool),
+        Some(true)
+    );
+    let steer_count = app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request("debug/requestCount", json!({ "target": "turn/steer" }))
+        .await
+        .unwrap();
+    assert_eq!(steer_count.get("count").and_then(Value::as_u64), Some(1));
 
     let thread = read_thread_payload(&state, "default", "thread-1", true)
         .await
@@ -7839,6 +8687,103 @@ async fn local_rollout_corruption_is_exposed_and_recovery_keeps_a_backup() {
 }
 
 #[tokio::test]
+async fn local_rollout_recovery_rejects_an_active_session_without_touching_the_file() {
+    let sandbox = unique_test_dir("rollout-active-recovery");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    let session_id = "019f5000-0000-7000-8000-000000000009";
+    let rollout_dir = codex_home.join("sessions/2026/07/10");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join(format!("rollout-2026-07-10T00-00-09-{session_id}.jsonl"));
+    let mut content = format!(
+        "{}\n",
+        json!({
+            "timestamp": "2026-07-10T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "timestamp": "2026-07-10T00:00:00.000Z",
+                "cwd": workspace.display().to_string()
+            }
+        })
+    )
+    .into_bytes();
+    content.extend_from_slice(b"{\"broken\":\"");
+    content.push(0xff);
+    content.extend_from_slice(b"\"}\n");
+    fs::write(&rollout_path, &content).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace], codex_home.clone());
+    state.active_turns.lock().await.insert(
+        runtime_session_key("default", session_id),
+        "turn-active".to_string(),
+    );
+
+    let error = recover_session_rollout_payload(&state, "default", UserRole::Admin, session_id)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "SESSION_ACTIVE");
+    assert_eq!(fs::read(&rollout_path).unwrap(), content);
+    assert_eq!(
+        fs::read_dir(&rollout_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".bak-"))
+            .count(),
+        0
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn goal_cache_does_not_regress_to_an_older_notification() {
+    let sandbox = unique_test_dir("goal-cache-ordering");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let session_id = "thread-goal-ordering";
+
+    cache_session_goal_payload(
+        &state,
+        "default",
+        session_id,
+        &json!({
+            "threadId": session_id,
+            "objective": "new objective",
+            "status": "active",
+            "updatedAt": 200
+        }),
+    )
+    .await;
+    cache_session_goal_payload(
+        &state,
+        "default",
+        session_id,
+        &json!({
+            "threadId": session_id,
+            "objective": "stale objective",
+            "status": "paused",
+            "updatedAt": 100
+        }),
+    )
+    .await;
+
+    let cached = cached_session_goal_or_null_payload(&state, "default", session_id).await;
+    assert_eq!(
+        cached.get("objective").and_then(Value::as_str),
+        Some("new objective")
+    );
+    assert_eq!(cached.get("status").and_then(Value::as_str), Some("active"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
 async fn local_rollout_invalid_json_is_exposed_as_recoverable() {
     let sandbox = unique_test_dir("rollout-invalid-json-recovery");
     let workspace = sandbox.join("workspace");
@@ -7894,6 +8839,41 @@ async fn local_rollout_invalid_json_is_exposed_as_recoverable() {
         )
         .unwrap()
         .contains("valid content survives")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn local_rollout_accepts_complete_final_record_without_newline() {
+    let sandbox = unique_test_dir("rollout-final-record-without-newline");
+    let rollout_path = sandbox.join("rollout.jsonl");
+    fs::create_dir_all(&sandbox).unwrap();
+    let records = [
+        json!({ "timestamp": "2026-07-10T00:00:00Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "turn-final" } }),
+        json!({ "timestamp": "2026-07-10T00:00:01Z", "type": "event_msg", "payload": { "type": "user_message", "message": "Finish this" } }),
+        json!({ "timestamp": "2026-07-10T00:00:02Z", "type": "event_msg", "payload": { "type": "task_complete", "turn_id": "turn-final", "last_agent_message": "Finished without newline" } }),
+    ];
+    fs::write(
+        &rollout_path,
+        records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    let window = read_local_rollout_full_window(rollout_path).await.unwrap();
+    assert_eq!(window.turns.len(), 1);
+    assert_eq!(
+        window.turns[0].get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert!(
+        serde_json::to_string(&window.turns[0])
+            .unwrap()
+            .contains("Finished without newline")
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -8255,10 +9235,10 @@ async fn queue_retry_registration_waits_for_lock_instead_of_being_lost() {
         }
     })
     .await
-    .unwrap();
+    .expect("queue retry registration should wait for the contended lock");
+
     if let Some(handle) = state.queue_drain_retries.lock().await.remove(&retry_key) {
         handle.abort();
     }
-
     let _ = fs::remove_dir_all(sandbox);
 }

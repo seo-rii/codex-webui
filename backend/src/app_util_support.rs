@@ -95,11 +95,46 @@ pub(crate) fn runtime_session_key(profile_id: &str, session_id: &str) -> String 
     format!("profile::{profile_id}::session-runtime::{session_id}")
 }
 
+pub(crate) async fn session_operation_lock(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> Arc<Mutex<()>> {
+    let key = runtime_session_key(profile_id, session_id);
+    let mut locks = state.session_operation_locks.lock().await;
+    if locks.len() >= 512 && !locks.contains_key(&key) {
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    Arc::clone(locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
+}
+
 pub(crate) fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
     ApiError {
         status,
         message: message.into(),
     }
+}
+
+pub(crate) fn bounded_pagination_cursor(
+    seen: &mut HashSet<String>,
+    raw_cursor: Option<&str>,
+    page_count: usize,
+    max_pages: usize,
+) -> std::result::Result<Option<String>, &'static str> {
+    let next_cursor = raw_cursor
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let Some(next_cursor) = next_cursor else {
+        return Ok(None);
+    };
+    if page_count >= max_pages {
+        return Err("pagination page limit reached");
+    }
+    if !seen.insert(next_cursor.clone()) {
+        return Err("pagination cursor cycle detected");
+    }
+    Ok(Some(next_cursor))
 }
 
 pub(crate) const SMALL_JSON_BODY_LIMIT: usize = 256 * 1024;
@@ -639,8 +674,13 @@ pub(crate) fn redact_user_facing_error(message: &str) -> String {
         }
     }
 
-    let lowered = redacted.to_ascii_lowercase();
-    while let Some(index) = lowered.find("bearer ") {
+    let mut bearer_search_start = 0;
+    loop {
+        let lowered = redacted.to_ascii_lowercase();
+        let Some(relative_index) = lowered[bearer_search_start..].find("bearer ") else {
+            break;
+        };
+        let index = bearer_search_start + relative_index;
         let value_start = index + "bearer ".len();
         let value_end = redacted[value_start..]
             .char_indices()
@@ -648,11 +688,12 @@ pub(crate) fn redact_user_facing_error(message: &str) -> String {
             .map(|(offset, _)| value_start + offset)
             .unwrap_or(redacted.len());
         if redacted[value_start..].starts_with("[redacted]") {
-            break;
+            bearer_search_start = value_start.saturating_add("[redacted]".len());
+            continue;
         }
         if value_end > value_start {
             redacted.replace_range(value_start..value_end, "[redacted]");
-            break;
+            bearer_search_start = value_start.saturating_add("[redacted]".len());
         } else {
             break;
         }
@@ -692,12 +733,14 @@ pub(crate) fn redact_user_facing_error(message: &str) -> String {
         "slackWebhookUrl",
     ] {
         for separator in ["=", ":", "\":", "':"] {
+            let mut search_start = 0;
             loop {
                 let lowered = redacted.to_ascii_lowercase();
                 let needle = format!("{}{}", key.to_ascii_lowercase(), separator);
-                let Some(index) = lowered.find(&needle) else {
+                let Some(relative_index) = lowered[search_start..].find(&needle) else {
                     break;
                 };
+                let index = search_start + relative_index;
                 let mut value_start = index + needle.len();
                 while let Some(ch) = redacted[value_start..].chars().next() {
                     if ch.is_whitespace() || matches!(ch, '"' | '\'') {
@@ -714,13 +757,14 @@ pub(crate) fn redact_user_facing_error(message: &str) -> String {
                     .map(|(offset, _)| value_start + offset)
                     .unwrap_or(redacted.len());
                 if redacted[value_start..].starts_with("[redacted]") {
-                    break;
+                    search_start = value_start.saturating_add("[redacted]".len());
+                    continue;
                 }
                 if value_end <= value_start {
                     break;
                 }
                 redacted.replace_range(value_start..value_end, "[redacted]");
-                break;
+                search_start = value_start.saturating_add("[redacted]".len());
             }
         }
     }

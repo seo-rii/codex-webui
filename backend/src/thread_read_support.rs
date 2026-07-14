@@ -479,6 +479,8 @@ pub(crate) async fn read_thread_metadata_payload(
 
             for archived in [false, true] {
                 let mut cursor: Option<String> = None;
+                let mut seen_cursors = HashSet::new();
+                let mut page_count = 0usize;
                 loop {
                     let response = match client
                         .request(
@@ -494,6 +496,7 @@ pub(crate) async fn read_thread_metadata_payload(
                         Ok(response) => response,
                         Err(_) => return Err(read_error),
                     };
+                    page_count += 1;
                     let batch = response
                         .get("data")
                         .and_then(Value::as_array)
@@ -506,12 +509,13 @@ pub(crate) async fn read_thread_metadata_payload(
                         return Ok(normalize_thread_payload(thread));
                     }
 
-                    cursor = response
-                        .get("nextCursor")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string);
+                    cursor = bounded_pagination_cursor(
+                        &mut seen_cursors,
+                        response.get("nextCursor").and_then(Value::as_str),
+                        page_count,
+                        32,
+                    )
+                    .unwrap_or(None);
                     if cursor.is_none() {
                         break;
                     }

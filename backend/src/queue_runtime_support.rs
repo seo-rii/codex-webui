@@ -75,10 +75,15 @@ pub(crate) fn schedule_queue_drain_retry(
     session_id: &str,
     attempt: usize,
 ) {
-    let delay_ms = QUEUE_DRAIN_RETRY_DELAYS_MS
+    let base_delay_ms = QUEUE_DRAIN_RETRY_DELAYS_MS
         .get(attempt)
         .copied()
         .unwrap_or_else(|| QUEUE_DRAIN_RETRY_DELAYS_MS[QUEUE_DRAIN_RETRY_DELAYS_MS.len() - 1]);
+    let jitter_window_ms = (base_delay_ms / 5).clamp(1, 1_000);
+    let jitter_ms = session_id.bytes().fold(0_u64, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(u64::from(byte))
+    }) % jitter_window_ms;
+    let delay_ms = base_delay_ms.saturating_add(jitter_ms);
     if attempt == QUEUE_DRAIN_RETRY_DELAYS_MS.len() {
         warn!(
             profile_id = %profile_id,
@@ -122,6 +127,151 @@ fn queue_dispatch_error_is_transient(error: &ApiError) -> bool {
         || message.contains("request timed out")
         || message.contains("codex app-server request channel closed")
         || message.contains("codex app-server is not running")
+}
+
+pub(crate) fn queue_item_is_dispatching(item: &Value) -> bool {
+    item.get("status").and_then(Value::as_str) == Some("dispatching")
+}
+
+// Callers hold the session's in-memory dispatch guard, so any persisted claim is orphaned.
+pub(crate) async fn recover_orphaned_session_queue_dispatch_claims(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> ApiResult<bool> {
+    let has_orphaned_claim = with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("queuesByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|queues| queues.get(session_id))
+            .and_then(|queue| queue.get("items"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(queue_item_is_dispatching)))
+    })
+    .await?;
+    if !has_orphaned_claim {
+        return Ok(false);
+    }
+
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(queue) = ui_state
+            .get_mut("queuesByThreadId")
+            .and_then(Value::as_object_mut)
+            .and_then(|queues| queues.get_mut(session_id))
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(false);
+        };
+
+        let mut recovered = false;
+        let mut has_failed_item = false;
+        if let Some(items) = queue.get_mut("items").and_then(Value::as_array_mut) {
+            for item in items {
+                let Some(item_object) = item.as_object_mut() else {
+                    continue;
+                };
+                if item_object.get("status").and_then(Value::as_str) == Some("failed") {
+                    has_failed_item = true;
+                }
+                if item_object.get("status").and_then(Value::as_str) != Some("dispatching") {
+                    continue;
+                }
+                item_object.remove("status");
+                item_object.remove("dispatchingAt");
+                item_object.remove("failedAt");
+                item_object.remove("error");
+                recovered = true;
+            }
+        }
+
+        if recovered {
+            if !has_failed_item {
+                queue.insert("resumePending".to_string(), json!(false));
+            }
+            queue.insert("updatedAt".to_string(), json!(now_unix_ms()));
+        }
+        Ok(recovered)
+    })
+    .await
+}
+
+pub(crate) async fn claim_session_queue_item_for_dispatch(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    queue_id: &str,
+) -> ApiResult<Value> {
+    with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(queue) = ui_state
+            .get_mut("queuesByThreadId")
+            .and_then(Value::as_object_mut)
+            .and_then(|queues| queues.get_mut(session_id))
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(api_error(StatusCode::NOT_FOUND, "QUEUE_ITEM_NOT_FOUND"));
+        };
+        let Some(items) = queue.get_mut("items").and_then(Value::as_array_mut) else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue items are missing",
+            ));
+        };
+        let Some(item) = items
+            .iter_mut()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(queue_id))
+        else {
+            return Err(api_error(StatusCode::NOT_FOUND, "QUEUE_ITEM_NOT_FOUND"));
+        };
+        if queue_item_is_dispatching(item) {
+            return Err(api_error(StatusCode::CONFLICT, "QUEUE_ALREADY_DISPATCHING"));
+        }
+        let Some(item_object) = item.as_object_mut() else {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "queue item had an unexpected shape",
+            ));
+        };
+        let dispatching_at = now_unix_ms();
+        item_object.insert("status".to_string(), json!("dispatching"));
+        item_object.insert("dispatchingAt".to_string(), json!(dispatching_at));
+        item_object.remove("failedAt");
+        item_object.remove("error");
+        let claimed = Value::Object(item_object.clone());
+        queue.insert("updatedAt".to_string(), json!(dispatching_at));
+        Ok(claimed)
+    })
+    .await
+}
+
+pub(crate) async fn release_session_queue_item_dispatch_claim(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    queue_id: &str,
+) {
+    let _ = with_ui_state_write(state, profile_id, |ui_state| {
+        let Some(item_object) = ui_state
+            .get_mut("queuesByThreadId")
+            .and_then(Value::as_object_mut)
+            .and_then(|queues| queues.get_mut(session_id))
+            .and_then(|queue| queue.get_mut("items"))
+            .and_then(Value::as_array_mut)
+            .and_then(|items| {
+                items
+                    .iter_mut()
+                    .find(|item| item.get("id").and_then(Value::as_str) == Some(queue_id))
+            })
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(());
+        };
+        if item_object.get("status").and_then(Value::as_str) == Some("dispatching") {
+            item_object.remove("status");
+            item_object.remove("dispatchingAt");
+        }
+        Ok(())
+    })
+    .await;
 }
 
 pub(crate) async fn remove_session_queue_item_after_dispatch(
@@ -184,25 +334,31 @@ pub(crate) async fn dispatch_queue_item(
     mode: &str,
     expected_turn_id: Option<&str>,
 ) -> ApiResult<()> {
-    let prompt = queued_item
+    let queue_id = queued_item
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "QUEUE_ITEM_NOT_FOUND"))?;
+    let claimed_item =
+        claim_session_queue_item_for_dispatch(state, profile_id, session_id, queue_id).await?;
+    let prompt = claimed_item
         .get("prompt")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let attachment_ids = queued_item
+    let attachment_ids = claimed_item
         .get("attachmentIds")
         .cloned()
         .unwrap_or_else(|| json!([]));
-    let selected_skills = queued_item
+    let selected_skills = claimed_item
         .get("skills")
         .cloned()
         .unwrap_or_else(|| json!([]));
-    let client_user_message_id = queued_item
+    let client_user_message_id = claimed_item
         .get("clientUserMessageId")
-        .or_else(|| queued_item.get("clientRequestId"))
+        .or_else(|| claimed_item.get("clientRequestId"))
         .and_then(Value::as_str)
-        .or_else(|| queued_item.get("id").and_then(Value::as_str));
+        .or_else(|| claimed_item.get("id").and_then(Value::as_str));
 
-    if mode == "steer" {
+    let result = if mode == "steer" {
         steer_turn_payload(
             state,
             profile_id,
@@ -228,7 +384,11 @@ pub(crate) async fn dispatch_queue_item(
         )
         .await
         .map(|_| ())
+    };
+    if result.is_err() {
+        release_session_queue_item_dispatch_claim(state, profile_id, session_id, queue_id).await;
     }
+    result
 }
 
 async fn session_turn_activity(
@@ -367,6 +527,27 @@ async fn maybe_drain_queue_with_attempt(
     attempt: usize,
 ) {
     let guarded = with_queue_dispatch_guard(state, profile_id, session_id, async {
+        match recover_orphaned_session_queue_dispatch_claims(state, profile_id, session_id).await {
+            Ok(true) => {
+                warn!(
+                    profile_id = %profile_id,
+                    session_id = %session_id,
+                    "recovered an orphaned queued-message dispatch claim"
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    profile_id = %profile_id,
+                    session_id = %session_id,
+                    error = %error.message,
+                    "failed to recover queued-message dispatch claims"
+                );
+                schedule_queue_drain_retry(state, profile_id, session_id, attempt);
+                return;
+            }
+        }
+
         let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
         let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
         if state
@@ -505,10 +686,39 @@ async fn maybe_drain_queue_with_attempt(
             .await
         {
             Ok(()) => {
-                let _ = remove_session_queue_item_after_dispatch(
+                match remove_session_queue_item_after_dispatch(
                     state, profile_id, session_id, &queue_id,
                 )
-                .await;
+                .await
+                {
+                    Ok(next_queue) => {
+                        let has_remaining_items = next_queue
+                            .get("items")
+                            .and_then(Value::as_array)
+                            .is_some_and(|items| !items.is_empty());
+                        let resume_required = next_queue
+                            .get("resumeRequired")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if has_remaining_items && !resume_required {
+                            schedule_queue_drain_retry(state, profile_id, session_id, 0);
+                        }
+                    }
+                    Err(error) => {
+                        release_session_queue_item_dispatch_claim(
+                            state, profile_id, session_id, &queue_id,
+                        )
+                        .await;
+                        warn!(
+                            profile_id = %profile_id,
+                            session_id = %session_id,
+                            queue_id = %queue_id,
+                            error = %error.message,
+                            "failed to remove a dispatched queue item; retrying idempotently"
+                        );
+                        schedule_queue_drain_retry(state, profile_id, session_id, attempt);
+                    }
+                }
             }
             Err(error) => {
                 if queue_dispatch_error_is_transient(&error) {

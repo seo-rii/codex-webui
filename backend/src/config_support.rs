@@ -1,5 +1,26 @@
 use super::*;
 
+#[derive(Clone)]
+struct CachedRuntimeProfiles {
+    checked_at: Instant,
+    file_len: u64,
+    modified_at: Option<SystemTime>,
+    snapshot: (String, HashMap<String, RuntimeProfile>),
+}
+
+static RUNTIME_PROFILES_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<PathBuf, CachedRuntimeProfiles>>,
+> = std::sync::OnceLock::new();
+const RUNTIME_PROFILES_CACHE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+pub(crate) fn invalidate_runtime_profiles_snapshot(config_path: &Path) {
+    if let Some(cache) = RUNTIME_PROFILES_CACHE.get()
+        && let Ok(mut cache) = cache.lock()
+    {
+        cache.remove(config_path);
+    }
+}
+
 pub(crate) fn runtime_logs_dir(config: &Config) -> PathBuf {
     config.data_dir.join("logs")
 }
@@ -596,7 +617,32 @@ pub(crate) fn runtime_profiles_snapshot(
     let config_path = optional_env("CODEX_WEBUI_CONFIG_PATH")
         .map(PathBuf::from)
         .or_else(|| config.config_file_path.clone());
-    match read_runtime_profiles_from_config_path(config_path) {
+    let Some(config_path) = config_path else {
+        return (config.default_profile_id.clone(), config.profiles.clone());
+    };
+
+    let now = Instant::now();
+    let cache = RUNTIME_PROFILES_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some(entry) = cache.get(&config_path)
+        && now.saturating_duration_since(entry.checked_at) < RUNTIME_PROFILES_CACHE_CHECK_INTERVAL
+    {
+        return entry.snapshot.clone();
+    }
+
+    let metadata = fs::metadata(&config_path).ok();
+    let file_len = metadata.as_ref().map_or(0, fs::Metadata::len);
+    let modified_at = metadata.as_ref().and_then(|value| value.modified().ok());
+    if let Ok(mut cache) = cache.lock()
+        && let Some(entry) = cache.get_mut(&config_path)
+        && entry.file_len == file_len
+        && entry.modified_at == modified_at
+    {
+        entry.checked_at = now;
+        return entry.snapshot.clone();
+    }
+
+    let snapshot = match read_runtime_profiles_from_config_path(Some(config_path.clone())) {
         Ok(Some((yaml_default_profile_id, profiles))) => runtime_profiles_from_shapes(
             yaml_default_profile_id.unwrap_or_else(|| config.default_profile_id.clone()),
             &default_codex_home,
@@ -604,7 +650,19 @@ pub(crate) fn runtime_profiles_snapshot(
             profiles,
         ),
         Ok(None) | Err(_) => (config.default_profile_id.clone(), config.profiles.clone()),
+    };
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(
+            config_path,
+            CachedRuntimeProfiles {
+                checked_at: now,
+                file_len,
+                modified_at,
+                snapshot: snapshot.clone(),
+            },
+        );
     }
+    snapshot
 }
 
 fn read_runtime_profiles_from_config_file()

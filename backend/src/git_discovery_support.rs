@@ -95,6 +95,48 @@ pub(crate) async fn resolve_git_repo_root(state: &AppState, repo_path: &str) -> 
     Ok(repo_root_path.display().to_string())
 }
 
+pub(crate) async fn git_common_dir_lock_key(repo_root: &str) -> String {
+    let Ok(repo_root_path) = tokio_fs::canonicalize(repo_root).await else {
+        return normalize_path(PathBuf::from(repo_root))
+            .display()
+            .to_string();
+    };
+    let fallback = repo_root_path.display().to_string();
+    let Ok(output) = run_command_with_timeout(
+        "git",
+        vec![
+            "-C".to_string(),
+            fallback.clone(),
+            "rev-parse".to_string(),
+            "--git-common-dir".to_string(),
+        ],
+        Duration::from_secs(10),
+    )
+    .await
+    else {
+        return fallback;
+    };
+    if !output.status.success() {
+        return fallback;
+    }
+
+    let common_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if common_dir.is_empty() {
+        return fallback;
+    }
+    let common_dir_path = PathBuf::from(common_dir);
+    let common_dir_path = if common_dir_path.is_absolute() {
+        common_dir_path
+    } else {
+        repo_root_path.join(common_dir_path)
+    };
+    tokio_fs::canonicalize(&common_dir_path)
+        .await
+        .unwrap_or_else(|_| normalize_path(common_dir_path))
+        .display()
+        .to_string()
+}
+
 pub(crate) async fn run_git_text_payload(
     _state: &AppState,
     repo_path: &str,

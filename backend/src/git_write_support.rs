@@ -1,9 +1,10 @@
 use super::*;
 
 pub(crate) async fn git_operation_lock(state: &AppState, repo_root: &str) -> Arc<Mutex<()>> {
+    let lock_key = git_common_dir_lock_key(repo_root).await;
     let mut locks = state.git_operation_locks.lock().await;
     locks.retain(|_, lock| Arc::strong_count(lock) > 1);
-    if !locks.contains_key(repo_root) && locks.len() >= GIT_OPERATION_LOCK_MAX_ENTRIES {
+    if !locks.contains_key(&lock_key) && locks.len() >= GIT_OPERATION_LOCK_MAX_ENTRIES {
         if let Some(idle_key) = locks
             .iter()
             .find(|(_, lock)| Arc::strong_count(lock) == 1)
@@ -14,7 +15,7 @@ pub(crate) async fn git_operation_lock(state: &AppState, repo_root: &str) -> Arc
     }
     Arc::clone(
         locks
-            .entry(repo_root.to_string())
+            .entry(lock_key)
             .or_insert_with(|| Arc::new(Mutex::new(()))),
     )
 }
@@ -31,6 +32,7 @@ pub(crate) async fn reject_git_mutation_if_repo_busy(
     let repo_root_path = tokio_fs::canonicalize(repo_root)
         .await
         .unwrap_or_else(|_| PathBuf::from(repo_root));
+    let repo_common_dir = git_common_dir_lock_key(repo_root).await;
     let runtime_keys = {
         let active_turns = state.active_turns.lock().await;
         let pending_turn_starts = state.pending_turn_starts.lock().await;
@@ -75,6 +77,7 @@ pub(crate) async fn reject_git_mutation_if_repo_busy(
                 .unwrap_or_else(|_| PathBuf::from(&candidate));
             if path_is_within(&repo_root_path, &candidate_path)
                 || path_is_within(&candidate_path, &repo_root_path)
+                || git_common_dir_lock_key(&candidate).await == repo_common_dir
             {
                 return Err(api_error(
                     StatusCode::CONFLICT,
@@ -102,7 +105,7 @@ pub(crate) async fn save_git_file_payload(
         .await
         .unwrap_or_else(|_| PathBuf::from(&repo_root));
     write_text_file_safely(&target_path, content, &[repo_root_path]).await?;
-    get_git_file_payload(state, &repo_root, file_path).await
+    get_git_file_payload_for_root(state, &repo_root, file_path).await
 }
 
 pub(crate) async fn stage_git_changes_payload(
@@ -125,7 +128,7 @@ pub(crate) async fn stage_git_changes_payload(
         vec!["add".to_string(), "-A".to_string()]
     };
     run_git_text_payload(state, &repo_root, args).await?;
-    get_git_status_payload(state, &repo_root).await
+    get_git_status_payload_for_root(state, &repo_root).await
 }
 
 pub(crate) async fn unstage_git_changes_payload(
@@ -153,7 +156,7 @@ pub(crate) async fn unstage_git_changes_payload(
         ]
     };
     run_git_text_payload(state, &repo_root, args).await?;
-    get_git_status_payload(state, &repo_root).await
+    get_git_status_payload_for_root(state, &repo_root).await
 }
 
 pub(crate) async fn fetch_git_repository_payload(
@@ -175,7 +178,7 @@ pub(crate) async fn fetch_git_repository_payload(
     )
     .await?;
     invalidate_git_repository_cache(state).await;
-    get_git_status_payload(state, &repo_root).await
+    get_git_status_payload_for_root(state, &repo_root).await
 }
 
 pub(crate) async fn pull_git_repository_payload(
@@ -193,7 +196,7 @@ pub(crate) async fn pull_git_repository_payload(
     )
     .await?;
     invalidate_git_repository_cache(state).await;
-    get_git_status_payload(state, &repo_root).await
+    get_git_status_payload_for_root(state, &repo_root).await
 }
 
 pub(crate) async fn commit_git_changes_payload(
@@ -222,7 +225,7 @@ pub(crate) async fn commit_git_changes_payload(
         ],
     )
     .await?;
-    get_git_status_payload(state, &repo_root).await
+    get_git_status_payload_for_root(state, &repo_root).await
 }
 
 pub(crate) async fn checkout_git_branch_payload(
@@ -253,5 +256,5 @@ pub(crate) async fn checkout_git_branch_payload(
     };
     run_git_text_payload(state, &repo_root, args).await?;
     invalidate_git_repository_cache(state).await;
-    get_git_status_payload(state, &repo_root).await
+    get_git_status_payload_for_root(state, &repo_root).await
 }

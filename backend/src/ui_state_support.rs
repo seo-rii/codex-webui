@@ -1,6 +1,35 @@
 use super::*;
 
 const UI_STATE_SCHEMA_VERSION: u64 = 1;
+const UI_STATE_WRITE_DEBOUNCE: Duration = Duration::from_millis(250);
+const UI_STATE_WRITE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const STORED_NOTIFICATION_NAME_MAX_CHARS: usize = 160;
+const STORED_NOTIFICATION_PAYLOAD_MAX_BYTES: usize = 16 * 1024;
+
+pub(crate) fn compact_stored_notification(notification: &mut Value) {
+    let Some(notification) = notification.as_object_mut() else {
+        return;
+    };
+    if let Some(name) = notification.get("sessionName").and_then(Value::as_str)
+        && name.chars().count() > STORED_NOTIFICATION_NAME_MAX_CHARS
+    {
+        let mut truncated = name
+            .chars()
+            .take(STORED_NOTIFICATION_NAME_MAX_CHARS)
+            .collect::<String>();
+        truncated.push_str("...");
+        notification.insert("sessionName".to_string(), Value::String(truncated));
+    }
+    if let Some(payload) = notification.get_mut("payload")
+        && let Ok(encoded) = serde_json::to_vec(payload)
+        && encoded.len() > STORED_NOTIFICATION_PAYLOAD_MAX_BYTES
+    {
+        *payload = json!({
+            "truncated": true,
+            "originalBytes": encoded.len()
+        });
+    }
+}
 
 pub(crate) fn default_notification_settings_value() -> Value {
     json!({
@@ -113,6 +142,11 @@ fn ensure_ui_state_sections(ui_state: &mut Value) {
     if let Some(notifications) = root.get_mut("notifications").and_then(Value::as_object_mut) {
         if !notifications.get("items").is_some_and(Value::is_array) {
             notifications.insert("items".to_string(), json!([]));
+        }
+        if let Some(items) = notifications.get_mut("items").and_then(Value::as_array_mut) {
+            for notification in items {
+                compact_stored_notification(notification);
+            }
         }
         if !notifications
             .get("webhookFailures")
@@ -309,33 +343,50 @@ async fn read_profile_ui_state(config: &Config, profile_id: &str) -> Result<Valu
     }
 }
 
-async fn read_cached_profile_ui_state(state: &AppState, profile_id: &str) -> Result<Value> {
-    if let Some(cached) = state.ui_state_cache.lock().await.get(profile_id).cloned() {
-        return Ok(cached);
+async fn ensure_cached_profile_ui_state(state: &AppState, profile_id: &str) -> Result<()> {
+    if state.ui_state_cache.lock().await.contains_key(profile_id) {
+        return Ok(());
     }
 
     let ui_state = read_profile_ui_state(&state.config, profile_id).await?;
-    cache_profile_ui_state(state, profile_id, ui_state.clone()).await;
-    Ok(ui_state)
+    cache_profile_ui_state(state, profile_id, ui_state).await;
+    Ok(())
 }
 
 async fn cache_profile_ui_state(state: &AppState, profile_id: &str, ui_state: Value) {
+    let dirty_profiles = state
+        .ui_state_persistence
+        .lock()
+        .await
+        .iter()
+        .filter_map(|(profile_id, persistence)| {
+            (persistence.revision != persistence.persisted_revision).then(|| profile_id.clone())
+        })
+        .collect::<HashSet<_>>();
     let mut cache = state.ui_state_cache.lock().await;
+    if cache.contains_key(profile_id) {
+        return;
+    }
     if !cache.contains_key(profile_id) && cache.len() >= UI_STATE_CACHE_MAX_ENTRIES {
         if let Some(evicted_profile_id) = cache
             .keys()
-            .find(|cached_profile_id| cached_profile_id.as_str() != profile_id)
+            .find(|cached_profile_id| {
+                cached_profile_id.as_str() != profile_id
+                    && !dirty_profiles.contains(cached_profile_id.as_str())
+            })
             .cloned()
         {
             cache.remove(&evicted_profile_id);
         }
     }
-    cache.insert(profile_id.to_string(), ui_state);
+    cache.insert(profile_id.to_string(), Arc::new(Mutex::new(ui_state)));
 }
 
 async fn write_profile_ui_state(config: &Config, profile_id: &str, ui_state: &Value) -> Result<()> {
     let path = profile_ui_state_path(config, profile_id);
-    let bytes = serde_json::to_vec_pretty(ui_state).context("failed to serialize ui-state")?;
+    // This file can grow to several MiB. Pretty-printing it for every status
+    // transition dominated gateway CPU without providing runtime value.
+    let bytes = serde_json::to_vec(ui_state).context("failed to serialize ui-state")?;
     if let Ok(previous_bytes) = tokio_fs::read(&path).await {
         write_file_atomically(&path.with_extension("json.bak"), previous_bytes)
             .await
@@ -345,6 +396,122 @@ async fn write_profile_ui_state(config: &Config, profile_id: &str, ui_state: &Va
         .await
         .context("failed to write ui-state file")?;
     Ok(())
+}
+
+async fn persist_cached_profile_ui_state(
+    state: &AppState,
+    profile_id: &str,
+    revision: u64,
+) -> Result<()> {
+    let lock = ui_state_lock(state, profile_id).await;
+    let _guard = lock.lock().await;
+    ensure_cached_profile_ui_state(state, profile_id).await?;
+    let cached = state
+        .ui_state_cache
+        .lock()
+        .await
+        .get(profile_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("cached ui-state disappeared before persistence"))?;
+    let snapshot = cached.lock().await.clone();
+    write_profile_ui_state(&state.config, profile_id, &snapshot).await?;
+    let mut persistence = state.ui_state_persistence.lock().await;
+    let entry = persistence.entry(profile_id.to_string()).or_default();
+    entry.persisted_revision = entry.persisted_revision.max(revision);
+    Ok(())
+}
+
+async fn run_ui_state_writer(state: AppState, profile_id: String) {
+    tokio::time::sleep(UI_STATE_WRITE_DEBOUNCE).await;
+    loop {
+        let revision = state
+            .ui_state_persistence
+            .lock()
+            .await
+            .get(&profile_id)
+            .map(|entry| entry.revision)
+            .unwrap_or_default();
+        if let Err(error) = persist_cached_profile_ui_state(&state, &profile_id, revision).await {
+            warn!(
+                profile_id,
+                "failed to persist coalesced ui-state update: {error:#}"
+            );
+            tokio::time::sleep(UI_STATE_WRITE_RETRY_DELAY).await;
+            continue;
+        }
+
+        let mut persistence = state.ui_state_persistence.lock().await;
+        let entry = persistence.entry(profile_id.clone()).or_default();
+        if entry.revision == entry.persisted_revision {
+            entry.writer_running = false;
+            return;
+        }
+        drop(persistence);
+        tokio::time::sleep(UI_STATE_WRITE_DEBOUNCE).await;
+    }
+}
+
+async fn mark_ui_state_dirty(state: &AppState, profile_id: &str) -> u64 {
+    let mut persistence = state.ui_state_persistence.lock().await;
+    let entry = persistence.entry(profile_id.to_string()).or_default();
+    entry.revision = entry.revision.saturating_add(1);
+    entry.revision
+}
+
+async fn start_ui_state_writer(state: &AppState, profile_id: &str) {
+    let should_spawn = {
+        let mut persistence = state.ui_state_persistence.lock().await;
+        let entry = persistence.entry(profile_id.to_string()).or_default();
+        if entry.writer_running {
+            false
+        } else {
+            entry.writer_running = true;
+            true
+        }
+    };
+    if should_spawn {
+        tokio::spawn(run_ui_state_writer(state.clone(), profile_id.to_string()));
+    }
+}
+
+async fn schedule_ui_state_write(state: &AppState, profile_id: &str) -> u64 {
+    let revision = mark_ui_state_dirty(state, profile_id).await;
+    start_ui_state_writer(state, profile_id).await;
+    revision
+}
+
+pub(crate) async fn flush_pending_ui_state_writes(state: &AppState) {
+    for attempt in 0..3 {
+        let dirty_profiles = state
+            .ui_state_persistence
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(profile_id, entry)| {
+                (entry.revision != entry.persisted_revision)
+                    .then(|| (profile_id.clone(), entry.revision))
+            })
+            .collect::<Vec<_>>();
+        if dirty_profiles.is_empty() {
+            return;
+        }
+        let mut failed = false;
+        for (profile_id, revision) in dirty_profiles {
+            if let Err(error) = persist_cached_profile_ui_state(state, &profile_id, revision).await
+            {
+                failed = true;
+                warn!(
+                    profile_id,
+                    attempt = attempt + 1,
+                    "failed to flush ui-state during shutdown: {error:#}"
+                );
+            }
+        }
+        if failed {
+            tokio::time::sleep(UI_STATE_WRITE_RETRY_DELAY).await;
+        }
+    }
+    warn!("ui-state remained dirty after shutdown flush retries");
 }
 
 pub(crate) async fn write_file_atomically(path: &Path, bytes: Vec<u8>) -> Result<()> {
@@ -442,9 +609,22 @@ where
         .to_string();
     let lock = ui_state_lock(state, &resolved_profile_id).await;
     let _guard = lock.lock().await;
-    let ui_state = read_cached_profile_ui_state(state, &resolved_profile_id)
+    ensure_cached_profile_ui_state(state, &resolved_profile_id)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let cached = state
+        .ui_state_cache
+        .lock()
+        .await
+        .get(&resolved_profile_id)
+        .cloned()
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cached ui-state is missing",
+            )
+        })?;
+    let ui_state = cached.lock().await;
     reader(&ui_state)
 }
 
@@ -461,14 +641,89 @@ where
         .to_string();
     let lock = ui_state_lock(state, &resolved_profile_id).await;
     let _guard = lock.lock().await;
-    let mut ui_state = read_cached_profile_ui_state(state, &resolved_profile_id)
+    ensure_cached_profile_ui_state(state, &resolved_profile_id)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let result = writer(&mut ui_state)?;
-    write_profile_ui_state(&state.config, &resolved_profile_id, &ui_state)
+    let cached = state
+        .ui_state_cache
+        .lock()
+        .await
+        .get(&resolved_profile_id)
+        .cloned()
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cached ui-state is missing",
+            )
+        })?;
+    let (result, snapshot) = {
+        let mut ui_state = cached.lock().await;
+        let result = writer(&mut ui_state);
+        let snapshot = result.as_ref().ok().map(|_| ui_state.clone());
+        (result, snapshot)
+    };
+    let Some(snapshot) = snapshot else {
+        schedule_ui_state_write(state, &resolved_profile_id).await;
+        return result;
+    };
+    let result = result?;
+    let revision = mark_ui_state_dirty(state, &resolved_profile_id).await;
+    if let Err(error) = write_profile_ui_state(&state.config, &resolved_profile_id, &snapshot).await
+    {
+        start_ui_state_writer(state, &resolved_profile_id).await;
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.to_string(),
+        ));
+    }
+    let mut persistence = state.ui_state_persistence.lock().await;
+    let entry = persistence.entry(resolved_profile_id).or_default();
+    entry.persisted_revision = entry.persisted_revision.max(revision);
+    Ok(result)
+}
+
+pub(crate) async fn with_ui_state_write_debounced<R, F>(
+    state: &AppState,
+    profile_id: &str,
+    writer: F,
+) -> ApiResult<R>
+where
+    F: FnOnce(&mut Value) -> ApiResult<(R, bool)>,
+{
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
+        .0
+        .to_string();
+    let lock = ui_state_lock(state, &resolved_profile_id).await;
+    let _guard = lock.lock().await;
+    ensure_cached_profile_ui_state(state, &resolved_profile_id)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    cache_profile_ui_state(state, &resolved_profile_id, ui_state).await;
+    let cached = state
+        .ui_state_cache
+        .lock()
+        .await
+        .get(&resolved_profile_id)
+        .cloned()
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cached ui-state is missing",
+            )
+        })?;
+    let result = {
+        let mut ui_state = cached.lock().await;
+        writer(&mut ui_state)
+    };
+    let (result, changed) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            schedule_ui_state_write(state, &resolved_profile_id).await;
+            return Err(error);
+        }
+    };
+    if changed {
+        schedule_ui_state_write(state, &resolved_profile_id).await;
+    }
     Ok(result)
 }
 

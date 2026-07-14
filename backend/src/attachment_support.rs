@@ -48,7 +48,22 @@ pub(crate) async fn list_session_attachment_records(
             Err(_) => continue,
         };
         if let Ok(record) = serde_json::from_str::<StoredAttachmentRecord>(&raw) {
-            attachments.push(record);
+            let (expected_file_path, expected_metadata_path) = attachment_storage_paths(
+                state,
+                profile_id,
+                session_id,
+                &record.id,
+                &record.original_name,
+            );
+            let stored_file_path = record.path.as_deref().map(PathBuf::from);
+            if path == expected_metadata_path
+                && stored_file_path.as_ref() == Some(&expected_file_path)
+                && tokio_fs::symlink_metadata(&expected_file_path)
+                    .await
+                    .is_ok_and(|metadata| metadata.file_type().is_file())
+            {
+                attachments.push(record);
+            }
         }
     }
 
@@ -144,6 +159,19 @@ pub(crate) fn attachment_storage_quota_error_message(max_storage_bytes: u64) -> 
 pub(crate) const MAX_ATTACHMENTS_PER_REQUEST: usize = 20;
 pub(crate) const MAX_TOTAL_ATTACHMENT_UPLOAD_MULTIPLIER: u64 = 4;
 const ATTACHMENT_STORAGE_USAGE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+async fn attachment_storage_lock(state: &AppState, profile_id: &str) -> Arc<Mutex<()>> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let mut locks = state.attachment_storage_locks.lock().await;
+    if locks.len() >= 64 && !locks.contains_key(&resolved_profile_id) {
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    Arc::clone(
+        locks
+            .entry(resolved_profile_id)
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
 
 pub(crate) fn attachment_count_limit_error() -> ApiError {
     api_error(
@@ -376,7 +404,8 @@ pub(crate) async fn save_uploaded_attachment_records(
         .map(|upload| upload.bytes.len() as u64)
         .fold(0_u64, u64::saturating_add);
     validate_total_attachment_size(&state.config, total_size)?;
-    validate_attachment_storage_quota(state, profile_id, total_size).await?;
+    let storage_lock = attachment_storage_lock(state, profile_id).await;
+    let _storage_guard = storage_lock.lock().await;
 
     for upload in uploads {
         if upload.bytes.is_empty() {
@@ -421,9 +450,15 @@ pub(crate) async fn save_uploaded_attachment_records(
             created_at: Some(now_unix_ms().to_string()),
         };
 
-        write_attachment_bytes_atomically(&file_path, &upload.bytes).await?;
         let metadata = serde_json::to_vec_pretty(&record)
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        validate_attachment_storage_quota(
+            state,
+            profile_id,
+            size.saturating_add(metadata.len() as u64),
+        )
+        .await?;
+        write_attachment_bytes_atomically(&file_path, &upload.bytes).await?;
         write_attachment_bytes_atomically(&meta_path, &metadata).await?;
         adjust_attachment_storage_usage_cache(
             state,
@@ -481,13 +516,6 @@ pub(crate) async fn store_uploaded_attachment_file(
         &attachment_id,
         &original_name,
     );
-    tokio_fs::rename(source_path, &file_path)
-        .await
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    if let Ok(parent_dir) = tokio_fs::File::open(&uploads_dir).await {
-        let _ = parent_dir.sync_all().await;
-    }
-
     let record = StoredAttachmentRecord {
         id: attachment_id,
         original_name,
@@ -499,6 +527,20 @@ pub(crate) async fn store_uploaded_attachment_file(
     };
     let metadata = serde_json::to_vec_pretty(&record)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let storage_lock = attachment_storage_lock(state, profile_id).await;
+    let _storage_guard = storage_lock.lock().await;
+    validate_attachment_storage_quota(
+        state,
+        profile_id,
+        size.saturating_add(metadata.len() as u64),
+    )
+    .await?;
+    tokio_fs::rename(source_path, &file_path)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if let Ok(parent_dir) = tokio_fs::File::open(&uploads_dir).await {
+        let _ = parent_dir.sync_all().await;
+    }
     write_attachment_bytes_atomically(&meta_path, &metadata).await?;
     adjust_attachment_storage_usage_cache(
         state,
@@ -571,6 +613,8 @@ pub(crate) async fn delete_attachment_payload(
     session_id: &str,
     attachment_id: &str,
 ) -> ApiResult<Value> {
+    let storage_lock = attachment_storage_lock(state, profile_id).await;
+    let _storage_guard = storage_lock.lock().await;
     let attachments = list_session_attachment_records(state, profile_id, session_id)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;

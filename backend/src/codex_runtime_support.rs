@@ -477,6 +477,8 @@ pub(crate) async fn codex_quota_status(
                         "fetchedAt": now_unix_ms(),
                         "account": Value::Null,
                         "plan": Value::Null,
+                        "limits": [],
+                        "windows": [],
                         "fiveHour": Value::Null,
                         "weekly": Value::Null,
                         "refreshing": true,
@@ -494,6 +496,8 @@ pub(crate) async fn codex_quota_status(
             "fetchedAt": now_unix_ms(),
             "account": Value::Null,
             "plan": Value::Null,
+            "limits": [],
+            "windows": [],
             "fiveHour": Value::Null,
             "weekly": Value::Null,
             "error": error.to_string(),
@@ -661,7 +665,7 @@ pub(crate) async fn codex_reset_tickets_payload(
             "account/rateLimits/read",
             Value::Null,
             ACCOUNT_APP_SERVER_RECOVERY_RETRY_TIMEOUT,
-            true,
+            false,
         )
         .await
     {
@@ -752,13 +756,16 @@ pub(crate) async fn use_codex_reset_ticket_payload(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let consume_payload = json!({ "idempotencyKey": idempotency_key });
+    let mut consume_payload = json!({ "idempotencyKey": idempotency_key });
+    if !ticket_id.starts_with("rate-limit-reset-credit-") {
+        consume_payload["creditId"] = Value::String(ticket_id.clone());
+    }
     match client
         .request_with_timeout(
             "account/rateLimitResetCredit/consume",
             consume_payload,
             ACCOUNT_APP_SERVER_RECOVERY_RETRY_TIMEOUT,
-            true,
+            false,
         )
         .await
     {
@@ -798,7 +805,7 @@ pub(crate) async fn use_codex_reset_ticket_payload(
                 method,
                 payload.clone(),
                 ACCOUNT_APP_SERVER_RECOVERY_RETRY_TIMEOUT,
-                true,
+                false,
             )
             .await
         {
@@ -875,7 +882,16 @@ fn collect_reset_ticket_entries(value: &Value, entries: &mut Vec<(Value, Option<
                     .filter(|ch| ch.is_ascii_alphanumeric())
                     .collect::<String>()
                     .to_ascii_lowercase();
-                if normalized_key.contains("resetticket") {
+                if normalized_key == "ratelimitresetcredits" {
+                    if let Some(credits) = child
+                        .get("credits")
+                        .or_else(|| child.get("resetCredits"))
+                        .or_else(|| child.get("reset_credits"))
+                    {
+                        collect_reset_ticket_field(credits, entries);
+                    }
+                    found = true;
+                } else if normalized_key.contains("resetticket") {
                     collect_reset_ticket_field(child, entries);
                     found = true;
                 } else {
@@ -946,6 +962,29 @@ fn normalize_reset_ticket_entry(
                         .map(str::to_string)
                 })
             };
+            let timestamp_field = |names: &[&str]| {
+                names.iter().find_map(|name| {
+                    object.get(*name).and_then(|value| match value {
+                        Value::String(value) if !value.trim().is_empty() => {
+                            Some(Value::String(value.trim().to_string()))
+                        }
+                        Value::Number(value) => {
+                            value.as_i64().filter(|value| *value > 0).map(|value| {
+                                let value = value as u64;
+                                Value::Number(
+                                    (if value >= 10_000_000_000 {
+                                        value
+                                    } else {
+                                        value.saturating_mul(1000)
+                                    })
+                                    .into(),
+                                )
+                            })
+                        }
+                        _ => None,
+                    })
+                })
+            };
             let ticket_id = string_field(&[
                 "id",
                 "ticketId",
@@ -955,19 +994,27 @@ fn normalize_reset_ticket_entry(
             ])
             .or(fallback_id)
             .unwrap_or_else(|| format!("ticket-{}", index + 1));
-            let used_at = string_field(&["usedAt", "used_at"]);
+            let used_at = timestamp_field(&["usedAt", "used_at", "redeemedAt", "redeemed_at"]);
+            let status = string_field(&["status"]);
             let available = object
                 .get("available")
                 .or_else(|| object.get("active"))
                 .and_then(Value::as_bool)
-                .unwrap_or(used_at.is_none());
+                .unwrap_or_else(|| {
+                    status
+                        .as_deref()
+                        .map(|status| status.eq_ignore_ascii_case("available"))
+                        .unwrap_or(used_at.is_none())
+                });
             Some(json!({
                 "id": ticket_id,
                 "label": string_field(&["label", "name", "title", "description"]),
                 "limitId": string_field(&["limitId", "limit_id", "rateLimitId", "rate_limit_id"]),
                 "limitName": string_field(&["limitName", "limit_name", "rateLimitName", "rate_limit_name"]),
-                "expiresAt": string_field(&["expiresAt", "expires_at", "expiration", "expires"]),
-                "createdAt": string_field(&["createdAt", "created_at"]),
+                "resetType": string_field(&["resetType", "reset_type"]),
+                "status": status,
+                "expiresAt": timestamp_field(&["expiresAt", "expires_at", "expiration", "expires"]),
+                "createdAt": timestamp_field(&["createdAt", "created_at", "grantedAt", "granted_at"]),
                 "usedAt": used_at,
                 "available": available,
                 "raw": Value::Object(object),
@@ -984,7 +1031,7 @@ pub(crate) async fn get_account_state(state: &AppState, profile_id: &str) -> Res
             "account/read",
             json!({ "refreshToken": false }),
             ACCOUNT_APP_SERVER_REQUEST_TIMEOUT,
-            true,
+            false,
         )
         .await
     {
@@ -1346,7 +1393,9 @@ async fn write_codex_webui_config_yaml(
         .dump(config_value)
         .map_err(|error| anyhow!("failed to encode codex-webui.yml: {error}"))?;
     encoded.push('\n');
-    write_file_atomically(config_path, encoded.into_bytes()).await
+    write_file_atomically(config_path, encoded.into_bytes()).await?;
+    invalidate_runtime_profiles_snapshot(config_path);
+    Ok(())
 }
 
 fn default_import_profile_label(parsed: &Value, input_path: &Path) -> String {
@@ -2081,29 +2130,102 @@ async fn fetch_codex_quota(state: &AppState, profile_id: &str) -> Result<Value> 
         .json()
         .await
         .context("invalid Codex quota response")?;
-    let five_hour = normalize_quota_window(
+    Ok(normalize_quota_payload(payload))
+}
+
+pub(crate) fn normalize_quota_payload(payload: UsageResponseShape) -> Value {
+    let individual_limit = payload
+        .spend_control
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("individual_limit")
+                .or_else(|| value.get("individualLimit"))
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
+    let rate_limit_reached_type = payload.rate_limit_reached_type.as_ref().and_then(|value| {
+        value
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| value.as_str().map(str::to_string))
+    });
+    let mut limits = vec![normalize_quota_limit(
+        "codex",
+        "Codex",
+        payload.rate_limit.as_ref(),
+        payload.credits.clone().unwrap_or(Value::Null),
+        individual_limit.clone(),
+        rate_limit_reached_type.clone(),
+    )];
+    limits.extend(
         payload
-            .rate_limit
-            .as_ref()
-            .and_then(|rate_limit| rate_limit.primary_window.as_ref()),
-    );
-    let weekly = normalize_quota_window(
-        payload
-            .rate_limit
-            .as_ref()
-            .and_then(|rate_limit| rate_limit.secondary_window.as_ref()),
+            .additional_rate_limits
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(index, limit)| {
+                let limit_id = limit
+                    .metered_feature
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("additional-{}", index + 1));
+                let limit_name = limit
+                    .limit_name
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(&limit_id);
+                normalize_quota_limit(
+                    &limit_id,
+                    limit_name,
+                    limit.rate_limit.as_ref(),
+                    Value::Null,
+                    Value::Null,
+                    None,
+                )
+            }),
     );
 
-    Ok(json!({
-        "available": five_hour.is_some() || weekly.is_some(),
+    let windows = limits
+        .iter()
+        .find(|limit| limit.get("id").and_then(Value::as_str) == Some("codex"))
+        .and_then(|limit| limit.get("windows"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let five_hour = windows
+        .iter()
+        .find(|window| quota_window_matches_duration(window, 5 * 60))
+        .cloned();
+    let weekly = windows
+        .iter()
+        .find(|window| quota_window_matches_duration(window, 7 * 24 * 60))
+        .cloned();
+    let available = limits.iter().any(|limit| {
+        limit
+            .get("windows")
+            .and_then(Value::as_array)
+            .is_some_and(|windows| !windows.is_empty())
+    });
+
+    json!({
+        "available": available,
         "source": "backend-api",
         "fetchedAt": now_unix_ms(),
         "account": payload.email,
         "plan": payload.plan_type,
+        "limits": limits,
+        "windows": windows,
         "fiveHour": five_hour,
         "weekly": weekly,
+        "credits": payload.credits,
+        "individualLimit": individual_limit,
+        "rateLimitReachedType": rate_limit_reached_type,
         "error": Value::Null,
-    }))
+    })
 }
 
 fn read_codex_auth(codex_home: &PathBuf) -> Result<AuthFile> {
@@ -2113,24 +2235,131 @@ fn read_codex_auth(codex_home: &PathBuf) -> Result<AuthFile> {
     serde_json::from_str(&raw).context("invalid Codex auth.json")
 }
 
-fn normalize_quota_window(window: Option<&UsageWindowShape>) -> Option<Value> {
-    let window = window?;
+fn normalize_quota_limit(
+    limit_id: &str,
+    limit_name: &str,
+    rate_limit: Option<&UsageRateLimitShape>,
+    credits: Value,
+    individual_limit: Value,
+    rate_limit_reached_type: Option<String>,
+) -> Value {
+    let mut windows = Vec::with_capacity(2);
+    if let Some(window) = rate_limit
+        .and_then(|rate_limit| rate_limit.primary_window.as_ref())
+        .and_then(|window| normalize_quota_window(window, "primary", limit_id, limit_name))
+    {
+        windows.push(window);
+    }
+    if let Some(window) = rate_limit
+        .and_then(|rate_limit| rate_limit.secondary_window.as_ref())
+        .and_then(|window| normalize_quota_window(window, "secondary", limit_id, limit_name))
+    {
+        windows.push(window);
+    }
+
+    json!({
+        "id": limit_id,
+        "name": limit_name,
+        "windows": windows,
+        "credits": credits,
+        "individualLimit": individual_limit,
+        "rateLimitReachedType": rate_limit_reached_type,
+    })
+}
+
+fn normalize_quota_window(
+    window: &UsageWindowShape,
+    kind: &str,
+    limit_id: &str,
+    limit_name: &str,
+) -> Option<Value> {
     let used_percent = (window.used_percent.unwrap_or(0.0))
         .clamp(0.0, 100.0)
         .round() as u64;
+    let window_duration_minutes = window
+        .window_duration_mins
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            window
+                .limit_window_seconds
+                .filter(|value| *value > 0)
+                .map(|seconds| seconds.saturating_add(59) / 60)
+        });
+    let absolute_reset_at = window.reset_at.filter(|value| *value > 0).map(|value| {
+        let value = value as u64;
+        if value >= 10_000_000_000 {
+            value
+        } else {
+            value.saturating_mul(1000)
+        }
+    });
     let reset_after_seconds = window
         .reset_after_seconds
         .filter(|value| *value > 0)
-        .map(|value| value as u64);
-    let reset_at = reset_after_seconds
-        .map(|seconds| now_unix_ms().saturating_add(seconds.saturating_mul(1000)));
+        .map(|value| value as u64)
+        .or_else(|| {
+            absolute_reset_at
+                .map(|reset_at| reset_at.saturating_sub(now_unix_ms()).saturating_add(999) / 1000)
+        });
+    let reset_at = absolute_reset_at.or_else(|| {
+        reset_after_seconds
+            .map(|seconds| now_unix_ms().saturating_add(seconds.saturating_mul(1000)))
+    });
+    let label = quota_window_label(window_duration_minutes, kind == "secondary");
 
     Some(json!({
+        "id": format!("{limit_id}:{kind}"),
+        "kind": kind,
+        "label": label,
+        "limitId": limit_id,
+        "limitName": limit_name,
         "usedPercent": used_percent,
         "remainingPercent": 100_u64.saturating_sub(used_percent),
+        "windowDurationMinutes": window_duration_minutes,
         "resetAfterSeconds": reset_after_seconds,
         "resetAt": reset_at,
     }))
+}
+
+fn quota_window_matches_duration(window: &Value, expected_minutes: i64) -> bool {
+    window
+        .get("windowDurationMinutes")
+        .and_then(Value::as_i64)
+        .is_some_and(|minutes| approximate_quota_window(minutes, expected_minutes))
+}
+
+fn quota_window_label(window_minutes: Option<i64>, secondary: bool) -> String {
+    let Some(window_minutes) = window_minutes else {
+        return if secondary {
+            "Secondary usage".to_string()
+        } else {
+            "Usage".to_string()
+        };
+    };
+
+    for (expected, label) in [
+        (5 * 60, "5h"),
+        (24 * 60, "Daily"),
+        (7 * 24 * 60, "Weekly"),
+        (30 * 24 * 60, "Monthly"),
+        (365 * 24 * 60, "Annual"),
+    ] {
+        if approximate_quota_window(window_minutes, expected) {
+            return label.to_string();
+        }
+    }
+
+    if secondary {
+        "Secondary usage".to_string()
+    } else {
+        "Usage".to_string()
+    }
+}
+
+fn approximate_quota_window(actual_minutes: i64, expected_minutes: i64) -> bool {
+    let actual = actual_minutes.max(0) as f64;
+    let expected = expected_minutes.max(0) as f64;
+    actual >= expected * 0.95 && actual <= expected * 1.05
 }
 
 pub(crate) fn is_invalid_refresh_token_error_message(message: &str) -> bool {

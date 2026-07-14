@@ -89,7 +89,7 @@ pub(crate) async fn cache_session_goal_payload(
     goal: &Value,
 ) {
     let goal = goal.clone();
-    let _ = with_ui_state_write(state, profile_id, |ui_state| {
+    let _ = with_ui_state_write_debounced(state, profile_id, |ui_state| {
         let Some(goals_by_thread_id) = ui_state
             .get_mut("goalsByThreadId")
             .and_then(Value::as_object_mut)
@@ -100,11 +100,26 @@ pub(crate) async fn cache_session_goal_payload(
             ));
         };
         if goal.is_null() {
-            goals_by_thread_id.remove(session_id);
+            return Ok(((), goals_by_thread_id.remove(session_id).is_some()));
         } else {
-            goals_by_thread_id.insert(session_id.to_string(), goal);
+            let incoming_updated_at = goal
+                .get("updatedAt")
+                .or_else(|| goal.get("updated_at"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let cached_updated_at = goals_by_thread_id
+                .get(session_id)
+                .and_then(|cached| cached.get("updatedAt").or_else(|| cached.get("updated_at")))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if incoming_updated_at >= cached_updated_at
+                && goals_by_thread_id.get(session_id) != Some(&goal)
+            {
+                goals_by_thread_id.insert(session_id.to_string(), goal);
+                return Ok(((), true));
+            }
         }
-        Ok(())
+        Ok(((), false))
     })
     .await;
 }
@@ -232,6 +247,9 @@ pub(crate) async fn fetch_session_goal_payload(
     profile_id: &str,
     session_id: &str,
 ) -> ApiResult<Value> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
+    let _session_guard = session_lock.lock().await;
     let cached_goal = cached_session_goal_or_null_payload(state, profile_id, session_id).await;
     let response = request_thread_goal(
         state,
@@ -312,6 +330,10 @@ pub(crate) async fn set_session_goal_payload(
         ));
     }
 
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
+    let _session_guard = session_lock.lock().await;
+
     let response = request_thread_goal(
         state,
         profile_id,
@@ -333,6 +355,9 @@ pub(crate) async fn clear_session_goal_payload(
     profile_id: &str,
     session_id: &str,
 ) -> ApiResult<Value> {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
+    let _session_guard = session_lock.lock().await;
     let response = request_thread_goal(
         state,
         profile_id,

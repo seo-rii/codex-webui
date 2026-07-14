@@ -133,10 +133,11 @@ After setup, running `codex-webui` again starts the background server and prints
 - CLI launcher log path
 - runtime error log path
 
-The Rust gateway writes its own non-blocking runtime log to
-`<dataDir>/logs/codex-webui-gateway.log`. Slow WebSocket request warnings are
-rate-limited there so a closed code-server terminal or an undrained stdout pipe
-cannot stall request handling.
+The Rust gateway writes hourly non-blocking runtime logs under
+`<dataDir>/logs/codex-webui-gateway.log.YYYY-MM-DD-HH` and retains the latest
+72 files. Slow WebSocket request warnings are rate-limited there so a closed
+code-server terminal or an undrained stdout pipe cannot stall request handling.
+Per-profile Codex stderr logs rotate at 8 MiB and retain three backups.
 
 `pnpm build` produces the public SPA bundle under `build/static`, builds the Rust gateway in release mode, and copies the current-platform gateway binary to `dist/backend/<target>/` for the CLI.
 
@@ -252,7 +253,8 @@ Meaning of the main fields:
 - Codex stores `auth.json`, `config.toml`, sessions, plugins, and skills under `CODEX_HOME`, so separating profiles at that level avoids account collisions.
 - The web UI keeps profile state lightweight at startup and starts `codex app-server` processes only when a profile receives an active Codex request.
 - This means two browsers can stay connected to different accounts at the same time without swapping a shared `~/.codex/auth.json` file.
-- Active Codex app-server processes are capped by `CODEX_WEBUI_MAX_APP_SERVERS` and default to an automatic CPU/memory-based value capped at 4; raise it only when the host has enough memory for concurrent profiles or per-session runtimes.
+- Changing the active profile updates the default for settings and newly created sessions without reconnecting the browser WebSocket or discarding the currently open session. Existing sessions continue to use their persisted profile id.
+- Active Codex app-server processes are capped by `CODEX_WEBUI_MAX_APP_SERVERS` and default to an automatic CPU/memory-based value capped at 4; `auto` and the legacy value `0` both select this bounded mode. Use explicit `unlimited` only for diagnostics on a host with enough memory.
 - By default, sessions in the same profile share one Codex app-server. Set `CODEX_WEBUI_PER_SESSION_APP_SERVERS=true` to allocate a separate app-server for each newly active session in the same profile. Goal updates still get a dedicated process for unassigned sessions because goals tend to be long-running.
 
 If you only want one account at a time, you can still keep a single profile and swap `auth.json` manually before restart. For simultaneous multi-account use, separate `CODEX_HOME` directories are the intended model.
@@ -271,7 +273,7 @@ If you only want one account at a time, you can still keep a single profile and 
 
 Resource limits:
 
-- `CODEX_WEBUI_MAX_APP_SERVERS`: maximum active Codex app-server processes across profiles and optional per-session runtimes. Default: automatic from CPU and memory, capped at `4`.
+- `CODEX_WEBUI_MAX_APP_SERVERS`: maximum active Codex app-server processes across profiles and optional per-session runtimes. Default: automatic from CPU and memory, capped at `4`. `auto` and `0` use the automatic limit; `unlimited` opts into the internal hard cap and is not recommended for normal operation.
 - `CODEX_WEBUI_PER_SESSION_APP_SERVERS`: opt-in same-profile multi-session runtime mode. Default: `false`. When enabled, each newly active session gets its own Codex app-server unless it was already assigned.
 - `CODEX_WEBUI_APP_SERVER_TIMEOUT_SECONDS`: Codex app-server request timeout. Default: `600` seconds, so very long sessions can finish initial resume/loading before `turn/start` or `thread/read` is reported as failed.
 - `CODEX_WEBUI_SERVER_THREADS`: gateway Tokio worker threads. Default: up to `2` based on available parallelism.
@@ -390,6 +392,20 @@ cargo check --manifest-path backend/Cargo.toml
 ```
 
 ## Troubleshooting
+
+### Gateway CPU remains high while the UI is idle
+
+Keep `CODEX_WEBUI_MAX_APP_SERVERS=auto` unless dedicated per-session runtimes are required. The legacy value `0` also means automatic sizing; only the explicit value `unlimited` disables the practical limit. Use the Processes section in Settings to identify dedicated runtimes that are still active.
+
+The gateway coalesces high-frequency runtime/goal state writes, caches the YAML profile snapshot between change checks, and waits for ephemeral title/language-bridge workers through Codex completion events instead of polling full thread history. Browser status polling is retained only as a slower recovery fallback and is skipped while live stream evidence is arriving. These safeguards matter on installations with multi-megabyte UI state or hundreds of long rollout files.
+
+For a local CPU investigation, compare the gateway and Codex children separately:
+
+```bash
+ps -eo pid,ppid,%cpu,rss,etime,comm,args --sort=-%cpu | head -30
+```
+
+High CPU in `codex app-server` children normally reflects active model/tool work. Sustained CPU in the Rust gateway while idle should be reported with the process list, `runtime/processes/list` diagnostics, and the rotating gateway log.
 
 ### A session appears to still be running after Codex stopped
 

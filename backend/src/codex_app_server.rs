@@ -16,6 +16,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -23,11 +24,16 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
     runtime::{Builder as TokioRuntimeBuilder, Handle as TokioRuntimeHandle},
-    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, broadcast, oneshot},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, broadcast, mpsc, oneshot},
     task::JoinHandle,
     time::{Instant as TokioInstant, timeout, timeout_at},
 };
 use tracing::{info, warn};
+
+#[cfg(unix)]
+use tokio::net::UnixStream;
+#[cfg(unix)]
+use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message};
 
 const APP_SERVER_THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
 const APP_SERVER_REQUEST_TIMEOUT_DEFAULT_SECONDS: u64 = 600;
@@ -42,11 +48,7 @@ const APP_SERVER_MAX_PROCESSES_HARD_CAP: usize = 512;
 const APP_SERVER_DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 300;
 const APP_SERVER_READER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
-// Codex 0.144.1 app-server Unix sockets require a WebSocket upgrade, while
-// `codex app-server proxy` only copies raw bytes. Until this client speaks the
-// Unix WebSocket transport directly, spawning that pair would only create an
-// unusable daemon and an orphan-prone proxy.
-const RAW_HANDOFF_PROXY_IS_COMPATIBLE: bool = false;
+const APP_SERVER_WEBSOCKET_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppServerProfile {
@@ -77,6 +79,8 @@ pub struct AppServerHandoffStatus {
     pub active_process_count: usize,
     pub stdio_process_count: usize,
     pub handoff_proxy_process_count: usize,
+    pub blocking_process_count: usize,
+    pub closed_idle_process_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -154,7 +158,6 @@ struct AppServerClientInner {
     next_request_id: AtomicU64,
     next_process_generation: AtomicU64,
     last_activity_at_ms: AtomicU64,
-    handoff_disabled_after_failure: AtomicBool,
     notifications_tx: broadcast::Sender<AppServerNotification>,
     requests_tx: broadcast::Sender<AppServerRequest>,
 }
@@ -166,7 +169,7 @@ struct PendingRequest {
 
 struct ProcessState {
     generation: u64,
-    stdin: Arc<Mutex<ChildStdin>>,
+    writer: Arc<Mutex<AppServerWriter>>,
     pid: Option<u32>,
     process_identity: Option<ManagedProcessIdentity>,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -174,6 +177,12 @@ struct ProcessState {
     supervisor_start_tx: Option<oneshot::Sender<()>>,
     handoff_proxy: bool,
     _process_slot: OwnedSemaphorePermit,
+}
+
+enum AppServerWriter {
+    Stdio(ChildStdin),
+    #[cfg(unix)]
+    WebSocket(mpsc::Sender<String>),
 }
 
 #[derive(Clone, Debug)]
@@ -198,6 +207,23 @@ struct HandoffMeta {
     codex_home: String,
     started_at_ms: u128,
 }
+
+#[derive(Debug)]
+struct LiveHandoffDaemonUnavailable {
+    socket_path: PathBuf,
+}
+
+impl std::fmt::Display for LiveHandoffDaemonUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "persistent Codex app-server at {} is still alive but its WebSocket is unavailable",
+            self.socket_path.display()
+        )
+    }
+}
+
+impl StdError for LiveHandoffDaemonUnavailable {}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct ManagedProcessIdentity {
@@ -379,7 +405,6 @@ impl AppServerClient {
                 next_request_id: AtomicU64::new(1),
                 next_process_generation: AtomicU64::new(1),
                 last_activity_at_ms: AtomicU64::new(unix_time_ms()),
-                handoff_disabled_after_failure: AtomicBool::new(false),
                 notifications_tx,
                 requests_tx,
             }),
@@ -583,7 +608,9 @@ impl AppServerClient {
                 "codex app-server client closed",
             )
             .await;
-            terminate_managed_process_group(process.pid, process.process_identity).await;
+            if !process.handoff_proxy {
+                terminate_managed_process_group(process.pid, process.process_identity).await;
+            }
             if let Some(shutdown_tx) = process.shutdown_tx.take() {
                 let _ = shutdown_tx.send(());
             }
@@ -609,7 +636,15 @@ impl AppServerClient {
     }
 
     async fn is_idle_for(&self, idle_for: Duration) -> bool {
-        if !self.inner.pending.lock().await.is_empty()
+        if self.has_live_work().await {
+            return false;
+        }
+        unix_time_ms().saturating_sub(self.inner.last_activity_at_ms.load(Ordering::Relaxed))
+            >= idle_for.as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
+    async fn has_live_work(&self) -> bool {
+        !self.inner.pending.lock().await.is_empty()
             || !self.inner.active_turn_ids.lock().await.is_empty()
             || !self
                 .inner
@@ -617,11 +652,6 @@ impl AppServerClient {
                 .lock()
                 .await
                 .is_empty()
-        {
-            return false;
-        }
-        unix_time_ms().saturating_sub(self.inner.last_activity_at_ms.load(Ordering::Relaxed))
-            >= idle_for.as_millis().min(u128::from(u64::MAX)) as u64
     }
 
     async fn ensure_started(&self) -> Result<()> {
@@ -646,71 +676,56 @@ impl AppServerClient {
             .await;
         }
 
-        let mut last_start_error: Option<anyhow::Error> = None;
-        for _ in 0..2 {
-            let process_state = self.spawn_process().await?;
-            let used_handoff_proxy = process_state.handoff_proxy;
-            let mut process_state = process_state;
-            let supervisor_start_tx = process_state.supervisor_start_tx.take();
-            {
-                let mut process = self.inner.process.lock().await;
-                *process = Some(process_state);
-            }
-            if let Some(supervisor_start_tx) = supervisor_start_tx {
-                let _ = supervisor_start_tx.send(());
-            }
-
-            if let Err(error) = async {
-                self.request_started_with_timeout(
-                    "initialize".to_string(),
-                    json!({
-                    "clientInfo": {
-                            "name": self.inner.config.client_name.clone(),
-                            "title": self.inner.config.client_title.clone(),
-                            "version": self.inner.config.client_version.clone()
-                        },
-                        "capabilities": {
-                            "experimentalApi": true
-                        }
-                    }),
-                    self.inner.config.startup_timeout,
-                    false,
-                )
-                .await?;
-                self.write_message(&json!({
-                    "method": "initialized",
-                    "params": {}
-                }))
-                .await
-            }
-            .await
-            {
-                let _ = self.close_on_controller().await;
-                if used_handoff_proxy {
-                    warn!(
-                        profile_id = %self.inner.profile.id,
-                        error = %error,
-                        "codex app-server handoff proxy failed during initialization; falling back to stdio"
-                    );
-                    self.inner
-                        .handoff_disabled_after_failure
-                        .store(true, Ordering::SeqCst);
-                    let _ = stop_handoff_server(
-                        &self.inner.config,
-                        &self.inner.client_key,
-                        &self.inner.profile,
-                    )
-                    .await;
-                    last_start_error = Some(error);
-                    continue;
-                }
-                return Err(error);
-            }
-
-            return Ok(());
+        let process_state = self.spawn_process().await?;
+        let used_handoff_connection = process_state.handoff_proxy;
+        let mut process_state = process_state;
+        let supervisor_start_tx = process_state.supervisor_start_tx.take();
+        {
+            let mut process = self.inner.process.lock().await;
+            *process = Some(process_state);
+        }
+        if let Some(supervisor_start_tx) = supervisor_start_tx {
+            let _ = supervisor_start_tx.send(());
         }
 
-        Err(last_start_error.unwrap_or_else(|| anyhow!("failed to start codex app-server")))
+        if let Err(error) = async {
+            self.request_started_with_timeout(
+                "initialize".to_string(),
+                json!({
+                    "clientInfo": {
+                        "name": self.inner.config.client_name.clone(),
+                        "title": self.inner.config.client_title.clone(),
+                        "version": self.inner.config.client_version.clone()
+                    },
+                    "capabilities": {
+                        "experimentalApi": true
+                    }
+                }),
+                self.inner.config.startup_timeout,
+                false,
+            )
+            .await?;
+            self.write_message(&json!({
+                "method": "initialized",
+                "params": {}
+            }))
+            .await
+        }
+        .await
+        {
+            let _ = self.close_on_controller().await;
+            if used_handoff_connection {
+                warn!(
+                    profile_id = %self.inner.profile.id,
+                    error = %error,
+                    "persistent codex app-server connection failed during initialization; preserving the daemon for a later reconnect"
+                );
+                return Err(error);
+            }
+            return Err(error);
+        }
+
+        Ok(())
     }
 
     async fn request_started(&self, method: String, params: Value) -> Result<Value> {
@@ -728,12 +743,12 @@ impl AppServerClient {
         let deadline = TokioInstant::now() + request_timeout;
         let id = self.inner.next_request_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
-        let (generation, stdin) = {
+        let (generation, writer) = {
             let process = self.inner.process.lock().await;
             let process = process
                 .as_ref()
                 .ok_or_else(|| anyhow!("codex app-server is not running"))?;
-            (process.generation, process.stdin.clone())
+            (process.generation, process.writer.clone())
         };
         let method_name = method.clone();
         let encoded = serde_json::to_string(&json!({
@@ -751,19 +766,7 @@ impl AppServerClient {
         );
 
         let write_result = timeout_at(deadline, async {
-            let mut writer = stdin.lock().await;
-            writer
-                .write_all(encoded.as_bytes())
-                .await
-                .context("failed to write app-server message")?;
-            writer
-                .write_all(b"\n")
-                .await
-                .context("failed to terminate app-server message")?;
-            writer
-                .flush()
-                .await
-                .context("failed to flush app-server stdin")
+            write_app_server_message(&writer, encoded).await
         })
         .await;
         match write_result {
@@ -869,9 +872,6 @@ impl AppServerClient {
         self.terminate_unresponsive_process_state(process, reason)
             .await;
         if was_handoff_proxy {
-            self.inner
-                .handoff_disabled_after_failure
-                .store(true, Ordering::SeqCst);
             let _ = stop_handoff_server(
                 &self.inner.config,
                 &self.inner.client_key,
@@ -908,29 +908,17 @@ impl AppServerClient {
     }
 
     async fn write_message(&self, payload: &Value) -> Result<()> {
-        let stdin = {
+        let writer = {
             let process = self.inner.process.lock().await;
             process
                 .as_ref()
-                .map(|state| state.stdin.clone())
+                .map(|state| state.writer.clone())
                 .ok_or_else(|| anyhow!("codex app-server is not running"))?
         };
 
-        let mut writer = stdin.lock().await;
         let encoded =
             serde_json::to_string(payload).context("failed to encode app-server message")?;
-        writer
-            .write_all(encoded.as_bytes())
-            .await
-            .context("failed to write app-server message")?;
-        writer
-            .write_all(b"\n")
-            .await
-            .context("failed to terminate app-server message")?;
-        writer
-            .flush()
-            .await
-            .context("failed to flush app-server stdin")
+        write_app_server_message(&writer, encoded).await
     }
 
     async fn spawn_process(&self) -> Result<ProcessState> {
@@ -958,25 +946,70 @@ impl AppServerClient {
                 self.inner.config.max_processes.max(1)
             ),
         };
-        let handoff_paths = self.ensure_handoff_server_running().await?;
-        let handoff_proxy = handoff_paths.is_some();
-        let args = if let Some(handoff_paths) = handoff_paths {
-            vec![
-                OsString::from("app-server"),
-                OsString::from("proxy"),
-                OsString::from("--sock"),
-                handoff_paths.socket_path.as_os_str().to_os_string(),
-            ]
-        } else {
+        let handoff_paths = match self.ensure_handoff_server_running().await {
+            Ok(paths) => paths,
+            Err(error)
+                if error
+                    .downcast_ref::<LiveHandoffDaemonUnavailable>()
+                    .is_some() =>
+            {
+                return Err(error);
+            }
+            Err(error) => {
+                warn!(
+                    profile_id = %self.inner.profile.id,
+                    client_key = %self.inner.client_key,
+                    error = %error,
+                    "failed to prepare persistent Codex app-server; falling back to stdio"
+                );
+                let _ = stop_handoff_server(
+                    &self.inner.config,
+                    &self.inner.client_key,
+                    &self.inner.profile,
+                )
+                .await;
+                None
+            }
+        };
+        #[cfg(unix)]
+        if let Some(paths) = handoff_paths {
+            match self
+                .connect_handoff_process(paths.clone(), process_slot)
+                .await
+            {
+                Ok(process) => return Ok(process),
+                Err((error, process_slot)) => {
+                    warn!(
+                        profile_id = %self.inner.profile.id,
+                        socket = %paths.socket_path.display(),
+                        error = %error,
+                        "failed to connect to a live persistent Codex app-server; preserving it for a later reconnect"
+                    );
+                    drop(process_slot);
+                    return Err(error);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = handoff_paths;
+
+        self.spawn_stdio_process(process_slot).await
+    }
+
+    async fn spawn_stdio_process(
+        &self,
+        process_slot: OwnedSemaphorePermit,
+    ) -> Result<ProcessState> {
+        let mut command = codex_command_from_app_server_args(
+            &self.inner.config,
             vec![
                 OsString::from("app-server"),
                 OsString::from("--enable"),
                 OsString::from("goals"),
                 OsString::from("--listen"),
                 OsString::from("stdio://"),
-            ]
-        };
-        let mut command = codex_command_from_app_server_args(&self.inner.config, args);
+            ],
+        );
 
         command
             .env("CODEX_HOME", &self.inner.profile.codex_home)
@@ -997,10 +1030,10 @@ impl AppServerClient {
             .spawn()
             .with_context(|| format!("failed to spawn {}", self.inner.config.codex_bin))?;
         let pid = child.id();
-        let stdin =
-            Arc::new(Mutex::new(child.stdin.take().ok_or_else(|| {
-                anyhow!("failed to capture codex app-server stdin")
-            })?));
+        let writer = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to capture codex app-server stdin"))?;
         let stdout = child
             .stdout
             .take()
@@ -1029,38 +1062,94 @@ impl AppServerClient {
 
         Ok(ProcessState {
             generation,
-            stdin,
+            writer: Arc::new(Mutex::new(AppServerWriter::Stdio(writer))),
             pid,
             process_identity: read_managed_process_identity(pid),
             shutdown_tx: Some(shutdown_tx),
             join_handle,
             supervisor_start_tx: Some(supervisor_start_tx),
-            handoff_proxy,
+            handoff_proxy: false,
             _process_slot: process_slot,
         })
     }
 
-    async fn ensure_handoff_server_running(&self) -> Result<Option<HandoffPaths>> {
-        if self.inner.config.handoff_dir.is_some() && !RAW_HANDOFF_PROXY_IS_COMPATIBLE {
-            if !self
-                .inner
-                .handoff_disabled_after_failure
-                .swap(true, Ordering::SeqCst)
-            {
-                warn!(
-                    profile_id = %self.inner.profile.id,
-                    "Codex Unix app-server transport requires WebSocket framing; raw handoff proxy is disabled and stdio transport will be used"
-                );
+    #[cfg(unix)]
+    async fn connect_handoff_process(
+        &self,
+        paths: HandoffPaths,
+        process_slot: OwnedSemaphorePermit,
+    ) -> std::result::Result<ProcessState, (anyhow::Error, OwnedSemaphorePermit)> {
+        let connect_result = async {
+            let meta = tokio::fs::read(&paths.meta_path)
+                .await
+                .with_context(|| format!("failed to read {}", paths.meta_path.display()))
+                .and_then(|bytes| {
+                    serde_json::from_slice::<HandoffMeta>(&bytes)
+                        .context("failed to decode Codex app-server handoff metadata")
+                })?;
+            if !handoff_meta_matches(
+                &self.inner.config,
+                &paths,
+                &self.inner.client_key,
+                &self.inner.profile,
+                &meta,
+            ) {
+                anyhow::bail!("Codex app-server handoff metadata is stale or does not match");
             }
-            return Ok(None);
+
+            let websocket = connect_handoff_websocket(&paths.socket_path).await?;
+            let (outbound_tx, outbound_rx) = mpsc::channel(APP_SERVER_WEBSOCKET_QUEUE_CAPACITY);
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let (supervisor_start_tx, supervisor_start_rx) = oneshot::channel();
+            let generation = self
+                .inner
+                .next_process_generation
+                .fetch_add(1, Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let supervisor_paths = paths.clone();
+            let join_handle = tokio::spawn(async move {
+                supervise_handoff_connection(
+                    inner,
+                    generation,
+                    supervisor_paths,
+                    websocket,
+                    outbound_rx,
+                    shutdown_rx,
+                    supervisor_start_rx,
+                )
+                .await;
+            });
+
+            Ok::<_, anyhow::Error>((
+                generation,
+                outbound_tx,
+                shutdown_tx,
+                supervisor_start_tx,
+                join_handle,
+                meta,
+            ))
         }
-        if self
-            .inner
-            .handoff_disabled_after_failure
-            .load(Ordering::SeqCst)
-        {
-            return Ok(None);
+        .await;
+
+        match connect_result {
+            Ok((generation, outbound_tx, shutdown_tx, supervisor_start_tx, join_handle, meta)) => {
+                Ok(ProcessState {
+                    generation,
+                    writer: Arc::new(Mutex::new(AppServerWriter::WebSocket(outbound_tx))),
+                    pid: Some(meta.pid),
+                    process_identity: meta.process_identity,
+                    shutdown_tx: Some(shutdown_tx),
+                    join_handle,
+                    supervisor_start_tx: Some(supervisor_start_tx),
+                    handoff_proxy: true,
+                    _process_slot: process_slot,
+                })
+            }
+            Err(error) => Err((error, process_slot)),
         }
+    }
+
+    async fn ensure_handoff_server_running(&self) -> Result<Option<HandoffPaths>> {
         let Some(paths) = handoff_paths(
             &self.inner.config,
             &self.inner.client_key,
@@ -1077,38 +1166,53 @@ impl AppServerClient {
 
         #[cfg(unix)]
         {
-            if handoff_socket_is_live(&paths.socket_path).await {
-                let meta = tokio::fs::read(&paths.meta_path)
-                    .await
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<HandoffMeta>(&bytes).ok());
-                if meta.as_ref().is_some_and(|meta| {
-                    meta.enabled_features
+            let existing_meta = tokio::fs::read(&paths.meta_path)
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<HandoffMeta>(&bytes).ok());
+            if existing_meta.as_ref().is_some_and(|meta| {
+                handoff_meta_matches(
+                    &self.inner.config,
+                    &paths,
+                    &self.inner.client_key,
+                    &self.inner.profile,
+                    meta,
+                )
+            }) {
+                if existing_meta.as_ref().is_some_and(|meta| {
+                    !meta
+                        .enabled_features
                         .iter()
                         .any(|feature| feature == "goals")
                 }) {
-                    return Ok(Some(paths));
-                }
-
-                warn!(
-                    profile_id = %self.inner.profile.id,
-                    socket = %paths.socket_path.display(),
-                    "codex app-server handoff socket was started without required goal support; avoiding stale handoff daemon"
-                );
-                let _ = stop_handoff_server(
-                    &self.inner.config,
-                    &self.inner.client_key,
-                    &self.inner.profile,
-                )
-                .await;
-                if handoff_socket_is_live(&paths.socket_path).await {
                     warn!(
                         profile_id = %self.inner.profile.id,
                         socket = %paths.socket_path.display(),
-                        "stale codex app-server handoff socket is still live; using stdio app-server for required goal support"
+                        "reusing an older persistent Codex app-server without recorded goal support so active work is not interrupted"
                     );
-                    return Ok(None);
                 }
+                for _ in 0..3 {
+                    if handoff_socket_is_live(&paths.socket_path).await {
+                        return Ok(Some(paths));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                return Err(LiveHandoffDaemonUnavailable {
+                    socket_path: paths.socket_path.clone(),
+                }
+                .into());
+            }
+
+            if handoff_socket_is_live(&paths.socket_path).await {
+                warn!(
+                    profile_id = %self.inner.profile.id,
+                    socket = %paths.socket_path.display(),
+                    "refusing to replace a live Codex app-server socket whose metadata cannot be verified"
+                );
+                return Err(LiveHandoffDaemonUnavailable {
+                    socket_path: paths.socket_path.clone(),
+                }
+                .into());
             }
 
             if let Some(parent) = paths.socket_path.parent() {
@@ -1158,7 +1262,7 @@ impl AppServerClient {
                 command.process_group(0);
             }
 
-            let child = command.spawn().with_context(|| {
+            let mut child = command.spawn().with_context(|| {
                 format!(
                     "failed to spawn persistent {} app-server",
                     self.inner.config.codex_bin
@@ -1166,47 +1270,66 @@ impl AppServerClient {
             })?;
             let pid = child.id().unwrap_or_default();
             let process_identity = read_managed_process_identity(Some(pid));
-            drop(child);
+            let readiness = async {
+                let deadline = tokio::time::Instant::now()
+                    + self
+                        .inner
+                        .config
+                        .startup_timeout
+                        .min(Duration::from_secs(5));
+                while tokio::time::Instant::now() < deadline {
+                    if handoff_socket_is_live(&paths.socket_path).await {
+                        let meta = HandoffMeta {
+                            pid,
+                            process_identity,
+                            enabled_features: vec!["goals".to_string()],
+                            client_key: self.inner.client_key.clone(),
+                            profile_id: self.inner.profile.id.clone(),
+                            socket_path: paths.socket_path.display().to_string(),
+                            codex_bin: self.inner.config.codex_bin.clone(),
+                            codex_home: self.inner.profile.codex_home.display().to_string(),
+                            started_at_ms: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis(),
+                        };
+                        let encoded = serde_json::to_vec_pretty(&meta)
+                            .context("failed to encode app-server handoff metadata")?;
+                        write_bytes_atomically(&paths.meta_path, &encoded)
+                            .await
+                            .with_context(|| {
+                                format!("failed to write {}", paths.meta_path.display())
+                            })?;
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(anyhow!(
+                    "persistent codex app-server did not open {}",
+                    paths.socket_path.display()
+                ))
+            }
+            .await;
 
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            while tokio::time::Instant::now() < deadline {
-                if handoff_socket_is_live(&paths.socket_path).await {
-                    let meta = HandoffMeta {
-                        pid,
-                        process_identity,
-                        enabled_features: vec!["goals".to_string()],
-                        client_key: self.inner.client_key.clone(),
-                        profile_id: self.inner.profile.id.clone(),
-                        socket_path: paths.socket_path.display().to_string(),
-                        codex_bin: self.inner.config.codex_bin.clone(),
-                        codex_home: self.inner.profile.codex_home.display().to_string(),
-                        started_at_ms: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis(),
-                    };
-                    let encoded = serde_json::to_vec_pretty(&meta)
-                        .context("failed to encode app-server handoff metadata")?;
-                    write_bytes_atomically(&paths.meta_path, &encoded)
-                        .await
-                        .with_context(|| {
-                            format!("failed to write {}", paths.meta_path.display())
-                        })?;
+            match readiness {
+                Ok(()) => {
                     info!(
                         profile_id = %self.inner.profile.id,
                         pid,
                         socket = %paths.socket_path.display(),
                         "started persistent codex app-server for restart handoff"
                     );
-                    return Ok(Some(paths));
+                    drop(child);
+                    Ok(Some(paths))
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                Err(error) => {
+                    terminate_managed_process_group(Some(pid), process_identity).await;
+                    let _ = timeout(Duration::from_secs(2), child.wait()).await;
+                    let _ = tokio::fs::remove_file(&paths.socket_path).await;
+                    let _ = tokio::fs::remove_file(&paths.meta_path).await;
+                    Err(error)
+                }
             }
-
-            Err(anyhow!(
-                "persistent codex app-server did not open {}",
-                paths.socket_path.display()
-            ))
         }
     }
 }
@@ -1416,7 +1539,6 @@ impl AppServerManager {
             client_count: clients.len(),
             ..AppServerHandoffStatus::default()
         };
-
         for client in clients {
             let process = client.inner.process.lock().await;
             let Some(process) = process.as_ref() else {
@@ -1430,6 +1552,90 @@ impl AppServerManager {
                 status.handoff_proxy_process_count += 1;
             } else {
                 status.stdio_process_count += 1;
+            }
+        }
+
+        status
+    }
+
+    pub async fn prepare_restart_handoff(&self, handoff_enabled: bool) -> AppServerHandoffStatus {
+        let clients = {
+            let clients = self.clients.lock().await;
+            clients.values().cloned().collect::<Vec<_>>()
+        };
+        let mut status = AppServerHandoffStatus {
+            client_count: clients.len(),
+            ..AppServerHandoffStatus::default()
+        };
+        let mut closable_clients = Vec::new();
+
+        for client in &clients {
+            let process_kind = {
+                let process = client.inner.process.lock().await;
+                process.as_ref().and_then(|process| {
+                    process_state_is_usable(process).then_some(process.handoff_proxy)
+                })
+            };
+            let Some(handoff_process) = process_kind else {
+                continue;
+            };
+            status.active_process_count += 1;
+            if handoff_process {
+                status.handoff_proxy_process_count += 1;
+            } else {
+                status.stdio_process_count += 1;
+            }
+
+            if handoff_enabled && handoff_process {
+                continue;
+            }
+            if client.has_live_work().await {
+                status.blocking_process_count += 1;
+                continue;
+            }
+            closable_clients.push(client.clone());
+        }
+
+        if status.blocking_process_count > 0 {
+            return status;
+        }
+
+        for client in closable_clients {
+            let client_for_close = client.clone();
+            let close_result = client
+                .inner
+                .controller
+                .handle
+                .spawn(async move {
+                    let _lifecycle = client_for_close.inner.lifecycle.write().await;
+                    if client_for_close.has_live_work().await {
+                        return Ok(false);
+                    }
+                    client_for_close.close_on_controller().await?;
+                    Ok::<_, anyhow::Error>(true)
+                })
+                .await;
+            match close_result {
+                Ok(Ok(true)) => status.closed_idle_process_count += 1,
+                Ok(Ok(false)) => status.blocking_process_count += 1,
+                Ok(Err(error)) => {
+                    warn!(
+                        profile_id = %client.inner.profile.id,
+                        client_key = %client.inner.client_key,
+                        error = %error,
+                        "failed to close idle Codex app-server before restart"
+                    );
+                    status.blocking_process_count += 1;
+                }
+                Err(error) => {
+                    warn!(
+                        profile_id = %client.inner.profile.id,
+                        client_key = %client.inner.client_key,
+                        error = %error,
+                        "Codex app-server controller failed while preparing restart"
+                    );
+                    status.blocking_process_count += 1;
+                }
             }
         }
 
@@ -1611,9 +1817,6 @@ impl AppServerManager {
         }
         #[cfg(unix)]
         {
-            if !RAW_HANDOFF_PROXY_IS_COMPATIBLE {
-                return None;
-            }
             let paths = handoff_paths(&self.config, client_key, profile)?;
             let meta = tokio::fs::read(&paths.meta_path)
                 .await
@@ -1795,11 +1998,37 @@ fn handoff_paths(
 
 #[cfg(unix)]
 async fn handoff_socket_is_live(socket_path: &Path) -> bool {
-    use tokio::net::UnixStream;
+    let Ok(mut websocket) = connect_handoff_websocket(socket_path).await else {
+        return false;
+    };
+    let _ = websocket.close(None).await;
+    true
+}
 
-    timeout(Duration::from_millis(250), UnixStream::connect(socket_path))
+#[cfg(unix)]
+async fn connect_handoff_websocket(socket_path: &Path) -> Result<WebSocketStream<UnixStream>> {
+    let stream = timeout(Duration::from_secs(1), UnixStream::connect(socket_path))
         .await
-        .is_ok_and(|result| result.is_ok())
+        .context("timed out connecting to Codex app-server handoff socket")?
+        .with_context(|| {
+            format!(
+                "failed to connect to Codex app-server handoff socket {}",
+                socket_path.display()
+            )
+        })?;
+    let (websocket, _) = timeout(
+        Duration::from_secs(1),
+        client_async("ws://localhost/rpc", stream),
+    )
+    .await
+    .context("timed out upgrading Codex app-server handoff WebSocket")?
+    .with_context(|| {
+        format!(
+            "failed to upgrade Codex app-server handoff WebSocket {}",
+            socket_path.display()
+        )
+    })?;
+    Ok(websocket)
 }
 
 #[cfg(unix)]
@@ -1948,18 +2177,17 @@ async fn stop_handoff_server(
         return Ok(());
     };
 
-    if !handoff_socket_is_live(&paths.socket_path).await {
-        let _ = tokio::fs::remove_file(&paths.socket_path).await;
-        let _ = tokio::fs::remove_file(&paths.meta_path).await;
-        return Ok(());
-    }
-
     if !handoff_meta_matches(config, &paths, client_key, profile, &meta) {
-        warn!(
-            pid = meta.pid,
-            socket = %paths.socket_path.display(),
-            "refusing to terminate codex app-server from stale or unverified handoff metadata"
-        );
+        if handoff_socket_is_live(&paths.socket_path).await {
+            warn!(
+                pid = meta.pid,
+                socket = %paths.socket_path.display(),
+                "refusing to terminate codex app-server from stale or unverified handoff metadata"
+            );
+        } else {
+            let _ = tokio::fs::remove_file(&paths.socket_path).await;
+            let _ = tokio::fs::remove_file(&paths.meta_path).await;
+        }
         return Ok(());
     }
 
@@ -1993,9 +2221,25 @@ fn handoff_meta_matches(
         && meta.codex_home == profile.codex_home.display().to_string()
         && meta.socket_path == paths.socket_path.display().to_string()
         && meta.codex_bin == config.codex_bin
-        && meta
-            .process_identity
-            .is_some_and(|identity| managed_process_identity_matches(meta.pid, identity))
+        && handoff_process_identity_matches(meta.pid, meta.process_identity)
+}
+
+#[cfg(target_os = "linux")]
+fn handoff_process_identity_matches(pid: u32, identity: Option<ManagedProcessIdentity>) -> bool {
+    identity.is_some_and(|identity| managed_process_identity_matches(pid, identity))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn handoff_process_identity_matches(pid: u32, _identity: Option<ManagedProcessIdentity>) -> bool {
+    StdCommand::new("kill")
+        .arg("-0")
+        .arg("--")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(not(unix))]
@@ -2241,6 +2485,34 @@ fn parse_env_bool(value: &str) -> Option<bool> {
     }
 }
 
+async fn write_app_server_message(
+    writer: &Arc<Mutex<AppServerWriter>>,
+    encoded: String,
+) -> Result<()> {
+    let mut writer = writer.lock().await;
+    match &mut *writer {
+        AppServerWriter::Stdio(stdin) => {
+            stdin
+                .write_all(encoded.as_bytes())
+                .await
+                .context("failed to write app-server message")?;
+            stdin
+                .write_all(b"\n")
+                .await
+                .context("failed to terminate app-server message")?;
+            stdin
+                .flush()
+                .await
+                .context("failed to flush app-server stdin")
+        }
+        #[cfg(unix)]
+        AppServerWriter::WebSocket(outbound_tx) => outbound_tx
+            .send(encoded)
+            .await
+            .map_err(|_| anyhow!("codex app-server WebSocket writer is closed")),
+    }
+}
+
 async fn supervise_process(
     inner: Arc<AppServerClientInner>,
     generation: u64,
@@ -2299,6 +2571,110 @@ async fn supervise_process(
         ),
     };
 
+    finalize_process_exit(&inner, generation, reason, exit_code).await;
+
+    if !stdout_finished {
+        finish_reader_task(stdout_task, "stdout", &inner.profile.id).await;
+    }
+    finish_reader_task(stderr_task, "stderr", &inner.profile.id).await;
+}
+
+#[cfg(unix)]
+async fn supervise_handoff_connection(
+    inner: Arc<AppServerClientInner>,
+    generation: u64,
+    paths: HandoffPaths,
+    websocket: WebSocketStream<UnixStream>,
+    mut outbound_rx: mpsc::Receiver<String>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+    supervisor_start_rx: oneshot::Receiver<()>,
+) {
+    let (mut websocket_writer, mut websocket_reader) = websocket.split();
+    if supervisor_start_rx.await.is_err() {
+        let _ = websocket_writer.close().await;
+        return;
+    }
+
+    let reason = loop {
+        tokio::select! {
+            _ = &mut shutdown_rx => {
+                let _ = websocket_writer.close().await;
+                return;
+            }
+            outbound = outbound_rx.recv() => {
+                let Some(encoded) = outbound else {
+                    let _ = websocket_writer.close().await;
+                    break "codex app-server handoff writer closed".to_string();
+                };
+                if let Err(error) = websocket_writer.send(Message::Text(encoded.into())).await {
+                    break format!("failed to write Codex app-server handoff WebSocket: {error}");
+                }
+            }
+            incoming = websocket_reader.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        handle_incoming_message(&inner, text.as_str()).await;
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if let Err(error) = websocket_writer.send(Message::Pong(payload)).await {
+                            break format!("failed to answer Codex app-server handoff ping: {error}");
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(frame))) => {
+                        break frame
+                            .map(|frame| format!("Codex app-server handoff WebSocket closed: {}", frame.reason))
+                            .unwrap_or_else(|| "Codex app-server handoff WebSocket closed".to_string());
+                    }
+                    Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {}
+                    Some(Err(error)) => {
+                        break format!("Codex app-server handoff WebSocket failed: {error}");
+                    }
+                    None => break "Codex app-server handoff WebSocket reached EOF".to_string(),
+                }
+            }
+        }
+    };
+
+    if handoff_daemon_is_live(&inner, &paths).await {
+        finalize_handoff_connection_loss(&inner, generation, reason).await;
+    } else {
+        finalize_process_exit(&inner, generation, reason, Value::Null).await;
+    }
+}
+
+#[cfg(unix)]
+async fn handoff_daemon_is_live(inner: &AppServerClientInner, paths: &HandoffPaths) -> bool {
+    let Some(meta) = tokio::fs::read(&paths.meta_path)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<HandoffMeta>(&bytes).ok())
+    else {
+        return false;
+    };
+    if !handoff_meta_matches(
+        &inner.config,
+        paths,
+        &inner.client_key,
+        &inner.profile,
+        &meta,
+    ) {
+        return false;
+    }
+    for _ in 0..3 {
+        if handoff_socket_is_live(&paths.socket_path).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+async fn finalize_handoff_connection_loss(
+    inner: &Arc<AppServerClientInner>,
+    generation: u64,
+    reason: String,
+) {
     let cleared_current_process = {
         let mut process = inner.process.lock().await;
         if process
@@ -2312,7 +2688,42 @@ async fn supervise_process(
         }
     };
 
-    fail_pending_requests(&inner, generation, &reason).await;
+    fail_pending_requests(inner, generation, &reason).await;
+    if cleared_current_process {
+        inner.pending_server_request_ids.lock().await.clear();
+        warn!(
+            profile_id = %inner.profile.id,
+            codex_home = %inner.profile.codex_home.display(),
+            generation,
+            "{reason}; persistent Codex app-server is still alive and will be reconnected"
+        );
+        let _ = inner.notifications_tx.send(AppServerNotification {
+            method: "codex-webui/app-server/disconnected".to_string(),
+            params: json!({ "reason": reason }),
+        });
+    }
+}
+
+async fn finalize_process_exit(
+    inner: &Arc<AppServerClientInner>,
+    generation: u64,
+    reason: String,
+    exit_code: Value,
+) {
+    let cleared_current_process = {
+        let mut process = inner.process.lock().await;
+        if process
+            .as_ref()
+            .is_some_and(|process| process.generation == generation)
+        {
+            *process = None;
+            true
+        } else {
+            false
+        }
+    };
+
+    fail_pending_requests(inner, generation, &reason).await;
     if cleared_current_process {
         inner.active_turn_ids.lock().await.clear();
         inner.pending_server_request_ids.lock().await.clear();
@@ -2330,11 +2741,6 @@ async fn supervise_process(
             }),
         });
     }
-
-    if !stdout_finished {
-        finish_reader_task(stdout_task, "stdout", &inner.profile.id).await;
-    }
-    finish_reader_task(stderr_task, "stderr", &inner.profile.id).await;
 }
 
 async fn finish_reader_task<T>(mut task: JoinHandle<T>, stream: &str, profile_id: &str) {
@@ -2358,37 +2764,41 @@ async fn read_stdout(inner: Arc<AppServerClientInner>, stdout: ChildStdout) -> R
             .await
             .context("failed to read codex app-server stdout")?
             .ok_or_else(|| anyhow!("codex app-server stdout reached EOF"))?;
-        inner
-            .last_activity_at_ms
-            .store(unix_time_ms(), Ordering::Relaxed);
-        match classify_incoming_message(&line) {
-            Ok(Some(IncomingMessage::Response { id, payload })) => {
-                if let Some(pending) = inner.pending.lock().await.remove(&id) {
-                    let _ = pending.sender.send(payload);
-                }
+        handle_incoming_message(&inner, &line).await;
+    }
+}
+
+async fn handle_incoming_message(inner: &Arc<AppServerClientInner>, line: &str) {
+    inner
+        .last_activity_at_ms
+        .store(unix_time_ms(), Ordering::Relaxed);
+    match classify_incoming_message(line) {
+        Ok(Some(IncomingMessage::Response { id, payload })) => {
+            if let Some(pending) = inner.pending.lock().await.remove(&id) {
+                let _ = pending.sender.send(payload);
             }
-            Ok(Some(IncomingMessage::Notification(notification))) => {
-                record_notification_activity(&inner, &notification).await;
-                let _ = inner.notifications_tx.send(notification);
-            }
-            Ok(Some(IncomingMessage::Request(request))) => {
-                inner
-                    .pending_server_request_ids
-                    .lock()
-                    .await
-                    .insert(server_request_id_key(&request.id));
-                inner
-                    .last_activity_at_ms
-                    .store(unix_time_ms(), Ordering::Relaxed);
-                let _ = inner.requests_tx.send(request);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                warn!(
-                    profile_id = %inner.profile.id,
-                    "failed to parse codex app-server stdout line: {error:#}; line={line}"
-                );
-            }
+        }
+        Ok(Some(IncomingMessage::Notification(notification))) => {
+            record_notification_activity(&inner, &notification).await;
+            let _ = inner.notifications_tx.send(notification);
+        }
+        Ok(Some(IncomingMessage::Request(request))) => {
+            inner
+                .pending_server_request_ids
+                .lock()
+                .await
+                .insert(server_request_id_key(&request.id));
+            inner
+                .last_activity_at_ms
+                .store(unix_time_ms(), Ordering::Relaxed);
+            let _ = inner.requests_tx.send(request);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!(
+                profile_id = %inner.profile.id,
+                "failed to parse Codex app-server message: {error:#}; line={line}"
+            );
         }
     }
 }
@@ -2519,7 +2929,7 @@ fn process_state_is_alive(process: &ProcessState) -> bool {
 }
 
 fn process_state_is_usable(process: &ProcessState) -> bool {
-    process_state_is_alive(process) && (!process.handoff_proxy || RAW_HANDOFF_PROXY_IS_COMPATIBLE)
+    process_state_is_alive(process)
 }
 
 fn append_text_log_line(path: &Path, message: &str) {
@@ -2678,16 +3088,348 @@ fn classify_incoming_message(line: &str) -> Result<Option<IncomingMessage>> {
 mod tests {
     use super::{
         AppServerClient, AppServerClientConfig, AppServerManager, AppServerNotification,
-        AppServerProfile, AppServerRequest, IncomingMessage, app_server_request_timed_out,
-        app_server_timeout_recovered, classify_incoming_message, handoff_paths,
-        rotate_text_log_if_needed, write_bytes_atomically,
+        AppServerProfile, AppServerRequest, AppServerWriter, IncomingMessage, ProcessState,
+        app_server_request_timed_out, app_server_timeout_recovered, classify_incoming_message,
+        handoff_paths, rotate_text_log_if_needed, write_bytes_atomically,
     };
+    #[cfg(unix)]
+    use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unix_handoff_transport_uses_websocket_text_frames() {
+        use tokio::net::UnixListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let directory = std::env::temp_dir().join(format!(
+            "codex-webui-handoff-websocket-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket_path = directory.join("app-server.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            let Some(Ok(Message::Text(payload))) = websocket.next().await else {
+                panic!("expected a WebSocket text frame");
+            };
+            let request: serde_json::Value = serde_json::from_str(payload.as_str()).unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&json!({
+                        "id": request["id"],
+                        "result": request["params"]
+                    }))
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let mut websocket = super::connect_handoff_websocket(&socket_path)
+            .await
+            .expect("Unix handoff WebSocket should connect");
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&json!({
+                    "id": 7,
+                    "method": "echo",
+                    "params": { "ok": true }
+                }))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let Some(Ok(Message::Text(response))) = websocket.next().await else {
+            panic!("expected a WebSocket response");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(response.as_str()).unwrap(),
+            json!({ "id": 7, "result": { "ok": true } })
+        );
+
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_clients_reconnect_to_the_same_handoff_daemon() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::net::UnixListener;
+        use tokio::sync::oneshot;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let directory = std::env::temp_dir().join(format!(
+            "codex-webui-handoff-reconnect-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let handoff_dir = directory.join("handoff");
+        let codex_home = directory.join("codex-home");
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let config = AppServerClientConfig {
+            codex_bin: "codex-test".to_string(),
+            handoff_dir: Some(handoff_dir),
+            startup_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(2),
+            ..AppServerClientConfig::default()
+        };
+        let profile = AppServerProfile {
+            id: "default".to_string(),
+            codex_home,
+        };
+        let paths = handoff_paths(&config, &profile.id, &profile).unwrap();
+        if let Some(parent) = paths.socket_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let listener = UnixListener::bind(&paths.socket_path).unwrap();
+        let pid = std::process::id();
+        let meta = super::HandoffMeta {
+            pid,
+            process_identity: super::read_managed_process_identity(Some(pid)),
+            enabled_features: vec!["goals".to_string()],
+            client_key: profile.id.clone(),
+            profile_id: profile.id.clone(),
+            socket_path: paths.socket_path.display().to_string(),
+            codex_bin: config.codex_bin.clone(),
+            codex_home: profile.codex_home.display().to_string(),
+            started_at_ms: 1,
+        };
+        write_bytes_atomically(&paths.meta_path, &serde_json::to_vec(&meta).unwrap())
+            .await
+            .unwrap();
+
+        let accepted_connections = Arc::new(AtomicUsize::new(0));
+        let accepted_for_server = Arc::clone(&accepted_connections);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.unwrap();
+                        accepted_for_server.fetch_add(1, Ordering::SeqCst);
+                        tokio::spawn(async move {
+                            let Ok(mut websocket) = accept_async(stream).await else {
+                                return;
+                            };
+                            while let Some(message) = websocket.next().await {
+                                match message {
+                                    Ok(Message::Text(payload)) => {
+                                        let request: serde_json::Value =
+                                            serde_json::from_str(payload.as_str()).unwrap();
+                                        let Some(id) = request.get("id") else {
+                                            continue;
+                                        };
+                                        let result = if request.get("method") == Some(&json!("initialize")) {
+                                            json!({ "serverInfo": { "name": "persistent-test" } })
+                                        } else {
+                                            request.get("params").cloned().unwrap_or_else(|| json!({}))
+                                        };
+                                        websocket
+                                            .send(Message::Text(
+                                                serde_json::to_string(&json!({
+                                                    "id": id,
+                                                    "result": result
+                                                }))
+                                                .unwrap()
+                                                .into(),
+                                            ))
+                                            .await
+                                            .unwrap();
+                                    }
+                                    Ok(Message::Ping(payload)) => {
+                                        websocket.send(Message::Pong(payload)).await.unwrap();
+                                    }
+                                    Ok(Message::Close(_)) | Err(_) => break,
+                                    _ => {}
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        let first_manager = AppServerManager::new(config.clone());
+        let first_client = first_manager.get_or_create(profile.clone()).await;
+        assert_eq!(
+            first_client
+                .request("echo", json!({ "gateway": 1 }))
+                .await
+                .unwrap(),
+            json!({ "gateway": 1 })
+        );
+        first_manager.detach_all().await.unwrap();
+
+        let second_manager = AppServerManager::new(config);
+        let second_client = second_manager.get_or_create(profile).await;
+        assert_eq!(
+            second_client
+                .request("echo", json!({ "gateway": 2 }))
+                .await
+                .unwrap(),
+            json!({ "gateway": 2 })
+        );
+        second_manager.detach_all().await.unwrap();
+
+        assert!(
+            accepted_connections.load(Ordering::SeqCst) >= 4,
+            "each gateway should probe and then attach to the persistent daemon"
+        );
+        let _ = shutdown_tx.send(());
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    async fn install_synthetic_process(client: &AppServerClient, handoff: bool) {
+        let process_slot = client
+            .inner
+            .controller
+            .process_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let join_handle = tokio::spawn(async move {
+            let _ = shutdown_rx.await;
+        });
+        *client.inner.process.lock().await = Some(ProcessState {
+            generation: 1,
+            writer: std::sync::Arc::new(tokio::sync::Mutex::new(AppServerWriter::WebSocket(
+                outbound_tx,
+            ))),
+            pid: None,
+            process_identity: None,
+            shutdown_tx: Some(shutdown_tx),
+            join_handle,
+            supervisor_start_tx: None,
+            handoff_proxy: handoff,
+            _process_slot: process_slot,
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_preparation_closes_only_idle_legacy_processes() {
+        let manager = AppServerManager::new(AppServerClientConfig {
+            max_processes: 3,
+            ..AppServerClientConfig::default()
+        });
+        let idle = manager
+            .get_or_create(AppServerProfile {
+                id: "idle".to_string(),
+                codex_home: PathBuf::from("/tmp/codex-webui-idle"),
+            })
+            .await;
+        install_synthetic_process(&idle, false).await;
+
+        let status = manager.prepare_restart_handoff(true).await;
+        assert_eq!(status.closed_idle_process_count, 1);
+        assert_eq!(status.blocking_process_count, 0);
+        assert!(idle.inner.process.lock().await.is_none());
+
+        let active_legacy = manager
+            .get_or_create(AppServerProfile {
+                id: "active-legacy".to_string(),
+                codex_home: PathBuf::from("/tmp/codex-webui-active-legacy"),
+            })
+            .await;
+        install_synthetic_process(&active_legacy, false).await;
+        active_legacy
+            .inner
+            .active_turn_ids
+            .lock()
+            .await
+            .insert("turn-1".to_string());
+
+        let status = manager.prepare_restart_handoff(true).await;
+        assert_eq!(status.blocking_process_count, 1);
+        assert_eq!(status.closed_idle_process_count, 0);
+        assert!(active_legacy.inner.process.lock().await.is_some());
+
+        active_legacy.inner.active_turn_ids.lock().await.clear();
+        manager.close_all().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_preparation_preserves_active_handoff_processes() {
+        let manager = AppServerManager::new(AppServerClientConfig::default());
+        let client = manager
+            .get_or_create(AppServerProfile {
+                id: "handoff".to_string(),
+                codex_home: PathBuf::from("/tmp/codex-webui-handoff"),
+            })
+            .await;
+        install_synthetic_process(&client, true).await;
+        client
+            .inner
+            .active_turn_ids
+            .lock()
+            .await
+            .insert("turn-1".to_string());
+
+        let status = manager.prepare_restart_handoff(true).await;
+        assert_eq!(status.handoff_proxy_process_count, 1);
+        assert_eq!(status.blocking_process_count, 0);
+        assert!(client.inner.process.lock().await.is_some());
+
+        manager.detach_all().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_connection_loss_preserves_active_turns_for_reconnect() {
+        let manager = AppServerManager::new(AppServerClientConfig::default());
+        let client = manager
+            .get_or_create(AppServerProfile {
+                id: "handoff-loss".to_string(),
+                codex_home: PathBuf::from("/tmp/codex-webui-handoff-loss"),
+            })
+            .await;
+        install_synthetic_process(&client, true).await;
+        client
+            .inner
+            .active_turn_ids
+            .lock()
+            .await
+            .insert("turn-1".to_string());
+        let mut notifications = client.subscribe_notifications();
+
+        super::finalize_handoff_connection_loss(
+            &client.inner,
+            1,
+            "handoff transport interrupted".to_string(),
+        )
+        .await;
+
+        assert!(client.inner.process.lock().await.is_none());
+        assert!(client.inner.active_turn_ids.lock().await.contains("turn-1"));
+        let notification = timeout(Duration::from_secs(1), notifications.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(notification.method, "codex-webui/app-server/disconnected");
+
+        manager.detach_all().await.unwrap();
+    }
 
     #[test]
     fn text_log_rotation_keeps_a_bounded_backup_chain() {
@@ -3565,10 +4307,8 @@ if "app-server" in args and "--listen" in args and args[args.index("--listen") +
                 .as_nanos()
         ));
         let script_path = dir.join("fake-codex.py");
-        let handoff_dir = dir.join("handoff");
         let timeout_marker = dir.join("timed-out-once");
         std::fs::create_dir_all(&dir).expect("test dir should be created");
-        std::fs::create_dir_all(&handoff_dir).expect("handoff dir should be created");
         std::fs::write(
             &script_path,
             r#"#!/usr/bin/env python3
@@ -3617,7 +4357,7 @@ if "app-server" in args and "--listen" in args and args[args.index("--listen") +
             },
             AppServerClientConfig {
                 codex_bin: script_path.display().to_string(),
-                handoff_dir: Some(handoff_dir),
+                handoff_dir: None,
                 startup_timeout: std::time::Duration::from_secs(2),
                 request_timeout: std::time::Duration::from_secs(2),
                 extra_env: HashMap::from([(
@@ -3627,10 +4367,6 @@ if "app-server" in args and "--listen" in args and args[args.index("--listen") +
                 ..AppServerClientConfig::default()
             },
         );
-        client
-            .inner
-            .handoff_disabled_after_failure
-            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let error = client
             .request_with_timeout(
@@ -3660,7 +4396,7 @@ if "app-server" in args and "--listen" in args and args[args.index("--listen") +
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn incompatible_raw_handoff_proxy_is_skipped_for_stdio() {
+    async fn incompatible_handoff_websocket_falls_back_to_stdio() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!(
@@ -3765,11 +4501,11 @@ if "proxy" in args:
         let response = client
             .request("echo", json!({ "ok": true }))
             .await
-            .expect("client should use stdio without spawning an incompatible handoff proxy");
+            .expect("client should fall back to stdio after an incompatible handoff endpoint");
 
         assert_eq!(response, json!({ "ok": true }));
         let log = std::fs::read_to_string(&log_path).expect("start log should exist");
-        assert!(!log.contains("handoff-server"));
+        assert!(log.contains("handoff-server"));
         assert!(!log.contains("proxy"));
         assert!(log.contains("stdio"));
 
@@ -3779,7 +4515,7 @@ if "proxy" in args:
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "raw handoff proxy is intentionally disabled for Codex 0.144.1"]
+    #[ignore = "legacy raw-proxy fixture; direct WebSocket handoff is covered above"]
     async fn request_timeout_recovers_stale_handoff_proxy() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3963,7 +4699,7 @@ if "proxy" in args:
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "raw handoff proxy is intentionally disabled for Codex 0.144.1"]
+    #[ignore = "legacy raw-proxy fixture; direct WebSocket handoff is covered above"]
     async fn request_timeout_recovers_handoff_proxy_that_hangs_during_initialization() {
         use std::os::unix::fs::PermissionsExt;
 

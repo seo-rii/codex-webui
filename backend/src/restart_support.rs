@@ -99,16 +99,21 @@ pub(crate) async fn prepare_gateway_restart_payload(state: &AppState) -> ApiResu
     let plan = build_gateway_restart_plan(&state.config)
         .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
     let mode = plan.mode;
-    let handoff_status = state.app_servers.handoff_status().await;
-    let handoff_prepared = state.config.app_server_handoff_enabled
-        && cfg!(unix)
-        && handoff_status.stdio_process_count == 0;
-    if !handoff_prepared && handoff_status.active_process_count > 0 {
+    let handoff_enabled = state.config.app_server_handoff_enabled && cfg!(unix);
+    let handoff_status = state
+        .app_servers
+        .prepare_restart_handoff(handoff_enabled)
+        .await;
+    if handoff_status.blocking_process_count > 0 {
         return Err(api_error(
             StatusCode::CONFLICT,
-            "Codex app-server handoff is not available for every active client; restart would stop active Codex work.",
+            format!(
+                "Codex app-server handoff is unavailable for {} client(s) that still own active work; restart was not scheduled.",
+                handoff_status.blocking_process_count
+            ),
         ));
     }
+    let handoff_prepared = handoff_enabled;
     state
         .preserve_app_servers_on_shutdown
         .store(handoff_prepared, Ordering::SeqCst);
@@ -127,6 +132,7 @@ pub(crate) async fn prepare_gateway_restart_payload(state: &AppState) -> ApiResu
         "ok": true,
         "activeAppServerProcesses": handoff_status.active_process_count,
         "appServerClients": handoff_status.client_count,
+        "closedIdleAppServerProcesses": handoff_status.closed_idle_process_count,
         "handoffPrepared": handoff_prepared,
         "handoffProxyProcesses": handoff_status.handoff_proxy_process_count,
         "restartScheduled": true,

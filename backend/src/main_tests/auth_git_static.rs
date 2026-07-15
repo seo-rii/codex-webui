@@ -1729,7 +1729,7 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restart_handoff_refuses_to_drop_active_app_server_when_disabled() {
+async fn restart_handoff_closes_idle_app_server_when_disabled() {
     let sandbox = unique_test_dir("restart-handoff-disabled");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -1759,7 +1759,8 @@ async fn restart_handoff_refuses_to_drop_active_app_server_when_disabled() {
         .unwrap();
     let prepare_response =
         handle_http(State(state.clone()), CookieJar::new(), prepare_request).await;
-    assert_eq!(prepare_response.status(), StatusCode::CONFLICT);
+    assert_eq!(prepare_response.status(), StatusCode::OK);
+    assert_eq!(state.app_servers.active_process_count().await, 0);
     assert!(
         !state
             .preserve_app_servers_on_shutdown
@@ -1781,7 +1782,7 @@ async fn restart_handoff_refuses_to_drop_active_app_server_when_disabled() {
         .body(Body::empty())
         .unwrap();
     let restart_response = handle_http(State(state.clone()), owner_jar, restart_request).await;
-    assert_eq!(restart_response.status(), StatusCode::CONFLICT);
+    assert_eq!(restart_response.status(), StatusCode::OK);
     assert!(
         !state
             .preserve_app_servers_on_shutdown

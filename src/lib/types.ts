@@ -978,6 +978,7 @@ export type GatewayRestartPayload = {
   ok: true;
   activeAppServerProcesses: number;
   appServerClients: number;
+  closedIdleAppServerProcesses: number;
   handoffPrepared: boolean;
   handoffProxyProcesses: number;
   restartScheduled: boolean;

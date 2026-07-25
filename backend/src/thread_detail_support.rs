@@ -6,6 +6,12 @@ const SESSION_DETAIL_GOAL_TIMEOUT_MS: u64 = 150;
 const SESSION_DETAIL_ACTIVE_RECONCILE_TIMEOUT_MS: u64 = 1_000;
 const SESSION_DETAIL_INLINE_IMAGE_RESULT_MAX_CHARS: usize = 256 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionTurnDetailMode {
+    Collapsed,
+    Expanded,
+}
+
 pub(crate) struct LocalRolloutTurnWindow {
     pub(crate) turns: Vec<Value>,
     pub(crate) loaded_start: usize,
@@ -95,7 +101,7 @@ async fn session_pending_requests_payload(
 pub(crate) fn summarize_session_turn_for_detail_payload(
     turn: &Value,
     turn_index: usize,
-    compact_completed_process: bool,
+    detail_mode: SessionTurnDetailMode,
 ) -> Value {
     let mut summarized = turn.as_object().cloned().unwrap_or_default();
     let turn_id = summarized
@@ -148,7 +154,7 @@ pub(crate) fn summarize_session_turn_for_detail_payload(
                     }
                 }
             }
-            if compact_completed_process
+            if detail_mode == SessionTurnDetailMode::Collapsed
                 && compact_non_running_turn
                 && !matches!(
                     item_type.as_str(),
@@ -158,16 +164,10 @@ pub(crate) fn summarize_session_turn_for_detail_payload(
                 hidden_item_count = hidden_item_count.saturating_add(1);
                 return None;
             }
-            Some(if compact_completed_process {
-                match item_type.as_str() {
-                    "commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall"
-                    | "webSearch" => {
-                        prepare_session_deferred_item_payload(item, &turn_id, item_index)
-                    }
-                    _ => normalized,
-                }
-            } else {
-                normalized
+            Some(match item_type.as_str() {
+                "commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall"
+                | "webSearch" => prepare_session_deferred_item_payload(item, &turn_id, item_index),
+                _ => normalized,
             })
         })
         .collect::<Vec<_>>();
@@ -1692,7 +1692,7 @@ pub(crate) async fn local_session_diagnostics_payload(
             summarize_session_turn_for_detail_payload(
                 turn,
                 turn_window.loaded_start + visible_index,
-                true,
+                SessionTurnDetailMode::Collapsed,
             )
         })
         .collect::<Vec<_>>();
@@ -1832,7 +1832,7 @@ pub(crate) async fn session_detail_payload(
                     summarize_session_turn_for_detail_payload(
                         turn,
                         turn_window.loaded_start + visible_index,
-                        true,
+                        SessionTurnDetailMode::Collapsed,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1888,7 +1888,11 @@ pub(crate) async fn session_detail_payload(
                     .iter()
                     .enumerate()
                     .map(|(visible_index, turn)| {
-                        summarize_session_turn_for_detail_payload(turn, start + visible_index, true)
+                        summarize_session_turn_for_detail_payload(
+                            turn,
+                            start + visible_index,
+                            SessionTurnDetailMode::Collapsed,
+                        )
                     })
                     .collect::<Vec<_>>();
                 (
@@ -1970,7 +1974,7 @@ pub(crate) async fn session_detail_payload(
                             summarize_session_turn_for_detail_payload(
                                 turn,
                                 start + visible_index,
-                                true,
+                                SessionTurnDetailMode::Collapsed,
                             )
                         })
                         .collect::<Vec<_>>();
@@ -2533,7 +2537,7 @@ pub(crate) async fn session_older_turns_payload(
                 summarize_session_turn_for_detail_payload(
                     turn,
                     turn_window.loaded_start + start + visible_index,
-                    false,
+                    SessionTurnDetailMode::Collapsed,
                 )
             })
             .collect::<Vec<_>>();
@@ -2569,7 +2573,11 @@ pub(crate) async fn session_older_turns_payload(
         .iter()
         .enumerate()
         .map(|(visible_index, turn)| {
-            summarize_session_turn_for_detail_payload(turn, start + visible_index, false)
+            summarize_session_turn_for_detail_payload(
+                turn,
+                start + visible_index,
+                SessionTurnDetailMode::Collapsed,
+            )
         })
         .collect::<Vec<_>>();
     Ok(json!({
@@ -2611,7 +2619,7 @@ pub(crate) async fn session_rollback_targets_payload(
     ))
 }
 
-pub(crate) async fn session_turn_payload(
+async fn session_raw_turn_payload(
     state: &AppState,
     profile_id: &str,
     session_id: &str,
@@ -2627,14 +2635,12 @@ pub(crate) async fn session_turn_payload(
             .find(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id))
             .cloned()
         {
-            return Ok(json!({
-                "turn": summarize_session_turn_for_detail_payload(&turn, 0, false)
-            }));
+            return Ok(turn);
         }
     }
 
     let thread = read_thread_payload(state, profile_id, session_id, true).await?;
-    let turn = thread
+    thread
         .get("turns")
         .and_then(Value::as_array)
         .and_then(|turns| {
@@ -2643,9 +2649,22 @@ pub(crate) async fn session_turn_payload(
                 .find(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id))
         })
         .cloned()
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Turn not found."))?;
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Turn not found."))
+}
+
+pub(crate) async fn session_turn_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    turn_id: &str,
+) -> ApiResult<Value> {
+    let turn = session_raw_turn_payload(state, profile_id, session_id, turn_id).await?;
     Ok(json!({
-        "turn": summarize_session_turn_for_detail_payload(&turn, 0, false)
+        "turn": summarize_session_turn_for_detail_payload(
+            &turn,
+            0,
+            SessionTurnDetailMode::Expanded,
+        )
     }))
 }
 
@@ -2656,20 +2675,17 @@ pub(crate) async fn session_item_detail_payload(
     turn_id: &str,
     item_id: &str,
 ) -> ApiResult<Value> {
-    let turn = session_turn_payload(state, profile_id, session_id, turn_id)
-        .await?
-        .get("turn")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let turn = session_raw_turn_payload(state, profile_id, session_id, turn_id).await?;
     let mut item = turn
         .get("items")
         .and_then(Value::as_array)
         .and_then(|items| {
             items
                 .iter()
+                .enumerate()
+                .map(|(item_index, item)| normalize_session_item_payload(item, turn_id, item_index))
                 .find(|item| item.get("id").and_then(Value::as_str) == Some(item_id))
         })
-        .cloned()
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Transcript item detail not found."))?;
     if let Some(item_object) = item.as_object_mut() {
         item_object.insert(

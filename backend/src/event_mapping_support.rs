@@ -54,6 +54,16 @@ fn remove_deferred_item_detail_fields(normalized: &mut serde_json::Map<String, V
         "modified",
         "content",
         "patch",
+        "results",
+        "sources",
+        "citations",
+        "searchResults",
+        "sourceResults",
+        "citationResults",
+        "arguments",
+        "input",
+        "params",
+        "request",
     ] {
         normalized.remove(key);
     }
@@ -85,6 +95,8 @@ pub(crate) fn prepare_session_deferred_item_payload(
         }
         "commandExecution" => {
             remove_deferred_item_detail_fields(&mut normalized);
+            normalized.remove("action");
+            normalized.remove("invocation");
             normalized.insert("title".to_string(), json!("Command"));
             normalized.insert("detailState".to_string(), json!("deferred"));
             normalized.insert(

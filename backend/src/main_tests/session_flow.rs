@@ -98,7 +98,7 @@ fn generated_title_metadata_wins_over_full_first_message_fallback() {
 }
 
 #[test]
-fn completed_turn_summary_marks_hidden_tool_items_as_deferred() {
+fn completed_turn_summary_hides_tool_items_until_expanded() {
     let summarized = summarize_session_turn_for_detail_payload(
         &json!({
             "id": "turn-tools",
@@ -117,7 +117,7 @@ fn completed_turn_summary_marks_hidden_tool_items_as_deferred() {
             ]
         }),
         0,
-        true,
+        SessionTurnDetailMode::Collapsed,
     );
 
     assert_eq!(
@@ -128,6 +128,72 @@ fn completed_turn_summary_marks_hidden_tool_items_as_deferred() {
         summarized.get("hiddenItemCount").and_then(Value::as_u64),
         Some(1)
     );
+}
+
+#[test]
+fn expanded_turn_summary_defers_each_tool_payload() {
+    let summarized = summarize_session_turn_for_detail_payload(
+        &json!({
+            "id": "turn-tools",
+            "status": "completed",
+            "items": [
+                { "id": "user-1", "type": "userMessage", "text": "inspect it" },
+                {
+                    "id": "command-1",
+                    "type": "commandExecution",
+                    "command": ["bash", "-lc", "printf done"],
+                    "invocation": { "arguments": { "script": "large command arguments" } },
+                    "aggregatedOutput": "large command output",
+                    "exitCode": 0
+                },
+                {
+                    "id": "tool-1",
+                    "type": "mcpToolCall",
+                    "server": "docs",
+                    "tool": "search",
+                    "invocation": { "toolName": "search", "arguments": { "query": "lazy" } },
+                    "result": { "content": [{ "type": "text", "text": "large result" }] }
+                },
+                { "id": "agent-1", "type": "agentMessage", "text": "finished" }
+            ]
+        }),
+        0,
+        SessionTurnDetailMode::Expanded,
+    );
+
+    assert_eq!(
+        summarized.get("detailState").and_then(Value::as_str),
+        Some("full")
+    );
+    assert_eq!(
+        summarized.get("hiddenItemCount").and_then(Value::as_u64),
+        Some(0)
+    );
+    let items = summarized
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("expanded turn should include action summaries");
+    let command = items
+        .iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some("command-1"))
+        .expect("command summary should remain visible");
+    assert_eq!(
+        command.get("detailState").and_then(Value::as_str),
+        Some("deferred")
+    );
+    assert!(command.get("aggregatedOutput").is_none());
+    assert!(command.get("invocation").is_none());
+    assert!(command.get("command").is_some());
+    let tool = items
+        .iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some("tool-1"))
+        .expect("tool summary should remain visible");
+    assert_eq!(
+        tool.get("detailState").and_then(Value::as_str),
+        Some("deferred")
+    );
+    assert!(tool.get("invocation").is_none());
+    assert!(tool.get("result").is_none());
 }
 
 #[test]
@@ -3913,23 +3979,27 @@ async fn session_detail_and_turn_search_payloads_use_rust_thread_reads() {
     let older = session_older_turns_payload(&state, "default", "thread-1", "turn-2", 5)
         .await
         .unwrap();
-    let older_command = older
+    let older_turn = older
         .get("turns")
         .and_then(Value::as_array)
         .and_then(|turns| turns.first())
-        .and_then(|turn| turn.get("items"))
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|item| item.get("id").and_then(Value::as_str) == Some("item-command-1"))
-        })
         .unwrap();
     assert_eq!(
-        older_command.get("detailState").and_then(Value::as_str),
-        Some("deferred")
+        older_turn.get("detailState").and_then(Value::as_str),
+        Some("summary")
     );
-    assert!(older_command.get("aggregatedOutput").is_none());
+    assert_eq!(
+        older_turn.get("hiddenItemCount").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert!(
+        older_turn
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items
+                .iter()
+                .all(|item| { item.get("id").and_then(Value::as_str) != Some("item-command-1") }))
+    );
 
     assert_eq!(
         older.get("turns").and_then(Value::as_array).map(Vec::len),
@@ -3945,7 +4015,7 @@ async fn session_detail_and_turn_search_payloads_use_rust_thread_reads() {
             .and_then(Value::as_str),
         Some("turn-1")
     );
-    let full_command = turn
+    let command_summary = turn
         .get("turn")
         .and_then(|value| value.get("items"))
         .and_then(Value::as_array)
@@ -3955,16 +4025,29 @@ async fn session_detail_and_turn_search_payloads_use_rust_thread_reads() {
                 .find(|item| item.get("id").and_then(Value::as_str) == Some("item-command-1"))
         })
         .unwrap();
-    assert!(full_command.get("aggregatedOutput").is_some());
+    assert_eq!(
+        command_summary.get("detailState").and_then(Value::as_str),
+        Some("deferred")
+    );
+    assert!(command_summary.get("aggregatedOutput").is_none());
+    assert!(command_summary.get("command").is_some());
 
-    let item = session_item_detail_payload(&state, "default", "thread-1", "turn-1", "item-2")
-        .await
-        .unwrap();
+    let item =
+        session_item_detail_payload(&state, "default", "thread-1", "turn-1", "item-command-1")
+            .await
+            .unwrap();
     assert_eq!(
         item.get("item")
             .and_then(|value| value.get("detailState"))
             .and_then(Value::as_str),
         Some("loaded")
+    );
+    assert_eq!(
+        item.get("item")
+            .and_then(|value| value.get("aggregatedOutput"))
+            .and_then(Value::as_str)
+            .map(str::len),
+        Some(1024 * 128)
     );
 
     let search = search_session_turns_payload(&state, "default", "thread-1", "websocket", None, 20)
@@ -5684,12 +5767,11 @@ async fn local_session_detail_parses_rich_transcript_items_and_rollbacks() {
         Some("Found Codex web UI notes.")
     );
     assert_eq!(
-        web_search
-            .get("results")
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(1)
+        web_search.get("detailState").and_then(Value::as_str),
+        Some("deferred")
     );
+    assert!(web_search.get("results").is_none());
+    assert!(web_search.get("citations").is_none());
     let custom_tool = turn
         .get("items")
         .and_then(Value::as_array)
@@ -5709,16 +5791,43 @@ async fn local_session_detail_parses_rich_transcript_items_and_rollbacks() {
         Some(true)
     );
     assert!(
-        custom_tool
-            .get("result")
-            .is_some_and(|value| !value.is_null())
+        custom_tool.get("result").is_none(),
+        "collapsed custom tool should not include its result"
     );
     assert_eq!(
-        web_search
-            .get("citations")
+        custom_tool.get("detailState").and_then(Value::as_str),
+        Some("deferred")
+    );
+
+    let web_search_detail =
+        session_item_detail_payload(&state, "default", session_id, "turn-rich", "search-1")
+            .await
+            .unwrap();
+    assert_eq!(
+        web_search_detail
+            .get("item")
+            .and_then(|item| item.get("results"))
             .and_then(Value::as_array)
             .map(Vec::len),
         Some(1)
+    );
+    assert_eq!(
+        web_search_detail
+            .get("item")
+            .and_then(|item| item.get("citations"))
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    let custom_tool_detail =
+        session_item_detail_payload(&state, "default", session_id, "turn-rich", "custom-1")
+            .await
+            .unwrap();
+    assert!(
+        custom_tool_detail
+            .get("item")
+            .and_then(|item| item.get("result"))
+            .is_some_and(|value| !value.is_null())
     );
     assert!(!turns.iter().any(|turn| {
         serde_json::to_string(turn)

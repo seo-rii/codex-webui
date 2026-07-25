@@ -146,6 +146,7 @@
   } from "$lib/types";
 
   const SESSION_LIST_BROWSER_CACHE_SCHEMA_VERSION = 2;
+  const SESSION_DETAIL_BROWSER_CACHE_SCHEMA_VERSION = 2;
   const SESSION_LIST_VERSION_HINT_LIMIT = 240;
   const SESSION_DETAIL_VERSION_HINT_LIMIT = 5_000;
 
@@ -4603,6 +4604,7 @@
     }
 
     return JSON.stringify({
+      schema: SESSION_DETAIL_BROWSER_CACHE_SCHEMA_VERSION,
       profileId,
       sessionId
     });

@@ -598,11 +598,24 @@
       return String(value);
     }
     return new Intl.DateTimeFormat(getDateLocale(), {
+      year: "numeric",
       month: "short",
       day: "numeric",
       hour: "2-digit",
-      minute: "2-digit"
+      minute: "2-digit",
+      timeZoneName: "short"
     }).format(date);
+  }
+
+  function resetTicketExpirationLabel(ticket: CodexResetTicket) {
+    const expiresAt = formatResetTicketDate(ticket.expiresAt);
+    if (expiresAt) {
+      return m.reset_ticket_expires_at({ value: expiresAt });
+    }
+    if (ticket.expirationStatus === "never") {
+      return m.reset_ticket_never_expires();
+    }
+    return m.reset_ticket_expiration_unknown();
   }
 
   function compactQuotaLabel() {
@@ -2182,8 +2195,8 @@
                             <div class="truncate text-[11px] font-bold text-gray-800">
                               {ticket.label ?? ticket.limitName ?? ticket.limitId ?? ticket.id}
                             </div>
-                            <div class="truncate text-[10px] text-gray-400">
-                              {ticket.expiresAt ? (formatResetTicketDate(ticket.expiresAt) ?? ticket.id) : ticket.id}
+                            <div class="truncate text-[10px] text-gray-400" title={resetTicketExpirationLabel(ticket)}>
+                              {resetTicketExpirationLabel(ticket)}
                             </div>
                           </div>
                           <button

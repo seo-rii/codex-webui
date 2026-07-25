@@ -1384,6 +1384,15 @@ async fn codex_reset_tickets_payload_normalizes_app_server_rate_limit_tickets() 
                                     "label": "Reset five hour",
                                     "limitId": "codex",
                                     "expiresAt": "2026-06-14T00:00:00Z"
+                                },
+                                {
+                                    "ticketId": "ticket-never",
+                                    "label": "Permanent reset",
+                                    "expiresAt": Value::Null
+                                },
+                                {
+                                    "ticketId": "ticket-legacy",
+                                    "label": "Legacy reset"
                                 }
                             ]
                         }
@@ -1405,14 +1414,40 @@ async fn codex_reset_tickets_payload_normalizes_app_server_rate_limit_tickets() 
         payload.get("supported").and_then(Value::as_bool),
         Some(true)
     );
-    let ticket = payload
+    let tickets = payload
         .get("tickets")
         .and_then(Value::as_array)
-        .and_then(|tickets| tickets.first())
-        .expect("reset ticket should be normalized");
+        .expect("reset tickets should be normalized");
+    let ticket = tickets
+        .iter()
+        .find(|ticket| ticket.get("id").and_then(Value::as_str) == Some("ticket-1"))
+        .expect("expiring reset ticket should be present");
     assert_eq!(ticket.get("id").and_then(Value::as_str), Some("ticket-1"));
     assert_eq!(ticket.get("limitId").and_then(Value::as_str), Some("codex"));
     assert_eq!(ticket.get("available").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        ticket.get("expiresAt").and_then(Value::as_str),
+        Some("2026-06-14T00:00:00Z")
+    );
+    assert_eq!(
+        ticket.get("expirationStatus").and_then(Value::as_str),
+        Some("expires")
+    );
+    let never_expires = tickets
+        .iter()
+        .find(|ticket| ticket.get("id").and_then(Value::as_str) == Some("ticket-never"))
+        .expect("non-expiring reset ticket should be present");
+    assert_eq!(never_expires["expiresAt"], Value::Null);
+    assert_eq!(never_expires["expirationStatus"].as_str(), Some("never"));
+    let expiration_unknown = tickets
+        .iter()
+        .find(|ticket| ticket.get("id").and_then(Value::as_str) == Some("ticket-legacy"))
+        .expect("legacy reset ticket should be present");
+    assert_eq!(expiration_unknown["expiresAt"], Value::Null);
+    assert_eq!(
+        expiration_unknown["expirationStatus"].as_str(),
+        Some("unknown")
+    );
     assert!(payload.get("rateLimitsByLimitId").is_some());
 
     let _ = fs::remove_dir_all(sandbox);
@@ -1488,6 +1523,7 @@ async fn codex_reset_tickets_payload_supports_latest_reset_credit_summary() {
     assert_eq!(tickets[0]["resetType"].as_str(), Some("codex"));
     assert_eq!(tickets[0]["createdAt"].as_u64(), Some(1_800_000_000_000));
     assert_eq!(tickets[0]["expiresAt"].as_u64(), Some(1_800_086_400_000));
+    assert_eq!(tickets[0]["expirationStatus"].as_str(), Some("expires"));
 
     let _ = fs::remove_dir_all(sandbox);
 }

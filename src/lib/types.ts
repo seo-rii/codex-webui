@@ -1075,6 +1075,7 @@ export type CodexResetTicket = {
   resetType?: string | null;
   status?: string | null;
   expiresAt: string | number | null;
+  expirationStatus?: "expires" | "never" | "unknown";
   createdAt: string | number | null;
   usedAt: string | number | null;
   available: boolean;

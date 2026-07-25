@@ -701,6 +701,7 @@ pub(crate) async fn codex_reset_tickets_payload(
                     "limitId": Value::Null,
                     "limitName": "Codex",
                     "expiresAt": Value::Null,
+                    "expirationStatus": "unknown",
                     "createdAt": Value::Null,
                     "usedAt": Value::Null,
                     "available": true,
@@ -945,6 +946,7 @@ fn normalize_reset_ticket_entry(
                 "limitId": Value::Null,
                 "limitName": Value::Null,
                 "expiresAt": Value::Null,
+                "expirationStatus": "unknown",
                 "createdAt": Value::Null,
                 "usedAt": Value::Null,
                 "available": true,
@@ -995,6 +997,18 @@ fn normalize_reset_ticket_entry(
             .or(fallback_id)
             .unwrap_or_else(|| format!("ticket-{}", index + 1));
             let used_at = timestamp_field(&["usedAt", "used_at", "redeemedAt", "redeemed_at"]);
+            let expiration_field_names = ["expiresAt", "expires_at", "expiration", "expires"];
+            let expiration_field_present = expiration_field_names
+                .iter()
+                .any(|name| object.contains_key(*name));
+            let expires_at = timestamp_field(&expiration_field_names);
+            let expiration_status = if expires_at.is_some() {
+                "expires"
+            } else if expiration_field_present {
+                "never"
+            } else {
+                "unknown"
+            };
             let status = string_field(&["status"]);
             let available = object
                 .get("available")
@@ -1013,7 +1027,8 @@ fn normalize_reset_ticket_entry(
                 "limitName": string_field(&["limitName", "limit_name", "rateLimitName", "rate_limit_name"]),
                 "resetType": string_field(&["resetType", "reset_type"]),
                 "status": status,
-                "expiresAt": timestamp_field(&["expiresAt", "expires_at", "expiration", "expires"]),
+                "expiresAt": expires_at,
+                "expirationStatus": expiration_status,
                 "createdAt": timestamp_field(&["createdAt", "created_at", "grantedAt", "granted_at"]),
                 "usedAt": used_at,
                 "available": available,

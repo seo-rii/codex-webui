@@ -33,7 +33,10 @@ use tracing::{info, warn};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 #[cfg(unix)]
-use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message};
+use tokio_tungstenite::{
+    WebSocketStream, client_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 
 const APP_SERVER_THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
 const APP_SERVER_REQUEST_TIMEOUT_DEFAULT_SECONDS: u64 = 600;
@@ -49,6 +52,8 @@ const APP_SERVER_DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 300;
 const APP_SERVER_READER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 const APP_SERVER_WEBSOCKET_QUEUE_CAPACITY: usize = 256;
+#[cfg(unix)]
+const APP_SERVER_HANDOFF_MAX_WEBSOCKET_MESSAGE_BYTES: usize = 128 << 20;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppServerProfile {
@@ -2016,9 +2021,12 @@ async fn connect_handoff_websocket(socket_path: &Path) -> Result<WebSocketStream
                 socket_path.display()
             )
         })?;
+    let websocket_config = WebSocketConfig::default()
+        .max_frame_size(Some(APP_SERVER_HANDOFF_MAX_WEBSOCKET_MESSAGE_BYTES))
+        .max_message_size(Some(APP_SERVER_HANDOFF_MAX_WEBSOCKET_MESSAGE_BYTES));
     let (websocket, _) = timeout(
         Duration::from_secs(1),
-        client_async("ws://localhost/rpc", stream),
+        client_async_with_config("ws://localhost/rpc", stream, Some(websocket_config)),
     )
     .await
     .context("timed out upgrading Codex app-server handoff WebSocket")?
@@ -3156,6 +3164,41 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(response.as_str()).unwrap(),
             json!({ "id": 7, "result": { "ok": true } })
         );
+
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unix_handoff_transport_accepts_large_single_frame_responses() {
+        use tokio::net::UnixListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let directory = std::env::temp_dir().join(format!(
+            "codex-webui-handoff-large-frame-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket_path = directory.join("app-server.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let payload_bytes = (16 << 20) + 1;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            websocket
+                .send(Message::Text("x".repeat(payload_bytes).into()))
+                .await
+                .unwrap();
+        });
+
+        let mut websocket = super::connect_handoff_websocket(&socket_path)
+            .await
+            .expect("Unix handoff WebSocket should connect");
+        let Some(Ok(Message::Text(response))) = websocket.next().await else {
+            panic!("expected a large WebSocket response");
+        };
+        assert_eq!(response.len(), payload_bytes);
 
         server.await.unwrap();
         let _ = std::fs::remove_dir_all(directory);

@@ -83,6 +83,8 @@ const REQUEST_TIMEOUT_MS = 720_000;
 const SUBSCRIPTION_REQUEST_TIMEOUT_MS = 15_000;
 const RECONNECT_DELAYS = [250, 500, 1000, 2000, 4000];
 const SUBSCRIPTION_RETRY_DELAYS = [500, 1000, 2000, 5000, 10_000, 30_000];
+const MAX_INFLIGHT_REQUESTS = 20;
+const MAX_INFLIGHT_READ_REQUESTS = 12;
 const DEDUPED_READ_METHODS = new Set([
   "arena/list",
   "audit/list",
@@ -275,6 +277,7 @@ export class WebSocketRpcClient {
         this.pending.delete(id);
         pending.reject(new Error("WebSocket request timed out."));
         this.sendPing(true);
+        this.flushPending();
       }, timeoutMs);
 
       this.pending.set(id, {
@@ -571,6 +574,7 @@ export class WebSocketRpcClient {
         } else {
           pending.reject(new Error(payload.error || "WebSocket request failed."));
         }
+        this.flushPending();
         return;
       }
 
@@ -678,11 +682,45 @@ export class WebSocketRpcClient {
         for (const listener of this.resyncRequiredListeners) {
           listener(skippedReadReplay ? "readReplaySkipped" : "mutationReplaySkipped");
         }
+      }
+    }
+
+    let inflightRequests = 0;
+    let inflightReadRequests = 0;
+    for (const pending of this.pending.values()) {
+      if (pending.sentGeneration !== this.connectionGeneration) {
+        continue;
+      }
+      inflightRequests += 1;
+      if (DEDUPED_READ_METHODS.has(pending.message.method)) {
+        inflightReadRequests += 1;
+      }
+    }
+
+    for (const pending of this.pending.values()) {
+      if (pending.sentGeneration === this.connectionGeneration) {
         continue;
       }
 
-      this.socket.send(JSON.stringify(pending.message));
-      pending.sentGeneration = this.connectionGeneration;
+      const isReadRequest = DEDUPED_READ_METHODS.has(pending.message.method);
+      if (inflightRequests >= MAX_INFLIGHT_REQUESTS) {
+        break;
+      }
+      if (isReadRequest && inflightReadRequests >= MAX_INFLIGHT_READ_REQUESTS) {
+        continue;
+      }
+
+      try {
+        this.socket.send(JSON.stringify(pending.message));
+        pending.sentGeneration = this.connectionGeneration;
+        inflightRequests += 1;
+        if (isReadRequest) {
+          inflightReadRequests += 1;
+        }
+      } catch {
+        this.socket.close();
+        return;
+      }
     }
   }
 

@@ -4,6 +4,64 @@ const RUNTIME_ACTIVITY_RECONCILE_INTERVAL_SECS: u64 = 15;
 const RUNTIME_ACTIVITY_RECONCILE_LIMIT: usize = 8;
 const RUNTIME_ACTIVITY_RECONCILE_TIMEOUT_MS: u64 = 1_000;
 
+#[derive(Default)]
+struct RuntimeActivityReconcileSchedule {
+    cursor: Option<String>,
+}
+
+impl RuntimeActivityReconcileSchedule {
+    fn select(&mut self, mut candidates: Vec<String>, limit: usize) -> Vec<String> {
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() || limit == 0 {
+            self.cursor = None;
+            return Vec::new();
+        }
+
+        let start = self
+            .cursor
+            .as_ref()
+            .map(|cursor| candidates.partition_point(|candidate| candidate <= cursor))
+            .unwrap_or(0);
+        let selected = (0..limit.min(candidates.len()))
+            .map(|offset| candidates[(start + offset) % candidates.len()].clone())
+            .collect::<Vec<_>>();
+        self.cursor = selected.last().cloned();
+        selected
+    }
+}
+
+struct RuntimeActivityReconcileScheduleEntry {
+    owner: std::sync::Weak<tokio::sync::Mutex<HashMap<String, String>>>,
+    schedule: RuntimeActivityReconcileSchedule,
+}
+
+static RUNTIME_ACTIVITY_RECONCILE_SCHEDULES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<(usize, String), RuntimeActivityReconcileScheduleEntry>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn select_runtime_activity_reconcile_candidates(
+    state: &AppState,
+    resolved_profile_id: &str,
+    candidates: Vec<String>,
+) -> Vec<String> {
+    let owner_id = Arc::as_ptr(&state.active_turns) as usize;
+    let key = (owner_id, resolved_profile_id.to_string());
+    let mut schedules = RUNTIME_ACTIVITY_RECONCILE_SCHEDULES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    schedules.retain(|_, entry| entry.owner.upgrade().is_some());
+    let entry = schedules
+        .entry(key)
+        .or_insert_with(|| RuntimeActivityReconcileScheduleEntry {
+            owner: Arc::downgrade(&state.active_turns),
+            schedule: RuntimeActivityReconcileSchedule::default(),
+        });
+    entry
+        .schedule
+        .select(candidates, RUNTIME_ACTIVITY_RECONCILE_LIMIT)
+}
+
 pub(crate) async fn enqueue_profile_notification(
     state: &AppState,
     profile_id: &str,
@@ -466,6 +524,28 @@ pub(crate) fn runtime_status_from_codex_thread_status(status: &str) -> &str {
     }
 }
 
+#[cfg(test)]
+mod runtime_activity_reconcile_schedule_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_reconcile_round_robin_does_not_starve_candidates_past_limit() {
+        let candidates = (0..12)
+            .map(|index| format!("thread-{index:02}"))
+            .collect::<Vec<_>>();
+        let mut schedule = RuntimeActivityReconcileSchedule::default();
+
+        let first = schedule.select(candidates.clone(), RUNTIME_ACTIVITY_RECONCILE_LIMIT);
+        let second = schedule.select(candidates.clone(), RUNTIME_ACTIVITY_RECONCILE_LIMIT);
+
+        assert_eq!(first, candidates[..8]);
+        assert_eq!(second[..4], candidates[8..]);
+        let seen = first.into_iter().chain(second).collect::<HashSet<_>>();
+        assert_eq!(seen.len(), candidates.len());
+        assert!(candidates.iter().all(|candidate| seen.contains(candidate)));
+    }
+}
+
 async fn session_has_cached_runtime_activity(state: &AppState, runtime_key: &str) -> bool {
     state.active_turns.lock().await.contains_key(runtime_key)
         || state.pending_turn_starts.lock().await.contains(runtime_key)
@@ -862,11 +942,7 @@ pub(crate) async fn clear_stale_session_runtime_activity_if_app_server_missing(
     true
 }
 
-async fn cached_runtime_session_ids(
-    state: &AppState,
-    profile_id: &str,
-    limit: usize,
-) -> Vec<String> {
+async fn cached_runtime_session_ids(state: &AppState, profile_id: &str) -> Vec<String> {
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
         .0
         .to_string();
@@ -879,9 +955,6 @@ async fn cached_runtime_session_ids(
                 continue;
             };
             session_ids.insert(session_id.to_string());
-            if session_ids.len() >= limit {
-                return session_ids.into_iter().collect();
-            }
         }
     }
     {
@@ -891,9 +964,6 @@ async fn cached_runtime_session_ids(
                 continue;
             };
             session_ids.insert(session_id.to_string());
-            if session_ids.len() >= limit {
-                return session_ids.into_iter().collect();
-            }
         }
     }
     let live_status_session_ids = with_ui_state_read(state, profile_id, |ui_state| {
@@ -917,11 +987,10 @@ async fn cached_runtime_session_ids(
     .unwrap_or_default();
     for session_id in live_status_session_ids {
         session_ids.insert(session_id);
-        if session_ids.len() >= limit {
-            break;
-        }
     }
-    session_ids.into_iter().collect()
+    let mut session_ids = session_ids.into_iter().collect::<Vec<_>>();
+    session_ids.sort_unstable();
+    session_ids
 }
 
 async fn mark_runtime_session_terminal_after_reconcile(
@@ -1040,8 +1109,11 @@ pub(crate) async fn reconcile_lost_runtime_activity_for_profile(
         return affected_session_ids;
     }
 
-    let session_ids =
-        cached_runtime_session_ids(state, profile_id, RUNTIME_ACTIVITY_RECONCILE_LIMIT).await;
+    let session_ids = select_runtime_activity_reconcile_candidates(
+        state,
+        &resolved_profile_id,
+        cached_runtime_session_ids(state, profile_id).await,
+    );
     if session_ids.is_empty() {
         return Vec::new();
     }
@@ -1072,12 +1144,6 @@ pub(crate) async fn reconcile_lost_runtime_activity_for_profile(
         {
             continue;
         }
-        let cached_active_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
-        if let Some(turn_id) = cached_active_turn_id.as_deref()
-            && client.has_active_turn_id(turn_id).await
-        {
-            continue;
-        }
         let response = client
             .request_with_timeout(
                 "thread/read",
@@ -1101,8 +1167,18 @@ pub(crate) async fn reconcile_lost_runtime_activity_for_profile(
         if status == "running" {
             continue;
         }
-        if let Some(turn_id) = state.active_turns.lock().await.get(&runtime_key).cloned()
-            && client.has_active_turn_id(&turn_id).await
+        if state
+            .pending_turn_starts
+            .lock()
+            .await
+            .contains(&runtime_key)
+            || terminal_status_conflicts_with_live_turn(
+                state,
+                profile_id,
+                &session_id,
+                &runtime_key,
+            )
+            .await
         {
             continue;
         }

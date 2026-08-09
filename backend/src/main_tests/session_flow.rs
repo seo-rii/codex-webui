@@ -4803,7 +4803,7 @@ async fn runtime_reconcile_marks_lost_active_session_failed_without_app_server()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn runtime_reconcile_completes_session_when_app_server_becomes_idle() {
+async fn runtime_reconcile_clears_stale_duplicated_active_markers_after_native_verification() {
     let sandbox = unique_test_dir("runtime-reconcile-forgotten-turn");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -4814,11 +4814,24 @@ async fn runtime_reconcile_completes_session_when_app_server_becomes_idle() {
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
     let session_id = "thread-forgotten-active-turn";
     let runtime_key = runtime_session_key("default", session_id);
+    let client = app_server_client(&state, "default").await.unwrap();
+    let started = client
+        .request(
+            "turn/start",
+            json!({
+                "threadId": session_id,
+                "input": [{ "type": "text", "text": "leave a stale active marker" }],
+                "cwd": workspace.display().to_string()
+            }),
+        )
+        .await
+        .unwrap();
+    let turn_id = started["turn"]["id"].as_str().unwrap().to_string();
     state
         .active_turns
         .lock()
         .await
-        .insert(runtime_key.clone(), "turn-forgotten".to_string());
+        .insert(runtime_key.clone(), turn_id.clone());
     with_ui_state_write(&state, "default", |ui_state| {
         ui_state["runtimeStatusByThreadId"][session_id] = json!({
             "status": "running",
@@ -4828,9 +4841,7 @@ async fn runtime_reconcile_completes_session_when_app_server_becomes_idle() {
     })
     .await
     .unwrap();
-    app_server_client(&state, "default")
-        .await
-        .unwrap()
+    client
         .request(
             "thread/seed",
             json!({
@@ -4856,6 +4867,10 @@ async fn runtime_reconcile_completes_session_when_app_server_becomes_idle() {
     assert!(
         state.active_turns.lock().await.contains_key(&runtime_key),
         "test setup should keep the cached active turn"
+    );
+    assert!(
+        client.has_active_turn_id(&turn_id).await,
+        "test setup should duplicate the stale turn marker in the app-server client cache"
     );
     assert!(
         state.app_servers.active_process_count().await > 0,
@@ -4931,7 +4946,11 @@ async fn runtime_reconcile_preserves_turn_owned_by_live_app_server() {
                     "updatedAt": 2,
                     "status": "idle",
                     "isSubagent": false,
-                    "turns": []
+                    "turns": [{
+                        "id": turn_id,
+                        "status": "inProgress",
+                        "items": []
+                    }]
                 }
             }),
         )

@@ -74,6 +74,16 @@ type SessionSubscriptionState = {
   retryAttempt: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
 };
+type AuxiliarySubscriptionState = {
+  kind: "global" | "terminal";
+  terminalId: string | null;
+  desired: boolean;
+  syncedGeneration: number | null;
+  syncing: boolean;
+  retryAttempt: number;
+  retryTimer: ReturnType<typeof setTimeout> | null;
+  retryExhaustedGeneration: number | null;
+};
 
 const HEARTBEAT_MS = 20_000;
 const CONNECT_TIMEOUT_MS = 12_000;
@@ -83,6 +93,15 @@ const REQUEST_TIMEOUT_MS = 720_000;
 const SUBSCRIPTION_REQUEST_TIMEOUT_MS = 15_000;
 const RECONNECT_DELAYS = [250, 500, 1000, 2000, 4000];
 const SUBSCRIPTION_RETRY_DELAYS = [500, 1000, 2000, 5000, 10_000, 30_000];
+const GLOBAL_SUBSCRIPTION_KEY = "global";
+const ACKNOWLEDGED_SUBSCRIPTION_METHODS = new Set([
+  "events/subscribe",
+  "events/unsubscribe",
+  "session/subscribe",
+  "session/unsubscribe",
+  "terminal/subscribe",
+  "terminal/unsubscribe"
+]);
 const MAX_INFLIGHT_REQUESTS = 20;
 const MAX_INFLIGHT_READ_REQUESTS = 12;
 const DEDUPED_READ_METHODS = new Set([
@@ -204,6 +223,10 @@ function sessionSubscriptionKey(sessionId: string, profileId: string | null | un
   return `${normalizeSubscriptionProfileId(profileId)}:${sessionId}`;
 }
 
+function terminalSubscriptionKey(terminalId: string) {
+  return `terminal:${terminalId}`;
+}
+
 function profileIdFromSessionEvent(event: StreamEvent) {
   const params = event && typeof event === "object" && "params" in event ? event.params : null;
   if (!params || typeof params !== "object") {
@@ -229,6 +252,7 @@ export class WebSocketRpcClient {
   private sessionHandlers = new Map<string, Set<SessionEventHandler>>();
   private sessionSubscriptionOptions = new Map<string, Required<SessionSubscriptionOptions>>();
   private sessionSubscriptionStates = new Map<string, SessionSubscriptionState>();
+  private auxiliarySubscriptionStates = new Map<string, AuxiliarySubscriptionState>();
   private terminalHandlers = new Map<string, Set<TerminalEventHandler>>();
   private globalHandlers = new Set<(event: GlobalStreamEvent) => void>();
   private reconnectListeners = new Set<() => void>();
@@ -369,15 +393,36 @@ export class WebSocketRpcClient {
   subscribeGlobal(handler: (event: GlobalStreamEvent) => void) {
     const shouldSubscribe = this.globalHandlers.size === 0;
     this.globalHandlers.add(handler);
+    if (shouldSubscribe) {
+      const state = this.auxiliarySubscriptionStates.get(GLOBAL_SUBSCRIPTION_KEY) ?? {
+        kind: "global",
+        terminalId: null,
+        desired: true,
+        syncedGeneration: null,
+        syncing: false,
+        retryAttempt: 0,
+        retryTimer: null,
+        retryExhaustedGeneration: null
+      };
+      this.clearAuxiliarySubscriptionRetry(state);
+      state.desired = true;
+      this.auxiliarySubscriptionStates.set(GLOBAL_SUBSCRIPTION_KEY, state);
+    }
     this.ensureConnected();
     if (shouldSubscribe) {
-      this.sendTransient("events/subscribe", {});
+      void this.syncAuxiliarySubscription(GLOBAL_SUBSCRIPTION_KEY);
     }
 
     return () => {
       this.globalHandlers.delete(handler);
       if (this.globalHandlers.size === 0) {
-        this.sendTransient("events/unsubscribe", {});
+        const state = this.auxiliarySubscriptionStates.get(GLOBAL_SUBSCRIPTION_KEY);
+        if (!state) {
+          return;
+        }
+        this.clearAuxiliarySubscriptionRetry(state);
+        state.desired = false;
+        void this.syncAuxiliarySubscription(GLOBAL_SUBSCRIPTION_KEY);
       }
     };
   }
@@ -387,9 +432,25 @@ export class WebSocketRpcClient {
     const shouldSubscribe = current.size === 0;
     current.add(handler);
     this.terminalHandlers.set(terminalId, current);
+    if (shouldSubscribe) {
+      const subscriptionKey = terminalSubscriptionKey(terminalId);
+      const state = this.auxiliarySubscriptionStates.get(subscriptionKey) ?? {
+        kind: "terminal",
+        terminalId,
+        desired: true,
+        syncedGeneration: null,
+        syncing: false,
+        retryAttempt: 0,
+        retryTimer: null,
+        retryExhaustedGeneration: null
+      };
+      this.clearAuxiliarySubscriptionRetry(state);
+      state.desired = true;
+      this.auxiliarySubscriptionStates.set(subscriptionKey, state);
+    }
     this.ensureConnected();
     if (shouldSubscribe) {
-      this.sendTransient("terminal/subscribe", { terminalId });
+      void this.syncAuxiliarySubscription(terminalSubscriptionKey(terminalId));
     }
 
     return () => {
@@ -404,7 +465,14 @@ export class WebSocketRpcClient {
       }
 
       this.terminalHandlers.delete(terminalId);
-      this.sendTransient("terminal/unsubscribe", { terminalId });
+      const subscriptionKey = terminalSubscriptionKey(terminalId);
+      const state = this.auxiliarySubscriptionStates.get(subscriptionKey);
+      if (!state) {
+        return;
+      }
+      this.clearAuxiliarySubscriptionRetry(state);
+      state.desired = false;
+      void this.syncAuxiliarySubscription(subscriptionKey);
     };
   }
 
@@ -447,6 +515,7 @@ export class WebSocketRpcClient {
         this.forceReconnect();
         return;
       }
+      this.retryExhaustedAuxiliarySubscriptions();
       this.sendPing(true);
       this.flushPending();
       return;
@@ -487,9 +556,7 @@ export class WebSocketRpcClient {
     }
     this.pending.clear();
     this.inflightReadRequests.clear();
-    for (const state of this.sessionSubscriptionStates.values()) {
-      this.clearSessionSubscriptionRetry(state);
-    }
+    this.invalidateSubscriptionAcks();
   }
 
   private ensureConnected() {
@@ -628,6 +695,7 @@ export class WebSocketRpcClient {
       this.stopHeartbeat();
       this.clearConnectTimeout();
       this.clearPongTimeout();
+      this.invalidateSubscriptionAcks();
 
       if (!this.manualClose && this.hasConnectionDemand()) {
         this.setConnectionState("reconnecting");
@@ -687,7 +755,12 @@ export class WebSocketRpcClient {
 
     let inflightRequests = 0;
     let inflightReadRequests = 0;
-    for (const pending of this.pending.values()) {
+    const queuedRequests = [...this.pending.values()].sort(
+      (left, right) =>
+        Number(ACKNOWLEDGED_SUBSCRIPTION_METHODS.has(right.message.method)) -
+        Number(ACKNOWLEDGED_SUBSCRIPTION_METHODS.has(left.message.method))
+    );
+    for (const pending of queuedRequests) {
       if (pending.sentGeneration !== this.connectionGeneration) {
         continue;
       }
@@ -697,7 +770,7 @@ export class WebSocketRpcClient {
       }
     }
 
-    for (const pending of this.pending.values()) {
+    for (const pending of queuedRequests) {
       if (pending.sentGeneration === this.connectionGeneration) {
         continue;
       }
@@ -725,10 +798,6 @@ export class WebSocketRpcClient {
   }
 
   private restoreSubscriptions() {
-    if (this.globalHandlers.size > 0) {
-      this.sendTransient("events/subscribe", {});
-    }
-
     for (const [subscriptionKey, state] of this.sessionSubscriptionStates.entries()) {
       this.clearSessionSubscriptionRetry(state);
       state.syncedGeneration = null;
@@ -737,27 +806,15 @@ export class WebSocketRpcClient {
       }
     }
 
-    for (const terminalId of this.terminalHandlers.keys()) {
-      this.sendTransient("terminal/subscribe", { terminalId });
+    for (const [subscriptionKey, state] of this.auxiliarySubscriptionStates.entries()) {
+      this.clearAuxiliarySubscriptionRetry(state);
+      state.syncedGeneration = null;
+      if (state.desired) {
+        void this.syncAuxiliarySubscription(subscriptionKey);
+      } else {
+        this.auxiliarySubscriptionStates.delete(subscriptionKey);
+      }
     }
-  }
-
-  private sendTransient(method: string, params: unknown) {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    const scopedParams =
-      this.defaultProfileId && params && typeof params === "object" && !Array.isArray(params) && !("requestProfileId" in params)
-        ? { ...(params as Record<string, unknown>), requestProfileId: this.defaultProfileId }
-        : params;
-    const payload: ClientEnvelope = {
-      kind: "request",
-      id: makeRequestId(),
-      method,
-      params: scopedParams
-    };
-    this.socket.send(JSON.stringify(payload));
   }
 
   private async syncSessionSubscription(subscriptionKey: string) {
@@ -804,6 +861,10 @@ export class WebSocketRpcClient {
             SUBSCRIPTION_REQUEST_TIMEOUT_MS
           );
         } catch {
+          if (generation !== this.connectionGeneration) {
+            state.syncedGeneration = null;
+            continue;
+          }
           state.syncedGeneration = subscribing ? null : generation;
           this.scheduleSessionSubscriptionRetry(subscriptionKey, state, generation);
           return;
@@ -862,6 +923,140 @@ export class WebSocketRpcClient {
       }
       void this.syncSessionSubscription(subscriptionKey);
     }, delay);
+  }
+
+  private async syncAuxiliarySubscription(subscriptionKey: string) {
+    const state = this.auxiliarySubscriptionStates.get(subscriptionKey);
+    if (!state || state.syncing) {
+      return;
+    }
+
+    state.syncing = true;
+    try {
+      while (this.auxiliarySubscriptionStates.get(subscriptionKey) === state) {
+        const socketOpen = this.socket?.readyState === WebSocket.OPEN;
+        const subscribed = state.syncedGeneration === this.connectionGeneration;
+        if (!socketOpen) {
+          if (!state.desired) {
+            this.auxiliarySubscriptionStates.delete(subscriptionKey);
+          }
+          return;
+        }
+        if (state.desired === subscribed) {
+          if (!state.desired) {
+            this.auxiliarySubscriptionStates.delete(subscriptionKey);
+          }
+          return;
+        }
+        if (state.retryExhaustedGeneration === this.connectionGeneration) {
+          return;
+        }
+
+        const generation = this.connectionGeneration;
+        const subscribing = state.desired;
+        const params = state.kind === "terminal" ? { terminalId: state.terminalId } : {};
+        try {
+          await this.request(
+            state.kind === "global"
+              ? subscribing
+                ? "events/subscribe"
+                : "events/unsubscribe"
+              : subscribing
+                ? "terminal/subscribe"
+                : "terminal/unsubscribe",
+            params,
+            SUBSCRIPTION_REQUEST_TIMEOUT_MS
+          );
+        } catch {
+          if (generation !== this.connectionGeneration) {
+            state.syncedGeneration = null;
+            continue;
+          }
+          state.syncedGeneration = subscribing ? null : generation;
+          this.scheduleAuxiliarySubscriptionRetry(subscriptionKey, state, generation);
+          return;
+        }
+
+        if (generation !== this.connectionGeneration) {
+          state.syncedGeneration = null;
+          continue;
+        }
+        this.clearAuxiliarySubscriptionRetry(state);
+        state.syncedGeneration = subscribing ? generation : null;
+      }
+    } finally {
+      state.syncing = false;
+      const latest = this.auxiliarySubscriptionStates.get(subscriptionKey);
+      const subscribed = latest?.syncedGeneration === this.connectionGeneration;
+      if (
+        latest &&
+        !latest.retryTimer &&
+        latest.retryExhaustedGeneration !== this.connectionGeneration &&
+        this.socket?.readyState === WebSocket.OPEN &&
+        latest.desired !== subscribed
+      ) {
+        queueMicrotask(() => {
+          void this.syncAuxiliarySubscription(subscriptionKey);
+        });
+      }
+    }
+  }
+
+  private clearAuxiliarySubscriptionRetry(state: AuxiliarySubscriptionState) {
+    if (state.retryTimer) {
+      clearTimeout(state.retryTimer);
+      state.retryTimer = null;
+    }
+    state.retryAttempt = 0;
+    state.retryExhaustedGeneration = null;
+  }
+
+  private scheduleAuxiliarySubscriptionRetry(
+    subscriptionKey: string,
+    state: AuxiliarySubscriptionState,
+    generation: number
+  ) {
+    if (state.retryTimer || this.auxiliarySubscriptionStates.get(subscriptionKey) !== state) {
+      return;
+    }
+    if (state.retryAttempt >= SUBSCRIPTION_RETRY_DELAYS.length) {
+      state.retryExhaustedGeneration = generation;
+      return;
+    }
+    const delay = SUBSCRIPTION_RETRY_DELAYS[state.retryAttempt];
+    state.retryAttempt += 1;
+    state.retryTimer = setTimeout(() => {
+      state.retryTimer = null;
+      if (
+        this.auxiliarySubscriptionStates.get(subscriptionKey) !== state ||
+        generation !== this.connectionGeneration ||
+        this.socket?.readyState !== WebSocket.OPEN
+      ) {
+        return;
+      }
+      void this.syncAuxiliarySubscription(subscriptionKey);
+    }, delay);
+  }
+
+  private retryExhaustedAuxiliarySubscriptions() {
+    for (const [subscriptionKey, state] of this.auxiliarySubscriptionStates.entries()) {
+      if (state.retryExhaustedGeneration !== this.connectionGeneration) {
+        continue;
+      }
+      this.clearAuxiliarySubscriptionRetry(state);
+      void this.syncAuxiliarySubscription(subscriptionKey);
+    }
+  }
+
+  private invalidateSubscriptionAcks() {
+    for (const state of this.sessionSubscriptionStates.values()) {
+      this.clearSessionSubscriptionRetry(state);
+      state.syncedGeneration = null;
+    }
+    for (const state of this.auxiliarySubscriptionStates.values()) {
+      this.clearAuxiliarySubscriptionRetry(state);
+      state.syncedGeneration = null;
+    }
   }
 
   private startHeartbeat() {
@@ -945,6 +1140,7 @@ export class WebSocketRpcClient {
     this.stopHeartbeat();
     this.clearConnectTimeout();
     this.clearPongTimeout();
+    this.invalidateSubscriptionAcks();
     this.setConnectionState(this.hasConnectedOnce ? "reconnecting" : "connecting");
 
     if (socket && socket.readyState !== WebSocket.CLOSING && socket.readyState !== WebSocket.CLOSED) {

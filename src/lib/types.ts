@@ -596,6 +596,27 @@ export type SessionTurnPayload = {
   turn: CodexTurn;
 };
 
+export type SessionLatestCompletedTurnPayload = {
+  sessionId: string;
+  profileId: string;
+  targetTurnId: string | null;
+  threadStatus: string;
+  threadUpdatedAt: number | null;
+  turn: CodexTurn | null;
+  turnId: string | null;
+  turnPosition: number | null;
+  completionVersion: string | null;
+  settled: boolean;
+  expectedTurnReady: boolean;
+  sourceStable: boolean;
+  notModified: boolean;
+  retryAfterMs: number;
+  rolloutRevision: {
+    size: number;
+    modifiedAt: number | null;
+  } | null;
+};
+
 export type SessionForkPayload = {
   session: SessionSummary;
   draft: string;

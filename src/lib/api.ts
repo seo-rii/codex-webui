@@ -52,6 +52,7 @@ import type {
   SessionDetailPayload,
   SessionDetailResponse,
   SessionDraftPayload,
+  SessionLatestCompletedTurnPayload,
   SessionItemDetailPayload,
   SessionForkPayload,
   SessionListResponse,
@@ -755,6 +756,20 @@ export const api = {
 
   getSessionTurn(sessionId: string, turnId: string, profileId: string | null = null) {
     return ws.request<SessionTurnPayload>("session/turn/get", { sessionId, turnId, profileId });
+  },
+
+  getSessionLatestCompletedTurn(
+    sessionId: string,
+    expectedTurnId: string | null = null,
+    knownCompletionVersion: string | null = null,
+    profileId: string | null = null
+  ) {
+    return ws.request<SessionLatestCompletedTurnPayload>("session/latestCompletedTurn/get", {
+      sessionId,
+      expectedTurnId,
+      knownCompletionVersion,
+      profileId
+    });
   },
 
   getSessionItemDetail(sessionId: string, turnId: string, itemId: string, profileId: string | null = null) {

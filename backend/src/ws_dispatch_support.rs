@@ -698,6 +698,20 @@ pub(crate) async fn execute_ws_method(
                 .await
                 .map_err(anyhow::Error::from)
         }
+        "session/latestCompletedTurn/get" => {
+            let session_id = require_session_id(&params, "sessionId")?;
+            let profile_id =
+                ws_request_profile_id_for_session(state, auth, &params, &session_id).await?;
+            session_latest_completed_turn_payload(
+                state,
+                &profile_id,
+                &session_id,
+                params.get("expectedTurnId").and_then(Value::as_str),
+                params.get("knownCompletionVersion").and_then(Value::as_str),
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        }
         "session/itemDetail/get" => {
             let session_id = require_session_id(&params, "sessionId")?;
             let profile_id =

@@ -124,6 +124,7 @@
     SessionDetailPatchPayload,
     SessionDetailPayload,
     SessionDetailResponse,
+    SessionLatestCompletedTurnPayload,
     SessionPreferences,
     SessionQueueItem,
     SessionQueuePayload,
@@ -1688,7 +1689,12 @@
   let websocketResyncInFlight = false;
   let websocketResyncQueued = false;
   let selectedSessionDetailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  let selectedSessionCompletionRefreshTimers: ReturnType<typeof setTimeout>[] = [];
+  let selectedSessionCompletionRefreshJobs = new Map<
+    string,
+    {
+      timers: Set<ReturnType<typeof setTimeout>>;
+    }
+  >();
   let sessionListCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionDetailCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionListRequestVersion = 0;
@@ -5089,47 +5095,341 @@
   }
 
   function clearSelectedSessionCompletionRefreshes() {
-    for (const timer of selectedSessionCompletionRefreshTimers) {
-      clearTimeout(timer);
+    for (const job of selectedSessionCompletionRefreshJobs.values()) {
+      for (const timer of job.timers) {
+        clearTimeout(timer);
+      }
     }
-    selectedSessionCompletionRefreshTimers = [];
+    selectedSessionCompletionRefreshJobs.clear();
   }
 
-  function scheduleSelectedSessionCompletionRefresh(sessionId: string) {
-    clearSelectedSessionCompletionRefreshes();
+  function applyLatestCompletedTurnPayload(
+    sessionId: string,
+    profileId: string | null,
+    payload: SessionLatestCompletedTurnPayload,
+    expectedTurnId: string | null,
+    requestActiveTurnId: string | null
+  ) {
+    if (
+      !conversation ||
+      conversation.thread.id !== sessionId ||
+      !selectedSessionBindingMatches(sessionId, profileId)
+    ) {
+      return false;
+    }
+
+    const requestedTurnId = String(expectedTurnId ?? payload.targetTurnId ?? "").trim() || null;
+    const payloadTurnId = String(payload.turnId ?? "").trim() || null;
+    if (
+      !payload.settled ||
+      !payload.sourceStable ||
+      !payloadTurnId ||
+      (requestedTurnId && requestedTurnId !== payloadTurnId) ||
+      (payload.turn && payload.turn.id !== payloadTurnId)
+    ) {
+      return false;
+    }
+
+    let nextConversation = conversation;
+    if (payload.turn) {
+      const existingTurnIndex = nextConversation.thread.turns.findIndex((turn) => turn.id === payloadTurnId);
+      const activeTurnIndex = nextConversation.activeTurnId
+        ? nextConversation.thread.turns.findIndex((turn) => turn.id === nextConversation.activeTurnId)
+        : -1;
+      const loadedStart =
+        nextConversation.hydration.totalTurns === null
+          ? null
+          : Math.max(0, nextConversation.hydration.totalTurns - nextConversation.thread.turns.length);
+      const positionedInsertionIndex =
+        payload.turnPosition === null || loadedStart === null
+          ? null
+          : Math.max(0, Math.min(nextConversation.thread.turns.length, payload.turnPosition - loadedStart));
+      const activeTurn = activeTurnIndex >= 0 ? nextConversation.thread.turns[activeTurnIndex] : null;
+      const activeTurnIsRealtime = String(activeTurn?.id ?? "").startsWith("realtime:");
+      const payloadCompletedAt = normalizeSessionTimestamp(payload.turn.completedAt);
+      const activeStartedAt = normalizeSessionTimestamp(activeTurn?.startedAt);
+      const payloadPredatesActiveTurn =
+        payloadCompletedAt > 0 && activeStartedAt > 0 && payloadCompletedAt < activeStartedAt;
+      const replaceRealtimeTurn =
+        existingTurnIndex === -1 &&
+        activeTurnIndex >= 0 &&
+        activeTurnIsRealtime &&
+        !payloadPredatesActiveTurn &&
+        (positionedInsertionIndex === null || positionedInsertionIndex >= activeTurnIndex);
+      const mergeTargetIndex = existingTurnIndex !== -1 ? existingTurnIndex : replaceRealtimeTurn ? activeTurnIndex : -1;
+      let incomingTurn = payload.turn;
+      if (mergeTargetIndex !== -1) {
+        const existingTurn = nextConversation.thread.turns[mergeTargetIndex];
+        incomingTurn = {
+          ...incomingTurn,
+          items: incomingTurn.items.map((incomingItem) => {
+            if (String(incomingItem.type ?? "") !== "agentMessage") {
+              return incomingItem;
+            }
+            const incomingLineage = String(incomingItem.completionLineage ?? "").trim();
+            const incomingText = String(incomingItem.text ?? "").replace(/\s+/gu, " ").trim();
+            const matchingExistingItem = existingTurn.items.find((existingItem) => {
+              if (String(existingItem.type ?? "") !== "agentMessage") {
+                return false;
+              }
+              const existingLineage = String(existingItem.completionLineage ?? "").trim();
+              if (incomingLineage && existingLineage === incomingLineage) {
+                return true;
+              }
+              return (
+                Boolean(incomingText) &&
+                String(existingItem.text ?? "").replace(/\s+/gu, " ").trim() === incomingText
+              );
+            }) ??
+              (String(incomingItem.phase ?? "") !== "commentary"
+                ? [...existingTurn.items]
+                    .reverse()
+                    .find(
+                      (existingItem) =>
+                        String(existingItem.type ?? "") === "agentMessage" &&
+                        String(existingItem.phase ?? "") !== "commentary"
+                    )
+                : undefined);
+            return matchingExistingItem && matchingExistingItem.id !== incomingItem.id
+              ? { ...incomingItem, id: matchingExistingItem.id }
+              : incomingItem;
+          })
+        };
+      }
+      let turns: CodexTurn[];
+      if (existingTurnIndex !== -1) {
+        turns = nextConversation.thread.turns.map((turn, index) =>
+          index === existingTurnIndex ? mergeConversationTurnState(turn, incomingTurn) : turn
+        );
+      } else if (replaceRealtimeTurn) {
+        turns = nextConversation.thread.turns.map((turn, index) =>
+          index === activeTurnIndex ? mergeConversationTurnState(turn, incomingTurn) : turn
+        );
+      } else {
+        const insertionIndex =
+          positionedInsertionIndex ??
+          (activeTurnIndex >= 0 ? activeTurnIndex : nextConversation.thread.turns.length);
+        turns = [
+          ...nextConversation.thread.turns.slice(0, insertionIndex),
+          incomingTurn,
+          ...nextConversation.thread.turns.slice(insertionIndex)
+        ];
+      }
+      const currentActiveTurnId = nextConversation.activeTurnId;
+      const currentActiveTurnRepresentsPayload =
+        currentActiveTurnId === payloadTurnId || (replaceRealtimeTurn && currentActiveTurnId === activeTurn?.id);
+      const requestActiveTurnRepresentsPayload =
+        requestActiveTurnId === payloadTurnId || (replaceRealtimeTurn && requestActiveTurnId === activeTurn?.id);
+      const newerTurnIsActive = Boolean(currentActiveTurnId && !currentActiveTurnRepresentsPayload);
+      const requestObservedNewerTurn = Boolean(requestActiveTurnId && !requestActiveTurnRepresentsPayload);
+      const canSettleThread = !newerTurnIsActive && !requestObservedNewerTurn;
+      nextConversation = {
+        ...nextConversation,
+        activeTurnId:
+          canSettleThread && currentActiveTurnRepresentsPayload
+            ? null
+            : currentActiveTurnId,
+        thread: {
+          ...nextConversation.thread,
+          turns,
+          status:
+            canSettleThread
+              ? isLiveConversationStatus(payload.threadStatus)
+                ? "completed"
+                : payload.threadStatus
+              : nextConversation.thread.status,
+          updatedAt: Math.max(
+            normalizeSessionTimestamp(nextConversation.thread.updatedAt),
+            normalizeSessionTimestamp(payload.threadUpdatedAt)
+          )
+        }
+      };
+    } else {
+      const currentActiveTurnId = nextConversation.activeTurnId;
+      const canSettleThread =
+        (!currentActiveTurnId || currentActiveTurnId === payloadTurnId) &&
+        (!requestActiveTurnId || requestActiveTurnId === payloadTurnId);
+      nextConversation = {
+        ...nextConversation,
+        activeTurnId: canSettleThread && currentActiveTurnId === payloadTurnId ? null : currentActiveTurnId,
+        thread: {
+          ...nextConversation.thread,
+          status: canSettleThread
+            ? isLiveConversationStatus(payload.threadStatus)
+              ? "completed"
+              : payload.threadStatus
+            : nextConversation.thread.status,
+          updatedAt: Math.max(
+            normalizeSessionTimestamp(nextConversation.thread.updatedAt),
+            normalizeSessionTimestamp(payload.threadUpdatedAt)
+          )
+        }
+      };
+    }
+
+    conversation = applyLocalComposerPreferencesToConversation(
+      normalizeConversationExecutionState(nextConversation)
+    );
+    if (payload.turnId && payload.completionVersion) {
+      sessionTurnVersionsById = {
+        ...sessionTurnVersionsById,
+        [payload.turnId]: payload.completionVersion
+      };
+    }
+    if (payload.turn || payload.notModified) {
+      sessionDetailCacheVersion = null;
+      sessionDetailStateHash = null;
+      sessionDetailMetadataVersion = null;
+      markConversationCacheDirty();
+      applySessionSummaryUpdate(buildSessionSummaryFromConversation(conversation));
+      preserveTranscriptScrollAfterDataUpdate();
+    }
+    return true;
+  }
+
+  async function refreshSelectedSessionCompletionTail(
+    sessionId: string,
+    profileId: string | null,
+    selectionVersion: number,
+    expectedTurnId: string | null,
+    baselineCompletionVersion: string | null,
+    requireCompletionVersionChange: boolean
+  ) {
+    const latestTurn = conversation?.thread.id === sessionId ? conversation.thread.turns.at(-1) : null;
+    const expectedTurnIsLoaded = Boolean(
+      expectedTurnId &&
+      conversation?.thread.id === sessionId &&
+      conversation.thread.turns.some((turn) => turn.id === expectedTurnId)
+    );
+    const knownCompletionVersion =
+      expectedTurnId && expectedTurnIsLoaded
+        ? (sessionTurnVersionsById[expectedTurnId] ?? null)
+        : expectedTurnId
+          ? null
+          : (latestTurn ? (sessionTurnVersionsById[latestTurn.id] ?? null) : null);
+    const requestActiveTurnId = conversation?.thread.id === sessionId ? conversation.activeTurnId : null;
+    const payload = await api.getSessionLatestCompletedTurn(
+      sessionId,
+      expectedTurnId,
+      knownCompletionVersion,
+      profileId
+    );
+    if (
+      selectedSessionId !== sessionId ||
+      selectedSessionProfileId !== profileId ||
+      sessionSelectionVersion !== selectionVersion
+    ) {
+      return {
+        settled: true,
+        retryAfterMs: 0
+      };
+    }
+
+    const applied = applyLatestCompletedTurnPayload(
+      sessionId,
+      profileId,
+      payload,
+      expectedTurnId,
+      requestActiveTurnId
+    );
+    const completionChanged =
+      !requireCompletionVersionChange ||
+      !baselineCompletionVersion ||
+      (payload.completionVersion !== null && payload.completionVersion !== baselineCompletionVersion);
+    return {
+      settled: payload.expectedTurnReady && payload.sourceStable && completionChanged && applied,
+      retryAfterMs: Math.max(200, Math.min(Number(payload.retryAfterMs) || 750, 2_000))
+    };
+  }
+
+  function scheduleSelectedSessionCompletionRefresh(
+    sessionId: string,
+    expectedTurnId: string | null = null,
+    baselineCompletionVersion: string | null = null,
+    requireCompletionVersionChange = false,
+    probeDespiteLiveDetail = false
+  ) {
     const scheduledSelectionVersion = sessionSelectionVersion;
     const scheduledProfileId = profileIdForSession(sessionId);
-    selectedSessionCompletionRefreshTimers = [350, 1800].map((delay) => {
+    const normalizedExpectedTurnId = String(expectedTurnId ?? "").trim() || null;
+    const jobKey = `${sessionId}\u0000${normalizedExpectedTurnId ?? "latest"}`;
+    const existingJob = selectedSessionCompletionRefreshJobs.get(jobKey);
+    if (existingJob) {
+      for (const timer of existingJob.timers) {
+        clearTimeout(timer);
+      }
+    }
+    const refreshJob = {
+      timers: new Set<ReturnType<typeof setTimeout>>()
+    };
+    selectedSessionCompletionRefreshJobs.set(jobKey, refreshJob);
+    const retryDelays = [200, 500, 1_000, 2_000, 4_000, 8_000, 16_000];
+
+    const scheduleAttempt = (attempt: number, delay: number) => {
       const timer = setTimeout(() => {
-        selectedSessionCompletionRefreshTimers = selectedSessionCompletionRefreshTimers.filter((candidate) => candidate !== timer);
+        refreshJob.timers.delete(timer);
         if (
+          selectedSessionCompletionRefreshJobs.get(jobKey) !== refreshJob ||
           selectedSessionId !== sessionId ||
           sessionSelectionVersion !== scheduledSelectionVersion ||
           profileIdForSession(sessionId) !== scheduledProfileId ||
           !conversation ||
           conversation.thread.id !== sessionId ||
-          loadingDetail ||
-          isLiveConversationStatus(conversation.thread.status)
+          (!normalizedExpectedTurnId &&
+            !probeDespiteLiveDetail &&
+            isLiveConversationStatus(conversation.thread.status))
         ) {
+          if (selectedSessionCompletionRefreshJobs.get(jobKey) === refreshJob) {
+            selectedSessionCompletionRefreshJobs.delete(jobKey);
+          }
           return;
         }
 
-        void refreshSelectedSessionState(
+        if (loadingDetail) {
+          scheduleAttempt(attempt, 250);
+          return;
+        }
+
+        void refreshSelectedSessionCompletionTail(
           sessionId,
-          Math.max(conversation.thread.turns.length, olderTurnPageSize),
-          false,
-          sessionDetailCacheVersion,
-          false,
+          scheduledProfileId,
           scheduledSelectionVersion,
-          scheduledProfileId
-        )
-          .then(() => {
-            clearSelectedSessionCompletionRefreshes();
-          })
-          .catch(() => {});
+          normalizedExpectedTurnId,
+          baselineCompletionVersion,
+          requireCompletionVersionChange
+        ).then((result) => {
+          if (selectedSessionCompletionRefreshJobs.get(jobKey) !== refreshJob) {
+            return;
+          }
+          if (result.settled) {
+            for (const pendingTimer of refreshJob.timers) {
+              clearTimeout(pendingTimer);
+            }
+            selectedSessionCompletionRefreshJobs.delete(jobKey);
+            return;
+          }
+          const nextAttempt = attempt + 1;
+          if (nextAttempt < retryDelays.length) {
+            scheduleAttempt(nextAttempt, Math.max(retryDelays[nextAttempt], result.retryAfterMs));
+          } else {
+            selectedSessionCompletionRefreshJobs.delete(jobKey);
+          }
+        }).catch(() => {
+          if (selectedSessionCompletionRefreshJobs.get(jobKey) !== refreshJob) {
+            return;
+          }
+          const nextAttempt = attempt + 1;
+          if (nextAttempt < retryDelays.length) {
+            scheduleAttempt(nextAttempt, retryDelays[nextAttempt]);
+          } else {
+            selectedSessionCompletionRefreshJobs.delete(jobKey);
+          }
+        });
       }, delay);
-      return timer;
-    });
+      refreshJob.timers.add(timer);
+    };
+
+    scheduleAttempt(0, retryDelays[0]);
   }
 
   function getRequestedSessionIdFromUrl() {
@@ -5653,13 +5953,12 @@
     if (selectedSessionId === sessionId && conversation && (!profileId || currentSelectionProfileId === profileId)) {
       syncSelectedSessionInUrl(sessionId);
       if (!isLiveConversationStatus(conversation.thread.status)) {
-        void refreshSelectedSessionState(
+        const latestTurn = conversation.thread.turns.at(-1);
+        scheduleSelectedSessionCompletionRefresh(
           sessionId,
-          Math.max(conversation.thread.turns.length, olderTurnPageSize),
-          false,
-          sessionDetailCacheVersion,
-          false
-        ).catch(() => {});
+          null,
+          latestTurn ? (sessionTurnVersionsById[latestTurn.id] ?? null) : null
+        );
       }
       return true;
     }
@@ -5785,6 +6084,11 @@
       const detailCacheKey = buildSessionDetailBrowserCacheKey(sessionId, resolvedProfileId);
       let knownVersion: string | null = null;
       let turnLimit = olderTurnPageSize;
+      let cachedCompletionVersion: string | null = null;
+      let cachedDetailNeedsCompletionUpdate = false;
+      const terminalSelection = Boolean(
+        summaryForSelection && !isLiveConversationStatus(summaryForSelection.status)
+      );
 
       if (detailCacheKey) {
         const cacheReadEventRevision = sessionEventRevisions.get(selectionScopeKey) ?? 0;
@@ -5805,9 +6109,23 @@
             cachedEntry.payload.stateHash && cachedEntry.payload.turnVersions
               ? cachedEntry.version
               : null;
+          const cachedLatestTurn = cachedEntry.payload.thread.turns.at(-1);
+          cachedCompletionVersion = cachedLatestTurn
+            ? (cachedEntry.payload.turnVersions?.[cachedLatestTurn.id] ?? null)
+            : null;
+          cachedDetailNeedsCompletionUpdate =
+            terminalSelection &&
+            normalizeSessionTimestamp(summaryForSelection?.updatedAt) >
+              normalizeSessionTimestamp(cachedEntry.payload.thread.updatedAt);
           turnLimit = Math.max(olderTurnPageSize, cachedEntry.payload.thread.turns.length);
+          if (terminalSelection) {
+            knownVersion = null;
+          }
           requestTranscriptBottomScroll(true);
         }
+      }
+      if (terminalSelection) {
+        knownVersion = null;
       }
 
       const nextConversation = await refreshSelectedSessionState(
@@ -5847,6 +6165,15 @@
         }, 250);
       } else {
         clearHydrationRefresh();
+      }
+      if (terminalSelection || !isLiveConversationStatus(nextConversation.thread.status)) {
+        scheduleSelectedSessionCompletionRefresh(
+          sessionId,
+          null,
+          cachedCompletionVersion,
+          cachedDetailNeedsCompletionUpdate,
+          true
+        );
       }
       syncSelectedSessionInUrl(sessionId);
       return true;
@@ -6205,7 +6532,9 @@
 
         if (payload.kind === "notification" && payload.method === "turn/completed") {
           updateManualCompactPrompt(sessionId, conversation);
-          scheduleSelectedSessionCompletionRefresh(sessionId);
+          const completedTurn = payload.params.turn as { id?: unknown } | undefined;
+          const completedTurnId = String(completedTurn?.id ?? payload.params.turnId ?? "").trim() || null;
+          scheduleSelectedSessionCompletionRefresh(sessionId, completedTurnId);
         }
 
         if (isQueueUpdatedEvent(payload)) {
@@ -6781,20 +7110,21 @@
         selectedSessionProfileId = nextDetail.profileId;
         rememberSessionProfile({ id: nextDetail.thread.id, profileId: nextDetail.profileId });
       }
+      const streamedStateAdvanced = (sessionEventRevisions.get(scopeKey) ?? 0) > requestEventRevision;
       const nextConversation = applyLoadedSessionDetail(
         nextDetail.thread.id,
         sessionProfileId,
         nextDetail,
         !replaceWithRecentWindow,
-        (sessionEventRevisions.get(scopeKey) ?? 0) > requestEventRevision,
+        streamedStateAdvanced,
         replaceWithRecentWindow
       );
       const detailCacheKey = buildSessionDetailBrowserCacheKey(nextDetail.thread.id, sessionProfileId);
       if (detailCacheKey) {
         void writeSessionDetailCache(
           detailCacheKey,
-          sanitizeSessionDetailForBrowserCache(nextDetail),
-          nextDetail.cacheVersion
+          conversationToSessionDetailPayload(nextConversation),
+          streamedStateAdvanced ? null : nextDetail.cacheVersion
         );
       }
       if (replaceWithRecentWindow && skippedEventCount > 0 && staleSessionCatchup) {
@@ -6836,17 +7166,22 @@
       selectedSessionProfileId = detail.profileId;
       rememberSessionProfile({ id: detail.thread.id, profileId: detail.profileId });
     }
+    const streamedStateAdvanced = (sessionEventRevisions.get(scopeKey) ?? 0) > requestEventRevision;
     const nextConversation = applyLoadedSessionDetail(
       detail.thread.id,
       sessionProfileId,
       detail,
       !replaceWithRecentWindow,
-      (sessionEventRevisions.get(scopeKey) ?? 0) > requestEventRevision,
+      streamedStateAdvanced,
       replaceWithRecentWindow
     );
     const detailCacheKey = buildSessionDetailBrowserCacheKey(detail.thread.id, sessionProfileId);
     if (detailCacheKey) {
-      void writeSessionDetailCache(detailCacheKey, sanitizeSessionDetailForBrowserCache(detail), detail.cacheVersion);
+      void writeSessionDetailCache(
+        detailCacheKey,
+        conversationToSessionDetailPayload(nextConversation),
+        streamedStateAdvanced ? null : detail.cacheVersion
+      );
     }
     if (loadDraft) {
       await loadSavedDraft(
@@ -7029,7 +7364,18 @@
           };
           markConversationCacheDirty();
           if (summaryIsNewer || !isLiveConversationStatus(nextStatus)) {
-            scheduleSelectedSessionCompletionRefresh(summary.id);
+            const latestTurn = conversation.thread.turns.at(-1);
+            const summaryClaimsTerminal =
+              summary.status !== undefined &&
+              summary.status !== null &&
+              !isLiveConversationStatus(summary.status);
+            scheduleSelectedSessionCompletionRefresh(
+              summary.id,
+              summaryIsNewer ? null : (latestTurn?.id ?? null),
+              latestTurn ? (sessionTurnVersionsById[latestTurn.id] ?? null) : null,
+              summaryIsNewer,
+              summaryClaimsTerminal
+            );
           }
         }
         applySessionSummaryUpdate(summaryForList);

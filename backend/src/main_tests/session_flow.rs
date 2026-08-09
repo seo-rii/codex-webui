@@ -281,6 +281,9 @@ fn rollout_parser_preserves_tool_output_and_message_annotations() {
             records,
             truncated: false,
             corruption_detected: false,
+            trailing_incomplete: false,
+            changed_during_read: false,
+            file_size: 1,
             modified_at_ms: Some(1),
         },
         20,
@@ -5189,6 +5192,472 @@ async fn session_detail_uses_task_complete_last_agent_message_fallback() {
             .and_then(|item| item.get("text"))
             .and_then(Value::as_str),
         Some("final answer from task completion")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn latest_completed_turn_waits_for_rollout_settlement_and_returns_only_the_tail() {
+    let sandbox = unique_test_dir("session-latest-completed-turn");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000214";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join(format!("rollout-2026-04-24T01-17-00-{session_id}.jsonl"));
+    fs::write(
+        &rollout_path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:17:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:17:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:17:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-completion-tail"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:17:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "finish after the completion event"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:17:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "intermediate commentary that should stay deferred",
+                    "phase": "commentary"
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let pending = session_latest_completed_turn_payload(
+        &state,
+        "default",
+        session_id,
+        Some("turn-completion-tail"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(pending.get("settled").and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        pending.get("expectedTurnReady").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(pending.get("turn").is_some_and(Value::is_null));
+
+    {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .unwrap();
+        for record in [
+            json!({
+                "timestamp": "2026-04-24T01:17:05.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-queued-next"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:17:06.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "the queued follow-up started immediately"
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:17:07.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "the next turn is still running",
+                    "phase": "commentary"
+                }
+            }),
+        ] {
+            writeln!(file, "{record}").unwrap();
+        }
+        file.flush().unwrap();
+        file.sync_all().unwrap();
+    }
+    let inferred_previous_completion = session_latest_completed_turn_payload(
+        &state,
+        "default",
+        session_id,
+        Some("turn-completion-tail"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        inferred_previous_completion
+            .get("settled")
+            .and_then(Value::as_bool),
+        Some(false),
+        "a newer turn must not make an older turn look completed without its task_complete record"
+    );
+
+    let completed_record = json!({
+        "timestamp": "2026-04-24T01:17:04.000Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "turn_id": "turn-completion-tail",
+            "last_agent_message": "the final answer arrived after the first read",
+            "completed_at": 1_776_970_624_000_i64,
+            "duration_ms": 3_000
+        }
+    })
+    .to_string();
+    let split_at = completed_record.len() / 2;
+    {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .unwrap();
+        file.write_all(completed_record[..split_at].as_bytes())
+            .unwrap();
+        file.flush().unwrap();
+    }
+    let partial = session_latest_completed_turn_payload(
+        &state,
+        "default",
+        session_id,
+        Some("turn-completion-tail"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(partial.get("settled").and_then(Value::as_bool), Some(false));
+    assert!(partial.get("turn").is_some_and(Value::is_null));
+
+    {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .unwrap();
+        file.write_all(completed_record[split_at..].as_bytes())
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        file.flush().unwrap();
+        file.sync_all().unwrap();
+    }
+    let settled = session_latest_completed_turn_payload(
+        &state,
+        "default",
+        session_id,
+        Some("turn-completion-tail"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(settled.get("settled").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        settled.get("sourceStable").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        settled.get("expectedTurnReady").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        settled
+            .get("turn")
+            .and_then(|turn| turn.get("items"))
+            .and_then(Value::as_array)
+            .and_then(|items| items
+                .iter()
+                .find(|item| { item.get("type").and_then(Value::as_str) == Some("agentMessage") }))
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str),
+        Some("the final answer arrived after the first read")
+    );
+    assert_eq!(
+        settled
+            .get("turn")
+            .and_then(|turn| turn.get("items"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+                    .count()
+            }),
+        Some(1)
+    );
+    assert!(
+        settled
+            .get("turn")
+            .and_then(|turn| turn.get("items"))
+            .and_then(Value::as_array)
+            .and_then(|items| items
+                .iter()
+                .find(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage")))
+            .and_then(|item| item.get("completionLineage"))
+            .and_then(Value::as_str)
+            .is_some_and(|lineage| lineage.starts_with("turn-completion-tail:final-agent:"))
+    );
+    assert_eq!(
+        settled
+            .get("turn")
+            .and_then(|turn| turn.get("hiddenItemCount"))
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    let completion_version = settled
+        .get("completionVersion")
+        .and_then(Value::as_str)
+        .unwrap();
+
+    let previous_completion_while_next_turn_runs = session_latest_completed_turn_payload(
+        &state,
+        "default",
+        session_id,
+        Some("turn-completion-tail"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        previous_completion_while_next_turn_runs
+            .get("turnId")
+            .and_then(Value::as_str),
+        Some("turn-completion-tail")
+    );
+    assert_eq!(
+        previous_completion_while_next_turn_runs
+            .get("settled")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        previous_completion_while_next_turn_runs
+            .get("completionVersion")
+            .and_then(Value::as_str),
+        Some(completion_version)
+    );
+
+    let generic_latest =
+        session_latest_completed_turn_payload(&state, "default", session_id, None, None)
+            .await
+            .unwrap();
+    assert_eq!(
+        generic_latest.get("turnId").and_then(Value::as_str),
+        Some("turn-queued-next")
+    );
+    assert_eq!(
+        generic_latest.get("settled").and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let irrelevant_record = json!({
+        "timestamp": "2026-04-24T01:17:08.000Z",
+        "type": "response_item",
+        "payload": {
+            "type": "reasoning",
+            "summary": ["still being appended"]
+        }
+    })
+    .to_string();
+    let irrelevant_split = irrelevant_record.len() / 2;
+    {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .unwrap();
+        file.write_all(irrelevant_record[..irrelevant_split].as_bytes())
+            .unwrap();
+        file.flush().unwrap();
+    }
+    let unstable_tail = session_latest_completed_turn_payload(
+        &state,
+        "default",
+        session_id,
+        Some("turn-completion-tail"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        unstable_tail.get("sourceStable").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        unstable_tail.get("settled").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(unstable_tail.get("turn").is_some_and(Value::is_null));
+
+    {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .unwrap();
+        file.write_all(irrelevant_record[irrelevant_split..].as_bytes())
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        file.flush().unwrap();
+        file.sync_all().unwrap();
+    }
+    let unchanged = session_latest_completed_turn_payload(
+        &state,
+        "default",
+        session_id,
+        Some("turn-completion-tail"),
+        Some(completion_version),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        unchanged.get("notModified").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(unchanged.get("turn").is_some_and(Value::is_null));
+
+    let missing_target = session_latest_completed_turn_payload(
+        &state,
+        "default",
+        session_id,
+        Some("turn-that-does-not-exist"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        missing_target
+            .get("expectedTurnReady")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(missing_target.get("turnId").is_some_and(Value::is_null));
+    assert!(missing_target.get("turn").is_some_and(Value::is_null));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn latest_completed_turn_recovers_a_final_reply_beyond_the_initial_tail_window() {
+    const INITIAL_COMPLETION_TAIL_BYTES: usize = 512 * 1024;
+
+    let sandbox = unique_test_dir("session-latest-completed-turn-truncated-tail");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000215";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join(format!("rollout-2026-04-24T01-18-00-{session_id}.jsonl"));
+    let large_irrelevant_record = json!({
+        "timestamp": "2026-04-24T01:18:02.000Z",
+        "type": "response_item",
+        "payload": {
+            "type": "reasoning",
+            "encrypted_content": "x".repeat(INITIAL_COMPLETION_TAIL_BYTES + 64 * 1024)
+        }
+    });
+    fs::write(
+        &rollout_path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:18:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:18:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:18:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-truncated-tail"
+                }
+            }),
+            large_irrelevant_record,
+            json!({
+                "timestamp": "2026-04-24T01:18:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-truncated-tail",
+                    "last_agent_message": "the final answer survives a truncated completion tail"
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let payload = session_latest_completed_turn_payload(&state, "default", session_id, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(payload.get("settled").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        payload.get("turnId").and_then(Value::as_str),
+        Some("turn-truncated-tail")
+    );
+    assert!(payload.get("turnPosition").is_some_and(Value::is_null));
+    assert_eq!(
+        payload
+            .get("turn")
+            .and_then(|turn| turn.get("items"))
+            .and_then(Value::as_array)
+            .and_then(|items| items.last())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str),
+        Some("the final answer survives a truncated completion tail")
+    );
+    assert!(
+        payload
+            .get("rolloutRevision")
+            .and_then(|revision| revision.get("size"))
+            .and_then(Value::as_u64)
+            .is_some_and(|size| size > INITIAL_COMPLETION_TAIL_BYTES as u64)
     );
 
     let _ = fs::remove_dir_all(sandbox);

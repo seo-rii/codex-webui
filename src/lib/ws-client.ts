@@ -139,6 +139,7 @@ const DEDUPED_READ_METHODS = new Set([
   "session/get",
   "session/goal/get",
   "session/itemDetail/get",
+  "session/latestCompletedTurn/get",
   "session/olderTurns/get",
   "session/queue/get",
   "session/rollbackTargets/list",

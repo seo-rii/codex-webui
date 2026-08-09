@@ -1800,6 +1800,7 @@ fn viewer_websocket_permissions_are_session_observation_only() {
         "session/get",
         "session/olderTurns/get",
         "session/turn/get",
+        "session/latestCompletedTurn/get",
         "session/itemDetail/get",
         "notifications/list",
         "session/subscribe",

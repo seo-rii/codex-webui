@@ -2,6 +2,7 @@ use super::*;
 
 const SESSION_DETAIL_ROLLOUT_TAIL_INITIAL_BYTES: u64 = 8 * 1024 * 1024;
 const SESSION_DETAIL_ROLLOUT_TAIL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const SESSION_COMPLETION_ROLLOUT_TAIL_INITIAL_BYTES: u64 = 512 * 1024;
 const SESSION_DETAIL_GOAL_TIMEOUT_MS: u64 = 150;
 const SESSION_DETAIL_ACTIVE_RECONCILE_TIMEOUT_MS: u64 = 1_000;
 const SESSION_DETAIL_INLINE_IMAGE_RESULT_MAX_CHARS: usize = 256 * 1024;
@@ -17,6 +18,9 @@ pub(crate) struct LocalRolloutTurnWindow {
     pub(crate) loaded_start: usize,
     pub(crate) known_total_turns: Option<usize>,
     pub(crate) truncated: bool,
+    pub(crate) trailing_incomplete: bool,
+    pub(crate) changed_during_read: bool,
+    pub(crate) file_size: u64,
     pub(crate) token_usage: Value,
     pub(crate) recovery: Option<RolloutRecoveryInfoPayload>,
     pub(crate) modified_at_ms: Option<u64>,
@@ -31,6 +35,9 @@ pub(crate) struct RolloutRecordWindow {
     pub(crate) records: Vec<RolloutRecord>,
     pub(crate) truncated: bool,
     pub(crate) corruption_detected: bool,
+    pub(crate) trailing_incomplete: bool,
+    pub(crate) changed_during_read: bool,
+    pub(crate) file_size: u64,
     pub(crate) modified_at_ms: Option<u64>,
 }
 
@@ -202,6 +209,80 @@ pub(crate) fn summarize_session_turn_for_detail_payload(
         Value::from(hidden_item_count),
     );
     Value::Object(summarized)
+}
+
+fn summarize_completed_turn_tail_payload(turn: &Value, turn_index: usize) -> Value {
+    let mut summarized = summarize_session_turn_for_detail_payload(
+        turn,
+        turn_index,
+        SessionTurnDetailMode::Collapsed,
+    );
+    let Some(turn_object) = summarized.as_object_mut() else {
+        return summarized;
+    };
+    let turn_id = turn_object
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("turn")
+        .to_string();
+    let items = turn_object
+        .remove("items")
+        .and_then(|items| items.as_array().cloned())
+        .unwrap_or_default();
+    let final_agent_index = items
+        .iter()
+        .rposition(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"));
+    let mut additionally_hidden = 0usize;
+    let visible_items = items
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, mut item)| {
+            let item_type = item.get("type").and_then(Value::as_str);
+            if item_type == Some("userMessage")
+                || (item_type == Some("agentMessage") && final_agent_index == Some(index))
+            {
+                if item_type == Some("agentMessage") {
+                    let text = item.get("text").and_then(Value::as_str).unwrap_or_default();
+                    let content_version = payload_cache_version(&json!({
+                        "turnId": turn_id,
+                        "type": "agentMessage",
+                        "text": text,
+                    }));
+                    if let Some(item_object) = item.as_object_mut() {
+                        item_object.insert(
+                            "completionLineage".to_string(),
+                            Value::String(format!("{turn_id}:final-agent:{content_version}")),
+                        );
+                    }
+                }
+                return Some(item);
+            }
+            additionally_hidden = additionally_hidden.saturating_add(1);
+            None
+        })
+        .collect::<Vec<_>>();
+    let hidden_item_count = turn_object
+        .get("hiddenItemCount")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .saturating_add(additionally_hidden as u64);
+    turn_object.insert("items".to_string(), Value::Array(visible_items));
+    turn_object.insert(
+        "hiddenItemCount".to_string(),
+        Value::from(hidden_item_count),
+    );
+    turn_object.insert(
+        "detailState".to_string(),
+        Value::String(
+            if hidden_item_count > 0 {
+                "summary"
+            } else {
+                "full"
+            }
+            .to_string(),
+        ),
+    );
+    summarized
 }
 
 fn summarize_turn_for_rollback_target(turn: &Value) -> String {
@@ -673,6 +754,42 @@ fn rollout_tail_records(
     target_turns: usize,
     max_bytes: u64,
 ) -> Result<RolloutRecordWindow, String> {
+    rollout_tail_records_with_filter(
+        path,
+        target_turns,
+        SESSION_DETAIL_ROLLOUT_TAIL_INITIAL_BYTES,
+        max_bytes,
+        None,
+        rollout_tail_line_may_affect_detail,
+        false,
+    )
+}
+
+fn rollout_completion_tail_records(
+    path: &Path,
+    expected_turn_id: Option<&str>,
+    max_bytes: u64,
+) -> Result<RolloutRecordWindow, String> {
+    rollout_tail_records_with_filter(
+        path,
+        1,
+        SESSION_COMPLETION_ROLLOUT_TAIL_INITIAL_BYTES,
+        max_bytes,
+        expected_turn_id,
+        rollout_tail_line_may_affect_completion,
+        true,
+    )
+}
+
+fn rollout_tail_records_with_filter(
+    path: &Path,
+    target_turns: usize,
+    initial_bytes: u64,
+    max_bytes: u64,
+    expected_turn_id: Option<&str>,
+    line_filter: fn(&str) -> bool,
+    stop_at_target_turn_count: bool,
+) -> Result<RolloutRecordWindow, String> {
     let metadata =
         fs::metadata(path).map_err(|error| format!("failed to stat rollout file: {error}"))?;
     let file_len = metadata.len();
@@ -681,7 +798,7 @@ fn rollout_tail_records(
         .ok()
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-    let mut window = SESSION_DETAIL_ROLLOUT_TAIL_INITIAL_BYTES.min(file_len.max(1));
+    let mut window = initial_bytes.min(file_len.max(1));
     let target_turns = target_turns.max(1);
 
     loop {
@@ -713,6 +830,7 @@ fn rollout_tail_records(
         }
         let mut records = Vec::new();
         let mut corruption_detected = false;
+        let mut trailing_incomplete = false;
         while cursor < buffer.len() {
             let line_start = cursor;
             let next_newline = buffer[cursor..]
@@ -734,22 +852,29 @@ fn rollout_tail_records(
                 continue;
             }
             let Ok(text) = std::str::from_utf8(line) else {
-                if !trailing_without_newline {
+                if trailing_without_newline {
+                    trailing_incomplete = true;
+                } else {
                     corruption_detected = true;
                 }
                 continue;
             };
             let trimmed = text.trim();
+            // A filtered record can still be the line Codex is currently appending.
+            // Validate it before deciding whether it belongs in the compact view.
             let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
                 // Codex may currently be appending this final record. Ignore an
                 // incomplete trailing line, but accept a complete JSON value even
                 // when the process exited before writing its final newline.
-                if !trailing_without_newline {
+                if trailing_without_newline {
+                    trailing_incomplete = true;
+                } else {
                     corruption_detected = true;
                 }
                 continue;
             };
-            if rollout_tail_line_may_affect_detail(trimmed) {
+            let line_is_relevant = line_filter(trimmed);
+            if line_is_relevant {
                 records.push(RolloutRecord {
                     value,
                     absolute_offset: start.saturating_add(line_start as u64),
@@ -768,11 +893,53 @@ fn rollout_tail_records(
                         == Some("task_started")
             })
             .count();
-        if start == 0 || started_turn_count > target_turns || window >= max_bytes.min(file_len) {
+        let completed_turn_count = records
+            .iter()
+            .filter(|record| {
+                record.value.get("type").and_then(Value::as_str) == Some("event_msg")
+                    && record
+                        .value
+                        .get("payload")
+                        .and_then(|payload| payload.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("task_complete")
+            })
+            .count();
+        let expected_turn_seen = expected_turn_id.is_some_and(|expected_turn_id| {
+            records.iter().any(|record| {
+                record
+                    .value
+                    .get("payload")
+                    .and_then(|payload| payload.get("turn_id"))
+                    .and_then(Value::as_str)
+                    == Some(expected_turn_id)
+            })
+        });
+        let enough_turn_boundaries = if stop_at_target_turn_count {
+            started_turn_count >= target_turns || completed_turn_count >= target_turns
+        } else {
+            started_turn_count > target_turns
+        };
+        if start == 0
+            || expected_turn_seen
+            || (expected_turn_id.is_none() && enough_turn_boundaries)
+            || window >= max_bytes.min(file_len)
+        {
+            let metadata_after = fs::metadata(path)
+                .map_err(|error| format!("failed to restat rollout file: {error}"))?;
+            let modified_at_ms_after = metadata_after
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok());
             return Ok(RolloutRecordWindow {
                 records,
                 truncated: start > 0,
                 corruption_detected,
+                trailing_incomplete,
+                changed_during_read: metadata_after.len() != file_len
+                    || modified_at_ms_after != modified_at_ms,
+                file_size: file_len,
                 modified_at_ms,
             });
         }
@@ -813,6 +980,20 @@ fn rollout_tail_line_may_affect_detail(line: &str) -> bool {
         || line.contains(r#""type": "thread_rolled_back""#)
 }
 
+fn rollout_tail_line_may_affect_completion(line: &str) -> bool {
+    (line.contains(r#""type":"event_msg""#) || line.contains(r#""type": "event_msg""#))
+        && [
+            "task_started",
+            "user_message",
+            "agent_message",
+            "task_complete",
+            r#""type":"error""#,
+            r#""type": "error""#,
+        ]
+        .iter()
+        .any(|marker| line.contains(marker))
+}
+
 pub(crate) fn build_turn_window_from_rollout_records(
     record_window: RolloutRecordWindow,
     limit: usize,
@@ -821,6 +1002,9 @@ pub(crate) fn build_turn_window_from_rollout_records(
         records,
         truncated,
         corruption_detected: _,
+        trailing_incomplete,
+        changed_during_read,
+        file_size,
         modified_at_ms,
     } = record_window;
     let mut turns = Vec::new();
@@ -873,6 +1057,10 @@ pub(crate) fn build_turn_window_from_rollout_records(
                 // records back to the completed turn.
                 current_index = previous_current_index;
                 if let Some(turn) = turns.get_mut(index).and_then(Value::as_object_mut) {
+                    turn.insert(
+                        "completionRecordOffset".to_string(),
+                        Value::from(record_identity),
+                    );
                     if turn.get("status").and_then(Value::as_str) != Some("failed") {
                         turn.insert("status".to_string(), json!("completed"));
                     }
@@ -1480,6 +1668,9 @@ pub(crate) fn build_turn_window_from_rollout_records(
         loaded_start,
         known_total_turns,
         truncated,
+        trailing_incomplete,
+        changed_during_read,
+        file_size,
         token_usage,
         recovery: None,
         modified_at_ms,
@@ -1496,6 +1687,38 @@ pub(crate) async fn read_local_rollout_turn_window(
         SESSION_DETAIL_ROLLOUT_TAIL_MAX_BYTES,
     )
     .await
+}
+
+async fn read_local_rollout_completion_turn(
+    rollout_path: PathBuf,
+    expected_turn_id: Option<String>,
+) -> ApiResult<LocalRolloutTurnWindow> {
+    tokio::task::spawn_blocking(move || {
+        let record_window = rollout_completion_tail_records(
+            &rollout_path,
+            expected_turn_id.as_deref(),
+            SESSION_DETAIL_ROLLOUT_TAIL_MAX_BYTES,
+        )?;
+        let limit = if expected_turn_id.is_some() {
+            usize::MAX
+        } else {
+            1
+        };
+        Ok::<_, String>(build_turn_window_from_rollout_records(record_window, limit))
+    })
+    .await
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load the local session completion tail: {error}"),
+        )
+    })?
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load the local session completion tail: {error}"),
+        )
+    })
 }
 
 async fn read_local_rollout_turn_window_with_max(
@@ -1671,6 +1894,49 @@ async fn read_local_session_detail_source(
     };
     let turns = read_local_rollout_turn_window(rollout_path, limit.clamp(1, 200) as usize).await?;
     Ok(Some((thread, turns)))
+}
+
+async fn read_local_session_completion_source(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    expected_turn_id: Option<&str>,
+) -> ApiResult<Option<(Value, LocalRolloutTurnWindow)>> {
+    if let Some(rollout_path) =
+        find_rollout_path_by_session_id(state, profile_id, session_id).await?
+    {
+        let thread = read_local_thread_metadata_payload(state, profile_id, session_id)
+            .await?
+            .unwrap_or_else(|| {
+                json!({
+                    "id": session_id,
+                    "name": Value::Null,
+                    "preview": "",
+                    "cwd": Value::Null,
+                    "status": "completed",
+                    "createdAt": 0,
+                    "updatedAt": 0,
+                    "archived": false,
+                    "turns": []
+                })
+            });
+        let turn =
+            read_local_rollout_completion_turn(rollout_path, expected_turn_id.map(str::to_string))
+                .await?;
+        return Ok(Some((thread, turn)));
+    }
+
+    let Some(thread) = read_local_thread_metadata_payload(state, profile_id, session_id).await?
+    else {
+        return Ok(None);
+    };
+    let Some(rollout_path) = resolve_rollout_path(state, profile_id, session_id, &thread) else {
+        return Ok(None);
+    };
+    let turn =
+        read_local_rollout_completion_turn(rollout_path, expected_turn_id.map(str::to_string))
+            .await?;
+    Ok(Some((thread, turn)))
 }
 
 pub(crate) async fn local_session_diagnostics_payload(
@@ -2665,6 +2931,152 @@ pub(crate) async fn session_turn_payload(
             0,
             SessionTurnDetailMode::Expanded,
         )
+    }))
+}
+
+pub(crate) async fn session_latest_completed_turn_payload(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    expected_turn_id: Option<&str>,
+    known_completion_version: Option<&str>,
+) -> ApiResult<Value> {
+    let expected_turn_id = expected_turn_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some((thread, turn_window)) =
+        read_local_session_completion_source(state, profile_id, session_id, expected_turn_id)
+            .await?
+    else {
+        return Ok(json!({
+            "sessionId": session_id,
+            "profileId": profile_id,
+            "targetTurnId": expected_turn_id,
+            "threadStatus": "unknown",
+            "threadUpdatedAt": Value::Null,
+            "turn": Value::Null,
+            "turnId": Value::Null,
+            "turnPosition": Value::Null,
+            "completionVersion": Value::Null,
+            "settled": false,
+            "expectedTurnReady": false,
+            "sourceStable": false,
+            "notModified": false,
+            "retryAfterMs": 750,
+            "rolloutRevision": Value::Null
+        }));
+    };
+
+    let raw_turn_index = expected_turn_id
+        .and_then(|expected_turn_id| {
+            turn_window
+                .turns
+                .iter()
+                .position(|turn| turn.get("id").and_then(Value::as_str) == Some(expected_turn_id))
+        })
+        .or_else(|| {
+            expected_turn_id
+                .is_none()
+                .then(|| turn_window.turns.len().checked_sub(1))
+                .flatten()
+        });
+    let raw_turn = raw_turn_index
+        .and_then(|index| turn_window.turns.get(index))
+        .cloned();
+    let turn_id = raw_turn
+        .as_ref()
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str);
+    let turn_status = raw_turn
+        .as_ref()
+        .and_then(|turn| turn.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let turn_is_terminal = !matches!(
+        turn_status,
+        "" | "inProgress" | "running" | "active" | "pending" | "starting"
+    );
+    let turn_has_terminal_content = raw_turn.as_ref().is_some_and(|turn| {
+        session_turn_has_visible_agent_output(turn)
+            || turn.get("error").is_some_and(|error| !error.is_null())
+    });
+    let completion_record_observed = raw_turn
+        .as_ref()
+        .and_then(|turn| turn.get("completionRecordOffset"))
+        .and_then(Value::as_u64)
+        .is_some();
+    let expected_turn_matches = expected_turn_id.is_none_or(|expected| turn_id == Some(expected));
+    let source_stable = !turn_window.trailing_incomplete && !turn_window.changed_during_read;
+    let thread_updated_at = thread.get("updatedAt").and_then(Value::as_u64);
+    let turn_completed_at = raw_turn
+        .as_ref()
+        .and_then(|turn| turn.get("completedAt"))
+        .and_then(Value::as_u64);
+    let settled = expected_turn_matches
+        && completion_record_observed
+        && turn_is_terminal
+        && turn_has_terminal_content
+        && source_stable;
+    let summarized_turn = settled.then(|| {
+        summarize_completed_turn_tail_payload(
+            raw_turn
+                .as_ref()
+                .expect("a settled completion must have a turn"),
+            turn_window
+                .loaded_start
+                .saturating_add(raw_turn_index.unwrap_or_default()),
+        )
+    });
+    let completion_version = summarized_turn.as_ref().map(payload_cache_version);
+    let not_modified = settled
+        && completion_version.as_deref().is_some_and(|version| {
+            known_completion_version
+                .map(str::trim)
+                .is_some_and(|known| !known.is_empty() && known == version)
+        });
+    let metadata_status = normalized_thread_status(thread.get("status"));
+    let completion_targets_current_tail =
+        raw_turn_index.is_some_and(|index| index.saturating_add(1) == turn_window.turns.len());
+    let resolved_thread_status = if settled
+        && completion_targets_current_tail
+        && metadata_status.as_deref().is_none_or(|status| {
+            is_live_thread_status(status) || matches!(status, "notLoaded" | "unknown")
+        }) {
+        turn_status
+    } else {
+        metadata_status.as_deref().unwrap_or(if turn_is_terminal {
+            "completed"
+        } else {
+            "running"
+        })
+    };
+    let resolved_updated_at = thread_updated_at.into_iter().chain(turn_completed_at).max();
+
+    Ok(json!({
+        "sessionId": session_id,
+        "profileId": profile_id,
+        "targetTurnId": expected_turn_id,
+        "threadStatus": resolved_thread_status,
+        "threadUpdatedAt": resolved_updated_at,
+        "turn": if not_modified { Value::Null } else { summarized_turn.unwrap_or(Value::Null) },
+        "turnId": turn_id,
+        "turnPosition": (!turn_window.truncated)
+            .then(|| raw_turn_index.map(|index| turn_window.loaded_start.saturating_add(index)))
+            .flatten(),
+        "completionVersion": completion_version,
+        "settled": settled,
+        "expectedTurnReady": settled && expected_turn_matches,
+        "sourceStable": source_stable,
+        "notModified": not_modified,
+        "retryAfterMs": if turn_window.changed_during_read || turn_window.trailing_incomplete {
+            300
+        } else {
+            750
+        },
+        "rolloutRevision": {
+            "size": turn_window.file_size,
+            "modifiedAt": turn_window.modified_at_ms
+        }
     }))
 }
 

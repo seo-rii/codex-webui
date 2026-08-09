@@ -3,7 +3,8 @@ use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
 use anyhow::{Context, Result};
 use backend::codex_app_server::{
     AppServerClient, AppServerClientConfig, AppServerManager, AppServerNotification,
-    AppServerProfile, AppServerRequest, app_server_request_timed_out, app_server_timeout_recovered,
+    AppServerProfile, ObservedAppServerRequest, app_server_request_timed_out,
+    app_server_timeout_recovered,
 };
 use serde_json::{Value, json};
 #[cfg(target_os = "linux")]
@@ -43,9 +44,9 @@ async fn recv_notification(
 }
 
 async fn recv_request(
-    receiver: &mut broadcast::Receiver<AppServerRequest>,
+    receiver: &mut broadcast::Receiver<ObservedAppServerRequest>,
     method: &str,
-) -> Result<AppServerRequest> {
+) -> Result<ObservedAppServerRequest> {
     loop {
         let event = timeout(Duration::from_secs(2), receiver.recv())
             .await

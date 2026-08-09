@@ -1839,6 +1839,9 @@ async fn ws_approval_resolve_routes_by_actual_session_profile() {
             PendingServerRequestEntry {
                 raw_id: json!("srv-second"),
                 client_key: resolved_second_profile_id.clone(),
+                client_instance_id: None,
+                process_generation: None,
+                handoff_proxy: false,
                 method: "input/request".to_string(),
                 params: json!({
                     "threadId": session_id,
@@ -4562,6 +4565,9 @@ async fn app_server_exit_clears_cached_running_session_state() {
             PendingServerRequestEntry {
                 raw_id: json!("request-crashed"),
                 client_key: "default".to_string(),
+                client_instance_id: None,
+                process_generation: None,
+                handoff_proxy: false,
                 method: "input/request".to_string(),
                 params: json!({ "threadId": session_id }),
                 created_at: "2026-05-20T00:00:00Z".to_string(),

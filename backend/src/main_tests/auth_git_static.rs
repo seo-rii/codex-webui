@@ -3169,6 +3169,9 @@ async fn pending_server_requests_are_capped_per_session() {
                 PendingServerRequestEntry {
                     raw_id: json!(format!("request-{index}")),
                     client_key: "default".to_string(),
+                    client_instance_id: None,
+                    process_generation: None,
+                    handoff_proxy: false,
                     method: "item/commandExecution/requestApproval".to_string(),
                     params: json!({ "threadId": "thread-1" }),
                     created_at: index.to_string(),

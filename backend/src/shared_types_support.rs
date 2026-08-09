@@ -118,7 +118,7 @@ pub(crate) struct AppState {
     pub(crate) account_login_flows: Arc<Mutex<HashMap<String, PendingAccountLoginFlow>>>,
     pub(crate) shutdown_timers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(crate) runtime_profile_monitors:
-        Arc<std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+        Arc<std::sync::Mutex<HashMap<String, RuntimeProfileMonitorHandle>>>,
     pub(crate) preserve_app_servers_on_shutdown: Arc<AtomicBool>,
     pub(crate) shutdown_notify: Arc<Notify>,
     pub(crate) restart_plan: Arc<Mutex<Option<RestartPlan>>>,
@@ -153,6 +153,23 @@ pub(crate) struct RestartPlan {
     pub(crate) args: Vec<String>,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) mode: &'static str,
+}
+
+pub(crate) struct RuntimeProfileMonitorHandle {
+    pub(crate) client_instance_id: Option<u64>,
+    pub(crate) handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl RuntimeProfileMonitorHandle {
+    pub(crate) fn is_running(&self) -> bool {
+        !self.handles.is_empty() && self.handles.iter().all(|handle| !handle.is_finished())
+    }
+
+    pub(crate) fn abort(self) {
+        for handle in self.handles {
+            handle.abort();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -216,6 +233,9 @@ pub(crate) struct CachedGitRepositories {
 pub(crate) struct PendingServerRequestEntry {
     pub(crate) raw_id: Value,
     pub(crate) client_key: String,
+    pub(crate) client_instance_id: Option<u64>,
+    pub(crate) process_generation: Option<u64>,
+    pub(crate) handoff_proxy: bool,
     pub(crate) method: String,
     pub(crate) params: Value,
     pub(crate) created_at: String,

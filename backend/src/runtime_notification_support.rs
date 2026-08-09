@@ -1864,12 +1864,50 @@ pub(crate) async fn restore_runtime_profile_state(state: AppState, profile_id: S
     emit_runtime_profile_config_updated(&state, &profile_id).await;
 }
 
+async fn runtime_profile_monitor_instance_is_current(
+    state: &AppState,
+    profile_id: &str,
+    client_key: &str,
+    client_instance_id: u64,
+) -> bool {
+    state
+        .app_servers
+        .client_instance_id(profile_id, client_key)
+        .await
+        == Some(client_instance_id)
+}
+
+pub(crate) async fn handle_profile_server_request_batch(
+    state: &AppState,
+    profile_id: &str,
+    client_key: &str,
+    client_instance_id: u64,
+    requests: Vec<backend::codex_app_server::ObservedAppServerRequest>,
+) -> bool {
+    for request in requests {
+        if !runtime_profile_monitor_instance_is_current(
+            state,
+            profile_id,
+            client_key,
+            client_instance_id,
+        )
+        .await
+        {
+            return false;
+        }
+        handle_profile_observed_server_request(state, profile_id, client_key, &request).await;
+    }
+    true
+}
+
 pub(crate) fn register_runtime_profile_monitor(
     state: &AppState,
     profile_id: &str,
     client_key: &str,
+    client_instance_id: u64,
     mut notifications: broadcast::Receiver<AppServerNotification>,
-    mut requests: broadcast::Receiver<backend::codex_app_server::AppServerRequest>,
+    mut requests: broadcast::Receiver<backend::codex_app_server::ObservedAppServerRequest>,
+    initial_requests: Vec<backend::codex_app_server::ObservedAppServerRequest>,
 ) {
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id)
         .0
@@ -1879,23 +1917,22 @@ pub(crate) fn register_runtime_profile_monitor(
         warn!("runtime profile monitor registry is poisoned for {resolved_profile_id}");
         return;
     };
-    if monitors
-        .get(&monitor_key)
-        .is_some_and(|handle| !handle.is_finished())
-    {
+    if monitors.get(&monitor_key).is_some_and(|monitor| {
+        monitor.client_instance_id == Some(client_instance_id) && monitor.is_running()
+    }) {
         return;
     }
-    if let Some(handle) = monitors.remove(&monitor_key) {
-        handle.abort();
+    if let Some(monitor) = monitors.remove(&monitor_key) {
+        monitor.abort();
     }
 
     let maintenance_key = format!("{resolved_profile_id}::__profile_maintenance");
     if !monitors
         .get(&maintenance_key)
-        .is_some_and(|handle| !handle.is_finished())
+        .is_some_and(RuntimeProfileMonitorHandle::is_running)
     {
-        if let Some(handle) = monitors.remove(&maintenance_key) {
-            handle.abort();
+        if let Some(monitor) = monitors.remove(&maintenance_key) {
+            monitor.abort();
         }
         let maintenance_state = state.clone();
         let maintenance_profile_id = resolved_profile_id.clone();
@@ -1942,89 +1979,149 @@ pub(crate) fn register_runtime_profile_monitor(
                 }
             }
         });
-        monitors.insert(maintenance_key, maintenance_handle);
+        monitors.insert(
+            maintenance_key,
+            RuntimeProfileMonitorHandle {
+                client_instance_id: None,
+                handles: vec![maintenance_handle],
+            },
+        );
     }
 
-    let monitor_state = state.clone();
-    let monitor_profile_id = resolved_profile_id.clone();
-    let monitor_client_key = client_key.to_string();
-    let handle = tokio::spawn(async move {
+    let notification_state = state.clone();
+    let notification_profile_id = resolved_profile_id.clone();
+    let notification_client_key = client_key.to_string();
+    let notification_handle = tokio::spawn(async move {
         loop {
-            tokio::select! {
-                notification = notifications.recv() => match notification {
-                    Ok(notification) => {
-                        if notification.method == "codex-webui/app-server/exited" {
-                            let affected_session_ids =
-                                clear_runtime_activity_after_app_server_client_exit(
-                                &monitor_state,
-                                &monitor_profile_id,
-                                &monitor_client_key,
-                                notification.params.get("reason").and_then(Value::as_str),
-                            )
-                            .await;
-                            for session_id in affected_session_ids {
-                                emit_session_summary_updated(
-                                    &monitor_state,
-                                    &monitor_profile_id,
-                                    &session_id,
-                                    None,
-                                    Some("failed"),
+            let notification = match notifications.recv().await {
+                Ok(notification) => notification,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        "runtime app-server relay lagged for {notification_profile_id}: skipped {skipped} messages"
+                    );
+                    emit_profile_global_notification(
+                        &notification_state,
+                        &notification_profile_id,
+                        json!({
+                            "kind": "notification",
+                            "method": "codex-webui/resyncRequired",
+                            "params": {
+                                "reason": format!(
+                                    "runtime app-server relay lagged for {notification_profile_id}; skipped {skipped} messages"
                                 )
-                                .await;
                             }
-                        } else {
-                            handle_profile_runtime_notification(
-                                &monitor_state,
-                                &monitor_profile_id,
-                                &notification,
-                            )
-                            .await;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(
-                            "runtime app-server relay lagged for {monitor_profile_id}: skipped {skipped} messages"
-                        );
-                        // This receiver can lag independently of the lightweight global
-                        // receiver, so it must publish its own gap signal. Reconciliation stays
-                        // in the bounded maintenance task to avoid adding more app-server RPCs
-                        // while the notification path is already overloaded.
-                        emit_profile_global_notification(
-                            &monitor_state,
-                            &monitor_profile_id,
-                            json!({
-                                "kind": "notification",
-                                "method": "codex-webui/resyncRequired",
-                                "params": {
-                                    "reason": format!(
-                                        "runtime app-server relay lagged for {monitor_profile_id}; skipped {skipped} messages"
-                                    )
-                                }
-                            }),
-                        )
-                        .await;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
-                request = requests.recv() => match request {
-                    Ok(request) => {
-                        handle_profile_server_request(
-                            &monitor_state,
-                            &monitor_profile_id,
-                            &monitor_client_key,
-                            &request,
-                        )
-                            .await;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(
-                            "runtime app-server request relay lagged for {monitor_profile_id}: skipped {skipped} messages"
-                        );
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
+                        }),
+                    )
+                    .await;
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            if !runtime_profile_monitor_instance_is_current(
+                &notification_state,
+                &notification_profile_id,
+                &notification_client_key,
+                client_instance_id,
+            )
+            .await
+            {
+                break;
+            }
+            if notification.method == "codex-webui/app-server/exited" {
+                let affected_session_ids = clear_runtime_activity_after_app_server_client_exit(
+                    &notification_state,
+                    &notification_profile_id,
+                    &notification_client_key,
+                    notification.params.get("reason").and_then(Value::as_str),
+                )
+                .await;
+                for session_id in affected_session_ids {
+                    emit_session_summary_updated(
+                        &notification_state,
+                        &notification_profile_id,
+                        &session_id,
+                        None,
+                        Some("failed"),
+                    )
+                    .await;
+                }
+            } else {
+                handle_profile_runtime_notification(
+                    &notification_state,
+                    &notification_profile_id,
+                    &notification,
+                )
+                .await;
             }
         }
     });
-    monitors.insert(monitor_key, handle);
+
+    let request_state = state.clone();
+    let request_profile_id = resolved_profile_id.clone();
+    let request_client_key = client_key.to_string();
+    let request_handle = tokio::spawn(async move {
+        if !handle_profile_server_request_batch(
+            &request_state,
+            &request_profile_id,
+            &request_client_key,
+            client_instance_id,
+            initial_requests,
+        )
+        .await
+        {
+            return;
+        }
+        loop {
+            match requests.recv().await {
+                Ok(request) => {
+                    if !handle_profile_server_request_batch(
+                        &request_state,
+                        &request_profile_id,
+                        &request_client_key,
+                        client_instance_id,
+                        vec![request],
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        "runtime app-server request relay lagged for {request_profile_id}: skipped {skipped} messages; replaying pending requests"
+                    );
+                    let Some(pending_requests) = request_state
+                        .app_servers
+                        .pending_server_requests_for_client(
+                            &request_profile_id,
+                            &request_client_key,
+                            client_instance_id,
+                        )
+                        .await
+                    else {
+                        break;
+                    };
+                    if !handle_profile_server_request_batch(
+                        &request_state,
+                        &request_profile_id,
+                        &request_client_key,
+                        client_instance_id,
+                        pending_requests,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    monitors.insert(
+        monitor_key,
+        RuntimeProfileMonitorHandle {
+            client_instance_id: Some(client_instance_id),
+            handles: vec![notification_handle, request_handle],
+        },
+    );
 }

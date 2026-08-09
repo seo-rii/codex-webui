@@ -14,8 +14,18 @@ fn resolved_server_request_tombstone_key(
     state: &AppState,
     runtime_key: &str,
     request_id: &str,
+    source: Option<&backend::codex_app_server::ObservedAppServerRequest>,
 ) -> String {
-    format!("{state:p}:{runtime_key}:{request_id}")
+    let state_identity = Arc::as_ptr(&state.pending_server_requests) as usize;
+    let source = source
+        .map(|source| {
+            format!(
+                "{}:{}",
+                source.client_instance_id, source.process_generation
+            )
+        })
+        .unwrap_or_else(|| "*".to_string());
+    format!("{state_identity:x}:{runtime_key}:{request_id}:{source}")
 }
 
 fn pending_request_id(raw_id: &Value) -> String {
@@ -23,6 +33,55 @@ fn pending_request_id(raw_id: &Value) -> String {
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| raw_id.to_string())
+}
+
+async fn observed_server_request_source(
+    state: &AppState,
+    profile_id: &str,
+    runtime_key: &str,
+    request_id: &str,
+) -> Option<backend::codex_app_server::ObservedAppServerRequest> {
+    let client_key = state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .get(runtime_key)
+        .cloned()?;
+    let client_instance_id = state
+        .app_servers
+        .client_instance_id(profile_id, &client_key)
+        .await?;
+    state
+        .app_servers
+        .pending_server_requests_for_client(profile_id, &client_key, client_instance_id)
+        .await?
+        .into_iter()
+        .find(|request| pending_request_id(&request.id) == request_id)
+}
+
+pub(crate) async fn record_resolved_server_request_tombstone(
+    state: &AppState,
+    runtime_key: &str,
+    request_id: &str,
+    source: Option<&backend::codex_app_server::ObservedAppServerRequest>,
+) {
+    let tombstone_key =
+        resolved_server_request_tombstone_key(state, runtime_key, request_id, source);
+    let now = now_unix_ms();
+    let mut tombstones = resolved_server_request_tombstones().lock().await;
+    tombstones.retain(|_, resolved_at| {
+        now.saturating_sub(*resolved_at) <= RESOLVED_SERVER_REQUEST_TOMBSTONE_TTL_MS
+    });
+    if tombstones.len() >= RESOLVED_SERVER_REQUEST_TOMBSTONE_LIMIT {
+        if let Some(oldest_key) = tombstones
+            .iter()
+            .min_by_key(|(_, resolved_at)| **resolved_at)
+            .map(|(key, _)| key.clone())
+        {
+            tombstones.remove(&oldest_key);
+        }
+    }
+    tombstones.insert(tombstone_key, now);
 }
 
 pub(crate) async fn set_session_highlight(
@@ -89,24 +148,9 @@ pub(crate) async fn handle_server_request_resolved_notification(
         &resolve_runtime_profile_entry(&state.config, profile_id).0,
         session_id,
     );
-    let tombstone_key = resolved_server_request_tombstone_key(state, &runtime_key, &request_id);
-    let now = now_unix_ms();
-    {
-        let mut tombstones = resolved_server_request_tombstones().lock().await;
-        tombstones.retain(|_, resolved_at| {
-            now.saturating_sub(*resolved_at) <= RESOLVED_SERVER_REQUEST_TOMBSTONE_TTL_MS
-        });
-        if tombstones.len() >= RESOLVED_SERVER_REQUEST_TOMBSTONE_LIMIT {
-            if let Some(oldest_key) = tombstones
-                .iter()
-                .min_by_key(|(_, resolved_at)| **resolved_at)
-                .map(|(key, _)| key.clone())
-            {
-                tombstones.remove(&oldest_key);
-            }
-        }
-        tombstones.insert(tombstone_key, now);
-    }
+    let source = observed_server_request_source(state, profile_id, &runtime_key, &request_id).await;
+    record_resolved_server_request_tombstone(state, &runtime_key, &request_id, source.as_ref())
+        .await;
 
     let remaining = {
         let mut pending_requests = state.pending_server_requests.lock().await;
@@ -260,12 +304,90 @@ async fn session_accepts_server_request(
             .is_some_and(|assigned_client_key| assigned_client_key == client_key)
 }
 
+async fn respond_to_profile_server_request(
+    client: &backend::codex_app_server::AppServerClient,
+    request: &backend::codex_app_server::AppServerRequest,
+    source: Option<&backend::codex_app_server::ObservedAppServerRequest>,
+    result: Value,
+) -> Result<()> {
+    if let Some(source) = source {
+        client.respond_observed(source, result).await
+    } else {
+        client.respond(request.id.clone(), result).await
+    }
+}
+
+async fn reject_profile_server_request(
+    client: &backend::codex_app_server::AppServerClient,
+    request: &backend::codex_app_server::AppServerRequest,
+    source: Option<&backend::codex_app_server::ObservedAppServerRequest>,
+    message: impl Into<String>,
+) -> Result<()> {
+    let message = message.into();
+    if let Some(source) = source {
+        client.reject_observed(source, message).await
+    } else {
+        client.reject(request.id.clone(), message).await
+    }
+}
+
+fn observed_request_from_pending(
+    pending: &PendingServerRequestEntry,
+) -> Option<backend::codex_app_server::ObservedAppServerRequest> {
+    Some(backend::codex_app_server::ObservedAppServerRequest {
+        request: backend::codex_app_server::AppServerRequest {
+            id: pending.raw_id.clone(),
+            method: pending.method.clone(),
+            params: pending.params.clone(),
+        },
+        client_instance_id: pending.client_instance_id?,
+        process_generation: pending.process_generation?,
+        handoff_proxy: pending.handoff_proxy,
+    })
+}
+
+#[cfg(test)]
 pub(crate) async fn handle_profile_server_request(
     state: &AppState,
     profile_id: &str,
     client_key: &str,
     request: &backend::codex_app_server::AppServerRequest,
 ) {
+    handle_profile_server_request_inner(state, profile_id, client_key, request, None).await;
+}
+
+pub(crate) async fn handle_profile_observed_server_request(
+    state: &AppState,
+    profile_id: &str,
+    client_key: &str,
+    request: &backend::codex_app_server::ObservedAppServerRequest,
+) {
+    handle_profile_server_request_inner(
+        state,
+        profile_id,
+        client_key,
+        &request.request,
+        Some(request),
+    )
+    .await;
+}
+
+async fn handle_profile_server_request_inner(
+    state: &AppState,
+    profile_id: &str,
+    client_key: &str,
+    request: &backend::codex_app_server::AppServerRequest,
+    source: Option<&backend::codex_app_server::ObservedAppServerRequest>,
+) {
+    if let Some(source) = source
+        && state
+            .app_servers
+            .client_instance_id(profile_id, client_key)
+            .await
+            != Some(source.client_instance_id)
+    {
+        return;
+    }
     let Some(session_id) = request
         .params
         .get("threadId")
@@ -273,12 +395,13 @@ pub(crate) async fn handle_profile_server_request(
         .map(str::to_string)
     else {
         if let Ok(client) = app_server_client_by_key(state, profile_id, client_key).await {
-            let _ = client
-                .reject(
-                    request.id.clone(),
-                    "The app-server request did not identify a session.".to_string(),
-                )
-                .await;
+            let _ = reject_profile_server_request(
+                &client,
+                request,
+                source,
+                "The app-server request did not identify a session.",
+            )
+            .await;
         }
         return;
     };
@@ -288,7 +411,8 @@ pub(crate) async fn handle_profile_server_request(
         &session_id,
     );
     let request_id = pending_request_id(&request.id);
-    let tombstone_key = resolved_server_request_tombstone_key(state, &runtime_key, &request_id);
+    let tombstone_key =
+        resolved_server_request_tombstone_key(state, &runtime_key, &request_id, source);
     {
         let now = now_unix_ms();
         let mut tombstones = resolved_server_request_tombstones().lock().await;
@@ -301,12 +425,13 @@ pub(crate) async fn handle_profile_server_request(
     }
     if !session_accepts_server_request(state, &runtime_key, client_key).await {
         if let Ok(client) = app_server_client_by_key(state, profile_id, client_key).await {
-            let _ = client
-                .reject(
-                    request.id.clone(),
-                    "Session is no longer active; ignoring stale app-server request.".to_string(),
-                )
-                .await;
+            let _ = reject_profile_server_request(
+                &client,
+                request,
+                source,
+                "Session is no longer active; ignoring stale app-server request.",
+            )
+            .await;
         }
         return;
     }
@@ -347,7 +472,12 @@ pub(crate) async fn handle_profile_server_request(
 
     if let Some(result) = auto_approve_result {
         if let Ok(client) = app_server_client_by_key(state, profile_id, client_key).await {
-            if client.respond(request.id.clone(), result).await.is_ok() {
+            if respond_to_profile_server_request(&client, request, source, result)
+                .await
+                .is_ok()
+            {
+                record_resolved_server_request_tombstone(state, &runtime_key, &request_id, source)
+                    .await;
                 emit_session_notification(
                     state,
                     profile_id,
@@ -380,6 +510,9 @@ pub(crate) async fn handle_profile_server_request(
                 PendingServerRequestEntry {
                     raw_id: request.id.clone(),
                     client_key: client_key.to_string(),
+                    client_instance_id: source.map(|source| source.client_instance_id),
+                    process_generation: source.map(|source| source.process_generation),
+                    handoff_proxy: source.is_some_and(|source| source.handoff_proxy),
                     method: request.method.clone(),
                     params: request.params.clone(),
                     created_at: now_rfc3339(),
@@ -399,7 +532,7 @@ pub(crate) async fn handle_profile_server_request(
                         break;
                     }
                     if let Some(evicted) = entries.remove(&id) {
-                        evicted_requests.push((evicted.raw_id, evicted.client_key));
+                        evicted_requests.push(evicted);
                     }
                 }
             }
@@ -409,14 +542,21 @@ pub(crate) async fn handle_profile_server_request(
     if !request_was_new {
         return;
     }
-    for (raw_id, evicted_client_key) in evicted_requests {
-        if let Ok(client) = app_server_client_by_key(state, profile_id, &evicted_client_key).await {
-            let _ = client
-                .reject(
-                    raw_id,
-                    "Too many pending app-server requests for this session.".to_string(),
-                )
-                .await;
+    for evicted in evicted_requests {
+        if let Ok(client) = app_server_client_by_key(state, profile_id, &evicted.client_key).await {
+            let request = backend::codex_app_server::AppServerRequest {
+                id: evicted.raw_id.clone(),
+                method: evicted.method.clone(),
+                params: evicted.params.clone(),
+            };
+            let observed = observed_request_from_pending(&evicted);
+            let _ = reject_profile_server_request(
+                &client,
+                &request,
+                observed.as_ref(),
+                "Too many pending app-server requests for this session.",
+            )
+            .await;
         }
     }
 
@@ -591,8 +731,13 @@ pub(crate) async fn resolve_server_request_payload(
             )
         })?;
     let result = normalize_server_request_response(&pending, result);
-    client
-        .respond(pending.raw_id.clone(), result)
+    let request = backend::codex_app_server::AppServerRequest {
+        id: pending.raw_id.clone(),
+        method: pending.method.clone(),
+        params: pending.params.clone(),
+    };
+    let observed = observed_request_from_pending(&pending);
+    respond_to_profile_server_request(&client, &request, observed.as_ref(), result)
         .await
         .map_err(|error| {
             api_error(
@@ -600,6 +745,8 @@ pub(crate) async fn resolve_server_request_payload(
                 format!("Failed to resolve the server request: {error}"),
             )
         })?;
+    record_resolved_server_request_tombstone(state, &runtime_key, request_id, observed.as_ref())
+        .await;
 
     let remaining = {
         let mut pending_requests = state.pending_server_requests.lock().await;

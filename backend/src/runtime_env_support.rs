@@ -313,12 +313,20 @@ async fn app_server_client_with_key(
             },
         )
         .await;
+    // Subscribe before taking the snapshot so requests created during monitor
+    // registration are either in the snapshot, in the receiver, or both.
+    // The request handler is idempotent for the possible overlap.
+    let notifications = client.subscribe_notifications();
+    let requests = client.subscribe_requests();
+    let pending_requests = client.pending_server_requests().await;
     register_runtime_profile_monitor(
         state,
         resolved_profile_id,
         &client_key,
-        client.subscribe_notifications(),
-        client.subscribe_requests(),
+        client.instance_id(),
+        notifications,
+        requests,
+        pending_requests,
     );
     Ok(client)
 }

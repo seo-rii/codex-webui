@@ -281,6 +281,30 @@ async fn resolve_server_request_payload_uses_pending_request_store() {
         .cloned();
     assert!(pending_after.is_none());
 
+    handle_profile_server_request(
+        &state,
+        "default",
+        "default",
+        &backend::codex_app_server::AppServerRequest {
+            id: json!("srv-1"),
+            method: "input/request".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "question": "Continue?"
+            }),
+        },
+    )
+    .await;
+    assert!(
+        state
+            .pending_server_requests
+            .lock()
+            .await
+            .get(&runtime_session_key("default", "thread-1"))
+            .is_none(),
+        "a replayed request must stay resolved before the native resolved notification arrives"
+    );
+
     let highlight_after = with_ui_state_read(&state, "default", |ui_state| {
         Ok(ui_state
             .get("highlightsByThreadId")
@@ -7488,8 +7512,9 @@ async fn resolved_notification_tombstones_late_server_request() {
     let session_id = "thread-resolved-before-request";
     mark_test_session_active(&state, session_id).await;
 
+    let notification_state = state.clone();
     handle_profile_runtime_notification(
-        &state,
+        &notification_state,
         "default",
         &AppServerNotification {
             method: "serverRequest/resolved".to_string(),
@@ -7559,11 +7584,78 @@ async fn user_input_auto_resolution_clears_pending_request() {
     let _ = fs::remove_dir_all(sandbox);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolved_request_tombstone_does_not_block_a_new_process_generation() {
+    let sandbox = unique_test_dir("server-request-generation-tombstone");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home.clone());
+    let session_id = "thread-generation-tombstone";
+    let client_key = "default::generation-tombstone";
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .insert(runtime_key.clone(), client_key.to_string());
+    let client = state
+        .app_servers
+        .get_or_create_with_key(
+            client_key.to_string(),
+            AppServerProfile {
+                id: "default".to_string(),
+                codex_home,
+            },
+        )
+        .await;
+    let observed = |process_generation| backend::codex_app_server::ObservedAppServerRequest {
+        request: backend::codex_app_server::AppServerRequest {
+            id: json!("reused-request-id"),
+            method: "item/tool/requestUserInput".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "turnId": "turn-generation-tombstone",
+                "questions": []
+            }),
+        },
+        client_instance_id: client.instance_id(),
+        process_generation,
+        handoff_proxy: false,
+    };
+    let old_request = observed(1);
+    record_resolved_server_request_tombstone(
+        &state,
+        &runtime_key,
+        "reused-request-id",
+        Some(&old_request),
+    )
+    .await;
+
+    let new_request = observed(2);
+    handle_profile_observed_server_request(&state, "default", client_key, &new_request).await;
+
+    let pending = state.pending_server_requests.lock().await;
+    let entry = pending
+        .get(&runtime_key)
+        .and_then(|entries| entries.get("reused-request-id"))
+        .expect("the new process generation must not inherit the old tombstone");
+    assert_eq!(entry.process_generation, Some(2));
+    drop(pending);
+
+    state.app_servers.close_all().await.unwrap();
+    let _ = fs::remove_dir_all(sandbox);
+}
+
 #[test]
 fn manual_permission_decisions_use_native_response_shape() {
     let pending = PendingServerRequestEntry {
         raw_id: json!("permissions-1"),
         client_key: "default".to_string(),
+        client_instance_id: None,
+        process_generation: None,
+        handoff_proxy: false,
         method: "item/permissions/requestApproval".to_string(),
         params: json!({
             "permissions": {
@@ -7583,6 +7675,178 @@ fn manual_permission_decisions_use_native_response_shape() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_monitor_replays_pending_server_request_snapshot() {
+    let sandbox = unique_test_dir("runtime-monitor-request-snapshot");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home.clone());
+    let session_id = "thread-request-snapshot";
+    let client_key = "default::request-snapshot";
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .insert(runtime_key.clone(), client_key.to_string());
+    let client = state
+        .app_servers
+        .get_or_create_with_key(
+            client_key.to_string(),
+            AppServerProfile {
+                id: "default".to_string(),
+                codex_home,
+            },
+        )
+        .await;
+
+    register_runtime_profile_monitor(
+        &state,
+        "default",
+        client_key,
+        client.instance_id(),
+        client.subscribe_notifications(),
+        client.subscribe_requests(),
+        vec![backend::codex_app_server::ObservedAppServerRequest {
+            request: backend::codex_app_server::AppServerRequest {
+                id: json!("request-snapshot"),
+                method: "item/tool/requestUserInput".to_string(),
+                params: json!({
+                    "threadId": session_id,
+                    "turnId": "turn-request-snapshot",
+                    "questions": []
+                }),
+            },
+            client_instance_id: client.instance_id(),
+            process_generation: 1,
+            handoff_proxy: false,
+        }],
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if state
+                .pending_server_requests
+                .lock()
+                .await
+                .get(&runtime_key)
+                .and_then(|entries| entries.get("request-snapshot"))
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the monitor should replay pending requests captured before registration");
+
+    for (_, monitor) in state.runtime_profile_monitors.lock().unwrap().drain() {
+        monitor.abort();
+    }
+    state.app_servers.close_all().await.unwrap();
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replaced_client_requests_cannot_reenter_the_runtime_monitor() {
+    let sandbox = unique_test_dir("runtime-monitor-client-generation");
+    let workspace = sandbox.join("workspace");
+    let first_codex_home = sandbox.join("first-codex-home");
+    let second_codex_home = sandbox.join("second-codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&first_codex_home).unwrap();
+    fs::create_dir_all(&second_codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], first_codex_home.clone());
+    let session_id = "thread-client-generation";
+    let client_key = "default::client-generation";
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .insert(runtime_key.clone(), client_key.to_string());
+
+    let original = state
+        .app_servers
+        .get_or_create_with_key(
+            client_key.to_string(),
+            AppServerProfile {
+                id: "default".to_string(),
+                codex_home: first_codex_home,
+            },
+        )
+        .await;
+    let replacement = state
+        .app_servers
+        .get_or_create_with_key(
+            client_key.to_string(),
+            AppServerProfile {
+                id: "default".to_string(),
+                codex_home: second_codex_home,
+            },
+        )
+        .await;
+    let request = |client_instance_id| backend::codex_app_server::ObservedAppServerRequest {
+        request: backend::codex_app_server::AppServerRequest {
+            id: json!("generation-request"),
+            method: "item/tool/requestUserInput".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "turnId": "turn-generation",
+                "questions": []
+            }),
+        },
+        client_instance_id,
+        process_generation: 1,
+        handoff_proxy: false,
+    };
+
+    assert!(
+        !handle_profile_server_request_batch(
+            &state,
+            "default",
+            client_key,
+            original.instance_id(),
+            vec![request(original.instance_id())],
+        )
+        .await
+    );
+    assert!(
+        state
+            .pending_server_requests
+            .lock()
+            .await
+            .get(&runtime_key)
+            .is_none(),
+        "a replaced client generation must not restore a stale server request"
+    );
+
+    assert!(
+        handle_profile_server_request_batch(
+            &state,
+            "default",
+            client_key,
+            replacement.instance_id(),
+            vec![request(replacement.instance_id())],
+        )
+        .await
+    );
+    {
+        let pending = state.pending_server_requests.lock().await;
+        let pending = pending
+            .get(&runtime_key)
+            .and_then(|entries| entries.get("generation-request"))
+            .expect("the current client generation should be retained");
+        assert_eq!(pending.client_instance_id, Some(replacement.instance_id()));
+    }
+
+    state.app_servers.close_all().await.unwrap();
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_maintenance_monitor_is_registered_once_per_profile() {
     let sandbox = unique_test_dir("single-profile-maintenance-monitor");
     let workspace = sandbox.join("workspace");
@@ -7594,20 +7858,35 @@ async fn profile_maintenance_monitor_is_registered_once_per_profile() {
     let (requests_a, request_receiver_a) = broadcast::channel(4);
     let (notifications_b, receiver_b) = broadcast::channel(4);
     let (requests_b, request_receiver_b) = broadcast::channel(4);
+    let (notifications_a_replacement, receiver_a_replacement) = broadcast::channel(4);
+    let (requests_a_replacement, request_receiver_a_replacement) = broadcast::channel(4);
 
     register_runtime_profile_monitor(
         &state,
         "default",
         "client-a",
+        1,
         receiver_a,
         request_receiver_a,
+        Vec::new(),
     );
     register_runtime_profile_monitor(
         &state,
         "default",
         "client-b",
+        2,
         receiver_b,
         request_receiver_b,
+        Vec::new(),
+    );
+    register_runtime_profile_monitor(
+        &state,
+        "default",
+        "client-a",
+        3,
+        receiver_a_replacement,
+        request_receiver_a_replacement,
+        Vec::new(),
     );
     let maintenance_count = state
         .runtime_profile_monitors
@@ -7617,10 +7896,27 @@ async fn profile_maintenance_monitor_is_registered_once_per_profile() {
         .filter(|key| key.ends_with("::__profile_maintenance"))
         .count();
     assert_eq!(maintenance_count, 1);
+    assert_eq!(
+        state
+            .runtime_profile_monitors
+            .lock()
+            .unwrap()
+            .get("default::client-a")
+            .and_then(|monitor| monitor.client_instance_id),
+        Some(3),
+        "a replacement client must replace the previous monitor for the same key"
+    );
 
-    drop((notifications_a, requests_a, notifications_b, requests_b));
-    for (_, handle) in state.runtime_profile_monitors.lock().unwrap().drain() {
-        handle.abort();
+    drop((
+        notifications_a,
+        requests_a,
+        notifications_b,
+        requests_b,
+        notifications_a_replacement,
+        requests_a_replacement,
+    ));
+    for (_, monitor) in state.runtime_profile_monitors.lock().unwrap().drain() {
+        monitor.abort();
     }
     let _ = fs::remove_dir_all(sandbox);
 }

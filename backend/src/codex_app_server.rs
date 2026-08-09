@@ -50,6 +50,7 @@ const APP_SERVER_DEFAULT_MAX_PROCESSES_CAP: usize = 4;
 const APP_SERVER_MAX_PROCESSES_HARD_CAP: usize = 512;
 const APP_SERVER_DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 300;
 const APP_SERVER_READER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+static NEXT_APP_SERVER_CLIENT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 const APP_SERVER_WEBSOCKET_QUEUE_CAPACITY: usize = 256;
 #[cfg(unix)]
@@ -136,6 +137,22 @@ pub struct AppServerRequest {
     pub params: Value,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObservedAppServerRequest {
+    pub request: AppServerRequest,
+    pub client_instance_id: u64,
+    pub process_generation: u64,
+    pub handoff_proxy: bool,
+}
+
+impl std::ops::Deref for ObservedAppServerRequest {
+    type Target = AppServerRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
 #[derive(Clone)]
 pub struct AppServerClient {
     inner: Arc<AppServerClientInner>,
@@ -149,6 +166,7 @@ pub struct AppServerManager {
 }
 
 struct AppServerClientInner {
+    instance_id: u64,
     client_key: String,
     profile: AppServerProfile,
     config: AppServerClientConfig,
@@ -159,12 +177,13 @@ struct AppServerClientInner {
     process: Mutex<Option<ProcessState>>,
     pending: Mutex<HashMap<u64, PendingRequest>>,
     active_turn_ids: Mutex<HashSet<String>>,
-    pending_server_request_ids: Mutex<HashSet<String>>,
+    pending_server_requests: Mutex<HashMap<String, ObservedAppServerRequest>>,
     next_request_id: AtomicU64,
     next_process_generation: AtomicU64,
     last_activity_at_ms: AtomicU64,
+    retired: AtomicBool,
     notifications_tx: broadcast::Sender<AppServerNotification>,
-    requests_tx: broadcast::Sender<AppServerRequest>,
+    requests_tx: broadcast::Sender<ObservedAppServerRequest>,
 }
 
 struct PendingRequest {
@@ -187,7 +206,13 @@ struct ProcessState {
 enum AppServerWriter {
     Stdio(ChildStdin),
     #[cfg(unix)]
-    WebSocket(mpsc::Sender<String>),
+    WebSocket(mpsc::Sender<AppServerWebSocketOutbound>),
+}
+
+#[cfg(unix)]
+struct AppServerWebSocketOutbound {
+    encoded: String,
+    sent_tx: oneshot::Sender<std::result::Result<(), String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -396,6 +421,7 @@ impl AppServerClient {
 
         Self {
             inner: Arc::new(AppServerClientInner {
+                instance_id: NEXT_APP_SERVER_CLIENT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
                 client_key,
                 profile,
                 config,
@@ -406,10 +432,11 @@ impl AppServerClient {
                 process: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
                 active_turn_ids: Mutex::new(HashSet::new()),
-                pending_server_request_ids: Mutex::new(HashSet::new()),
+                pending_server_requests: Mutex::new(HashMap::new()),
                 next_request_id: AtomicU64::new(1),
                 next_process_generation: AtomicU64::new(1),
                 last_activity_at_ms: AtomicU64::new(unix_time_ms()),
+                retired: AtomicBool::new(false),
                 notifications_tx,
                 requests_tx,
             }),
@@ -420,12 +447,26 @@ impl AppServerClient {
         self.inner.notifications_tx.subscribe()
     }
 
-    pub fn subscribe_requests(&self) -> broadcast::Receiver<AppServerRequest> {
+    pub fn subscribe_requests(&self) -> broadcast::Receiver<ObservedAppServerRequest> {
         self.inner.requests_tx.subscribe()
+    }
+
+    pub fn instance_id(&self) -> u64 {
+        self.inner.instance_id
     }
 
     pub fn request_timeout(&self) -> Duration {
         self.inner.config.request_timeout
+    }
+
+    pub async fn pending_server_requests(&self) -> Vec<ObservedAppServerRequest> {
+        self.inner
+            .pending_server_requests
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub async fn request(&self, method: impl Into<String>, params: Value) -> Result<Value> {
@@ -475,6 +516,21 @@ impl AppServerClient {
             .context("codex app-server controller task failed")?
     }
 
+    pub async fn respond_observed(
+        &self,
+        request: &ObservedAppServerRequest,
+        result: Value,
+    ) -> Result<()> {
+        let client = self.clone();
+        let request = request.clone();
+        self.inner
+            .controller
+            .handle
+            .spawn(async move { client.respond_observed_on_controller(request, result).await })
+            .await
+            .context("codex app-server controller task failed")?
+    }
+
     pub async fn reject(&self, id: Value, message: impl Into<String>) -> Result<()> {
         let client = self.clone();
         let message = message.into();
@@ -482,6 +538,22 @@ impl AppServerClient {
             .controller
             .handle
             .spawn(async move { client.reject_on_controller(id, message).await })
+            .await
+            .context("codex app-server controller task failed")?
+    }
+
+    pub async fn reject_observed(
+        &self,
+        request: &ObservedAppServerRequest,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        let client = self.clone();
+        let request = request.clone();
+        let message = message.into();
+        self.inner
+            .controller
+            .handle
+            .spawn(async move { client.reject_observed_on_controller(request, message).await })
             .await
             .context("codex app-server controller task failed")?
     }
@@ -496,12 +568,24 @@ impl AppServerClient {
             .context("codex app-server controller task failed")?
     }
 
+    async fn retire_and_close(&self) -> Result<()> {
+        let client = self.clone();
+        self.inner
+            .controller
+            .handle
+            .spawn(async move { client.retire_and_close_on_controller().await })
+            .await
+            .context("codex app-server controller task failed")?
+    }
+
     pub async fn has_active_turn_id(&self, turn_id: &str) -> bool {
         self.inner.active_turn_ids.lock().await.contains(turn_id)
     }
 
     async fn request_on_controller(&self, method: String, params: Value) -> Result<Value> {
+        self.ensure_not_retired()?;
         let _lifecycle = self.inner.lifecycle.read().await;
+        self.ensure_not_retired()?;
         self.touch_activity();
         self.ensure_started().await?;
         self.request_started(method, params).await
@@ -514,7 +598,9 @@ impl AppServerClient {
         request_timeout: Duration,
         recover_handoff_on_timeout: bool,
     ) -> Result<Value> {
+        self.ensure_not_retired()?;
         let _lifecycle = self.inner.lifecycle.read().await;
+        self.ensure_not_retired()?;
         self.touch_activity();
         let deadline = TokioInstant::now() + request_timeout;
         // Starting Codex mutates shared process state. Keep that work alive when a
@@ -548,63 +634,125 @@ impl AppServerClient {
     }
 
     async fn respond_on_controller(&self, id: Value, result: Value) -> Result<()> {
+        self.respond_message_on_controller(id, result, None).await
+    }
+
+    async fn respond_observed_on_controller(
+        &self,
+        request: ObservedAppServerRequest,
+        result: Value,
+    ) -> Result<()> {
+        self.respond_message_on_controller(request.id.clone(), result, Some(&request))
+            .await
+    }
+
+    async fn respond_message_on_controller(
+        &self,
+        id: Value,
+        result: Value,
+        observed: Option<&ObservedAppServerRequest>,
+    ) -> Result<()> {
+        self.ensure_not_retired()?;
         let _lifecycle = self.inner.lifecycle.read().await;
+        self.ensure_not_retired()?;
         self.touch_activity();
         let request_id_key = server_request_id_key(&id);
-        if !self
-            .inner
-            .process
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(process_state_is_usable)
-        {
-            anyhow::bail!("codex app-server request expired after its process exited");
-        }
-        self.write_message(&json!({
+        let writer = self.writer_for_server_request(observed).await?;
+        let encoded = serde_json::to_string(&json!({
             "id": id,
             "result": result
         }))
-        .await?;
-        self.inner
-            .pending_server_request_ids
-            .lock()
-            .await
-            .remove(&request_id_key);
+        .context("failed to encode app-server response")?;
+        write_app_server_message(&writer, encoded).await?;
+        self.remove_pending_server_request_if_matches(&request_id_key, observed)
+            .await;
         Ok(())
     }
 
     async fn reject_on_controller(&self, id: Value, message: String) -> Result<()> {
+        self.reject_message_on_controller(id, message, None).await
+    }
+
+    async fn reject_observed_on_controller(
+        &self,
+        request: ObservedAppServerRequest,
+        message: String,
+    ) -> Result<()> {
+        self.reject_message_on_controller(request.id.clone(), message, Some(&request))
+            .await
+    }
+
+    async fn reject_message_on_controller(
+        &self,
+        id: Value,
+        message: String,
+        observed: Option<&ObservedAppServerRequest>,
+    ) -> Result<()> {
+        self.ensure_not_retired()?;
         let _lifecycle = self.inner.lifecycle.read().await;
+        self.ensure_not_retired()?;
         self.touch_activity();
         let request_id_key = server_request_id_key(&id);
-        if !self
-            .inner
-            .process
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(process_state_is_usable)
-        {
-            anyhow::bail!("codex app-server request expired after its process exited");
-        }
-        self.write_message(&json!({
+        let writer = self.writer_for_server_request(observed).await?;
+        let encoded = serde_json::to_string(&json!({
             "id": id,
             "error": {
                 "code": -32000,
                 "message": message
             }
         }))
-        .await?;
-        self.inner
-            .pending_server_request_ids
-            .lock()
-            .await
-            .remove(&request_id_key);
+        .context("failed to encode app-server rejection")?;
+        write_app_server_message(&writer, encoded).await?;
+        self.remove_pending_server_request_if_matches(&request_id_key, observed)
+            .await;
         Ok(())
     }
 
+    async fn writer_for_server_request(
+        &self,
+        observed: Option<&ObservedAppServerRequest>,
+    ) -> Result<Arc<Mutex<AppServerWriter>>> {
+        if let Some(observed) = observed
+            && observed.client_instance_id != self.instance_id()
+        {
+            anyhow::bail!("codex app-server request belongs to a replaced client");
+        }
+        let process = self.inner.process.lock().await;
+        let process = process
+            .as_ref()
+            .filter(|process| process_state_is_usable(process))
+            .ok_or_else(|| anyhow!("codex app-server request expired after its process exited"))?;
+        if let Some(observed) = observed
+            && process.generation != observed.process_generation
+            && !(observed.handoff_proxy && process.handoff_proxy)
+        {
+            anyhow::bail!("codex app-server request belongs to an expired process generation");
+        }
+        Ok(process.writer.clone())
+    }
+
+    async fn remove_pending_server_request_if_matches(
+        &self,
+        request_id_key: &str,
+        observed: Option<&ObservedAppServerRequest>,
+    ) {
+        let mut pending = self.inner.pending_server_requests.lock().await;
+        if observed.is_none_or(|expected| pending.get(request_id_key) == Some(expected)) {
+            pending.remove(request_id_key);
+        }
+    }
+
     async fn close_on_controller(&self) -> Result<()> {
+        self.close_process_on_controller().await
+    }
+
+    async fn retire_and_close_on_controller(&self) -> Result<()> {
+        let _lifecycle = self.inner.lifecycle.write().await;
+        self.inner.retired.store(true, Ordering::Release);
+        self.close_process_on_controller().await
+    }
+
+    async fn close_process_on_controller(&self) -> Result<()> {
         let process = self.inner.process.lock().await.take();
         if let Some(mut process) = process {
             fail_pending_requests(
@@ -640,6 +788,13 @@ impl AppServerClient {
             .store(unix_time_ms(), Ordering::Relaxed);
     }
 
+    fn ensure_not_retired(&self) -> Result<()> {
+        if self.inner.retired.load(Ordering::Acquire) {
+            anyhow::bail!("codex app-server client was replaced and can no longer accept requests");
+        }
+        Ok(())
+    }
+
     async fn is_idle_for(&self, idle_for: Duration) -> bool {
         if self.has_live_work().await {
             return false;
@@ -651,16 +806,13 @@ impl AppServerClient {
     async fn has_live_work(&self) -> bool {
         !self.inner.pending.lock().await.is_empty()
             || !self.inner.active_turn_ids.lock().await.is_empty()
-            || !self
-                .inner
-                .pending_server_request_ids
-                .lock()
-                .await
-                .is_empty()
+            || !self.inner.pending_server_requests.lock().await.is_empty()
     }
 
     async fn ensure_started(&self) -> Result<()> {
+        self.ensure_not_retired()?;
         let _guard = self.inner.start_lock.lock().await;
+        self.ensure_not_retired()?;
         let existing_process = {
             let mut process = self.inner.process.lock().await;
             match process.as_ref() {
@@ -839,7 +991,7 @@ impl AppServerClient {
     ) -> bool {
         let active_turn_count = self.inner.active_turn_ids.lock().await.len();
         let pending_request_count = self.inner.pending.lock().await.len();
-        let pending_server_request_count = self.inner.pending_server_request_ids.lock().await.len();
+        let pending_server_request_count = self.inner.pending_server_requests.lock().await.len();
         if active_turn_count > 0 || pending_request_count > 0 || pending_server_request_count > 0 {
             warn!(
                 profile_id = %self.inner.profile.id,
@@ -1387,7 +1539,9 @@ impl AppServerManager {
                     new_codex_home = %profile.codex_home.display(),
                     "replacing codex app-server client after runtime profile changed"
                 );
-                let _ = stale_client.close().await;
+                let stale_profile = stale_client.inner.profile.clone();
+                let _ = stale_client.retire_and_close().await;
+                let _ = stop_handoff_server(&self.config, &client_key, &stale_profile).await;
                 continue;
             }
 
@@ -1463,7 +1617,7 @@ impl AppServerManager {
         };
         for (client_key, client) in clients {
             let profile = client.inner.profile.clone();
-            client.close().await?;
+            client.retire_and_close().await?;
             stop_handoff_server(&self.config, &client_key, &profile).await?;
         }
         Ok(())
@@ -1471,6 +1625,34 @@ impl AppServerManager {
 
     pub async fn client_count(&self) -> usize {
         self.clients.lock().await.len()
+    }
+
+    pub async fn client_instance_id(&self, profile_id: &str, client_key: &str) -> Option<u64> {
+        self.clients
+            .lock()
+            .await
+            .get(client_key)
+            .filter(|client| client.inner.profile.id == profile_id)
+            .map(AppServerClient::instance_id)
+    }
+
+    pub async fn pending_server_requests_for_client(
+        &self,
+        profile_id: &str,
+        client_key: &str,
+        expected_instance_id: u64,
+    ) -> Option<Vec<ObservedAppServerRequest>> {
+        let client = self
+            .clients
+            .lock()
+            .await
+            .get(client_key)
+            .filter(|client| {
+                client.inner.profile.id == profile_id
+                    && client.instance_id() == expected_instance_id
+            })
+            .cloned()?;
+        Some(client.pending_server_requests().await)
     }
 
     pub async fn active_process_count(&self) -> usize {
@@ -1498,12 +1680,12 @@ impl AppServerManager {
         let clients = {
             let clients = self.clients.lock().await;
             clients
-                .values()
-                .filter(|client| client.inner.profile.id == profile_id)
-                .cloned()
+                .iter()
+                .filter(|(_, client)| client.inner.profile.id == profile_id)
+                .map(|(client_key, client)| (client_key.clone(), client.clone()))
                 .collect::<Vec<_>>()
         };
-        for client in clients {
+        for (client_key, client) in clients {
             if client
                 .inner
                 .process
@@ -1511,6 +1693,13 @@ impl AppServerManager {
                 .await
                 .as_ref()
                 .is_some_and(process_state_is_usable)
+            {
+                return true;
+            }
+            if self
+                .handoff_process_snapshot_for_client_key(&client.inner.profile, &client_key)
+                .await
+                .is_some()
             {
                 return true;
             }
@@ -1526,13 +1715,19 @@ impl AppServerManager {
         let Some(client) = client.filter(|client| client.inner.profile.id == profile_id) else {
             return false;
         };
-        client
+        if client
             .inner
             .process
             .lock()
             .await
             .as_ref()
             .is_some_and(process_state_is_usable)
+        {
+            return true;
+        }
+        self.handoff_process_snapshot_for_client_key(&client.inner.profile, client_key)
+            .await
+            .is_some()
     }
 
     pub async fn handoff_status(&self) -> AppServerHandoffStatus {
@@ -1860,7 +2055,7 @@ impl AppServerManager {
         for client in clients {
             let profile = client.inner.profile.clone();
             let client_key = client.inner.client_key.clone();
-            client.close().await?;
+            client.retire_and_close().await?;
             stop_handoff_server(&self.config, &client_key, &profile).await?;
         }
         Ok(())
@@ -1876,7 +2071,7 @@ impl AppServerManager {
         };
 
         for client in clients {
-            client.close().await?;
+            client.retire_and_close().await?;
         }
         Ok(())
     }
@@ -2514,10 +2709,17 @@ async fn write_app_server_message(
                 .context("failed to flush app-server stdin")
         }
         #[cfg(unix)]
-        AppServerWriter::WebSocket(outbound_tx) => outbound_tx
-            .send(encoded)
-            .await
-            .map_err(|_| anyhow!("codex app-server WebSocket writer is closed")),
+        AppServerWriter::WebSocket(outbound_tx) => {
+            let (sent_tx, sent_rx) = oneshot::channel();
+            outbound_tx
+                .send(AppServerWebSocketOutbound { encoded, sent_tx })
+                .await
+                .map_err(|_| anyhow!("codex app-server WebSocket writer is closed"))?;
+            sent_rx
+                .await
+                .map_err(|_| anyhow!("codex app-server WebSocket writer closed before sending"))?
+                .map_err(anyhow::Error::msg)
+        }
     }
 }
 
@@ -2535,18 +2737,18 @@ async fn supervise_process(
         let _ = child.wait().await;
         return;
     }
-    let mut stdout_task = tokio::spawn(read_stdout(inner.clone(), stdout));
+    let mut stdout_task = tokio::spawn(read_stdout(inner.clone(), generation, stdout));
     let stderr_task = tokio::spawn(read_stderr(stderr, inner.config.stderr_log_path.clone()));
     let pid = child.id();
     let process_identity = read_managed_process_identity(pid);
     let mut stdout_finished = false;
 
-    let (exit_result, reader_failure) = tokio::select! {
+    let (exit_result, reader_failure, shutdown_requested) = tokio::select! {
         _ = &mut shutdown_rx => {
             let _ = child.kill().await;
-            (child.wait().await, None)
+            (child.wait().await, None, true)
         }
-        result = child.wait() => (result, None),
+        result = child.wait() => (result, None, false),
         result = &mut stdout_task => {
             stdout_finished = true;
             let reason = match result {
@@ -2556,7 +2758,7 @@ async fn supervise_process(
             };
             terminate_managed_process_group(pid, process_identity).await;
             let _ = child.kill().await;
-            (child.wait().await, Some(reason))
+            (child.wait().await, Some(reason), false)
         }
     };
 
@@ -2579,7 +2781,9 @@ async fn supervise_process(
         ),
     };
 
-    finalize_process_exit(&inner, generation, reason, exit_code).await;
+    if !shutdown_requested {
+        finalize_process_exit(&inner, generation, reason, exit_code).await;
+    }
 
     if !stdout_finished {
         finish_reader_task(stdout_task, "stdout", &inner.profile.id).await;
@@ -2593,7 +2797,7 @@ async fn supervise_handoff_connection(
     generation: u64,
     paths: HandoffPaths,
     websocket: WebSocketStream<UnixStream>,
-    mut outbound_rx: mpsc::Receiver<String>,
+    mut outbound_rx: mpsc::Receiver<AppServerWebSocketOutbound>,
     mut shutdown_rx: oneshot::Receiver<()>,
     supervisor_start_rx: oneshot::Receiver<()>,
 ) {
@@ -2610,18 +2814,24 @@ async fn supervise_handoff_connection(
                 return;
             }
             outbound = outbound_rx.recv() => {
-                let Some(encoded) = outbound else {
+                let Some(outbound) = outbound else {
                     let _ = websocket_writer.close().await;
                     break "codex app-server handoff writer closed".to_string();
                 };
-                if let Err(error) = websocket_writer.send(Message::Text(encoded.into())).await {
-                    break format!("failed to write Codex app-server handoff WebSocket: {error}");
+                if let Err(error) = websocket_writer
+                    .send(Message::Text(outbound.encoded.into()))
+                    .await
+                {
+                    let reason = format!("failed to write Codex app-server handoff WebSocket: {error}");
+                    let _ = outbound.sent_tx.send(Err(reason.clone()));
+                    break reason;
                 }
+                let _ = outbound.sent_tx.send(Ok(()));
             }
             incoming = websocket_reader.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        handle_incoming_message(&inner, text.as_str()).await;
+                        handle_incoming_message(&inner, generation, true, text.as_str()).await;
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         if let Err(error) = websocket_writer.send(Message::Pong(payload)).await {
@@ -2678,11 +2888,30 @@ async fn handoff_daemon_is_live(inner: &AppServerClientInner, paths: &HandoffPat
     false
 }
 
+async fn acquire_process_finalization_guard<'a>(
+    inner: &'a Arc<AppServerClientInner>,
+    generation: u64,
+    reason: &str,
+) -> (tokio::sync::MutexGuard<'a, ()>, bool) {
+    match inner.start_lock.try_lock() {
+        Ok(guard) => (guard, false),
+        Err(_) => {
+            // Initialization holds start_lock while waiting for its response. Fail
+            // that generation first so it can release the lock, then fence any
+            // replacement process before mutating shared runtime state.
+            fail_pending_requests(inner, generation, reason).await;
+            (inner.start_lock.lock().await, true)
+        }
+    }
+}
+
 async fn finalize_handoff_connection_loss(
     inner: &Arc<AppServerClientInner>,
     generation: u64,
     reason: String,
 ) {
+    let (_start_guard, pending_already_failed) =
+        acquire_process_finalization_guard(inner, generation, &reason).await;
     let cleared_current_process = {
         let mut process = inner.process.lock().await;
         if process
@@ -2696,9 +2925,10 @@ async fn finalize_handoff_connection_loss(
         }
     };
 
-    fail_pending_requests(inner, generation, &reason).await;
+    if !pending_already_failed {
+        fail_pending_requests(inner, generation, &reason).await;
+    }
     if cleared_current_process {
-        inner.pending_server_request_ids.lock().await.clear();
         warn!(
             profile_id = %inner.profile.id,
             codex_home = %inner.profile.codex_home.display(),
@@ -2707,7 +2937,7 @@ async fn finalize_handoff_connection_loss(
         );
         let _ = inner.notifications_tx.send(AppServerNotification {
             method: "codex-webui/app-server/disconnected".to_string(),
-            params: json!({ "reason": reason }),
+            params: json!({ "reason": reason, "generation": generation }),
         });
     }
 }
@@ -2718,6 +2948,8 @@ async fn finalize_process_exit(
     reason: String,
     exit_code: Value,
 ) {
+    let (_start_guard, pending_already_failed) =
+        acquire_process_finalization_guard(inner, generation, &reason).await;
     let cleared_current_process = {
         let mut process = inner.process.lock().await;
         if process
@@ -2731,10 +2963,12 @@ async fn finalize_process_exit(
         }
     };
 
-    fail_pending_requests(inner, generation, &reason).await;
+    if !pending_already_failed {
+        fail_pending_requests(inner, generation, &reason).await;
+    }
     if cleared_current_process {
         inner.active_turn_ids.lock().await.clear();
-        inner.pending_server_request_ids.lock().await.clear();
+        inner.pending_server_requests.lock().await.clear();
         warn!(
             profile_id = %inner.profile.id,
             codex_home = %inner.profile.codex_home.display(),
@@ -2746,6 +2980,7 @@ async fn finalize_process_exit(
             params: json!({
                 "reason": reason,
                 "exitCode": exit_code,
+                "generation": generation,
             }),
         });
     }
@@ -2764,7 +2999,11 @@ async fn finish_reader_task<T>(mut task: JoinHandle<T>, stream: &str, profile_id
     }
 }
 
-async fn read_stdout(inner: Arc<AppServerClientInner>, stdout: ChildStdout) -> Result<()> {
+async fn read_stdout(
+    inner: Arc<AppServerClientInner>,
+    generation: u64,
+    stdout: ChildStdout,
+) -> Result<()> {
     let mut reader = BufReader::new(stdout).lines();
     loop {
         let line = reader
@@ -2772,11 +3011,16 @@ async fn read_stdout(inner: Arc<AppServerClientInner>, stdout: ChildStdout) -> R
             .await
             .context("failed to read codex app-server stdout")?
             .ok_or_else(|| anyhow!("codex app-server stdout reached EOF"))?;
-        handle_incoming_message(&inner, &line).await;
+        handle_incoming_message(&inner, generation, false, &line).await;
     }
 }
 
-async fn handle_incoming_message(inner: &Arc<AppServerClientInner>, line: &str) {
+async fn handle_incoming_message(
+    inner: &Arc<AppServerClientInner>,
+    generation: u64,
+    handoff_proxy: bool,
+    line: &str,
+) {
     inner
         .last_activity_at_ms
         .store(unix_time_ms(), Ordering::Relaxed);
@@ -2791,15 +3035,22 @@ async fn handle_incoming_message(inner: &Arc<AppServerClientInner>, line: &str) 
             let _ = inner.notifications_tx.send(notification);
         }
         Ok(Some(IncomingMessage::Request(request))) => {
+            let request_key = server_request_id_key(&request.id);
+            let observed = ObservedAppServerRequest {
+                request,
+                client_instance_id: inner.instance_id,
+                process_generation: generation,
+                handoff_proxy,
+            };
             inner
-                .pending_server_request_ids
+                .pending_server_requests
                 .lock()
                 .await
-                .insert(server_request_id_key(&request.id));
+                .insert(request_key, observed.clone());
             inner
                 .last_activity_at_ms
                 .store(unix_time_ms(), Ordering::Relaxed);
-            let _ = inner.requests_tx.send(request);
+            let _ = inner.requests_tx.send(observed);
         }
         Ok(None) => {}
         Err(error) => {
@@ -3096,17 +3347,20 @@ fn classify_incoming_message(line: &str) -> Result<Option<IncomingMessage>> {
 mod tests {
     use super::{
         AppServerClient, AppServerClientConfig, AppServerManager, AppServerNotification,
-        AppServerProfile, AppServerRequest, AppServerWriter, IncomingMessage, ProcessState,
-        app_server_request_timed_out, app_server_timeout_recovered, classify_incoming_message,
-        handoff_paths, rotate_text_log_if_needed, write_bytes_atomically,
+        AppServerProfile, AppServerRequest, AppServerWriter, IncomingMessage,
+        ObservedAppServerRequest, ProcessState, app_server_request_timed_out,
+        app_server_timeout_recovered, classify_incoming_message, finalize_process_exit,
+        handoff_paths, rotate_text_log_if_needed, write_app_server_message, write_bytes_atomically,
     };
     #[cfg(unix)]
     use futures_util::{SinkExt, StreamExt};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::Mutex;
     use tokio::time::timeout;
 
     #[cfg(unix)]
@@ -3316,6 +3570,19 @@ mod tests {
                 .unwrap(),
             json!({ "gateway": 1 })
         );
+        first_client.close().await.unwrap();
+        assert!(first_client.inner.process.lock().await.is_none());
+        assert!(
+            first_manager.profile_has_active_process("default").await,
+            "a detached but live handoff daemon must still count as recoverable"
+        );
+        assert_eq!(
+            first_client
+                .request("echo", json!({ "gateway": "reattached" }))
+                .await
+                .unwrap(),
+            json!({ "gateway": "reattached" })
+        );
         first_manager.detach_all().await.unwrap();
 
         let second_manager = AppServerManager::new(config);
@@ -3339,7 +3606,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn install_synthetic_process(client: &AppServerClient, handoff: bool) {
+    async fn install_synthetic_process(client: &AppServerClient, generation: u64, handoff: bool) {
         let process_slot = client
             .inner
             .controller
@@ -3354,7 +3621,7 @@ mod tests {
             let _ = shutdown_rx.await;
         });
         *client.inner.process.lock().await = Some(ProcessState {
-            generation: 1,
+            generation,
             writer: std::sync::Arc::new(tokio::sync::Mutex::new(AppServerWriter::WebSocket(
                 outbound_tx,
             ))),
@@ -3381,7 +3648,7 @@ mod tests {
                 codex_home: PathBuf::from("/tmp/codex-webui-idle"),
             })
             .await;
-        install_synthetic_process(&idle, false).await;
+        install_synthetic_process(&idle, 1, false).await;
 
         let status = manager.prepare_restart_handoff(true).await;
         assert_eq!(status.closed_idle_process_count, 1);
@@ -3394,7 +3661,7 @@ mod tests {
                 codex_home: PathBuf::from("/tmp/codex-webui-active-legacy"),
             })
             .await;
-        install_synthetic_process(&active_legacy, false).await;
+        install_synthetic_process(&active_legacy, 1, false).await;
         active_legacy
             .inner
             .active_turn_ids
@@ -3421,7 +3688,7 @@ mod tests {
                 codex_home: PathBuf::from("/tmp/codex-webui-handoff"),
             })
             .await;
-        install_synthetic_process(&client, true).await;
+        install_synthetic_process(&client, 1, true).await;
         client
             .inner
             .active_turn_ids
@@ -3447,13 +3714,26 @@ mod tests {
                 codex_home: PathBuf::from("/tmp/codex-webui-handoff-loss"),
             })
             .await;
-        install_synthetic_process(&client, true).await;
+        install_synthetic_process(&client, 1, true).await;
         client
             .inner
             .active_turn_ids
             .lock()
             .await
             .insert("turn-1".to_string());
+        client.inner.pending_server_requests.lock().await.insert(
+            "request-1".to_string(),
+            ObservedAppServerRequest {
+                request: AppServerRequest {
+                    id: json!("request-1"),
+                    method: "item/tool/requestUserInput".to_string(),
+                    params: json!({ "threadId": "thread-1" }),
+                },
+                client_instance_id: client.instance_id(),
+                process_generation: 1,
+                handoff_proxy: true,
+            },
+        );
         let mut notifications = client.subscribe_notifications();
 
         super::finalize_handoff_connection_loss(
@@ -3465,6 +3745,15 @@ mod tests {
 
         assert!(client.inner.process.lock().await.is_none());
         assert!(client.inner.active_turn_ids.lock().await.contains("turn-1"));
+        assert!(
+            client
+                .inner
+                .pending_server_requests
+                .lock()
+                .await
+                .contains_key("request-1"),
+            "a reconnectable handoff transport must preserve unresolved server requests"
+        );
         let notification = timeout(Duration::from_secs(1), notifications.recv())
             .await
             .unwrap()
@@ -3472,6 +3761,124 @@ mod tests {
         assert_eq!(notification.method, "codex-webui/app-server/disconnected");
 
         manager.detach_all().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_process_exit_does_not_clear_replacement_generation() {
+        let manager = AppServerManager::new(AppServerClientConfig::default());
+        let client = manager
+            .get_or_create(AppServerProfile {
+                id: "generation-fence".to_string(),
+                codex_home: PathBuf::from("/tmp/codex-webui-generation-fence"),
+            })
+            .await;
+        install_synthetic_process(&client, 2, false).await;
+        client
+            .inner
+            .active_turn_ids
+            .lock()
+            .await
+            .insert("turn-new".to_string());
+        let mut notifications = client.subscribe_notifications();
+
+        finalize_process_exit(
+            &client.inner,
+            1,
+            "stale generation exited".to_string(),
+            Value::Null,
+        )
+        .await;
+
+        assert_eq!(
+            client
+                .inner
+                .process
+                .lock()
+                .await
+                .as_ref()
+                .map(|process| process.generation),
+            Some(2)
+        );
+        assert!(
+            client
+                .inner
+                .active_turn_ids
+                .lock()
+                .await
+                .contains("turn-new")
+        );
+        assert!(
+            timeout(Duration::from_millis(50), notifications.recv())
+                .await
+                .is_err(),
+            "a stale generation must not emit an exit event for the replacement"
+        );
+
+        manager.close_all().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn observed_request_rejects_replaced_stdio_generation() {
+        let manager = AppServerManager::new(AppServerClientConfig::default());
+        let client = manager
+            .get_or_create(AppServerProfile {
+                id: "request-generation".to_string(),
+                codex_home: PathBuf::from("/tmp/codex-webui-request-generation"),
+            })
+            .await;
+        install_synthetic_process(&client, 2, false).await;
+        let observed = ObservedAppServerRequest {
+            request: AppServerRequest {
+                id: json!("request-old"),
+                method: "item/tool/requestUserInput".to_string(),
+                params: json!({ "threadId": "thread-old" }),
+            },
+            client_instance_id: client.instance_id(),
+            process_generation: 1,
+            handoff_proxy: false,
+        };
+
+        let error = match client.writer_for_server_request(Some(&observed)).await {
+            Ok(_) => panic!("an old stdio request must not target a replacement process"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("expired process generation"));
+
+        manager.close_all().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handoff_writer_waits_for_socket_send_acknowledgement() {
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel(1);
+        let writer = Arc::new(Mutex::new(AppServerWriter::WebSocket(outbound_tx)));
+        let task_writer = Arc::clone(&writer);
+        let send_task = tokio::spawn(async move {
+            write_app_server_message(
+                &task_writer,
+                r#"{"id":"request-1","result":{}}"#.to_string(),
+            )
+            .await
+        });
+        let outbound = timeout(Duration::from_secs(1), outbound_rx.recv())
+            .await
+            .expect("the writer should enqueue the response")
+            .expect("the handoff channel should remain open");
+
+        assert!(
+            !send_task.is_finished(),
+            "enqueueing alone must not acknowledge the app-server response"
+        );
+        outbound
+            .sent_tx
+            .send(Ok(()))
+            .expect("the sender should still await the acknowledgement");
+        send_task
+            .await
+            .expect("the writer task should join")
+            .expect("the acknowledged response should succeed");
     }
 
     #[test]
@@ -3749,6 +4156,39 @@ mod tests {
             assert!(first.is_none());
             assert!(second.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn replacing_client_key_retires_existing_clones() {
+        let manager = AppServerManager::new(AppServerClientConfig::default());
+        let original = manager
+            .get_or_create_with_key(
+                "shared-client".to_string(),
+                AppServerProfile {
+                    id: "default".to_string(),
+                    codex_home: PathBuf::from("/tmp/codex-webui-original-home"),
+                },
+            )
+            .await;
+        let original_clone = original.clone();
+        let replacement = manager
+            .get_or_create_with_key(
+                "shared-client".to_string(),
+                AppServerProfile {
+                    id: "default".to_string(),
+                    codex_home: PathBuf::from("/tmp/codex-webui-replacement-home"),
+                },
+            )
+            .await;
+
+        assert_ne!(original.instance_id(), replacement.instance_id());
+        let error = original_clone
+            .request("thread/read", json!({ "threadId": "stale" }))
+            .await
+            .expect_err("a replaced client clone must not restart");
+        assert!(error.to_string().contains("was replaced"));
+
+        manager.close_all().await.unwrap();
     }
 
     #[tokio::test]

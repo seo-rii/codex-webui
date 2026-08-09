@@ -820,7 +820,7 @@ async fn codex_protocol_proxy_methods_forward_to_app_server() {
 
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {
         role: UserRole::Owner,
@@ -940,7 +940,7 @@ async fn codex_apps_list_proxy_forwards_to_app_server() {
 
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {
         role: UserRole::Owner,
@@ -1012,7 +1012,7 @@ async fn codex_apps_list_routes_by_thread_profile_when_request_profile_is_stale(
 
     let default_client = app_server_client(&state, "default").await.unwrap();
     let second_client = app_server_client(&state, "second").await.unwrap();
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {
         role: UserRole::Owner,
@@ -5701,7 +5701,7 @@ async fn ws_queue_dispatch_uses_requested_session_profile() {
     .await
     .unwrap();
 
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {

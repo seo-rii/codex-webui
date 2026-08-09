@@ -783,7 +783,7 @@ async fn session_unsubscribe_uses_the_requested_profile_after_a_move() {
         session_relay_key("second", session_id),
         tokio::spawn(std::future::pending::<()>()),
     );
-    let (out_tx, _out_rx) = mpsc::channel(4);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(4);
     let payload = execute_ws_method(
         &state,
         &out_tx,
@@ -1650,7 +1650,7 @@ async fn ws_turn_send_routes_by_session_profile_when_request_profile_is_stale() 
         .await
         .unwrap();
 
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {
@@ -1849,7 +1849,7 @@ async fn ws_approval_resolve_routes_by_actual_session_profile() {
             },
         );
 
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {
@@ -3308,7 +3308,7 @@ async fn ws_review_start_proxies_to_session_app_server() {
         .await
         .unwrap();
 
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {
@@ -3429,7 +3429,7 @@ async fn ws_session_rollback_proxies_to_session_app_server() {
         .await
         .unwrap();
 
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {
@@ -3506,7 +3506,7 @@ fn ws_session_cache_validation_returns_not_modified_for_matching_versions() {
         .unwrap()
         .to_string();
 
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {

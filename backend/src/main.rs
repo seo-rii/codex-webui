@@ -48,7 +48,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     runtime::Builder as TokioRuntimeBuilder,
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch},
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};

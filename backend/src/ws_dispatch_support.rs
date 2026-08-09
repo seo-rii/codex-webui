@@ -75,7 +75,7 @@ async fn ws_request_profile_id_for_thread(
 
 pub(crate) async fn execute_ws_method(
     state: &AppState,
-    out_tx: &mpsc::Sender<ServerEnvelope>,
+    out_tx: &WsOutbound,
     subscriptions: &Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     auth: &AuthContext,
     method: &str,

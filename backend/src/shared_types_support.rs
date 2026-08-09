@@ -16,6 +16,65 @@ pub(crate) struct AuthContext {
 }
 
 #[derive(Clone)]
+pub(crate) struct WsOutbound {
+    sender: mpsc::Sender<ServerEnvelope>,
+    invalidation: watch::Sender<Option<String>>,
+}
+
+impl WsOutbound {
+    pub(crate) fn new(
+        capacity: usize,
+    ) -> (
+        Self,
+        mpsc::Receiver<ServerEnvelope>,
+        watch::Receiver<Option<String>>,
+    ) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        let (invalidation, invalidation_rx) = watch::channel(None);
+        (
+            Self {
+                sender,
+                invalidation,
+            },
+            receiver,
+            invalidation_rx,
+        )
+    }
+
+    pub(crate) fn try_send(
+        &self,
+        message: ServerEnvelope,
+    ) -> Result<(), mpsc::error::TrySendError<ServerEnvelope>> {
+        self.sender.try_send(message)
+    }
+
+    pub(crate) async fn send(
+        &self,
+        message: ServerEnvelope,
+    ) -> Result<(), mpsc::error::SendError<ServerEnvelope>> {
+        self.sender.send(message).await
+    }
+
+    pub(crate) fn subscribe_invalidation(&self) -> watch::Receiver<Option<String>> {
+        self.invalidation.subscribe()
+    }
+
+    pub(crate) fn invalidate(&self, reason: String) -> bool {
+        self.invalidation.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(reason);
+            true
+        })
+    }
+
+    pub(crate) fn invalidation_reason(&self) -> Option<String> {
+        self.invalidation.borrow().clone()
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) config: Arc<Config>,
     pub(crate) app_servers: AppServerManager,
@@ -109,7 +168,7 @@ pub(crate) struct InflightRequest {
     pub(crate) created_at: Instant,
     pub(crate) method: String,
     pub(crate) params_hash: String,
-    pub(crate) waiters: Vec<mpsc::Sender<ServerEnvelope>>,
+    pub(crate) waiters: Vec<WsOutbound>,
 }
 
 #[derive(Clone)]

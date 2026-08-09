@@ -112,14 +112,35 @@ async fn websocket_session(
     auth_token: Option<String>,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<ServerEnvelope>(WS_OUTBOUND_QUEUE_CAPACITY);
+    let (out_tx, mut out_rx, mut invalidation_rx) =
+        WsOutbound::new(WS_OUTBOUND_QUEUE_CAPACITY);
     let connection_id = Uuid::new_v4().to_string();
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let request_slots = Arc::new(tokio::sync::Semaphore::new(WS_MAX_CONCURRENT_REQUESTS));
 
+    let writer_out_tx = out_tx.clone();
+    let mut writer_invalidation_rx = out_tx.subscribe_invalidation();
     let writer = tokio::spawn(async move {
-        while let Some(message) = out_rx.recv().await {
+        loop {
+            let message = tokio::select! {
+                biased;
+                changed = writer_invalidation_rx.changed() => {
+                    if changed.is_ok() {
+                        warn!(
+                            reason = ?writer_invalidation_rx.borrow_and_update().clone(),
+                            "closing invalidated websocket writer"
+                        );
+                    }
+                    break;
+                }
+                message = out_rx.recv() => {
+                    let Some(message) = message else {
+                        break;
+                    };
+                    message
+                }
+            };
             let text = match serde_json::to_string(&message) {
                 Ok(text) => text,
                 Err(error) => {
@@ -135,9 +156,13 @@ async fn websocket_session(
             .await
             {
                 Ok(Ok(())) => {}
-                Ok(Err(_)) => break,
+                Ok(Err(error)) => {
+                    writer_out_tx.invalidate(format!("websocket socket send failed: {error}"));
+                    break;
+                }
                 Err(_) => {
                     warn!("closing websocket connection after stalled socket send");
+                    writer_out_tx.invalidate("websocket socket send stalled".to_string());
                     break;
                 }
             }
@@ -152,7 +177,23 @@ async fn websocket_session(
         "ready",
     );
 
-    while let Some(Ok(message)) = receiver.next().await {
+    loop {
+        let message = tokio::select! {
+            biased;
+            changed = invalidation_rx.changed() => {
+                if changed.is_ok() {
+                    warn!(
+                        reason = ?invalidation_rx.borrow_and_update().clone(),
+                        "closing invalidated websocket connection"
+                    );
+                }
+                break;
+            }
+            message = receiver.next() => message,
+        };
+        let Some(Ok(message)) = message else {
+            break;
+        };
         if auth_token
             .as_deref()
             .is_some_and(|token| valid_auth_cookie_role(&state.config, token) != Some(auth.role))
@@ -261,29 +302,28 @@ async fn websocket_session(
 }
 
 pub(crate) fn queue_ws_envelope(
-    out_tx: &mpsc::Sender<ServerEnvelope>,
+    out_tx: &WsOutbound,
     message: ServerEnvelope,
     context: &str,
 ) -> bool {
+    if out_tx.invalidation_reason().is_some() {
+        return false;
+    }
     match out_tx.try_send(message) {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(_)) => {
             let reason = format!("outbound queue saturated while sending {context}");
             warn!(
                 context = context,
-                "dropping websocket message for saturated outbound queue"
+                "invalidating websocket with saturated outbound queue"
             );
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(500),
-                    out_tx.send(ServerEnvelope::ResyncRequired { reason }),
-                )
-                .await;
-            });
+            out_tx.invalidate(reason);
             false
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            out_tx.invalidate(format!("outbound queue closed while sending {context}"));
+            false
+        }
     }
 }
 
@@ -306,7 +346,7 @@ pub(crate) async fn try_acquire_profile_ws_request_slot(
 
 async fn handle_ws_message(
     state: &AppState,
-    out_tx: &mpsc::Sender<ServerEnvelope>,
+    out_tx: &WsOutbound,
     subscriptions: &Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     auth: &AuthContext,
     payload: ClientEnvelope,

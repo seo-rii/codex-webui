@@ -875,7 +875,7 @@ async fn websocket_session_methods_reject_invalid_session_ids() {
     fs::create_dir_all(&codex_home).unwrap();
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
@@ -909,7 +909,7 @@ async fn websocket_attachment_upload_rejects_large_base64_payload_before_decodin
     fs::create_dir_all(&codex_home).unwrap();
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let encoded_size =
@@ -1000,7 +1000,7 @@ async fn session_recovery_ws_method_recovers_rollout_file() {
         .await
         .unwrap();
 
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let payload = execute_ws_method(
@@ -1201,7 +1201,7 @@ async fn session_recovery_ws_method_uses_thread_list_metadata_when_thread_read_f
         .await
         .unwrap();
 
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let payload = execute_ws_method(

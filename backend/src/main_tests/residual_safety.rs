@@ -92,7 +92,7 @@ async fn websocket_request_profile_overrides_the_connection_default_without_reco
         },
     );
     state.config = Arc::new(config);
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {
         role: UserRole::Admin,

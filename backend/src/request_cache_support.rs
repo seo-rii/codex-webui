@@ -89,7 +89,7 @@ pub(crate) async fn register_inflight_request(
     request_id: &str,
     method: &str,
     params_hash: &str,
-    out_tx: &mpsc::Sender<ServerEnvelope>,
+    out_tx: &WsOutbound,
 ) -> InflightRequestRegistration {
     let mut inflight = state.inflight_requests.lock().await;
     inflight.retain(|_, request| {

@@ -835,7 +835,7 @@ async fn session_subscription_drops_slow_outbound_client() {
     fs::create_dir_all(&codex_home).unwrap();
 
     let state = test_state(workspace.clone(), vec![workspace], codex_home);
-    let (out_tx, _out_rx) = mpsc::channel(1);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(1);
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
     subscribe_session(
         state.clone(),
@@ -922,7 +922,7 @@ async fn viewer_session_subscription_redacts_queue_payloads() {
     .await
     .expect("queue fixture should save");
 
-    let (out_tx, mut out_rx) = mpsc::channel(8);
+    let (out_tx, mut out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
     subscribe_session(
         state.clone(),
@@ -964,7 +964,7 @@ async fn session_subscription_coalesces_text_delta_events() {
     fs::create_dir_all(&codex_home).unwrap();
 
     let state = test_state(workspace.clone(), vec![workspace], codex_home);
-    let (out_tx, mut out_rx) = mpsc::channel(8);
+    let (out_tx, mut out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
     subscribe_session(
         state.clone(),
@@ -1053,7 +1053,7 @@ async fn session_subscription_flushes_continuous_text_delta_streams() {
     fs::create_dir_all(&codex_home).unwrap();
 
     let state = test_state(workspace.clone(), vec![workspace], codex_home);
-    let (out_tx, mut out_rx) = mpsc::channel(8);
+    let (out_tx, mut out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
     subscribe_session(
         state.clone(),
@@ -1138,7 +1138,7 @@ async fn viewer_global_subscription_filters_sensitive_events() {
 
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
-    let (out_tx, mut out_rx) = mpsc::channel(8);
+    let (out_tx, mut out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
     subscribe_global(
         state.clone(),

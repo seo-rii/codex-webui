@@ -662,7 +662,7 @@ async fn owner_config_blocks_admin_from_owner_only_websocket_methods() {
     let mut config = (*state.config).clone();
     config.owner_password = Some("owner-secret".to_string());
     state.config = Arc::new(config);
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {
         profile_id: "default".to_string(),
@@ -995,8 +995,8 @@ async fn websocket_inflight_requests_reject_id_reuse_with_different_payloads() {
     let state = test_state(workspace.clone(), vec![workspace], codex_home);
     let request_key = request_cache_key("default", "client-id", UserRole::Admin);
     let params_hash = request_params_hash(&json!({ "value": 1 }));
-    let (first_tx, _first_rx) = mpsc::channel(8);
-    let (second_tx, _second_rx) = mpsc::channel(8);
+    let (first_tx, _first_rx, _invalidation_rx) = WsOutbound::new(8);
+    let (second_tx, _second_rx, _invalidation_rx) = WsOutbound::new(8);
 
     assert!(matches!(
         register_inflight_request(&state, &request_key, "session/get", &params_hash, &first_tx)
@@ -1052,7 +1052,7 @@ async fn websocket_inflight_requests_limit_join_waiters() {
     let state = test_state(workspace.clone(), vec![workspace], codex_home);
     let request_key = request_cache_key("default", "client-id", UserRole::Admin);
     let params_hash = request_params_hash(&json!({ "value": 1 }));
-    let (first_tx, _first_rx) = mpsc::channel(8);
+    let (first_tx, _first_rx, _invalidation_rx) = WsOutbound::new(8);
 
     assert!(matches!(
         register_inflight_request(&state, &request_key, "session/get", &params_hash, &first_tx)
@@ -1061,14 +1061,14 @@ async fn websocket_inflight_requests_limit_join_waiters() {
     ));
 
     for _ in 1..INFLIGHT_REQUEST_MAX_WAITERS {
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, _rx, _invalidation_rx) = WsOutbound::new(8);
         assert!(matches!(
             register_inflight_request(&state, &request_key, "session/get", &params_hash, &tx).await,
             InflightRequestRegistration::Joined
         ));
     }
 
-    let (overflow_tx, _overflow_rx) = mpsc::channel(8);
+    let (overflow_tx, _overflow_rx, _invalidation_rx) = WsOutbound::new(8);
     assert!(matches!(
         register_inflight_request(
             &state,
@@ -1094,7 +1094,7 @@ async fn websocket_inflight_resolution_drops_saturated_waiters_without_blocking(
     let state = test_state(workspace.clone(), vec![workspace], codex_home);
     let request_key = request_cache_key("default", "client-id", UserRole::Admin);
     let params_hash = request_params_hash(&json!({ "value": 1 }));
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx, _invalidation_rx) = WsOutbound::new(1);
     tx.try_send(ServerEnvelope::Pong { nonce: None })
         .expect("test channel should fill");
 
@@ -1123,8 +1123,8 @@ async fn websocket_inflight_resolution_drops_saturated_waiters_without_blocking(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn saturated_websocket_queue_gets_resync_required_signal() {
-    let (tx, mut rx) = mpsc::channel(1);
+async fn saturated_websocket_queue_invalidates_connection() {
+    let (tx, mut rx, mut invalidation_rx) = WsOutbound::new(1);
     tx.try_send(ServerEnvelope::Pong { nonce: None })
         .expect("test channel should fill");
 
@@ -1141,16 +1141,16 @@ async fn saturated_websocket_queue_gets_resync_required_signal() {
 
     let first = rx.recv().await.expect("filled message should be present");
     assert!(matches!(first, ServerEnvelope::Pong { .. }));
-    let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+    invalidation_rx
+        .changed()
         .await
-        .expect("resync message should be queued")
-        .expect("resync message should be readable");
-    match second {
-        ServerEnvelope::ResyncRequired { reason } => {
-            assert!(reason.contains("test-saturation"));
-        }
-        other => panic!("expected resync required envelope, got {other:?}"),
-    }
+        .expect("connection invalidation should be observable");
+    let reason = invalidation_rx
+        .borrow_and_update()
+        .clone()
+        .expect("saturation should include an invalidation reason");
+    assert!(reason.contains("test-saturation"));
+    assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1698,7 +1698,7 @@ async fn health_readiness_and_metrics_endpoints_report_gateway_state() {
     state
         .preserve_app_servers_on_shutdown
         .store(false, Ordering::SeqCst);
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
     let ws_restart_payload = execute_ws_method(
         &state,
@@ -2003,7 +2003,7 @@ async fn viewer_notification_list_payloads_are_redacted() {
     )
     .unwrap();
 
-    let (out_tx, _out_rx) = mpsc::channel(8);
+    let (out_tx, _out_rx, _invalidation_rx) = WsOutbound::new(8);
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
     let auth = AuthContext {
         profile_id: "default".to_string(),

@@ -6,7 +6,7 @@ const RELAY_DELTA_MAX_FLUSH_INTERVAL: Duration = Duration::from_millis(120);
 const RELAY_DELTA_MAX_BYTES: usize = 4 * 1024;
 
 async fn send_relay_envelope(
-    out_tx: &mpsc::Sender<ServerEnvelope>,
+    out_tx: &WsOutbound,
     message: ServerEnvelope,
     context: &str,
 ) -> bool {
@@ -17,13 +17,9 @@ async fn send_relay_envelope(
             let reason = format!("relay send stalled while sending {context}");
             warn!(
                 context = context,
-                "requesting websocket resync after stalled relay send"
+                "invalidating websocket after stalled relay send"
             );
-            let _ = queue_ws_envelope(
-                out_tx,
-                ServerEnvelope::ResyncRequired { reason },
-                "stalled-relay-resync",
-            );
+            out_tx.invalidate(reason);
             false
         }
     }
@@ -31,7 +27,7 @@ async fn send_relay_envelope(
 
 pub(crate) async fn subscribe_session(
     state: AppState,
-    out_tx: mpsc::Sender<ServerEnvelope>,
+    out_tx: WsOutbound,
     subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     profile_id: String,
     session_id: String,
@@ -326,7 +322,7 @@ pub(crate) async fn subscribe_session(
 
 pub(crate) async fn subscribe_terminal(
     state: AppState,
-    out_tx: mpsc::Sender<ServerEnvelope>,
+    out_tx: WsOutbound,
     subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     terminal_id: String,
 ) -> Result<()> {
@@ -380,7 +376,7 @@ pub(crate) async fn subscribe_terminal(
 
 pub(crate) async fn subscribe_global(
     state: AppState,
-    out_tx: mpsc::Sender<ServerEnvelope>,
+    out_tx: WsOutbound,
     subscriptions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     profile_id: String,
     role: UserRole,

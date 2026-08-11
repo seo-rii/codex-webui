@@ -3035,22 +3035,7 @@ async fn handle_incoming_message(
             let _ = inner.notifications_tx.send(notification);
         }
         Ok(Some(IncomingMessage::Request(request))) => {
-            let request_key = server_request_id_key(&request.id);
-            let observed = ObservedAppServerRequest {
-                request,
-                client_instance_id: inner.instance_id,
-                process_generation: generation,
-                handoff_proxy,
-            };
-            inner
-                .pending_server_requests
-                .lock()
-                .await
-                .insert(request_key, observed.clone());
-            inner
-                .last_activity_at_ms
-                .store(unix_time_ms(), Ordering::Relaxed);
-            let _ = inner.requests_tx.send(observed);
+            record_incoming_server_request(inner, generation, handoff_proxy, request).await;
         }
         Ok(None) => {}
         Err(error) => {
@@ -3060,6 +3045,30 @@ async fn handle_incoming_message(
             );
         }
     }
+}
+
+async fn record_incoming_server_request(
+    inner: &Arc<AppServerClientInner>,
+    generation: u64,
+    handoff_proxy: bool,
+    request: AppServerRequest,
+) {
+    let request_key = server_request_id_key(&request.id);
+    let observed = ObservedAppServerRequest {
+        request,
+        client_instance_id: inner.instance_id,
+        process_generation: generation,
+        handoff_proxy,
+    };
+    inner
+        .pending_server_requests
+        .lock()
+        .await
+        .insert(request_key, observed.clone());
+    inner
+        .last_activity_at_ms
+        .store(unix_time_ms(), Ordering::Relaxed);
+    let _ = inner.requests_tx.send(observed);
 }
 
 async fn record_notification_activity(
@@ -3350,7 +3359,8 @@ mod tests {
         AppServerProfile, AppServerRequest, AppServerWriter, IncomingMessage,
         ObservedAppServerRequest, ProcessState, app_server_request_timed_out,
         app_server_timeout_recovered, classify_incoming_message, finalize_process_exit,
-        handoff_paths, rotate_text_log_if_needed, write_app_server_message, write_bytes_atomically,
+        handoff_paths, record_incoming_server_request, rotate_text_log_if_needed,
+        write_app_server_message, write_bytes_atomically,
     };
     #[cfg(unix)]
     use futures_util::{SinkExt, StreamExt};
@@ -3362,6 +3372,52 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Mutex;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn pending_registry_preserves_requests_after_relay_lag() {
+        const REQUEST_COUNT: usize = 132;
+
+        let manager = AppServerManager::new(AppServerClientConfig::default());
+        let client = manager
+            .get_or_create(AppServerProfile {
+                id: "request-relay-lag".to_string(),
+                codex_home: PathBuf::from("/tmp/codex-webui-request-relay-lag"),
+            })
+            .await;
+        let mut requests = client.subscribe_requests();
+
+        for index in 0..REQUEST_COUNT {
+            record_incoming_server_request(
+                &client.inner,
+                1,
+                false,
+                AppServerRequest {
+                    id: json!(format!("request-{index}")),
+                    method: "item/tool/requestUserInput".to_string(),
+                    params: json!({
+                        "threadId": format!("thread-{index}"),
+                        "questions": []
+                    }),
+                },
+            )
+            .await;
+        }
+
+        assert!(matches!(
+            requests.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))
+                if skipped == (REQUEST_COUNT - 128) as u64
+        ));
+        let pending = client.pending_server_requests().await;
+        assert_eq!(pending.len(), REQUEST_COUNT);
+        let pending_ids = pending
+            .iter()
+            .filter_map(|request| request.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(pending_ids.len(), REQUEST_COUNT);
+
+        manager.close_all().await.unwrap();
+    }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

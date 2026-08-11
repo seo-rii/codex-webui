@@ -6407,36 +6407,35 @@
               ...catchup,
               eventCount: catchup.eventCount + 1
             };
-            return;
+          } else {
+            const nextEventCount = catchup.eventCount + 1;
+            if (nextEventCount >= staleSessionCatchupEventThreshold) {
+              if (staleSessionCatchupTimer) {
+                clearTimeout(staleSessionCatchupTimer);
+                staleSessionCatchupTimer = null;
+              }
+              staleSessionCatchup = {
+                ...catchup,
+                eventCount: 1,
+                refreshing: true
+              };
+              void refreshSelectedSessionState(
+                sessionId,
+                olderTurnPageSize,
+                false,
+                sessionDetailCacheVersion,
+                true
+              ).catch((error) => {
+                clearStaleSessionCatchup();
+                errorText = describeError(error);
+              });
+            } else {
+              staleSessionCatchup = {
+                ...catchup,
+                eventCount: nextEventCount
+              };
+            }
           }
-
-          const nextEventCount = catchup.eventCount + 1;
-          if (nextEventCount >= staleSessionCatchupEventThreshold) {
-            staleSessionCatchup = {
-              ...catchup,
-              eventCount: 0,
-              refreshing: true
-            };
-            const nextPendingEvents = { ...pendingSessionEvents };
-            delete nextPendingEvents[scopeKey];
-            pendingSessionEvents = nextPendingEvents;
-            void refreshSelectedSessionState(
-              sessionId,
-              olderTurnPageSize,
-              false,
-              sessionDetailCacheVersion,
-              true
-            ).catch((error) => {
-              clearStaleSessionCatchup();
-              errorText = describeError(error);
-            });
-            return;
-          }
-
-          staleSessionCatchup = {
-            ...catchup,
-            eventCount: nextEventCount
-          };
         }
 
         if (payload.kind === "notification" && payload.method === "codex-webui/preferencesUpdated") {
@@ -6777,10 +6776,6 @@
         : createConversationState(detail);
     if (flushPendingEvents) {
       nextConversation = flushPendingSessionEvents(sessionId, profileId, nextConversation);
-    } else if (pendingEventsBeforeFlush.length > 0) {
-      const nextPendingEvents = { ...pendingSessionEvents };
-      delete nextPendingEvents[scopeKey];
-      pendingSessionEvents = nextPendingEvents;
     }
     nextConversation = applyLocalComposerPreferencesToConversation(normalizeConversationExecutionState(nextConversation));
     const mergedQueue = mergeQueueSnapshot(sessionQueueSnapshotsBySessionId[scopeKey], nextConversation.queue);
@@ -6812,7 +6807,9 @@
     titleDraft = getConversationDisplayTitle(nextConversation) ?? "";
     upsertSessionSummary(buildSessionSummaryFromConversation(nextConversation), false);
     clearHydrationRefresh();
-    clearStaleSessionCatchup();
+    if (!replaceTranscriptWindow) {
+      clearStaleSessionCatchup();
+    }
     updateSessionRecoveryPrompt(sessionId, nextConversation);
     updateManualCompactPrompt(sessionId, nextConversation);
     return nextConversation;
@@ -7111,12 +7108,14 @@
         rememberSessionProfile({ id: nextDetail.thread.id, profileId: nextDetail.profileId });
       }
       const streamedStateAdvanced = (sessionEventRevisions.get(scopeKey) ?? 0) > requestEventRevision;
+      const preserveStreamedState =
+        streamedStateAdvanced || (replaceWithRecentWindow && skippedEventCount > 0);
       const nextConversation = applyLoadedSessionDetail(
         nextDetail.thread.id,
         sessionProfileId,
         nextDetail,
         !replaceWithRecentWindow,
-        streamedStateAdvanced,
+        preserveStreamedState,
         replaceWithRecentWindow
       );
       const detailCacheKey = buildSessionDetailBrowserCacheKey(nextDetail.thread.id, sessionProfileId);
@@ -7124,13 +7123,17 @@
         void writeSessionDetailCache(
           detailCacheKey,
           conversationToSessionDetailPayload(nextConversation),
-          streamedStateAdvanced ? null : nextDetail.cacheVersion
+          preserveStreamedState ? null : nextDetail.cacheVersion
         );
       }
-      if (replaceWithRecentWindow && skippedEventCount > 0 && staleSessionCatchup) {
-        if (staleSessionCatchup.refreshRetries < 1) {
+      if (
+        replaceWithRecentWindow &&
+        staleSessionCatchup?.sessionId === nextDetail.thread.id
+      ) {
+        if (skippedEventCount > 0 && staleSessionCatchup.refreshRetries < 1) {
           staleSessionCatchup = {
             ...staleSessionCatchup,
+            eventCount: 0,
             refreshRetries: staleSessionCatchup.refreshRetries + 1
           };
           scheduleSelectedSessionStateRefresh(nextDetail.thread.id, 2_000, true);
@@ -7167,12 +7170,14 @@
       rememberSessionProfile({ id: detail.thread.id, profileId: detail.profileId });
     }
     const streamedStateAdvanced = (sessionEventRevisions.get(scopeKey) ?? 0) > requestEventRevision;
+    const preserveStreamedState =
+      streamedStateAdvanced || (replaceWithRecentWindow && skippedEventCount > 0);
     const nextConversation = applyLoadedSessionDetail(
       detail.thread.id,
       sessionProfileId,
       detail,
       !replaceWithRecentWindow,
-      streamedStateAdvanced,
+      preserveStreamedState,
       replaceWithRecentWindow
     );
     const detailCacheKey = buildSessionDetailBrowserCacheKey(detail.thread.id, sessionProfileId);
@@ -7180,7 +7185,7 @@
       void writeSessionDetailCache(
         detailCacheKey,
         conversationToSessionDetailPayload(nextConversation),
-        streamedStateAdvanced ? null : detail.cacheVersion
+        preserveStreamedState ? null : detail.cacheVersion
       );
     }
     if (loadDraft) {
@@ -7192,10 +7197,14 @@
         requestSelectionVersion
       );
     }
-    if (replaceWithRecentWindow && skippedEventCount > 0 && staleSessionCatchup) {
-      if (staleSessionCatchup.refreshRetries < 1) {
+    if (
+      replaceWithRecentWindow &&
+      staleSessionCatchup?.sessionId === detail.thread.id
+    ) {
+      if (skippedEventCount > 0 && staleSessionCatchup.refreshRetries < 1) {
         staleSessionCatchup = {
           ...staleSessionCatchup,
+          eventCount: 0,
           refreshRetries: staleSessionCatchup.refreshRetries + 1
         };
         scheduleSelectedSessionStateRefresh(detail.thread.id, 2_000, true);

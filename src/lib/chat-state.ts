@@ -647,13 +647,22 @@ export function mergeConversationState(
       : turn
   );
   const hasLiveTurn = mergedTurns.some((turn) => String(turn.status ?? "") === "inProgress");
+  const staleIncomingLiveStatus = !hasLiveTurn && isLiveThreadStatus(incoming.thread.status);
   const threadStatus = hasLiveTurn
     ? (isLiveThreadStatus(incoming.thread.status) ? incoming.thread.status : current.thread.status || "running")
-    : incoming.thread.status;
+    : staleIncomingLiveStatus
+      ? current.thread.status
+      : incoming.thread.status;
+  const activeTurnId = hasLiveTurn
+    ? (incoming.activeTurnId && mergedTurns.some((turn) => turn.id === incoming.activeTurnId && turn.status === "inProgress")
+        ? incoming.activeTurnId
+        : (mergedTurns.find((turn) => turn.status === "inProgress")?.id ?? null))
+    : null;
   const livePlans = pruneLivePlansForRunningTurns(current.livePlans, mergedTurns);
 
   return {
     ...incoming,
+    activeTurnId,
     thread: {
       ...current.thread,
       ...incoming.thread,

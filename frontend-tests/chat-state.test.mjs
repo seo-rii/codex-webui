@@ -110,6 +110,40 @@ test("a snapshot that already contains the delta remains exactly once", () => {
   assert.equal(merged.thread.turns[0].items[0].text, "hello");
 });
 
+test("a stale live snapshot cannot reopen a turn completed while the request was in flight", () => {
+  const staleSnapshot = detailWithItems([{ id: "message-1", type: "agentMessage", text: "hel" }]);
+  let current = applyStreamEvent(createConversationState(staleSnapshot), {
+    kind: "notification",
+    method: "item/agentMessage/delta",
+    params: { turnId: "turn-1", itemId: "message-1", delta: "lo" }
+  });
+  current = applyStreamEvent(current, {
+    kind: "notification",
+    method: "turn/completed",
+    params: {
+      turnId: "turn-1",
+      turn: {
+        id: "turn-1",
+        items: [{ id: "message-1", type: "agentMessage", text: "hello" }],
+        status: "completed",
+        error: null,
+        startedAt: 1,
+        completedAt: 2,
+        durationMs: 1
+      }
+    }
+  });
+
+  const merged = mergeConversationState(current, staleSnapshot);
+
+  assert.equal(merged.thread.turns.length, 1);
+  assert.equal(merged.thread.turns[0].items.length, 1);
+  assert.equal(merged.thread.turns[0].items[0].text, "hello");
+  assert.equal(merged.thread.turns[0].status, "completed");
+  assert.equal(merged.thread.status, "completed");
+  assert.equal(merged.activeTurnId, null);
+});
+
 test("snapshot and optimistic user echoes with different ids are deduplicated", () => {
   const current = createConversationState(
     detailWithItems([{ id: "optimistic-user", type: "userMessage", text: "same prompt" }])

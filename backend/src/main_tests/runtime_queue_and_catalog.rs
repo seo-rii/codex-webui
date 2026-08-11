@@ -5524,6 +5524,162 @@ async fn manual_queue_dispatch_resumes_remaining_items_after_turn_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_turn_event_precedes_queued_follow_up_start() {
+    let sandbox = unique_test_dir("queue-completion-lifecycle-order");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5.4"
+        }),
+        None,
+        Some("Queue lifecycle ordering"),
+    )
+    .await
+    .unwrap();
+    let session_id = created.get("id").and_then(Value::as_str).unwrap();
+    let completed_turn_id = "turn-completing";
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key, completed_turn_id.to_string());
+    set_runtime_session_status(&state, "default", session_id, "running").await;
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["queuesByThreadId"][session_id] = json!({
+            "items": [
+                {
+                    "id": "queue-next",
+                    "prompt": "start only after the previous completion is visible",
+                    "attachmentIds": [],
+                    "attachmentNames": [],
+                    "createdAt": 15
+                }
+            ],
+            "resumePending": false,
+            "updatedAt": 20
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Queue lifecycle ordering",
+                    "preview": "previous turn",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "completed",
+                    "isSubagent": false,
+                    "agentNickname": Value::Null,
+                    "agentRole": Value::Null,
+                    "turns": [
+                        {
+                            "id": completed_turn_id,
+                            "status": "completed",
+                            "items": [
+                                {
+                                    "id": "answer-1",
+                                    "type": "agentMessage",
+                                    "text": "previous turn complete"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let relay = ensure_stream_relay(&state, "default", session_id)
+        .await
+        .expect("session relay should initialize");
+    let mut receiver = relay.subscribe();
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "turn/completed".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "turnId": completed_turn_id,
+                "turn": {
+                    "id": completed_turn_id,
+                    "status": "completed",
+                    "items": [
+                        {
+                            "id": "answer-1",
+                            "type": "agentMessage",
+                            "text": "previous turn complete"
+                        }
+                    ]
+                }
+            }),
+        },
+    )
+    .await;
+
+    let lifecycle = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut observed = Vec::new();
+        loop {
+            let event = receiver.recv().await.expect("session event should arrive");
+            let method = event
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let status = event
+                .get("params")
+                .and_then(|params| params.get("status"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let next_turn_started =
+                method == "thread/status/changed" && status.as_deref() == Some("starting");
+            observed.push((method, status));
+            if next_turn_started {
+                return observed;
+            }
+        }
+    })
+    .await
+    .expect("queued follow-up should start after completion");
+    let completion_index = lifecycle
+        .iter()
+        .position(|(method, _)| method == "turn/completed")
+        .unwrap_or_else(|| panic!("completed turn event should be published: {lifecycle:?}"));
+    let next_start_index = lifecycle
+        .iter()
+        .position(|(method, status)| {
+            method == "thread/status/changed" && status.as_deref() == Some("starting")
+        })
+        .expect("queued turn starting event should be published");
+    assert!(
+        completion_index < next_start_index,
+        "previous completion must precede queued turn start: {lifecycle:?}"
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queue_drain_recovers_orphaned_dispatch_claim_without_manual_resume() {
     let sandbox = unique_test_dir("queue-recovers-orphaned-dispatch-claim");
     let workspace = sandbox.join("workspace");

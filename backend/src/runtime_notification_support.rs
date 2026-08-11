@@ -1074,15 +1074,16 @@ async fn mark_runtime_session_terminal_after_reconcile(
         }),
     )
     .await;
-    if matches!(status, "completed" | "stopped") {
-        spawn_queue_drain(state, profile_id, session_id);
-        if status == "completed" {
-            maybe_schedule_global_shutdown(state, profile_id, None).await;
-        }
-    } else if status == "failed" {
+    if status == "failed" {
         mark_runtime_session_attention(state, profile_id, session_id, "failed", reason).await;
     }
     emit_session_summary_updated(state, profile_id, session_id, None, Some(status)).await;
+    if matches!(status, "completed" | "stopped") {
+        if status == "completed" {
+            maybe_schedule_global_shutdown(state, profile_id, None).await;
+        }
+        spawn_queue_drain(state, profile_id, session_id);
+    }
 }
 
 pub(crate) async fn reconcile_lost_runtime_activity_for_profile(
@@ -1383,6 +1384,7 @@ pub(crate) async fn handle_profile_runtime_notification(
         .0
         .to_string();
     let runtime_key = runtime_session_key(&resolved_profile_id, &session_id);
+    let mut drain_queue_after_publish = false;
 
     match notification.method.as_str() {
         "turn/started" => {
@@ -1463,7 +1465,7 @@ pub(crate) async fn handle_profile_runtime_notification(
                     None,
                 )
                 .await;
-                spawn_queue_drain(state, profile_id, &session_id);
+                drain_queue_after_publish = true;
                 maybe_schedule_global_shutdown(state, profile_id, turn_id.as_deref()).await;
                 emit_profile_global_notification(
                     state,
@@ -1599,7 +1601,7 @@ pub(crate) async fn handle_profile_runtime_notification(
                     )
                     .await;
                 }
-                spawn_queue_drain(state, profile_id, &session_id);
+                drain_queue_after_publish = true;
                 if status == "completed" {
                     maybe_schedule_global_shutdown(state, profile_id, None).await;
                 }
@@ -1738,6 +1740,13 @@ pub(crate) async fn handle_profile_runtime_notification(
             status_override.as_deref(),
         )
         .await;
+    }
+
+    // A queued follow-up emits its own `starting` lifecycle immediately. Publish
+    // the terminal event and summary first so clients cannot observe the next
+    // turn starting before the previous turn has completed.
+    if drain_queue_after_publish {
+        spawn_queue_drain(state, profile_id, &session_id);
     }
 }
 

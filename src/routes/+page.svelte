@@ -1751,6 +1751,7 @@
   let transcriptPinnedTurnId: string | null = null;
   let transcriptPinnedTurnAlignment: TranscriptWindowAlignment = "center";
   let transcriptPinReleaseTimer: ReturnType<typeof setTimeout> | null = null;
+  let transcriptPinScrollEndCleanup: (() => void) | null = null;
   let stickTranscriptToBottom = $state(true);
   let forceTranscriptScroll = $state(false);
   let pendingTranscriptBottomScroll = $state(false);
@@ -3297,9 +3298,7 @@
       if (transcriptMeasurementFrame !== null) {
         cancelAnimationFrame(transcriptMeasurementFrame);
       }
-      if (transcriptPinReleaseTimer) {
-        clearTimeout(transcriptPinReleaseTimer);
-      }
+      clearTranscriptPinReleaseWait();
       if (composerTextareaResizeFrame !== null) {
         cancelAnimationFrame(composerTextareaResizeFrame);
       }
@@ -3561,10 +3560,7 @@
       transcriptTurnWindow = EMPTY_TRANSCRIPT_WINDOW;
       transcriptPinnedTurnId = null;
       transcriptMeasuredWidth = transcriptElement?.clientWidth ?? 0;
-      if (transcriptPinReleaseTimer) {
-        clearTimeout(transcriptPinReleaseTimer);
-        transcriptPinReleaseTimer = null;
-      }
+      clearTranscriptPinReleaseWait();
     }
 
     void tick().then(() => {
@@ -3598,10 +3594,12 @@
         rebuildTranscriptTurnLayout();
         if (anchor) {
           void restoreTranscriptScrollAnchor(anchor);
-        } else {
+        } else if (stickTranscriptToBottom) {
           const newestTurnId = conversation?.thread.turns.at(-1)?.id ?? null;
           refreshTranscriptTurnWindow(newestTurnId, "end");
           scheduleTranscriptScrollToBottom();
+        } else {
+          refreshTranscriptTurnWindow();
         }
         return;
       }
@@ -4397,22 +4395,26 @@
     }
   }
 
-  function pinTranscriptTurn(turnId: string, alignment: TranscriptWindowAlignment = "center") {
-    transcriptPinnedTurnId = turnId;
-    transcriptPinnedTurnAlignment = alignment;
+  function clearTranscriptPinReleaseWait() {
     if (transcriptPinReleaseTimer) {
       clearTimeout(transcriptPinReleaseTimer);
       transcriptPinReleaseTimer = null;
     }
+    transcriptPinScrollEndCleanup?.();
+    transcriptPinScrollEndCleanup = null;
+  }
+
+  function pinTranscriptTurn(turnId: string, alignment: TranscriptWindowAlignment = "center") {
+    clearTranscriptPinReleaseWait();
+    transcriptPinnedTurnId = turnId;
+    transcriptPinnedTurnAlignment = alignment;
   }
 
   function releaseTranscriptTurnPin(turnId: string | null = transcriptPinnedTurnId, delay = 0) {
     if (!turnId || transcriptPinnedTurnId !== turnId) {
       return;
     }
-    if (transcriptPinReleaseTimer) {
-      clearTimeout(transcriptPinReleaseTimer);
-    }
+    clearTranscriptPinReleaseWait();
     transcriptPinReleaseTimer = setTimeout(() => {
       transcriptPinReleaseTimer = null;
       if (transcriptPinnedTurnId !== turnId) {
@@ -4421,6 +4423,29 @@
       transcriptPinnedTurnId = null;
       refreshTranscriptTurnWindow();
     }, delay);
+  }
+
+  function releaseTranscriptTurnPinWhenScrollEnds(turnId: string) {
+    if (!transcriptElement || transcriptPinnedTurnId !== turnId) {
+      releaseTranscriptTurnPin(turnId);
+      return;
+    }
+    clearTranscriptPinReleaseWait();
+    const transcript = transcriptElement;
+    const finish = () => {
+      if (transcriptPinnedTurnId !== turnId) {
+        clearTranscriptPinReleaseWait();
+        return;
+      }
+      transcriptPinnedTurnId = null;
+      clearTranscriptPinReleaseWait();
+      refreshTranscriptTurnWindow();
+    };
+    transcript.addEventListener("scrollend", finish, { once: true });
+    transcriptPinScrollEndCleanup = () => {
+      transcript.removeEventListener("scrollend", finish);
+    };
+    transcriptPinReleaseTimer = setTimeout(finish, 4_000);
   }
 
   function captureTranscriptScrollAnchor(): TranscriptScrollAnchor | null {
@@ -4593,10 +4618,7 @@
   function suspendTranscriptAutoScrollForUser(preservePinnedTurn = false) {
     if (!preservePinnedTurn) {
       transcriptPinnedTurnId = null;
-      if (transcriptPinReleaseTimer) {
-        clearTimeout(transcriptPinReleaseTimer);
-        transcriptPinReleaseTimer = null;
-      }
+      clearTranscriptPinReleaseWait();
     }
     transcriptAutoScrollSuspendedByUser = true;
     stickTranscriptToBottom = false;
@@ -13784,6 +13806,7 @@
           : match.turnId.replace(/"/g, '\\"');
       const target = transcriptContentElement?.querySelector<HTMLElement>(`[data-turn-id="${escapedTurnId}"]`);
       if (!target) {
+        releaseTranscriptTurnPin(match.turnId);
         sessionTurnSearchError = describeUiError({
           code: "SESSION_SEARCH_RESULT_UNAVAILABLE",
           message: "Search result could not be located."
@@ -13795,7 +13818,7 @@
         block: "start",
         behavior: "smooth"
       });
-      releaseTranscriptTurnPin(match.turnId, 700);
+      releaseTranscriptTurnPinWhenScrollEnds(match.turnId);
       sessionTurnSearchFocusedTurnId = match.turnId;
       if (sessionTurnSearchHighlightTimer) {
         clearTimeout(sessionTurnSearchHighlightTimer);
@@ -13806,6 +13829,7 @@
         }
       }, 2200);
     } catch (error) {
+      releaseTranscriptTurnPin(match.turnId);
       if (matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
         sessionTurnSearchError = describeError(error);
       }

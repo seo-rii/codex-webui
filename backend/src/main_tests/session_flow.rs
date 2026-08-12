@@ -5109,6 +5109,113 @@ async fn runtime_reconcile_preserves_turn_owned_by_live_app_server() {
         ui_state["runtimeStatusByThreadId"][session_id]["status"].as_str(),
         Some("running")
     );
+    let request_count = client
+        .request("debug/requestCount", json!({ "target": "thread/read" }))
+        .await
+        .unwrap();
+    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(0));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_reconcile_preserves_manager_ownership_acquired_during_native_probe() {
+    let sandbox = unique_test_dir("runtime-reconcile-concurrent-manager-owner");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-runtime-concurrent-manager-owner";
+    let runtime_key = runtime_session_key("default", session_id);
+    let client = app_server_client(&state, "default").await.unwrap();
+    let started = client
+        .request(
+            "turn/start",
+            json!({
+                "threadId": session_id,
+                "input": [{ "type": "text", "text": "own this turn during reconciliation" }],
+                "cwd": workspace.display().to_string()
+            }),
+        )
+        .await
+        .unwrap();
+    let owned_turn_id = started["turn"]["id"].as_str().unwrap().to_string();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Idle native snapshot",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    client
+        .request(
+            "debug/setDelay",
+            json!({
+                "method": "thread/read",
+                "delayMs": 200
+            }),
+        )
+        .await
+        .unwrap();
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-stale-before-probe".to_string());
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][session_id] = json!({
+            "status": "running",
+            "updatedAt": now_unix_ms().saturating_sub(120_000)
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let reconcile = reconcile_lost_runtime_activity_for_profile(&state, "default");
+    let acquire_current_ownership = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state
+            .active_turns
+            .lock()
+            .await
+            .insert(runtime_key.clone(), owned_turn_id.clone());
+    };
+    let (reconciled, ()) = tokio::join!(reconcile, acquire_current_ownership);
+
+    assert!(reconciled.is_empty());
+    assert_eq!(
+        state.active_turns.lock().await.get(&runtime_key),
+        Some(&owned_turn_id)
+    );
+    assert!(client.has_active_turn_id(&owned_turn_id).await);
+    let status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][session_id]["status"].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.as_str(), Some("running"));
+    let request_count = client
+        .request("debug/requestCount", json!({ "target": "thread/read" }))
+        .await
+        .unwrap();
+    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(1));
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -7023,6 +7130,109 @@ async fn session_summary_skips_native_read_for_manager_owned_turn() {
         .await
         .unwrap();
     assert_eq!(count.get("count").and_then(Value::as_u64), Some(0));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_summary_preserves_manager_ownership_acquired_during_native_probe() {
+    let sandbox = unique_test_dir("session-summary-concurrent-manager-owner");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-summary-concurrent-manager-owner";
+    let runtime_key = runtime_session_key("default", session_id);
+    let client = app_server_client(&state, "default").await.unwrap();
+    let started = client
+        .request(
+            "turn/start",
+            json!({
+                "threadId": session_id,
+                "input": [{ "type": "text", "text": "own this turn during summary refresh" }],
+                "cwd": workspace.display().to_string()
+            }),
+        )
+        .await
+        .unwrap();
+    let owned_turn_id = started["turn"]["id"].as_str().unwrap().to_string();
+    client
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Idle summary snapshot",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "idle",
+                    "isSubagent": false,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    client
+        .request(
+            "debug/setDelay",
+            json!({
+                "method": "thread/read",
+                "delayMs": 200
+            }),
+        )
+        .await
+        .unwrap();
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-stale-before-summary".to_string());
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][session_id] = json!({
+            "status": "running",
+            "updatedAt": now_unix_ms().saturating_sub(120_000)
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let reconcile = read_session_summary_ui_snapshot(&state, "default");
+    let acquire_current_ownership = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state
+            .active_turns
+            .lock()
+            .await
+            .insert(runtime_key.clone(), owned_turn_id.clone());
+    };
+    let (snapshot, ()) = tokio::join!(reconcile, acquire_current_ownership);
+    let snapshot = snapshot.unwrap();
+
+    assert!(snapshot.active_thread_ids.contains(session_id));
+    assert_eq!(
+        state.active_turns.lock().await.get(&runtime_key),
+        Some(&owned_turn_id)
+    );
+    assert!(client.has_active_turn_id(&owned_turn_id).await);
+    let status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][session_id]["status"].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.as_str(), Some("running"));
+    let request_count = client
+        .request("debug/requestCount", json!({ "target": "thread/read" }))
+        .await
+        .unwrap();
+    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(1));
 
     let _ = fs::remove_dir_all(sandbox);
 }

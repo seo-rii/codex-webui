@@ -862,8 +862,23 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                 continue;
             }
         }
-        state.active_turns.lock().await.remove(&runtime_key);
-        state.pending_turn_starts.lock().await.remove(&runtime_key);
+        {
+            let mut active_turns = state.active_turns.lock().await;
+            if let Some(current_turn_id) = active_turns.get(&runtime_key).map(String::as_str) {
+                if Some(current_turn_id) != observed_cached_turn_id.as_deref() {
+                    continue;
+                }
+                active_turns.remove(&runtime_key);
+            }
+        }
+        if state
+            .pending_turn_starts
+            .lock()
+            .await
+            .contains(&runtime_key)
+        {
+            continue;
+        }
         with_ui_state_write(state, profile_id, |ui_state| {
             let Some(runtime_status_by_thread_id) = ui_state
                 .get_mut("runtimeStatusByThreadId")

@@ -1199,6 +1199,11 @@ pub(crate) async fn reconcile_lost_runtime_activity_for_profile(
         }
         let cached_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
         if let Some(cached_turn_id) = cached_turn_id.as_deref()
+            && client.has_active_turn_id(cached_turn_id).await
+        {
+            continue;
+        }
+        if let Some(cached_turn_id) = cached_turn_id.as_deref()
             && let Ok(Some(local_evidence)) =
                 read_local_rollout_runtime_evidence(state, profile_id, &session_id, cached_turn_id)
                     .await
@@ -1216,6 +1221,7 @@ pub(crate) async fn reconcile_lost_runtime_activity_for_profile(
                         .lock()
                         .await
                         .contains(&runtime_key)
+                    && !client.has_active_turn_id(cached_turn_id).await
                 {
                     mark_runtime_session_terminal_after_reconcile(
                         state,
@@ -1264,13 +1270,21 @@ pub(crate) async fn reconcile_lost_runtime_activity_for_profile(
             .lock()
             .await
             .contains(&runtime_key)
-            || terminal_status_conflicts_with_live_turn(
-                state,
-                profile_id,
-                &session_id,
-                &runtime_key,
-            )
+        {
+            continue;
+        }
+        if let Some(current_turn_id) = state.active_turns.lock().await.get(&runtime_key).cloned() {
+            if cached_turn_id.as_deref() != Some(current_turn_id.as_str())
+                || client.has_active_turn_id(&current_turn_id).await
+            {
+                continue;
+            }
+        }
+        if state
+            .pending_turn_starts
+            .lock()
             .await
+            .contains(&runtime_key)
         {
             continue;
         }

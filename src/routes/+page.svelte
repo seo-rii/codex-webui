@@ -5818,6 +5818,7 @@
     };
     selectedSessionCompletionRefreshJobs.set(jobKey, refreshJob);
     const retryDelays = [200, 500, 1_000, 2_000, 4_000, 8_000, 16_000];
+    const longRetryDelay = 30_000;
 
     const scheduleAttempt = (attempt: number, delay: number) => {
       const timer = setTimeout(() => {
@@ -5863,21 +5864,16 @@
             return;
           }
           const nextAttempt = attempt + 1;
-          if (nextAttempt < retryDelays.length) {
-            scheduleAttempt(nextAttempt, Math.max(retryDelays[nextAttempt], result.retryAfterMs));
-          } else {
-            selectedSessionCompletionRefreshJobs.delete(jobKey);
-          }
+          scheduleAttempt(
+            nextAttempt,
+            Math.max(retryDelays[nextAttempt] ?? longRetryDelay, result.retryAfterMs)
+          );
         }).catch(() => {
           if (selectedSessionCompletionRefreshJobs.get(jobKey) !== refreshJob) {
             return;
           }
           const nextAttempt = attempt + 1;
-          if (nextAttempt < retryDelays.length) {
-            scheduleAttempt(nextAttempt, retryDelays[nextAttempt]);
-          } else {
-            selectedSessionCompletionRefreshJobs.delete(jobKey);
-          }
+          scheduleAttempt(nextAttempt, retryDelays[nextAttempt] ?? longRetryDelay);
         });
       }, delay);
       refreshJob.timers.add(timer);

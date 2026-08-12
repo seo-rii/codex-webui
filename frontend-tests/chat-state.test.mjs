@@ -100,6 +100,34 @@ test("a stale snapshot cannot overwrite a newer streamed delta", () => {
   assert.equal(merged.thread.turns[0].items[0].text, "hello");
 });
 
+test("active deltas preserve historical turn references in long transcripts", () => {
+  const detail = detailWithItems([{ id: "message-199", type: "agentMessage", text: "hel" }]);
+  detail.thread.turns = Array.from({ length: 200 }, (_, index) => ({
+    id: `turn-${index}`,
+    items: [{ id: `message-${index}`, type: "agentMessage", text: index === 199 ? "hel" : `history-${index}` }],
+    status: index === 199 ? "inProgress" : "completed",
+    error: null,
+    startedAt: index + 1,
+    completedAt: index === 199 ? null : index + 2,
+    durationMs: index === 199 ? null : 1
+  }));
+  detail.activeTurnId = "turn-199";
+  const current = createConversationState(detail);
+  const historicalTurn = current.thread.turns[0];
+  const activeTurn = current.thread.turns[199];
+
+  const streamed = applyStreamEvent(current, {
+    kind: "notification",
+    method: "item/agentMessage/delta",
+    params: { turnId: "turn-199", itemId: "message-199", delta: "lo" }
+  });
+
+  assert.equal(streamed.thread.turns[0], historicalTurn);
+  assert.notEqual(streamed.thread.turns[199], activeTurn);
+  assert.equal(streamed.thread.turns[199].items[0].text, "hello");
+  assert.equal(current.thread.turns[199].items[0].text, "hel");
+});
+
 test("a snapshot that already contains the delta remains exactly once", () => {
   const completeSnapshot = detailWithItems([{ id: "message-1", type: "agentMessage", text: "hello" }]);
   const current = createConversationState(completeSnapshot);

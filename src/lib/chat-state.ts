@@ -64,8 +64,11 @@ function findContextCompactionItemIndex(items: CodexItem[]) {
 }
 
 function ensureTurn(state: ConversationState, turnId: string, seed?: Partial<CodexTurn>) {
-  const turns = [...state.thread.turns];
-  let index = turns.findIndex((turn) => turn.id === turnId);
+  const currentTurns = state.thread.turns;
+  let index = currentTurns.length > 0 && currentTurns[currentTurns.length - 1].id === turnId
+    ? currentTurns.length - 1
+    : currentTurns.findIndex((turn) => turn.id === turnId);
+  const turns = [...currentTurns];
   if (index === -1) {
     turns.push({
       id: turnId,
@@ -93,21 +96,23 @@ function upsertItem(turn: CodexTurn, item: CodexItem) {
     ...item,
     type: normalizeItemTypeName(item.type)
   };
-  const index = turn.items.findIndex((candidate) => candidate.id === normalizedItem.id);
+  const index = turn.items.length > 0 && turn.items[turn.items.length - 1].id === normalizedItem.id
+    ? turn.items.length - 1
+    : turn.items.findIndex((candidate) => candidate.id === normalizedItem.id);
   if (index === -1) {
     const contextCompactionIndex = isContextCompactionItem(normalizedItem) ? findContextCompactionItemIndex(turn.items) : -1;
     if (contextCompactionIndex !== -1) {
-      turn.items = turn.items.map((candidate, candidateIndex) =>
-        candidateIndex === contextCompactionIndex ? mergeItem(candidate, normalizedItem) : candidate
-      );
+    const items = [...turn.items];
+    items[contextCompactionIndex] = mergeItem(items[contextCompactionIndex], normalizedItem);
+    turn.items = items;
       return;
     }
     turn.items = [...turn.items, normalizedItem];
     return;
   }
-  turn.items = turn.items.map((candidate, candidateIndex) =>
-    candidateIndex === index ? mergeItem(candidate, normalizedItem) : candidate
-  );
+  const items = [...turn.items];
+  items[index] = mergeItem(items[index], normalizedItem);
+  turn.items = items;
 }
 
 function resolveConversationRunningTurn(state: ConversationState) {
@@ -159,6 +164,10 @@ function hasNonRealtimeTurnActivity(state: ConversationState) {
 }
 
 function withoutRealtimeTurn(state: ConversationState) {
+  const lastTurn = state.thread.turns.at(-1);
+  if (!isRealtimeTurnId(state.activeTurnId) && !isRealtimeTurnId(lastTurn?.id)) {
+    return state;
+  }
   const filteredTurns = state.thread.turns.filter((turn) => !isRealtimeTurnId(turn.id));
   if (filteredTurns.length === state.thread.turns.length && !isRealtimeTurnId(state.activeTurnId)) {
     return state;
@@ -687,7 +696,7 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
     ...current,
     thread: {
       ...current.thread,
-      turns: [...current.thread.turns]
+      turns: current.thread.turns
     },
     pendingRequests: [...current.pendingRequests],
     hydration: { ...current.hydration },

@@ -187,6 +187,10 @@
     | `file:${string}`
     | `terminal:${string}`;
   type ComposerSettingsTabId = "session" | "security" | "skills";
+  type TranscriptScrollAnchor = {
+    turnId: string;
+    viewportOffset: number;
+  };
   type GitDiffTab = {
     id: `git-diff:${string}`;
     repoPath: string;
@@ -1741,6 +1745,12 @@
   let transcriptTurnWindowSessionId: string | null = null;
   let transcriptTurnLayout: TranscriptLayout = EMPTY_TRANSCRIPT_LAYOUT;
   const transcriptTurnHeights = new Map<string, number>();
+  const pendingTranscriptTurnHeights = new Map<string, number>();
+  let transcriptMeasurementFrame: number | null = null;
+  let transcriptMeasuredWidth = 0;
+  let transcriptPinnedTurnId: string | null = null;
+  let transcriptPinnedTurnAlignment: TranscriptWindowAlignment = "center";
+  let transcriptPinReleaseTimer: ReturnType<typeof setTimeout> | null = null;
   let stickTranscriptToBottom = $state(true);
   let forceTranscriptScroll = $state(false);
   let pendingTranscriptBottomScroll = $state(false);
@@ -3284,6 +3294,12 @@
       if (transcriptScrollFrame !== null) {
         cancelAnimationFrame(transcriptScrollFrame);
       }
+      if (transcriptMeasurementFrame !== null) {
+        cancelAnimationFrame(transcriptMeasurementFrame);
+      }
+      if (transcriptPinReleaseTimer) {
+        clearTimeout(transcriptPinReleaseTimer);
+      }
       if (composerTextareaResizeFrame !== null) {
         cancelAnimationFrame(composerTextareaResizeFrame);
       }
@@ -3535,9 +3551,20 @@
 
     if (sessionChanged) {
       transcriptTurnWindowSessionId = sessionId;
+      if (transcriptMeasurementFrame !== null && typeof window !== "undefined") {
+        cancelAnimationFrame(transcriptMeasurementFrame);
+        transcriptMeasurementFrame = null;
+      }
+      pendingTranscriptTurnHeights.clear();
       transcriptTurnHeights.clear();
       transcriptTurnLayout = EMPTY_TRANSCRIPT_LAYOUT;
       transcriptTurnWindow = EMPTY_TRANSCRIPT_WINDOW;
+      transcriptPinnedTurnId = null;
+      transcriptMeasuredWidth = transcriptElement?.clientWidth ?? 0;
+      if (transcriptPinReleaseTimer) {
+        clearTimeout(transcriptPinReleaseTimer);
+        transcriptPinReleaseTimer = null;
+      }
     }
 
     void tick().then(() => {
@@ -3561,6 +3588,23 @@
 
     transcriptResizeObserver?.disconnect();
     transcriptResizeObserver = new ResizeObserver(() => {
+      const nextWidth = transcriptElement?.clientWidth ?? 0;
+      const widthChanged = transcriptMeasuredWidth > 0 && nextWidth > 0 && Math.abs(nextWidth - transcriptMeasuredWidth) >= 1;
+      transcriptMeasuredWidth = nextWidth;
+      if (widthChanged) {
+        const anchor = stickTranscriptToBottom ? null : captureTranscriptScrollAnchor();
+        pendingTranscriptTurnHeights.clear();
+        transcriptTurnHeights.clear();
+        rebuildTranscriptTurnLayout();
+        if (anchor) {
+          void restoreTranscriptScrollAnchor(anchor);
+        } else {
+          const newestTurnId = conversation?.thread.turns.at(-1)?.id ?? null;
+          refreshTranscriptTurnWindow(newestTurnId, "end");
+          scheduleTranscriptScrollToBottom();
+        }
+        return;
+      }
       refreshTranscriptTurnWindow();
       if (!transcriptElement || loadingOlderTurns || (!stickTranscriptToBottom && !forceTranscriptScroll)) {
         return;
@@ -4353,6 +4397,79 @@
     }
   }
 
+  function pinTranscriptTurn(turnId: string, alignment: TranscriptWindowAlignment = "center") {
+    transcriptPinnedTurnId = turnId;
+    transcriptPinnedTurnAlignment = alignment;
+    if (transcriptPinReleaseTimer) {
+      clearTimeout(transcriptPinReleaseTimer);
+      transcriptPinReleaseTimer = null;
+    }
+  }
+
+  function releaseTranscriptTurnPin(turnId: string | null = transcriptPinnedTurnId, delay = 0) {
+    if (!turnId || transcriptPinnedTurnId !== turnId) {
+      return;
+    }
+    if (transcriptPinReleaseTimer) {
+      clearTimeout(transcriptPinReleaseTimer);
+    }
+    transcriptPinReleaseTimer = setTimeout(() => {
+      transcriptPinReleaseTimer = null;
+      if (transcriptPinnedTurnId !== turnId) {
+        return;
+      }
+      transcriptPinnedTurnId = null;
+      refreshTranscriptTurnWindow();
+    }, delay);
+  }
+
+  function captureTranscriptScrollAnchor(): TranscriptScrollAnchor | null {
+    if (!transcriptElement || !transcriptTurnsElement) {
+      return null;
+    }
+    const transcriptTop = transcriptElement.getBoundingClientRect().top;
+    const turnElements = transcriptTurnsElement.querySelectorAll<HTMLElement>("[data-turn-id]");
+    for (const element of turnElements) {
+      const rect = element.getBoundingClientRect();
+      if (rect.bottom > transcriptTop + 1) {
+        const turnId = element.dataset.turnId;
+        return turnId ? { turnId, viewportOffset: rect.top - transcriptTop } : null;
+      }
+    }
+    return null;
+  }
+
+  async function restoreTranscriptScrollAnchor(anchor: TranscriptScrollAnchor | null) {
+    if (!anchor || !transcriptElement || !conversation?.thread.turns.some((turn) => turn.id === anchor.turnId)) {
+      return false;
+    }
+    pinTranscriptTurn(anchor.turnId, "start");
+    refreshTranscriptTurnWindow(anchor.turnId, "start");
+    await tick();
+    if (!transcriptElement) {
+      releaseTranscriptTurnPin(anchor.turnId);
+      return false;
+    }
+    const escapedTurnId =
+      typeof CSS !== "undefined" && typeof CSS.escape === "function"
+        ? CSS.escape(anchor.turnId)
+        : anchor.turnId.replace(/"/g, '\\"');
+    const target = transcriptTurnsElement?.querySelector<HTMLElement>(`[data-turn-id="${escapedTurnId}"]`);
+    if (!target) {
+      releaseTranscriptTurnPin(anchor.turnId);
+      return false;
+    }
+    const transcriptTop = transcriptElement.getBoundingClientRect().top;
+    const nextOffset = target.getBoundingClientRect().top - transcriptTop;
+    noteTranscriptProgrammaticScroll();
+    transcriptElement.scrollTo({
+      top: transcriptElement.scrollTop + nextOffset - anchor.viewportOffset,
+      behavior: "auto"
+    });
+    releaseTranscriptTurnPin(anchor.turnId);
+    return true;
+  }
+
   function refreshTranscriptTurnWindow(
     anchorTurnId: string | null = null,
     anchorAlignment: TranscriptWindowAlignment = "center"
@@ -4365,7 +4482,11 @@
     }
 
     ensureTranscriptTurnLayout();
-    const anchorIndex = anchorTurnId ? transcriptTurnLayout.turnIds.indexOf(anchorTurnId) : undefined;
+    const effectiveAnchorTurnId = anchorTurnId ?? transcriptPinnedTurnId;
+    const effectiveAnchorAlignment = anchorTurnId ? anchorAlignment : transcriptPinnedTurnAlignment;
+    const anchorIndex = effectiveAnchorTurnId
+      ? transcriptTurnLayout.turnIds.indexOf(effectiveAnchorTurnId)
+      : undefined;
     const nextWindow = computeTranscriptWindowFromLayout({
       layout: transcriptTurnLayout,
       scrollOffset: Math.max(0, (transcriptElement?.scrollTop ?? 0) - getTranscriptTurnsOffsetTop()),
@@ -4373,7 +4494,7 @@
       overscan: transcriptTurnOverscan,
       maxItems: transcriptTurnMountLimit,
       anchorIndex: anchorIndex !== undefined && anchorIndex >= 0 ? anchorIndex : undefined,
-      anchorAlignment
+      anchorAlignment: effectiveAnchorAlignment
     });
 
     if (!transcriptWindowsMatch(transcriptTurnWindow, nextWindow)) {
@@ -4381,23 +4502,56 @@
     }
   }
 
+  function flushTranscriptTurnMeasurements() {
+    transcriptMeasurementFrame = null;
+    let changed = false;
+    for (const [turnId, nextHeight] of pendingTranscriptTurnHeights) {
+      const previousHeight = transcriptTurnHeights.get(turnId) ?? 0;
+      if (Math.abs(nextHeight - previousHeight) < 1) {
+        continue;
+      }
+      transcriptTurnHeights.set(turnId, nextHeight);
+      changed = true;
+    }
+    pendingTranscriptTurnHeights.clear();
+    if (!changed) {
+      return;
+    }
+    rebuildTranscriptTurnLayout();
+    refreshTranscriptTurnWindow();
+    if (stickTranscriptToBottom || forceTranscriptScroll || pendingTranscriptBottomScroll) {
+      scheduleTranscriptScrollToBottom();
+    }
+  }
+
+  function queueTranscriptTurnMeasurement(turnId: string, nextHeight: number) {
+    if (!Number.isFinite(nextHeight) || nextHeight <= 0) {
+      return;
+    }
+    pendingTranscriptTurnHeights.set(turnId, nextHeight);
+    if (transcriptMeasurementFrame !== null) {
+      return;
+    }
+    if (typeof window === "undefined") {
+      flushTranscriptTurnMeasurements();
+      return;
+    }
+    transcriptMeasurementFrame = window.requestAnimationFrame(flushTranscriptTurnMeasurements);
+  }
+
   function measureTranscriptTurn(node: HTMLElement, initialTurnId: string) {
     let turnId = initialTurnId;
-    let lastHeight = transcriptTurnHeights.get(turnId) ?? 0;
-    const recordHeight = () => {
-      const nextHeight = node.getBoundingClientRect().height;
-      if (!Number.isFinite(nextHeight) || nextHeight <= 0 || Math.abs(nextHeight - lastHeight) < 1) {
-        return;
-      }
-      lastHeight = nextHeight;
-      transcriptTurnHeights.set(turnId, nextHeight);
-      rebuildTranscriptTurnLayout();
-      refreshTranscriptTurnWindow();
-      if (stickTranscriptToBottom || forceTranscriptScroll || pendingTranscriptBottomScroll) {
-        scheduleTranscriptScrollToBottom();
-      }
+    const recordHeight = (entry?: ResizeObserverEntry) => {
+      const borderBoxSize = entry?.borderBoxSize;
+      const nextHeight = Array.isArray(borderBoxSize)
+        ? borderBoxSize[0]?.blockSize
+        : borderBoxSize?.blockSize;
+      queueTranscriptTurnMeasurement(turnId, nextHeight ?? node.getBoundingClientRect().height);
     };
-    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(recordHeight);
+    const observer =
+      typeof ResizeObserver === "undefined"
+        ? null
+        : new ResizeObserver((entries) => recordHeight(entries[0]));
     observer?.observe(node);
     recordHeight();
 
@@ -4407,7 +4561,6 @@
           return;
         }
         turnId = nextTurnId;
-        lastHeight = transcriptTurnHeights.get(turnId) ?? 0;
         recordHeight();
       },
       destroy() {
@@ -4437,7 +4590,14 @@
     }
   }
 
-  function suspendTranscriptAutoScrollForUser() {
+  function suspendTranscriptAutoScrollForUser(preservePinnedTurn = false) {
+    if (!preservePinnedTurn) {
+      transcriptPinnedTurnId = null;
+      if (transcriptPinReleaseTimer) {
+        clearTimeout(transcriptPinReleaseTimer);
+        transcriptPinReleaseTimer = null;
+      }
+    }
     transcriptAutoScrollSuspendedByUser = true;
     stickTranscriptToBottom = false;
     forceTranscriptScroll = false;
@@ -13152,7 +13312,7 @@
         pendingTranscriptBottomScroll = false;
       }
     } else if (userScrollIntent || transcriptAutoScrollSuspendedByUser) {
-      suspendTranscriptAutoScrollForUser();
+      suspendTranscriptAutoScrollForUser(!userScrollIntent && Boolean(transcriptPinnedTurnId));
     } else if (initialScrollPending || forceTranscriptScroll || pendingTranscriptBottomScroll) {
       stickTranscriptToBottom = true;
     } else if (stickTranscriptToBottom) {
@@ -13399,7 +13559,12 @@
     }
   }
 
-  async function applyOlderTurnPage(response: SessionTurnsPagePayload, previousHeight: number, previousTop: number) {
+  async function applyOlderTurnPage(
+    response: SessionTurnsPagePayload,
+    previousHeight: number,
+    previousTop: number,
+    scrollAnchor: TranscriptScrollAnchor | null = null
+  ) {
     if (!conversation) {
       return false;
     }
@@ -13424,6 +13589,9 @@
     markConversationCacheDirty();
 
     await tick();
+    if (await restoreTranscriptScrollAnchor(scrollAnchor)) {
+      return true;
+    }
     refreshTranscriptTurnWindow();
     await tick();
     if (transcriptElement) {
@@ -13458,6 +13626,7 @@
 
     const previousHeight = transcriptElement?.scrollHeight ?? 0;
     const previousTop = transcriptElement?.scrollTop ?? 0;
+    const scrollAnchor = captureTranscriptScrollAnchor();
     loadingOlderTurns = true;
     if (mode === "manual") {
       olderTurnsAutoLoadPaused = false;
@@ -13475,7 +13644,7 @@
         return;
       }
 
-      await applyOlderTurnPage(response, previousHeight, previousTop);
+      await applyOlderTurnPage(response, previousHeight, previousTop, scrollAnchor);
     } catch (error) {
       if (matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
         errorText = describeError(error);
@@ -13542,6 +13711,7 @@
 
         const previousHeight = transcriptElement?.scrollHeight ?? 0;
         const previousTop = transcriptElement?.scrollTop ?? 0;
+        const scrollAnchor = captureTranscriptScrollAnchor();
         loadingOlderTurns = true;
         const response = await api.getSessionOlderTurns(
           sessionId,
@@ -13556,7 +13726,7 @@
         ) {
           return;
         }
-        await applyOlderTurnPage(response, previousHeight, previousTop);
+        await applyOlderTurnPage(response, previousHeight, previousTop, scrollAnchor);
         if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
           return;
         }
@@ -13601,6 +13771,8 @@
         }
       }
 
+      suspendTranscriptAutoScrollForUser();
+      pinTranscriptTurn(match.turnId, "center");
       refreshTranscriptTurnWindow(match.turnId, "center");
       await tick();
       if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
@@ -13619,11 +13791,11 @@
         return;
       }
 
-      suspendTranscriptAutoScrollForUser();
       target.scrollIntoView({
         block: "start",
         behavior: "smooth"
       });
+      releaseTranscriptTurnPin(match.turnId, 700);
       sessionTurnSearchFocusedTurnId = match.turnId;
       if (sessionTurnSearchHighlightTimer) {
         clearTimeout(sessionTurnSearchHighlightTimer);

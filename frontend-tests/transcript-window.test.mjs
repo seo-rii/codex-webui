@@ -64,3 +64,17 @@ test("anchors the newest turn at the end for initial bottom scrolling", () => {
   assert.ok(window.start >= 90);
   assert.equal(window.bottomSpacer, 0);
 });
+
+test("keeps a pinned search result mounted after measured heights change", () => {
+  const measuredHeights = new Map(Array.from({ length: 20 }, (_, index) => [`turn-${index + 65}`, 700 + index]));
+  const window = compute({
+    measuredHeights,
+    scrollOffset: 0,
+    anchorIndex: 72,
+    anchorAlignment: "center",
+    maxItems: 12
+  });
+
+  assert.ok(window.start <= 72);
+  assert.ok(window.end > 72);
+});

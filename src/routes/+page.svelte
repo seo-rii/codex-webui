@@ -497,6 +497,7 @@
   let sessionDetailStateHash = $state<string | null>(null);
   let sessionDetailMetadataVersion = $state<string | null>(null);
   let sessionTurnVersionsById = $state<Record<string, string>>({});
+  let sessionCompletionVersionsByTurnId = $state<Record<string, string>>({});
   const readOnlyRole = $derived(webRole === "viewer");
 
   $effect(() => {
@@ -5718,16 +5719,13 @@
       normalizeConversationExecutionState(nextConversation)
     );
     if (payload.turnId && payload.completionVersion) {
-      sessionTurnVersionsById = {
-        ...sessionTurnVersionsById,
+      sessionCompletionVersionsByTurnId = {
+        ...sessionCompletionVersionsByTurnId,
         [payload.turnId]: payload.completionVersion
       };
     }
     if (payload.turn || payload.notModified) {
-      sessionDetailCacheVersion = null;
-      sessionDetailStateHash = null;
-      sessionDetailMetadataVersion = null;
-      markConversationCacheDirty();
+      scheduleSessionDetailCachePersist(sessionDetailCacheVersion, "terminal");
       applySessionSummaryUpdate(buildSessionSummaryFromConversation(conversation));
       preserveTranscriptScrollAfterDataUpdate();
     }
@@ -5750,10 +5748,10 @@
     );
     const knownCompletionVersion =
       expectedTurnId && expectedTurnIsLoaded
-        ? (sessionTurnVersionsById[expectedTurnId] ?? null)
+        ? (sessionCompletionVersionsByTurnId[expectedTurnId] ?? null)
         : expectedTurnId
           ? null
-          : (latestTurn ? (sessionTurnVersionsById[latestTurn.id] ?? null) : null);
+          : (latestTurn ? (sessionCompletionVersionsByTurnId[latestTurn.id] ?? null) : null);
     const requestActiveTurnId = conversation?.thread.id === sessionId ? conversation.activeTurnId : null;
     const scopeKey = sessionStateKey(sessionId, profileId);
     const requestStreamCursor = sessionStreamCursors.get(scopeKey) ?? null;
@@ -5991,6 +5989,7 @@
     sessionDetailStateHash = null;
     sessionDetailMetadataVersion = null;
     sessionTurnVersionsById = {};
+    sessionCompletionVersionsByTurnId = {};
     loadingDetail = false;
     sessionsBusy = false;
     sending = false;
@@ -6416,7 +6415,7 @@
         scheduleSelectedSessionCompletionRefresh(
           sessionId,
           null,
-          latestTurn ? (sessionTurnVersionsById[latestTurn.id] ?? null) : null
+          latestTurn ? (sessionCompletionVersionsByTurnId[latestTurn.id] ?? null) : null
         );
       }
       return true;
@@ -6525,6 +6524,7 @@
     sessionDetailStateHash = null;
     sessionDetailMetadataVersion = null;
     sessionTurnVersionsById = {};
+    sessionCompletionVersionsByTurnId = {};
     pendingSteerResume = null;
     optimisticMessage = null;
     sendIntent = null;
@@ -6543,7 +6543,6 @@
       const detailCacheKey = buildSessionDetailBrowserCacheKey(sessionId, resolvedProfileId);
       let knownVersion: string | null = null;
       let turnLimit = olderTurnPageSize;
-      let cachedCompletionVersion: string | null = null;
       let cachedDetailNeedsCompletionUpdate = false;
       const terminalSelection = Boolean(
         summaryForSelection && !isLiveConversationStatus(summaryForSelection.status)
@@ -6568,23 +6567,13 @@
             cachedEntry.payload.stateHash && cachedEntry.payload.turnVersions
               ? cachedEntry.version
               : null;
-          const cachedLatestTurn = cachedEntry.payload.thread.turns.at(-1);
-          cachedCompletionVersion = cachedLatestTurn
-            ? (cachedEntry.payload.turnVersions?.[cachedLatestTurn.id] ?? null)
-            : null;
           cachedDetailNeedsCompletionUpdate =
             terminalSelection &&
             normalizeSessionTimestamp(summaryForSelection?.updatedAt) >
               normalizeSessionTimestamp(cachedEntry.payload.thread.updatedAt);
           turnLimit = Math.max(olderTurnPageSize, cachedEntry.payload.thread.turns.length);
-          if (terminalSelection) {
-            knownVersion = null;
-          }
           requestTranscriptBottomScroll(true);
         }
-      }
-      if (terminalSelection) {
-        knownVersion = null;
       }
 
       const nextConversation = await refreshSelectedSessionState(
@@ -6629,7 +6618,7 @@
         scheduleSelectedSessionCompletionRefresh(
           sessionId,
           null,
-          cachedCompletionVersion,
+          null,
           cachedDetailNeedsCompletionUpdate,
           true
         );
@@ -6787,6 +6776,7 @@
     sessionDetailStateHash = null;
     sessionDetailMetadataVersion = null;
     sessionTurnVersionsById = {};
+    sessionCompletionVersionsByTurnId = {};
     syncSelectedSessionInUrl(sessionId);
     draftPersistencePaused = previousDraftPersistencePaused;
 
@@ -7868,7 +7858,7 @@
             scheduleSelectedSessionCompletionRefresh(
               summary.id,
               summaryIsNewer ? null : (latestTurn?.id ?? null),
-              latestTurn ? (sessionTurnVersionsById[latestTurn.id] ?? null) : null,
+              latestTurn ? (sessionCompletionVersionsByTurnId[latestTurn.id] ?? null) : null,
               summaryIsNewer,
               summaryClaimsTerminal
             );

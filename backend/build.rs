@@ -12,26 +12,43 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CODEX_WEBUI_BUILD_DIRTY");
     println!("cargo:rerun-if-env-changed=CODEX_WEBUI_BUILD_EPOCH_MS");
     println!("cargo:rerun-if-env-changed=CODEX_WEBUI_BUILD_TIMESTAMP");
+    println!("cargo:rerun-if-env-changed=CODEX_WEBUI_BUILD_METADATA_PINNED");
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/refs");
     println!("cargo:rerun-if-changed=../.git/packed-refs");
 
     let package_version = non_empty_env("CODEX_WEBUI_PACKAGE_VERSION")
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-    let commit = non_empty_env("CODEX_WEBUI_BUILD_COMMIT")
-        .or_else(|| git_output(&["rev-parse", "HEAD"]))
+    let repository_commit = git_output(&["rev-parse", "HEAD"]);
+    let use_inherited_metadata = env::var("CODEX_WEBUI_BUILD_METADATA_PINNED")
+        .ok()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+        || repository_commit.is_none();
+    let commit = use_inherited_metadata
+        .then(|| non_empty_env("CODEX_WEBUI_BUILD_COMMIT"))
+        .flatten()
+        .or(repository_commit)
         .unwrap_or_else(|| "unknown".to_string());
-    let commit_short =
-        non_empty_env("CODEX_WEBUI_BUILD_COMMIT_SHORT").unwrap_or_else(|| short_commit(&commit));
-    let dirty = non_empty_env("CODEX_WEBUI_BUILD_DIRTY").unwrap_or_else(|| {
-        git_dirty()
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "false".to_string())
-    });
-    let epoch_ms = non_empty_env("CODEX_WEBUI_BUILD_EPOCH_MS").unwrap_or_else(current_epoch_ms);
-    let timestamp =
-        non_empty_env("CODEX_WEBUI_BUILD_TIMESTAMP").unwrap_or_else(|| epoch_ms.clone());
-    let requested_version = non_empty_env("CODEX_WEBUI_BUILD_VERSION");
+    let commit_short = use_inherited_metadata
+        .then(|| non_empty_env("CODEX_WEBUI_BUILD_COMMIT_SHORT"))
+        .flatten()
+        .unwrap_or_else(|| short_commit(&commit));
+    let dirty = use_inherited_metadata
+        .then(|| non_empty_env("CODEX_WEBUI_BUILD_DIRTY"))
+        .flatten()
+        .or_else(|| git_dirty().map(|value| value.to_string()))
+        .unwrap_or_else(|| "false".to_string());
+    let epoch_ms = use_inherited_metadata
+        .then(|| non_empty_env("CODEX_WEBUI_BUILD_EPOCH_MS"))
+        .flatten()
+        .unwrap_or_else(current_epoch_ms);
+    let timestamp = use_inherited_metadata
+        .then(|| non_empty_env("CODEX_WEBUI_BUILD_TIMESTAMP"))
+        .flatten()
+        .unwrap_or_else(|| epoch_ms.clone());
+    let requested_version = use_inherited_metadata
+        .then(|| non_empty_env("CODEX_WEBUI_BUILD_VERSION"))
+        .flatten();
     let version = if requested_version
         .as_ref()
         .is_some_and(|value| value.contains(&commit_short))

@@ -91,6 +91,7 @@ export function buildMetadataEnv(metadata) {
     CODEX_WEBUI_BUILD_COMMIT_SHORT: metadata.commitShort,
     CODEX_WEBUI_BUILD_DIRTY: metadata.dirty ? "true" : "false",
     CODEX_WEBUI_BUILD_EPOCH_MS: metadata.epochMs,
-    CODEX_WEBUI_BUILD_TIMESTAMP: metadata.timestamp
+    CODEX_WEBUI_BUILD_TIMESTAMP: metadata.timestamp,
+    CODEX_WEBUI_BUILD_METADATA_PINNED: "true"
   };
 }

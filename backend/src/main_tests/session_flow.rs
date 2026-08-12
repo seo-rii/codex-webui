@@ -1409,7 +1409,7 @@ async fn list_sessions_payload_includes_all_profiles_unless_profile_filtered() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn combined_profile_listing_hydrates_only_the_requested_page_prefix() {
+async fn combined_profile_listing_and_search_hydrate_only_the_requested_page_prefix() {
     let sandbox = unique_test_dir("session-list-bounded-profile-hydration");
     let workspace = sandbox.join("workspace");
     let default_codex_home = sandbox.join("codex-default");
@@ -1585,6 +1585,40 @@ async fn combined_profile_listing_hydrates_only_the_requested_page_prefix() {
         .lock()
         .unwrap()
         .remove(&hydration_key);
+
+    let search = search_sessions_payload(
+        &state,
+        "default",
+        "corpus session",
+        "title",
+        false,
+        None,
+        20,
+        &SessionFilterCriteria::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        search
+            .get("sessions")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(20)
+    );
+    assert_eq!(search.get("nextCursor").and_then(Value::as_str), Some("20"));
+    let search_hydrated_candidates = ROLLOUT_LISTING_HYDRATIONS_BY_PROJECT
+        .lock()
+        .unwrap()
+        .remove(&hydration_key)
+        .unwrap_or_default();
+    assert!(
+        search_hydrated_candidates <= 84,
+        "limit=20 search should hydrate only a bounded prefix per profile, hydrated {search_hydrated_candidates}"
+    );
+    assert!(
+        search_hydrated_candidates < 158,
+        "limit=20 search must not hydrate the full matching multi-profile corpus"
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }

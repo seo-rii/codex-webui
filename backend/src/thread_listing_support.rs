@@ -755,47 +755,6 @@ async fn merge_missing_runtime_session_summaries(
     Ok(())
 }
 
-async fn collect_session_summaries_for_listing_payload(
-    state: &AppState,
-    profile_id: &str,
-    archived: bool,
-    filter: &SessionFilterCriteria,
-    needle: Option<&str>,
-    include_full_text: bool,
-) -> ApiResult<Vec<Value>> {
-    let profile_ids = session_listing_profile_ids(state, profile_id, filter);
-    let mut summaries = Vec::new();
-    for listing_profile_id in profile_ids {
-        summaries.extend(
-            collect_session_summaries_with_query_payload(
-                state,
-                &listing_profile_id,
-                archived,
-                filter,
-                needle,
-                include_full_text,
-            )
-            .await?,
-        );
-    }
-    summaries.sort_by(|left, right| {
-        if left.get("id").and_then(Value::as_str) == right.get("id").and_then(Value::as_str) {
-            let left_profile = left
-                .get("profileId")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let right_profile = right
-                .get("profileId")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            return left_profile.cmp(right_profile);
-        }
-        std::cmp::Ordering::Equal
-    });
-    sort_session_summaries(&mut summaries);
-    Ok(summaries)
-}
-
 fn candidate_matches_session_filter_snapshot(
     candidate: &Value,
     snapshot: &SessionSummaryUiSnapshot,
@@ -1148,15 +1107,63 @@ pub(crate) async fn search_sessions_payload(
     let include_full_text = scope == "full";
     let listing_profile_ids = session_listing_profile_ids(state, profile_id, filter);
     if listing_profile_ids.len() != 1 {
-        let sessions = collect_session_summaries_for_listing_payload(
-            state,
-            profile_id,
-            archived,
-            filter,
-            Some(&needle),
-            include_full_text,
-        )
-        .await?;
+        let window_size = limit.clamp(1, 200) as usize;
+        let start = cursor
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let profile_window_size = start.saturating_add(window_size).saturating_add(1);
+        let mut sessions = Vec::new();
+
+        for listing_profile_id in listing_profile_ids {
+            let mut profile_sessions = if let Some(payload) =
+                scan_rollout_sessions_with_query_payload(
+                    state,
+                    &listing_profile_id,
+                    archived,
+                    None,
+                    profile_window_size,
+                    filter,
+                    Some(&needle),
+                    include_full_text,
+                )
+                .await?
+            {
+                payload
+                    .get("sessions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                collect_session_summaries_with_query_payload(
+                    state,
+                    &listing_profile_id,
+                    archived,
+                    filter,
+                    Some(&needle),
+                    include_full_text,
+                )
+                .await?
+            };
+            sort_session_summaries(&mut profile_sessions);
+            profile_sessions.truncate(profile_window_size);
+            sessions.extend(profile_sessions);
+        }
+
+        sessions.sort_by(|left, right| {
+            if left.get("id").and_then(Value::as_str) == right.get("id").and_then(Value::as_str) {
+                let left_profile = left
+                    .get("profileId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let right_profile = right
+                    .get("profileId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                return left_profile.cmp(right_profile);
+            }
+            std::cmp::Ordering::Equal
+        });
+        sort_session_summaries(&mut sessions);
         return Ok(session_summary_page(sessions, cursor, limit));
     }
     let profile_id = listing_profile_ids

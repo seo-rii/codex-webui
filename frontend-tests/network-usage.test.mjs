@@ -69,3 +69,20 @@ test("stale detail patches retry conditionally instead of forcing a full respons
   assert.notEqual(fallbackRequest, -1, "invalid reconstructed patches should retain a full fallback");
   assert.ok(staleRetry < fallbackRequest, "base mismatch must return before the unconditional fallback request");
 });
+
+test("foreground session catch-up only reloads after a confirmed stream gap", async () => {
+  const source = await readFile("src/routes/+page.svelte", "utf8");
+  const streamStart = source.indexOf("function connectStream(");
+  const streamEnd = source.indexOf("\n  function updateSessionDetailSyncState(", streamStart);
+  assert.notEqual(streamStart, -1, "session stream handler should exist");
+  assert.notEqual(streamEnd, -1, "session stream handler should have a stable boundary");
+  const streamHandler = source.slice(streamStart, streamEnd);
+
+  assert.match(streamHandler, /streamCursorResult\.gap/u);
+  assert.doesNotMatch(streamHandler, /staleSessionCatchupEventThreshold/u);
+  assert.doesNotMatch(
+    streamHandler,
+    /nextEventCount\s*>=/u,
+    "ordinary streamed deltas must not trigger a full transcript refresh by event count"
+  );
+});

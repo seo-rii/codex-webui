@@ -562,7 +562,6 @@
   const olderTurnAutoLoadWindowMs = 1500;
   const olderTurnAutoLoadBurstLimit = 3;
   const staleSessionCatchupHiddenThresholdMs = 45_000;
-  const staleSessionCatchupEventThreshold = 40;
   const staleSessionCatchupWindowMs = 7_500;
   const activeSessionStatusPollMs = 15_000;
   const initialTurnEntryRenderLimit = 80;
@@ -1847,12 +1846,9 @@
     profileId: string | null,
     event: StreamEvent
   ) {
-    applySessionStreamCursorResult(
-      scopeKey,
-      sessionId,
-      profileId,
-      observeSessionStreamEvent(sessionStreamCursors.get(scopeKey) ?? null, event)
-    );
+    const result = observeSessionStreamEvent(sessionStreamCursors.get(scopeKey) ?? null, event);
+    applySessionStreamCursorResult(scopeKey, sessionId, profileId, result);
+    return result;
   }
 
   function reconcileSelectedSessionStreamBoundary(
@@ -6812,7 +6808,8 @@
         return;
       }
       const scopeKey = sessionStateKey(sessionId, profileId);
-      observeSelectedSessionStreamEvent(scopeKey, sessionId, profileId, payload);
+      const previousStreamCursor = sessionStreamCursors.get(scopeKey) ?? null;
+      const streamCursorResult = observeSelectedSessionStreamEvent(scopeKey, sessionId, profileId, payload);
       sessionEventRevisions.set(scopeKey, (sessionEventRevisions.get(scopeKey) ?? 0) + 1);
       const queuePayload = queuePayloadFromEvent(payload);
       if (queuePayload) {
@@ -6855,34 +6852,23 @@
               ...catchup,
               eventCount: catchup.eventCount + 1
             };
-          } else {
-            const nextEventCount = catchup.eventCount + 1;
-            if (nextEventCount >= staleSessionCatchupEventThreshold) {
-              if (staleSessionCatchupTimer) {
-                clearTimeout(staleSessionCatchupTimer);
-                staleSessionCatchupTimer = null;
-              }
-              staleSessionCatchup = {
-                ...catchup,
-                eventCount: 1,
-                refreshing: true
-              };
-              void refreshSelectedSessionState(
-                sessionId,
-                olderTurnPageSize,
-                false,
-                sessionDetailCacheVersion,
-                true
-              ).catch((error) => {
-                clearStaleSessionCatchup();
-                errorText = describeError(error);
-              });
-            } else {
-              staleSessionCatchup = {
-                ...catchup,
-                eventCount: nextEventCount
-              };
+          } else if (streamCursorResult.gap) {
+            if (staleSessionCatchupTimer) {
+              clearTimeout(staleSessionCatchupTimer);
+              staleSessionCatchupTimer = null;
             }
+            staleSessionCatchup = {
+              ...catchup,
+              eventCount: 0,
+              refreshing: true
+            };
+          } else if (
+            streamCursorResult.cursor &&
+            previousStreamCursor &&
+            streamCursorResult.cursor.epoch === previousStreamCursor.epoch &&
+            streamCursorResult.cursor.sequence > previousStreamCursor.sequence
+          ) {
+            clearStaleSessionCatchup();
           }
         }
 

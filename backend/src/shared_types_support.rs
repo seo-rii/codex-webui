@@ -112,6 +112,7 @@ pub(crate) struct AppState {
     pub(crate) queue_drain_retries: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(crate) session_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub(crate) session_app_server_assignments: Arc<Mutex<HashMap<String, String>>>,
+    pub(crate) session_assignment_epochs: Arc<Mutex<HashMap<String, u64>>>,
     pub(crate) active_turns: Arc<Mutex<HashMap<String, String>>>,
     pub(crate) pending_turn_starts: Arc<Mutex<HashSet<String>>>,
     pub(crate) recent_client_user_messages: Arc<Mutex<HashMap<String, Instant>>>,

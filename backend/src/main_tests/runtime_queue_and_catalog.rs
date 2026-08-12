@@ -2691,6 +2691,42 @@ async fn runtime_notifications_emit_session_stream_events_from_rust_relay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assignment_epoch_suppresses_a_delayed_session_summary() {
+    let sandbox = unique_test_dir("assignment-summary-fence");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let session_id = "thread-moving-summary";
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .insert(runtime_key, format!("default::session::{session_id}"));
+    let fence = capture_session_assignment_fence(&state, "default", session_id).await;
+    let relay = ensure_global_relay(&state, "default")
+        .await
+        .expect("global relay should initialize");
+    let mut receiver = relay.subscribe();
+
+    emit_session_summary_updated(&state, "default", session_id, None, Some("running")).await;
+    clear_app_server_assignments_for_sessions(&state, "default", &[session_id.to_string()]).await;
+
+    assert!(!session_assignment_fence_is_current(&state, &fence).await);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), receiver.recv())
+            .await
+            .is_err(),
+        "a summary captured before assignment invalidation must not publish"
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_stream_sequence_advances_without_subscribers() {
     let sandbox = unique_test_dir("session-stream-sequence");
     let workspace = sandbox.join("workspace");

@@ -696,6 +696,7 @@ async fn generate_session_title(
     profile_id: &str,
     session_id: &str,
     answer: Option<&str>,
+    assignment_fence: &SessionAssignmentFence,
 ) -> ApiResult<()> {
     let _generation_slot = SESSION_TITLE_GENERATION_SLOTS
         .acquire()
@@ -706,6 +707,9 @@ async fn generate_session_title(
                 "Session title generation is unavailable.",
             )
         })?;
+    if !session_assignment_fence_is_current(state, assignment_fence).await {
+        return Ok(());
+    }
     let client = app_server_client_for_session(state, profile_id, session_id)
         .await
         .map_err(|error| {
@@ -826,6 +830,12 @@ async fn generate_session_title(
             )
         })?;
 
+        let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+        let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
+        let _session_guard = session_lock.lock().await;
+        if !session_assignment_fence_is_current(state, assignment_fence).await {
+            return Ok(());
+        }
         let latest = client
             .request(
                 "thread/read",
@@ -895,7 +905,12 @@ async fn generate_session_title(
     .await;
 
     if result.is_err() {
-        mark_session_title_generation_failed(state, profile_id, session_id).await;
+        let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+        let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
+        let _session_guard = session_lock.lock().await;
+        if session_assignment_fence_is_current(state, assignment_fence).await {
+            mark_session_title_generation_failed(state, profile_id, session_id).await;
+        }
     }
     result
 }
@@ -909,12 +924,19 @@ pub(crate) async fn spawn_generated_session_title_for_completed_turn(
     let answer = turn
         .and_then(extract_agent_message_item_from_turn)
         .map(|(_, text)| text);
+    let assignment_fence = capture_session_assignment_fence(state, profile_id, session_id).await;
     let state = state.clone();
     let profile_id = profile_id.to_string();
     let session_id = session_id.to_string();
     tokio::spawn(async move {
-        if let Err(error) =
-            generate_session_title(&state, &profile_id, &session_id, answer.as_deref()).await
+        if let Err(error) = generate_session_title(
+            &state,
+            &profile_id,
+            &session_id,
+            answer.as_deref(),
+            &assignment_fence,
+        )
+        .await
         {
             warn!(
                 profile_id,
@@ -1180,10 +1202,14 @@ pub(crate) async fn spawn_language_bridge_response_translation_for_completed_tur
         return;
     }
 
+    let assignment_fence = capture_session_assignment_fence(state, profile_id, session_id).await;
     let state = state.clone();
     let profile_id = profile_id.to_string();
     let session_id = session_id.to_string();
     tokio::spawn(async move {
+        if !session_assignment_fence_is_current(&state, &assignment_fence).await {
+            return;
+        }
         let cwd = preferences
             .get("cwd")
             .and_then(Value::as_str)
@@ -1300,6 +1326,12 @@ pub(crate) async fn spawn_language_bridge_response_translation_for_completed_tur
             }
         };
         let translated_at = now_unix_ms();
+        let resolved_profile_id = resolve_runtime_profile_entry(&state.config, &profile_id).0;
+        let session_lock = session_operation_lock(&state, &resolved_profile_id, &session_id).await;
+        let _session_guard = session_lock.lock().await;
+        if !session_assignment_fence_is_current(&state, &assignment_fence).await {
+            return;
+        }
         if let Err(error) = with_ui_state_write(&state, &profile_id, |ui_state| {
             let thread_state = ensure_language_bridge_thread_state(ui_state, &session_id)?;
             let translations = thread_state

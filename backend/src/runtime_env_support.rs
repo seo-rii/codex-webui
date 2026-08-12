@@ -9,6 +9,13 @@ struct PersistedAppServerAssignments {
     assignments: HashMap<String, String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionAssignmentFence {
+    runtime_key: String,
+    client_key: String,
+    epoch: u64,
+}
+
 fn app_server_assignments_path(state: &AppState) -> PathBuf {
     state.config.data_dir.join("app-server-assignments.json")
 }
@@ -297,6 +304,48 @@ pub(crate) async fn app_server_client_key_for_session(
         .unwrap_or_else(|| resolved_profile_id.to_string())
 }
 
+pub(crate) async fn capture_session_assignment_fence(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> SessionAssignmentFence {
+    ensure_app_server_assignments_loaded(state).await;
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
+    let assignments = state.session_app_server_assignments.lock().await;
+    let epochs = state.session_assignment_epochs.lock().await;
+    SessionAssignmentFence {
+        client_key: assignments
+            .get(&runtime_key)
+            .cloned()
+            .unwrap_or(resolved_profile_id),
+        epoch: epochs.get(&runtime_key).copied().unwrap_or_default(),
+        runtime_key,
+    }
+}
+
+pub(crate) async fn session_assignment_fence_is_current(
+    state: &AppState,
+    fence: &SessionAssignmentFence,
+) -> bool {
+    ensure_app_server_assignments_loaded(state).await;
+    let Some((profile_id, _)) = fence
+        .runtime_key
+        .strip_prefix("profile::")
+        .and_then(|value| value.split_once("::session-runtime::"))
+    else {
+        return false;
+    };
+    let assignments = state.session_app_server_assignments.lock().await;
+    let epochs = state.session_assignment_epochs.lock().await;
+    let current_client_key = assignments
+        .get(&fence.runtime_key)
+        .map(String::as_str)
+        .unwrap_or(profile_id);
+    current_client_key == fence.client_key
+        && epochs.get(&fence.runtime_key).copied().unwrap_or_default() == fence.epoch
+}
+
 async fn app_server_client_with_key(
     state: &AppState,
     resolved_profile_id: &str,
@@ -393,9 +442,14 @@ pub(crate) async fn clear_app_server_assignments_for_sessions(
     ensure_app_server_assignments_loaded(state).await;
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
     let mut assignments = state.session_app_server_assignments.lock().await;
+    let mut epochs = state.session_assignment_epochs.lock().await;
     for session_id in session_ids {
-        assignments.remove(&runtime_session_key(&resolved_profile_id, session_id));
+        let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
+        assignments.remove(&runtime_key);
+        let epoch = epochs.entry(runtime_key).or_default();
+        *epoch = epoch.saturating_add(1);
     }
+    drop(epochs);
     drop(assignments);
     if let Err(error) = persist_app_server_assignments(state).await {
         warn!(

@@ -1397,12 +1397,16 @@ pub(crate) async fn emit_session_summary_updated(
         .0
         .to_string();
     let task_key = format!("{resolved_profile_id}:{session_id}");
+    let assignment_fence = capture_session_assignment_fence(state, profile_id, session_id).await;
     let state_for_task = state.clone();
     let profile_id = profile_id.to_string();
     let session_id = session_id.to_string();
     let status_override = status_override.map(str::to_string);
     let handle = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(120)).await;
+        if !session_assignment_fence_is_current(&state_for_task, &assignment_fence).await {
+            return;
+        }
         let summary = if status_override
             .as_deref()
             .is_some_and(|status| status == "starting" || is_live_thread_status(status))
@@ -1426,6 +1430,12 @@ pub(crate) async fn emit_session_summary_updated(
             .await
         };
         if let Ok(summary) = summary {
+            let session_lock =
+                session_operation_lock(&state_for_task, &resolved_profile_id, &session_id).await;
+            let _session_guard = session_lock.lock().await;
+            if !session_assignment_fence_is_current(&state_for_task, &assignment_fence).await {
+                return;
+            }
             emit_profile_global_notification(
                 &state_for_task,
                 &profile_id,

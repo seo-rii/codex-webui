@@ -3732,6 +3732,7 @@ fn ws_session_cache_validation_returns_not_modified_for_matching_versions() {
         .and_then(Value::as_str)
         .unwrap()
         .to_string();
+    assert_ne!(detail_version, detail_state_hash);
     let detail_not_modified = execute_ws_method(
         &state,
         &out_tx,
@@ -3764,6 +3765,7 @@ fn ws_session_cache_validation_returns_not_modified_for_matching_versions() {
             "sessionId": session_id,
             "limit": 20,
             "knownVersion": "stale-client-payload-version",
+            "knownTurnVersions": detail_turn_versions.clone(),
             "knownStateHash": detail_state_hash
         }),
     )
@@ -3773,9 +3775,9 @@ fn ws_session_cache_validation_returns_not_modified_for_matching_versions() {
         detail_state_hash_not_modified
             .get("notModified")
             .and_then(Value::as_bool),
-        Some(true)
+        Some(false)
     );
-    assert!(detail_state_hash_not_modified.get("thread").is_none());
+    assert!(detail_state_hash_not_modified.get("patch").is_some());
 
     let detail_patch_when_state_hash_differs = execute_ws_method(
         &state,

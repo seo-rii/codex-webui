@@ -1153,6 +1153,41 @@ async fn saturated_websocket_queue_invalidates_connection() {
     assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
 }
 
+#[test]
+fn websocket_encoder_compresses_only_large_negotiated_envelopes() {
+    let large_message = ServerEnvelope::Response {
+        id: "large-response".to_string(),
+        ok: true,
+        result: Some(json!({ "text": "repeated websocket payload ".repeat(8_192) })),
+        error: None,
+    };
+    let encoded = encode_server_envelope(large_message, true).unwrap();
+    let Message::Binary(frame) = encoded else {
+        panic!("large negotiated response should use a binary gzip frame");
+    };
+    assert_eq!(&frame[..WS_GZIP_FRAME_MAGIC.len()], WS_GZIP_FRAME_MAGIC);
+    let mut decoder = flate2::read::GzDecoder::new(&frame[WS_GZIP_FRAME_MAGIC.len()..]);
+    let mut decoded = String::new();
+    std::io::Read::read_to_string(&mut decoder, &mut decoded).unwrap();
+    let payload: Value = serde_json::from_str(&decoded).unwrap();
+    assert_eq!(
+        payload.get("kind").and_then(Value::as_str),
+        Some("response")
+    );
+    assert_eq!(
+        payload.get("id").and_then(Value::as_str),
+        Some("large-response")
+    );
+
+    let small_message = ServerEnvelope::Pong {
+        nonce: Some("small".to_string()),
+    };
+    assert!(matches!(
+        encode_server_envelope(small_message, true).unwrap(),
+        Message::Text(_)
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_profile_request_slot_waits_for_transient_capacity() {
     let sandbox = unique_test_dir("ws-profile-slot-wait");

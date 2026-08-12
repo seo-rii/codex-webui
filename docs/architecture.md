@@ -113,6 +113,7 @@ The browser-facing session path is optimized around bounded payloads:
 - older turns are requested with an explicit cursor and limit
 - large transcript items, command output, MCP payloads, file changes, and Monaco diffs stay collapsed until expanded
 - summary pages include per-session version hashes so clients can request diffs and avoid replacing the whole list when only a few sessions changed
+- browsers with native streaming decompression negotiate gzip binary frames for WebSocket envelopes above 64 KiB; compression runs outside Tokio I/O workers, while small events and legacy clients retain the JSON text protocol
 
 This gives the web UI a different performance profile from a native local surface. A browser reconnect can restore the visible shell quickly, then progressively hydrate deeper history without blocking chat input, queue operations, or live WebSocket notifications.
 

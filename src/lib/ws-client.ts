@@ -104,6 +104,7 @@ const ACKNOWLEDGED_SUBSCRIPTION_METHODS = new Set([
 ]);
 const MAX_INFLIGHT_REQUESTS = 20;
 const MAX_INFLIGHT_READ_REQUESTS = 12;
+const WS_GZIP_FRAME_MAGIC = new Uint8Array([0x43, 0x57, 0x5a, 0x31]);
 const DEDUPED_READ_METHODS = new Set([
   "arena/list",
   "audit/list",
@@ -261,6 +262,7 @@ export class WebSocketRpcClient {
   private connectionState: WsConnectionState = "idle";
   private connectionStateListeners = new Set<(state: WsConnectionState) => void>();
   private defaultProfileId: string | null = null;
+  private incomingMessageChain: Promise<void> = Promise.resolve();
 
   setDefaultProfileId(profileId: string | null | undefined) {
     const normalized = typeof profileId === "string" && profileId.trim() ? profileId.trim() : null;
@@ -571,7 +573,9 @@ export class WebSocketRpcClient {
 
     this.manualClose = false;
     this.setConnectionState(this.hasConnectedOnce ? "reconnecting" : "connecting");
+    this.incomingMessageChain = Promise.resolve();
     const socket = new WebSocket(this.buildWebSocketUrl());
+    socket.binaryType = "arraybuffer";
     this.socket = socket;
     this.startConnectTimeout(socket);
 
@@ -603,89 +607,66 @@ export class WebSocketRpcClient {
       if (this.socket !== socket) {
         return;
       }
-      if (typeof event.data !== "string") {
-        return;
-      }
-
-      let payload: ServerEnvelope;
-      try {
-        payload = JSON.parse(event.data) as ServerEnvelope;
-      } catch {
-        return;
-      }
-
       this.lastActivityAt = Date.now();
       this.clearPongTimeout();
-
-      if (payload.kind === "pong") {
-        return;
-      }
-
-      if (payload.kind === "resyncRequired") {
-        for (const listener of this.resyncRequiredListeners) {
-          listener(payload.reason);
-        }
-        this.forceReconnect();
-        return;
-      }
-
-      if (payload.kind === "response") {
-        const pending = this.pending.get(payload.id);
-        if (!pending) {
-          return;
-        }
-
-        this.pending.delete(payload.id);
-        clearTimeout(pending.timeoutTimer);
-        if (payload.ok) {
-          pending.resolve(payload.result);
-        } else {
-          pending.reject(new Error(payload.error || "WebSocket request failed."));
-        }
-        this.flushPending();
-        return;
-      }
-
-      if (payload.kind === "event") {
-        const eventProfileId =
-          normalizeSubscriptionProfileId(payload.profileId) !== "default" || payload.profileId
-            ? normalizeSubscriptionProfileId(payload.profileId)
-            : profileIdFromSessionEvent(payload.event);
-        const handlerSets = eventProfileId
-          ? [this.sessionHandlers.get(sessionSubscriptionKey(payload.sessionId, eventProfileId))]
-          : Array.from(this.sessionHandlers.entries())
-              .filter(([key]) => key.endsWith(`:${payload.sessionId}`))
-              .map(([, handlers]) => handlers);
-        if (handlerSets.every((handlers) => !handlers)) {
-          return;
-        }
-        for (const handlers of handlerSets) {
-          if (!handlers) {
-            continue;
+      this.incomingMessageChain = this.incomingMessageChain
+        .then(async () => {
+          if (this.socket !== socket) {
+            return;
           }
-          for (const handler of handlers) {
-            handler(payload.event);
+          let text: string;
+          if (typeof event.data === "string") {
+            text = event.data;
+          } else {
+            const frame =
+              event.data instanceof ArrayBuffer
+                ? new Uint8Array(event.data)
+                : new Uint8Array(await (event.data as Blob).arrayBuffer());
+            const hasGzipMagic =
+              frame.length > WS_GZIP_FRAME_MAGIC.length &&
+              WS_GZIP_FRAME_MAGIC.every((byte, index) => frame[index] === byte);
+            if (!hasGzipMagic || typeof DecompressionStream !== "function") {
+              throw new Error("Unsupported compressed WebSocket frame.");
+            }
+            const compressed = frame.subarray(WS_GZIP_FRAME_MAGIC.length);
+            const decompressed = new ReadableStream<BufferSource>({
+              start(controller) {
+                controller.enqueue(compressed);
+                controller.close();
+              }
+            }).pipeThrough(new DecompressionStream("gzip"));
+            const reader = decompressed.getReader();
+            const chunks: Uint8Array[] = [];
+            let totalLength = 0;
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) {
+                break;
+              }
+              chunks.push(value);
+              totalLength += value.byteLength;
+            }
+            const decoded = new Uint8Array(totalLength);
+            let offset = 0;
+            for (const chunk of chunks) {
+              decoded.set(chunk, offset);
+              offset += chunk.byteLength;
+            }
+            text = new TextDecoder().decode(decoded);
           }
-        }
-        return;
-      }
-
-      if (payload.kind === "terminalEvent") {
-        const handlers = this.terminalHandlers.get(payload.terminalId);
-        if (!handlers) {
-          return;
-        }
-        for (const handler of handlers) {
-          handler(payload.event);
-        }
-        return;
-      }
-
-      if (payload.kind === "globalEvent") {
-        for (const handler of this.globalHandlers) {
-          handler(payload.event);
-        }
-      }
+          if (this.socket === socket) {
+            this.handleServerEnvelope(socket, text);
+          }
+        })
+        .catch(() => {
+          if (this.socket !== socket) {
+            return;
+          }
+          for (const listener of this.resyncRequiredListeners) {
+            listener("compressedMessageDecodeFailed");
+          }
+          this.forceReconnect();
+        });
     });
 
     socket.addEventListener("close", () => {
@@ -709,6 +690,88 @@ export class WebSocketRpcClient {
     socket.addEventListener("error", () => {
       socket.close();
     });
+  }
+
+  private handleServerEnvelope(socket: WebSocket, text: string) {
+    if (this.socket !== socket) {
+      return;
+    }
+    let payload: ServerEnvelope;
+    try {
+      payload = JSON.parse(text) as ServerEnvelope;
+    } catch {
+      return;
+    }
+
+    if (payload.kind === "pong") {
+      return;
+    }
+
+    if (payload.kind === "resyncRequired") {
+      for (const listener of this.resyncRequiredListeners) {
+        listener(payload.reason);
+      }
+      this.forceReconnect();
+      return;
+    }
+
+    if (payload.kind === "response") {
+      const pending = this.pending.get(payload.id);
+      if (!pending) {
+        return;
+      }
+
+      this.pending.delete(payload.id);
+      clearTimeout(pending.timeoutTimer);
+      if (payload.ok) {
+        pending.resolve(payload.result);
+      } else {
+        pending.reject(new Error(payload.error || "WebSocket request failed."));
+      }
+      this.flushPending();
+      return;
+    }
+
+    if (payload.kind === "event") {
+      const eventProfileId =
+        normalizeSubscriptionProfileId(payload.profileId) !== "default" || payload.profileId
+          ? normalizeSubscriptionProfileId(payload.profileId)
+          : profileIdFromSessionEvent(payload.event);
+      const handlerSets = eventProfileId
+        ? [this.sessionHandlers.get(sessionSubscriptionKey(payload.sessionId, eventProfileId))]
+        : Array.from(this.sessionHandlers.entries())
+            .filter(([key]) => key.endsWith(`:${payload.sessionId}`))
+            .map(([, handlers]) => handlers);
+      if (handlerSets.every((handlers) => !handlers)) {
+        return;
+      }
+      for (const handlers of handlerSets) {
+        if (!handlers) {
+          continue;
+        }
+        for (const handler of handlers) {
+          handler(payload.event);
+        }
+      }
+      return;
+    }
+
+    if (payload.kind === "terminalEvent") {
+      const handlers = this.terminalHandlers.get(payload.terminalId);
+      if (!handlers) {
+        return;
+      }
+      for (const handler of handlers) {
+        handler(payload.event);
+      }
+      return;
+    }
+
+    if (payload.kind === "globalEvent") {
+      for (const handler of this.globalHandlers) {
+        handler(payload.event);
+      }
+    }
   }
 
   private scheduleReconnect() {
@@ -1158,6 +1221,9 @@ export class WebSocketRpcClient {
   private buildWebSocketUrl() {
     const url = new URL(appPath("/ws"), window.location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    if (typeof DecompressionStream === "function") {
+      url.searchParams.set("compression", "gzip");
+    }
     return url.toString();
   }
 

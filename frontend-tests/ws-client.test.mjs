@@ -1,18 +1,20 @@
 import assert from "node:assert/strict";
-import { registerHooks } from "node:module";
-import test from "node:test";
+import { readFile } from "node:fs/promises";
+import test, { afterEach } from "node:test";
 
-registerHooks({
-  resolve(specifier, context, nextResolve) {
-    if (specifier === "$app/paths") {
-      return {
-        url: "data:text/javascript,export const base = ''",
-        shortCircuit: true
-      };
-    }
-    return nextResolve(specifier, context);
+import ts from "typescript";
+
+const sourceUrl = new URL("../src/lib/ws-client.ts", import.meta.url);
+const source = (await readFile(sourceUrl, "utf8")).replace(
+  'import { base } from "$app/paths";',
+  'const base = "";'
+);
+const transpiled = ts.transpileModule(source, {
+  compilerOptions: {
+    module: ts.ModuleKind.ESNext,
+    target: ts.ScriptTarget.ES2022
   }
-});
+}).outputText;
 
 class MockWebSocket extends EventTarget {
   static CONNECTING = 0;
@@ -39,19 +41,19 @@ class MockWebSocket extends EventTarget {
   }
 
   respond(message) {
-    this.dispatchEvent(
-      new MessageEvent("message", {
-        data: JSON.stringify({ kind: "response", id: message.id, ok: true, result: {} })
-      })
-    );
+    const event = new Event("message");
+    Object.defineProperty(event, "data", {
+      value: JSON.stringify({ kind: "response", id: message.id, ok: true, result: {} })
+    });
+    this.dispatchEvent(event);
   }
 
   respondError(message, error = "subscription rejected") {
-    this.dispatchEvent(
-      new MessageEvent("message", {
-        data: JSON.stringify({ kind: "response", id: message.id, ok: false, error })
-      })
-    );
+    const event = new Event("message");
+    Object.defineProperty(event, "data", {
+      value: JSON.stringify({ kind: "response", id: message.id, ok: false, error })
+    });
+    this.dispatchEvent(event);
   }
 
   close() {
@@ -63,7 +65,23 @@ class MockWebSocket extends EventTarget {
 globalThis.window = { location: new URL("http://localhost/") };
 globalThis.WebSocket = MockWebSocket;
 
-const { WebSocketRpcClient } = await import("../src/lib/ws-client.ts");
+const { WebSocketRpcClient } = await import(
+  `data:text/javascript;base64,${Buffer.from(transpiled).toString("base64")}`
+);
+
+const activeClients = [];
+
+function createClient() {
+  const client = new WebSocketRpcClient();
+  activeClients.push(client);
+  return client;
+}
+
+afterEach(() => {
+  for (const client of activeClients.splice(0)) {
+    client.disconnect();
+  }
+});
 
 function requests(socket, method, sessionId) {
   return socket.sent.filter(
@@ -72,12 +90,11 @@ function requests(socket, method, sessionId) {
 }
 
 async function settle() {
-  await Promise.resolve();
-  await Promise.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
 }
 
 test("A-B-A subscription changes finish with A subscribed and B unsubscribed", async () => {
-  const client = new WebSocketRpcClient();
+  const client = createClient();
   const releaseInitialA = client.subscribeSession("A", () => {}, { profileId: "profile-1" });
   const socket = MockWebSocket.instances.at(-1);
   socket.open();
@@ -125,7 +142,7 @@ test("A-B-A subscription changes finish with A subscribed and B unsubscribed", a
 });
 
 test("changing the default profile keeps the socket and scopes later requests", async () => {
-  const client = new WebSocketRpcClient();
+  const client = createClient();
   client.setDefaultProfileId("profile-1");
   const firstRequest = client.request("config/get");
   const socket = MockWebSocket.instances.at(-1);
@@ -157,7 +174,7 @@ test("changing the default profile keeps the socket and scopes later requests", 
 });
 
 test("moving a session subscription between profiles keeps the existing socket", async () => {
-  const client = new WebSocketRpcClient();
+  const client = createClient();
   const releaseSource = client.subscribeSession("session-1", () => {}, { profileId: "profile-1" });
   const socket = MockWebSocket.instances.at(-1);
   const socketCount = MockWebSocket.instances.length;
@@ -194,7 +211,7 @@ test("moving a session subscription between profiles keeps the existing socket",
 });
 
 test("rejected session subscriptions retry with bounded backoff", async () => {
-  const client = new WebSocketRpcClient();
+  const client = createClient();
   const release = client.subscribeSession("session-retry", () => {}, { profileId: "profile-1" });
   const socket = MockWebSocket.instances.at(-1);
   socket.open();
@@ -222,7 +239,7 @@ test("rejected session subscriptions retry with bounded backoff", async () => {
 });
 
 test("rejected session unsubscriptions remain pending and retry", async () => {
-  const client = new WebSocketRpcClient();
+  const client = createClient();
   const release = client.subscribeSession("session-unsubscribe-retry", () => {}, { profileId: "profile-1" });
   const socket = MockWebSocket.instances.at(-1);
   socket.open();

@@ -1,4 +1,7 @@
 use super::*;
+use axum::extract::Query;
+use flate2::{Compression, write::GzEncoder};
+use std::io::Write as _;
 
 tokio::task_local! {
     static ACTIVE_PROFILE_ID: String;
@@ -6,6 +9,8 @@ tokio::task_local! {
 
 const SLOW_WS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const WS_SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+const WS_GZIP_RESPONSE_THRESHOLD: usize = 64 * 1024;
+pub(crate) const WS_GZIP_FRAME_MAGIC: &[u8; 4] = b"CWZ1";
 
 struct SlowWebSocketLogState {
     next_log_at: Instant,
@@ -81,6 +86,7 @@ pub(crate) async fn handle_ws(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     jar: CookieJar,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
     if !websocket_origin_allowed(&state.config, &headers, Some(peer_addr)) {
@@ -96,10 +102,13 @@ pub(crate) async fn handle_ws(
         return response;
     };
     let auth_token = strongest_auth_token(&state.config, &jar, &headers);
+    let gzip_responses = query.get("compression").map(String::as_str) == Some("gzip");
 
     let mut response = ws
         .max_message_size(WS_MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| websocket_session(socket, state, auth, auth_token))
+        .on_upgrade(move |socket| {
+            websocket_session(socket, state, auth, auth_token, gzip_responses)
+        })
         .into_response();
     apply_security_headers(response.headers_mut());
     response
@@ -110,6 +119,7 @@ async fn websocket_session(
     state: AppState,
     auth: AuthContext,
     auth_token: Option<String>,
+    gzip_responses: bool,
 ) {
     let (mut sender, mut receiver) = socket.split();
     let (out_tx, mut out_rx, mut invalidation_rx) =
@@ -141,20 +151,33 @@ async fn websocket_session(
                     message
                 }
             };
-            let text = match serde_json::to_string(&message) {
-                Ok(text) => text,
-                Err(error) => {
-                    error!("failed to serialize websocket message: {error:#}");
-                    continue;
+            let should_compress =
+                gzip_responses && rough_ws_response_size(&message) >= WS_GZIP_RESPONSE_THRESHOLD;
+            let encoded = if should_compress {
+                match tokio::task::spawn_blocking(move || encode_server_envelope(message, true))
+                    .await
+                {
+                    Ok(Ok(encoded)) => encoded,
+                    Ok(Err(error)) => {
+                        error!("failed to encode websocket message: {error}");
+                        continue;
+                    }
+                    Err(error) => {
+                        error!("websocket encoder task failed: {error}");
+                        continue;
+                    }
+                }
+            } else {
+                match encode_server_envelope(message, false) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        error!("failed to encode websocket message: {error}");
+                        continue;
+                    }
                 }
             };
 
-            match tokio::time::timeout(
-                WS_SOCKET_SEND_TIMEOUT,
-                sender.send(Message::Text(text.into())),
-            )
-            .await
-            {
+            match tokio::time::timeout(WS_SOCKET_SEND_TIMEOUT, sender.send(encoded)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     writer_out_tx.invalidate(format!("websocket socket send failed: {error}"));
@@ -299,6 +322,30 @@ async fn websocket_session(
         handle.abort();
     }
     writer.abort();
+}
+
+pub(crate) fn encode_server_envelope(
+    message: ServerEnvelope,
+    gzip_response: bool,
+) -> std::result::Result<Message, String> {
+    let encoded = serde_json::to_vec(&message).map_err(|error| error.to_string())?;
+    if gzip_response && encoded.len() >= WS_GZIP_RESPONSE_THRESHOLD {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder
+            .write_all(&encoded)
+            .map_err(|error| error.to_string())?;
+        let compressed = encoder.finish().map_err(|error| error.to_string())?;
+        if compressed.len().saturating_add(WS_GZIP_FRAME_MAGIC.len()) < encoded.len() {
+            let mut frame = Vec::with_capacity(WS_GZIP_FRAME_MAGIC.len() + compressed.len());
+            frame.extend_from_slice(WS_GZIP_FRAME_MAGIC);
+            frame.extend_from_slice(&compressed);
+            return Ok(Message::Binary(frame.into()));
+        }
+    }
+
+    String::from_utf8(encoded)
+        .map(|text| Message::Text(text.into()))
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn queue_ws_envelope(

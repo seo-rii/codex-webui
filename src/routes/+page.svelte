@@ -5364,6 +5364,8 @@
           ? null
           : (latestTurn ? (sessionTurnVersionsById[latestTurn.id] ?? null) : null);
     const requestActiveTurnId = conversation?.thread.id === sessionId ? conversation.activeTurnId : null;
+    const scopeKey = sessionStateKey(sessionId, profileId);
+    const requestStreamCursor = sessionStreamCursors.get(scopeKey) ?? null;
     const payload = await api.getSessionLatestCompletedTurn(
       sessionId,
       expectedTurnId,
@@ -5380,6 +5382,13 @@
         retryAfterMs: 0
       };
     }
+    reconcileSelectedSessionStreamBoundary(
+      scopeKey,
+      sessionId,
+      profileId,
+      requestStreamCursor,
+      payload
+    );
 
     const applied = applyLatestCompletedTurnPayload(
       sessionId,

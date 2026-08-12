@@ -603,6 +603,8 @@ export type SessionTurnPayload = {
 };
 
 export type SessionLatestCompletedTurnPayload = {
+  streamEpoch?: string;
+  streamSequence?: number;
   sessionId: string;
   profileId: string;
   targetTurnId: string | null;

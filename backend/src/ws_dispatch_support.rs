@@ -709,7 +709,9 @@ pub(crate) async fn execute_ws_method(
             let session_id = require_session_id(&params, "sessionId")?;
             let profile_id =
                 ws_request_profile_id_for_session(state, auth, &params, &session_id).await?;
-            session_latest_completed_turn_payload(
+            let (stream_epoch, stream_sequence) =
+                session_stream_boundary(state, &profile_id, &session_id).await;
+            let mut response = session_latest_completed_turn_payload(
                 state,
                 &profile_id,
                 &session_id,
@@ -717,7 +719,12 @@ pub(crate) async fn execute_ws_method(
                 params.get("knownCompletionVersion").and_then(Value::as_str),
             )
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(anyhow::Error::from)?;
+            if let Some(response) = response.as_object_mut() {
+                response.insert("streamEpoch".to_string(), Value::String(stream_epoch));
+                response.insert("streamSequence".to_string(), json!(stream_sequence));
+            }
+            Ok(response)
         }
         "session/itemDetail/get" => {
             let session_id = require_session_id(&params, "sessionId")?;

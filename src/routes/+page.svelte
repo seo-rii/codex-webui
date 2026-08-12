@@ -69,6 +69,12 @@
     writeSessionDetailCache,
     writeSessionListCache
   } from "$lib/session-browser-cache";
+  import {
+    observeSessionStreamEvent,
+    reconcileSessionStreamBoundary,
+    type SessionStreamCursor,
+    type SessionStreamCursorResult
+  } from "$lib/session-stream-cursor";
   import SessionRecoveryModal from "$lib/components/SessionRecoveryModal.svelte";
   import SessionSidebar from "$lib/components/SessionSidebar.svelte";
   import SessionTurnSearchPopover from "$lib/components/SessionTurnSearchPopover.svelte";
@@ -1754,6 +1760,7 @@
   const pendingComposerMutationSignatures = new Set<string>();
   const pendingEnqueuesByOptimisticId = new Map<string, PendingEnqueueState>();
   const sessionEventRevisions = new Map<string, number>();
+  const sessionStreamCursors = new Map<string, SessionStreamCursor>();
   const queueStateRevisions = new Map<string, number>();
   let pendingComposerMutationRevision = $state(0);
   let lastLoadedConversationId = $state<string | null>(null);
@@ -1765,6 +1772,55 @@
 
   function selectedSessionBindingMatches(sessionId: string, profileId: string | null | undefined) {
     return selectedSessionStateKey() === sessionStateKey(sessionId, profileId);
+  }
+
+  function applySessionStreamCursorResult(
+    scopeKey: string,
+    sessionId: string,
+    profileId: string | null,
+    result: SessionStreamCursorResult
+  ) {
+    if (result.cursor) {
+      sessionStreamCursors.set(scopeKey, result.cursor);
+    }
+    if (!result.gap || !selectedSessionBindingMatches(sessionId, profileId)) {
+      return;
+    }
+
+    sessionDetailCacheVersion = null;
+    sessionDetailStateHash = null;
+    sessionDetailMetadataVersion = null;
+    sessionTurnVersionsById = {};
+    scheduleSelectedSessionStateRefresh(sessionId, 0, true);
+  }
+
+  function observeSelectedSessionStreamEvent(
+    scopeKey: string,
+    sessionId: string,
+    profileId: string | null,
+    event: StreamEvent
+  ) {
+    applySessionStreamCursorResult(
+      scopeKey,
+      sessionId,
+      profileId,
+      observeSessionStreamEvent(sessionStreamCursors.get(scopeKey) ?? null, event)
+    );
+  }
+
+  function reconcileSelectedSessionStreamBoundary(
+    scopeKey: string,
+    sessionId: string,
+    profileId: string | null,
+    requestCursor: SessionStreamCursor | null,
+    detail: SessionDetailResponse
+  ) {
+    applySessionStreamCursorResult(
+      scopeKey,
+      sessionId,
+      profileId,
+      reconcileSessionStreamBoundary(sessionStreamCursors.get(scopeKey) ?? null, requestCursor, detail)
+    );
   }
 
   function isLiveConversationStatus(status: string | null | undefined) {
@@ -5591,6 +5647,7 @@
     queuedMessageRequestCountsBySessionId = {};
     pendingEnqueuesByOptimisticId.clear();
     sessionEventRevisions.clear();
+    sessionStreamCursors.clear();
     queueStateRevisions.clear();
     clearPendingQueueMode();
     liveTurnCardExpanded = false;
@@ -6276,6 +6333,8 @@
       targetScopeKey,
       Math.max(sourceEventRevision, sessionEventRevisions.get(targetScopeKey) ?? 0)
     );
+    sessionStreamCursors.delete(sourceScopeKey);
+    sessionStreamCursors.delete(targetScopeKey);
     const sourceQueueRevision = queueStateRevisions.get(sourceScopeKey) ?? 0;
     queueStateRevisions.delete(sourceScopeKey);
     queueStateRevisions.set(
@@ -6365,6 +6424,7 @@
         return;
       }
       const scopeKey = sessionStateKey(sessionId, profileId);
+      observeSelectedSessionStreamEvent(scopeKey, sessionId, profileId, payload);
       sessionEventRevisions.set(scopeKey, (sessionEventRevisions.get(scopeKey) ?? 0) + 1);
       const queuePayload = queuePayloadFromEvent(payload);
       if (queuePayload) {
@@ -6751,6 +6811,8 @@
       metadataVersion: patch.metadataVersion,
       stateHash: patch.finalStateHash,
       cacheVersion: payload.cacheVersion,
+      streamEpoch: payload.streamEpoch,
+      streamSequence: payload.streamSequence,
       notModified: false
     };
   }
@@ -7020,6 +7082,7 @@
     const sessionProfileId = expectedProfileId ?? profileIdForSession(sessionId);
     const scopeKey = sessionStateKey(sessionId, sessionProfileId);
     const requestEventRevision = sessionEventRevisions.get(scopeKey) ?? 0;
+    const requestStreamCursor = sessionStreamCursors.get(scopeKey) ?? null;
     const knownTurnVersions =
       knownVersion && sessionDetailStateHash && conversation?.thread.id === sessionId
         ? boundedVersionHints(sessionTurnVersionsById, SESSION_DETAIL_VERSION_HINT_LIMIT)
@@ -7041,6 +7104,13 @@
     ) {
       return null;
     }
+    reconcileSelectedSessionStreamBoundary(
+      scopeKey,
+      sessionId,
+      sessionProfileId,
+      requestStreamCursor,
+      detail
+    );
     if (isCacheValidationResponse(detail)) {
       sessionDetailCacheVersion = detail.cacheVersion;
       if (selectedSessionId !== sessionId || !conversation || conversation.thread.id !== sessionId) {
@@ -7078,6 +7148,7 @@
 
     if (isSessionDetailPatchResponse(detail)) {
       const patchedDetail = applySessionDetailPatch(detail);
+      const fallbackRequestStreamCursor = sessionStreamCursors.get(scopeKey) ?? null;
       const fallbackDetail = patchedDetail
         ? null
         : await api.getSession(sessionId, turnLimit, null, null, null, sessionProfileId);
@@ -7087,6 +7158,15 @@
         sessionSelectionVersion !== requestSelectionVersion
       ) {
         return null;
+      }
+      if (fallbackDetail) {
+        reconcileSelectedSessionStreamBoundary(
+          scopeKey,
+          sessionId,
+          sessionProfileId,
+          fallbackRequestStreamCursor,
+          fallbackDetail
+        );
       }
       const nextDetail = patchedDetail ?? fallbackDetail;
       if (!nextDetail || isCacheValidationResponse(nextDetail) || isSessionDetailPatchResponse(nextDetail)) {

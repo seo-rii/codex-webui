@@ -188,6 +188,8 @@ export type SessionListPayload = {
 export type CacheValidationPayload = {
   cacheVersion: string;
   notModified: true;
+  streamEpoch?: string;
+  streamSequence?: number;
 };
 
 export type SessionListPatchPayload = {
@@ -511,6 +513,8 @@ export type CodexAccountLoginFlow =
     };
 
 export type SessionDetailPayload = {
+  streamEpoch?: string;
+  streamSequence?: number;
   profileId?: string | null;
   profileLabel?: string | null;
   profileCodexHome?: string | null;
@@ -548,6 +552,8 @@ export type SessionDetailPayload = {
 };
 
 export type SessionDetailPatchPayload = {
+  streamEpoch?: string;
+  streamSequence?: number;
   cacheVersion: string;
   notModified: false;
   patch: {
@@ -720,12 +726,18 @@ export type StreamEvent =
       kind: "notification";
       method: string;
       params: Record<string, unknown>;
+      streamEpoch?: string;
+      streamSequenceStart?: number;
+      streamSequence?: number;
     }
   | {
       kind: "serverRequest";
       id: string;
       method: string;
       params: Record<string, unknown>;
+      streamEpoch?: string;
+      streamSequenceStart?: number;
+      streamSequence?: number;
     };
 
 export type ComputerFramePayload = {

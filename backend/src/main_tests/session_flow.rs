@@ -7413,6 +7413,130 @@ async fn send_turn_payload_clears_runtime_state_when_turn_start_fails() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_turn_payload_reconciles_an_accepted_start_after_response_timeout() {
+    let sandbox = unique_test_dir("turn-send-ambiguous-timeout");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let mut state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let fake_server_path = state.config.project_root.join("fake-codex-test.py");
+    state.app_servers = AppServerManager::new(AppServerClientConfig {
+        codex_bin: fake_server_path.display().to_string(),
+        request_timeout: Duration::from_millis(75),
+        ..AppServerClientConfig::default()
+    });
+    let created = create_session_payload(
+        &state,
+        "default",
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        None,
+        Some("Ambiguous turn start"),
+    )
+    .await
+    .unwrap();
+    let session_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    let client = app_server_client(&state, "default").await.unwrap();
+    client
+        .request(
+            "debug/setDelay",
+            json!({
+                "method": "turn/start",
+                "delayMs": 250
+            }),
+        )
+        .await
+        .unwrap();
+
+    let payload = send_turn_payload(
+        &state,
+        "default",
+        &session_id,
+        "Accept this turn before its response times out.",
+        None,
+        None,
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        Some("client-ambiguous-turn"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        payload.get("responseTimedOut").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(payload.get("pending").and_then(Value::as_bool), Some(true));
+
+    let runtime_key = runtime_session_key(
+        &resolve_runtime_profile_entry(&state.config, "default").0,
+        &session_id,
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if state.active_turns.lock().await.get(&runtime_key).is_some()
+                && !state
+                    .pending_turn_starts
+                    .lock()
+                    .await
+                    .contains(&runtime_key)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the delayed accepted turn should reconcile as active");
+
+    let runtime_status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][&session_id].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime_status.get("status").and_then(Value::as_str),
+        Some("running")
+    );
+    let duplicate = send_turn_payload(
+        &state,
+        "default",
+        &session_id,
+        "Accept this turn before its response times out.",
+        None,
+        None,
+        json!({
+            "cwd": workspace.display().to_string(),
+            "model": "gpt-5"
+        }),
+        Some("client-ambiguous-turn"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        duplicate.get("duplicate").and_then(Value::as_bool),
+        Some(true)
+    );
+    let request_count = client
+        .request("debug/requestCount", json!({ "target": "turn/start" }))
+        .await
+        .unwrap();
+    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(1));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_session_compaction_payload_proxies_native_compact_start() {
     let sandbox = unique_test_dir("manual-compact-start");
     let workspace = sandbox.join("workspace");

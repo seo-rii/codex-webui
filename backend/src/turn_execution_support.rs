@@ -8,6 +8,15 @@ use crate::thread_read_support::{
 };
 
 const DUPLICATE_TURN_START_ACTIVE_GRACE_MS: u64 = 30_000;
+#[cfg(not(test))]
+const AMBIGUOUS_TURN_START_RECONCILE_DELAY_MS: u64 = 250;
+#[cfg(test)]
+const AMBIGUOUS_TURN_START_RECONCILE_DELAY_MS: u64 = 25;
+#[cfg(not(test))]
+const AMBIGUOUS_TURN_START_READ_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const AMBIGUOUS_TURN_START_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const AMBIGUOUS_TURN_START_RECONCILE_ATTEMPTS: usize = 3;
 const RECENT_CLIENT_USER_MESSAGE_TTL: Duration = Duration::from_secs(60 * 30);
 const LANGUAGE_BRIDGE_TRANSLATION_TIMEOUT: Duration = Duration::from_secs(180);
 const SESSION_TITLE_GENERATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -85,6 +94,219 @@ async fn remember_sent_client_user_message(
     let mut recent = state.recent_client_user_messages.lock().await;
     recent.retain(|_, sent_at| now.duration_since(*sent_at) <= RECENT_CLIENT_USER_MESSAGE_TTL);
     recent.insert(key, now);
+}
+
+async fn settle_accepted_turn_start(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    runtime_key: &str,
+    turn_id: Option<&str>,
+    preferences: &Value,
+    status: &str,
+) -> ApiResult<()> {
+    if let Some(turn_id) = turn_id {
+        state
+            .active_turns
+            .lock()
+            .await
+            .insert(runtime_key.to_string(), turn_id.to_string());
+    } else if !is_live_thread_status(status) {
+        state.active_turns.lock().await.remove(runtime_key);
+    }
+    state.pending_turn_starts.lock().await.remove(runtime_key);
+    set_runtime_session_status(state, profile_id, session_id, status).await;
+    set_session_highlight(state, profile_id, session_id, None).await;
+    emit_session_notification(
+        state,
+        profile_id,
+        session_id,
+        json!({
+            "kind": "notification",
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": session_id,
+                "status": status
+            }
+        }),
+    )
+    .await;
+    emit_session_status_summary_updated(
+        state,
+        profile_id,
+        session_id,
+        Some(preferences.clone()),
+        status,
+    )
+    .await;
+    Ok(())
+}
+
+fn spawn_ambiguous_turn_start_reconciliation(
+    state: AppState,
+    profile_id: String,
+    session_id: String,
+    runtime_key: String,
+    client: AppServerClient,
+    preferences: Value,
+    client_user_message_id: Option<String>,
+    assignment_fence: SessionAssignmentFence,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(
+            AMBIGUOUS_TURN_START_RECONCILE_DELAY_MS,
+        ))
+        .await;
+
+        let mut observed_authoritative_negative = false;
+        for attempt in 0..AMBIGUOUS_TURN_START_RECONCILE_ATTEMPTS {
+            if !session_assignment_fence_is_current(&state, &assignment_fence).await
+                || !state
+                    .pending_turn_starts
+                    .lock()
+                    .await
+                    .contains(&runtime_key)
+            {
+                return;
+            }
+
+            if let Some(turn_id) = state.active_turns.lock().await.get(&runtime_key).cloned() {
+                let session_lock = session_operation_lock(&state, &profile_id, &session_id).await;
+                let _session_guard = session_lock.lock().await;
+                if session_assignment_fence_is_current(&state, &assignment_fence).await {
+                    let _ = settle_accepted_turn_start(
+                        &state,
+                        &profile_id,
+                        &session_id,
+                        &runtime_key,
+                        Some(&turn_id),
+                        &preferences,
+                        "running",
+                    )
+                    .await;
+                }
+                return;
+            }
+
+            let response = client
+                .request_with_timeout(
+                    "thread/read",
+                    json!({
+                        "threadId": session_id,
+                        "includeTurns": true
+                    }),
+                    AMBIGUOUS_TURN_START_READ_TIMEOUT,
+                    false,
+                )
+                .await;
+            if let Ok(response) = response {
+                let thread = response.get("thread").unwrap_or(&response);
+                let active_turn_id = thread
+                    .get("turns")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .and_then(active_turn_id_from_turns);
+                let accepted_client_message =
+                    client_user_message_id
+                        .as_deref()
+                        .is_some_and(|client_user_message_id| {
+                            thread
+                                .get("turns")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .flat_map(|turn| {
+                                    turn.get("items")
+                                        .and_then(Value::as_array)
+                                        .into_iter()
+                                        .flatten()
+                                })
+                                .any(|item| {
+                                    item.get("clientUserMessageId")
+                                        .or_else(|| item.get("clientId"))
+                                        .and_then(Value::as_str)
+                                        == Some(client_user_message_id)
+                                })
+                        });
+                let thread_status = normalized_thread_status(thread.get("status"));
+
+                if active_turn_id.is_some() || accepted_client_message {
+                    let status = if active_turn_id.is_some()
+                        || thread_status.as_deref().is_some_and(is_live_thread_status)
+                    {
+                        "running"
+                    } else {
+                        thread_status
+                            .as_deref()
+                            .map(runtime_status_from_codex_thread_status)
+                            .unwrap_or("completed")
+                    };
+                    let session_lock =
+                        session_operation_lock(&state, &profile_id, &session_id).await;
+                    let _session_guard = session_lock.lock().await;
+                    if session_assignment_fence_is_current(&state, &assignment_fence).await {
+                        let _ = settle_accepted_turn_start(
+                            &state,
+                            &profile_id,
+                            &session_id,
+                            &runtime_key,
+                            active_turn_id.as_deref(),
+                            &preferences,
+                            status,
+                        )
+                        .await;
+                    }
+                    return;
+                }
+
+                observed_authoritative_negative = true;
+            }
+
+            if attempt + 1 < AMBIGUOUS_TURN_START_RECONCILE_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(
+                    AMBIGUOUS_TURN_START_RECONCILE_DELAY_MS
+                        * u64::try_from(attempt + 2).unwrap_or(1),
+                ))
+                .await;
+            }
+        }
+
+        let session_lock = session_operation_lock(&state, &profile_id, &session_id).await;
+        let _session_guard = session_lock.lock().await;
+        if session_assignment_fence_is_current(&state, &assignment_fence).await
+            && state.pending_turn_starts.lock().await.remove(&runtime_key)
+        {
+            let final_status =
+                if observed_authoritative_negative && client_user_message_id.is_some() {
+                    "failed"
+                } else {
+                    "unknown"
+                };
+            set_runtime_session_status(&state, &profile_id, &session_id, final_status).await;
+            emit_session_notification(
+                &state,
+                &profile_id,
+                &session_id,
+                json!({
+                    "kind": "notification",
+                    "method": "thread/status/changed",
+                    "params": {
+                        "threadId": session_id,
+                        "status": final_status
+                    }
+                }),
+            )
+            .await;
+            emit_session_summary_updated(
+                &state,
+                &profile_id,
+                &session_id,
+                None,
+                Some(final_status),
+            )
+            .await;
+        }
+    });
 }
 
 async fn resolve_selected_attachment_records(
@@ -1868,6 +2090,58 @@ pub(crate) async fn send_turn_payload(
         .await
     {
         Ok(response) => response,
+        Err(error) if app_server_request_timed_out(&error) => {
+            if let Some(client_id) = client_user_message_id.as_deref() {
+                remember_sent_client_user_message(state, &runtime_key, client_id).await;
+            }
+            if let Some(output_language) = resolved_output_language.as_deref() {
+                remember_language_bridge_output_language(
+                    state,
+                    profile_id,
+                    session_id,
+                    output_language,
+                )
+                .await?;
+            }
+            clear_session_draft_payload(state, profile_id, session_id).await?;
+
+            if let Some(turn_id) = state.active_turns.lock().await.get(&runtime_key).cloned() {
+                settle_accepted_turn_start(
+                    state,
+                    profile_id,
+                    session_id,
+                    &runtime_key,
+                    Some(&turn_id),
+                    &next_preferences,
+                    "running",
+                )
+                .await?;
+                return Ok(json!({
+                    "ok": true,
+                    "turnId": turn_id,
+                    "responseTimedOut": true
+                }));
+            }
+
+            let assignment_fence =
+                capture_session_assignment_fence(state, profile_id, session_id).await;
+            spawn_ambiguous_turn_start_reconciliation(
+                state.clone(),
+                profile_id.to_string(),
+                session_id.to_string(),
+                runtime_key.clone(),
+                client.clone(),
+                next_preferences.clone(),
+                client_user_message_id.clone(),
+                assignment_fence,
+            );
+            return Ok(json!({
+                "ok": true,
+                "pending": true,
+                "clientUserMessageId": client_user_message_id,
+                "responseTimedOut": true
+            }));
+        }
         Err(error) => {
             let message = format!("Failed to start the turn: {error}");
             if let Some(recovery_error) =
@@ -1883,18 +2157,11 @@ pub(crate) async fn send_turn_payload(
         }
     };
 
-    if let Some(turn_id) = response
+    let turn_id = response
         .get("turn")
         .and_then(|value| value.get("id"))
         .and_then(Value::as_str)
-        .map(str::to_string)
-    {
-        state
-            .active_turns
-            .lock()
-            .await
-            .insert(runtime_key.clone(), turn_id);
-    }
+        .map(str::to_string);
     if let Some(client_id) = client_user_message_id.as_deref() {
         remember_sent_client_user_message(state, &runtime_key, client_id).await;
     }
@@ -1902,41 +2169,21 @@ pub(crate) async fn send_turn_payload(
         remember_language_bridge_output_language(state, profile_id, session_id, output_language)
             .await?;
     }
-    set_runtime_session_status(state, profile_id, session_id, "running").await;
-    set_session_highlight(state, profile_id, session_id, None).await;
-    emit_session_notification(
-        state,
-        profile_id,
-        session_id,
-        json!({
-            "kind": "notification",
-            "method": "thread/status/changed",
-            "params": {
-                "threadId": session_id,
-                "status": "running"
-            }
-        }),
-    )
-    .await;
-    state.pending_turn_starts.lock().await.remove(&runtime_key);
-
     clear_session_draft_payload(state, profile_id, session_id).await?;
-    emit_session_status_summary_updated(
+    settle_accepted_turn_start(
         state,
         profile_id,
         session_id,
-        Some(next_preferences.clone()),
+        &runtime_key,
+        turn_id.as_deref(),
+        &next_preferences,
         "running",
     )
-    .await;
+    .await?;
 
     Ok(json!({
         "ok": true,
-        "turnId": response
-            .get("turn")
-            .and_then(|value| value.get("id"))
-            .cloned()
-            .unwrap_or(Value::Null)
+        "turnId": turn_id
     }))
     }
     .await;

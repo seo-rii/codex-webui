@@ -26,6 +26,11 @@ pub(crate) struct LocalRolloutTurnWindow {
     pub(crate) modified_at_ms: Option<u64>,
 }
 
+pub(crate) struct LocalRolloutRuntimeEvidence {
+    pub(crate) status: String,
+    pub(crate) modified_at_ms: Option<u64>,
+}
+
 pub(crate) struct RolloutRecord {
     pub(crate) value: Value,
     pub(crate) absolute_offset: u64,
@@ -1717,6 +1722,59 @@ async fn read_local_rollout_completion_turn(
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to load the local session completion tail: {error}"),
+        )
+    })
+}
+
+pub(crate) async fn read_local_rollout_runtime_evidence(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    expected_turn_id: &str,
+) -> ApiResult<Option<LocalRolloutRuntimeEvidence>> {
+    let Some(rollout_path) = find_rollout_path_by_session_id(state, profile_id, session_id).await?
+    else {
+        return Ok(None);
+    };
+    let expected_turn_id = expected_turn_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let record_window = rollout_completion_tail_records(
+            &rollout_path,
+            Some(&expected_turn_id),
+            SESSION_DETAIL_ROLLOUT_TAIL_MAX_BYTES,
+        )?;
+        if record_window.trailing_incomplete || record_window.changed_during_read {
+            return Ok(None);
+        }
+        let mut status = None;
+        for record in &record_window.records {
+            let payload = record.value.get("payload").unwrap_or(&Value::Null);
+            if payload.get("turn_id").and_then(Value::as_str) != Some(&expected_turn_id) {
+                continue;
+            }
+            status = match payload.get("type").and_then(Value::as_str) {
+                Some("task_started") => Some("running"),
+                Some("task_complete") => Some("completed"),
+                Some("error") => Some("failed"),
+                _ => status,
+            };
+        }
+        Ok::<_, String>(status.map(|status| LocalRolloutRuntimeEvidence {
+            status: status.to_string(),
+            modified_at_ms: record_window.modified_at_ms,
+        }))
+    })
+    .await
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to inspect the local runtime tail: {error}"),
+        )
+    })?
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to inspect the local runtime tail: {error}"),
         )
     })
 }

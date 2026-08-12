@@ -3,6 +3,7 @@ use super::*;
 const RUNTIME_ACTIVITY_RECONCILE_INTERVAL_SECS: u64 = 15;
 const RUNTIME_ACTIVITY_RECONCILE_LIMIT: usize = 8;
 const RUNTIME_ACTIVITY_RECONCILE_TIMEOUT_MS: u64 = 1_000;
+const RUNTIME_ACTIVITY_LOCAL_EVIDENCE_FRESH_MS: u64 = 60_000;
 
 #[derive(Default)]
 struct RuntimeActivityReconcileSchedule {
@@ -1195,6 +1196,45 @@ pub(crate) async fn reconcile_lost_runtime_activity_for_profile(
             .contains(&runtime_key)
         {
             continue;
+        }
+        let cached_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
+        if let Some(cached_turn_id) = cached_turn_id.as_deref()
+            && let Ok(Some(local_evidence)) =
+                read_local_rollout_runtime_evidence(state, profile_id, &session_id, cached_turn_id)
+                    .await
+        {
+            if local_evidence.status != "running" {
+                let active_turn_is_unchanged = state
+                    .active_turns
+                    .lock()
+                    .await
+                    .get(&runtime_key)
+                    .is_some_and(|turn_id| turn_id == cached_turn_id);
+                if active_turn_is_unchanged
+                    && !state
+                        .pending_turn_starts
+                        .lock()
+                        .await
+                        .contains(&runtime_key)
+                {
+                    mark_runtime_session_terminal_after_reconcile(
+                        state,
+                        profile_id,
+                        &session_id,
+                        &local_evidence.status,
+                        "the local rollout tail contains the terminal turn record",
+                    )
+                    .await;
+                    reconciled.push(session_id);
+                    continue;
+                }
+            } else if local_evidence.modified_at_ms.is_some_and(|modified_at_ms| {
+                now_unix_ms().saturating_sub(modified_at_ms)
+                    < RUNTIME_ACTIVITY_LOCAL_EVIDENCE_FRESH_MS
+            }) && client.has_active_turn_id(cached_turn_id).await
+            {
+                continue;
+            }
         }
         let response = client
             .request_with_timeout(

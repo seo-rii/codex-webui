@@ -5042,6 +5042,120 @@ async fn runtime_reconcile_preserves_turn_owned_by_live_app_server() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_reconcile_prefers_bounded_local_rollout_evidence() {
+    let sandbox = unique_test_dir("runtime-reconcile-local-tail");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    let session_id = "019df000-0000-7000-8000-000000000113";
+    let runtime_key = runtime_session_key("default", session_id);
+    let client = app_server_client(&state, "default").await.unwrap();
+    let started = client
+        .request(
+            "turn/start",
+            json!({
+                "threadId": session_id,
+                "input": [{ "type": "text", "text": "use the local rollout tail" }],
+                "cwd": workspace.display().to_string()
+            }),
+        )
+        .await
+        .unwrap();
+    let turn_id = started["turn"]["id"].as_str().unwrap().to_string();
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), turn_id.clone());
+    set_runtime_session_status(&state, "default", session_id, "running").await;
+
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("05")
+        .join("03");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join(format!("rollout-2026-05-03T22-40-25-{session_id}.jsonl"));
+    fs::write(
+        &rollout_path,
+        format!(
+            "{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:06:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": turn_id
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let local_evidence =
+        read_local_rollout_runtime_evidence(&state, "default", session_id, &turn_id)
+            .await
+            .unwrap()
+            .expect("the current rollout turn should be visible in the bounded tail");
+    assert_eq!(local_evidence.status, "running");
+    assert!(client.has_active_turn_id(&turn_id).await);
+
+    let first_reconciled = reconcile_lost_runtime_activity_for_profile(&state, "default").await;
+    assert!(first_reconciled.is_empty());
+    let request_count = client
+        .request("debug/requestCount", json!({ "target": "thread/read" }))
+        .await
+        .unwrap();
+    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(0));
+
+    use std::io::Write as _;
+    let mut rollout = fs::OpenOptions::new()
+        .append(true)
+        .open(&rollout_path)
+        .unwrap();
+    writeln!(
+        rollout,
+        "{}",
+        json!({
+            "timestamp": "2026-04-24T01:06:01.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": turn_id,
+                "completed_at": 1_777_000_361_000_i64,
+                "duration_ms": 1_000
+            }
+        })
+    )
+    .unwrap();
+    rollout.sync_all().unwrap();
+
+    let second_reconciled = reconcile_lost_runtime_activity_for_profile(&state, "default").await;
+    assert_eq!(second_reconciled, vec![session_id.to_string()]);
+    assert!(state.active_turns.lock().await.get(&runtime_key).is_none());
+    let status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][session_id]["status"].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.as_str(), Some("completed"));
+    let request_count = client
+        .request("debug/requestCount", json!({ "target": "thread/read" }))
+        .await
+        .unwrap();
+    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(0));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn truncated_local_session_detail_exposes_idle_history_state() {
     let sandbox = unique_test_dir("session-detail-truncated-idle");
     let workspace = sandbox.join("workspace");
@@ -6782,6 +6896,61 @@ async fn session_summary_confirms_cached_activity_with_app_server_before_clearin
     assert_eq!(first.get("id").and_then(Value::as_str), Some(session_id));
     assert_eq!(first.get("status").and_then(Value::as_str), Some("running"));
     assert!(state.active_turns.lock().await.contains_key(&runtime_key));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_summary_skips_native_read_for_manager_owned_turn() {
+    let sandbox = unique_test_dir("session-summary-manager-owned-turn");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-summary-manager-owned";
+    let runtime_key = runtime_session_key("default", session_id);
+    let client = app_server_client(&state, "default").await.unwrap();
+    let started = client
+        .request(
+            "turn/start",
+            json!({
+                "threadId": session_id,
+                "input": [{ "type": "text", "text": "keep summary reconciliation local" }],
+                "cwd": workspace.display().to_string()
+            }),
+        )
+        .await
+        .unwrap();
+    let turn_id = started["turn"]["id"].as_str().unwrap().to_string();
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key, turn_id.clone());
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][session_id] = json!({
+            "status": "running",
+            "updatedAt": now_unix_ms().saturating_sub(120_000)
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let snapshot = read_session_summary_ui_snapshot(&state, "default")
+        .await
+        .unwrap();
+
+    assert!(snapshot.active_thread_ids.contains(session_id));
+    assert!(client.has_active_turn_id(&turn_id).await);
+    let count = client
+        .request("debug/requestCount", json!({ "target": "thread/read" }))
+        .await
+        .unwrap();
+    assert_eq!(count.get("count").and_then(Value::as_u64), Some(0));
 
     let _ = fs::remove_dir_all(sandbox);
 }

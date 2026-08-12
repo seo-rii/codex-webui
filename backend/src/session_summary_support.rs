@@ -784,6 +784,8 @@ pub(crate) async fn read_session_summary_ui_snapshot(
         }
     }
     for (runtime_key, session_id, has_cached_activity) in reconcile_candidates {
+        let observed_cached_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
+        let mut observed_client = None;
         if has_cached_activity {
             let has_active_turn = async {
                 let client = app_server_client_for_session(state, profile_id, &session_id)
@@ -794,6 +796,12 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                             format!("Failed to connect to codex app-server: {error}"),
                         )
                     })?;
+                if let Some(turn_id) = observed_cached_turn_id.as_deref()
+                    && client.has_active_turn_id(turn_id).await
+                {
+                    observed_client = Some(client);
+                    return Ok::<bool, ApiError>(true);
+                }
                 let response = client
                     .request_with_timeout(
                         "thread/read",
@@ -811,6 +819,7 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                             format!("Failed to read the session: {error}"),
                         )
                     })?;
+                observed_client = Some(client);
                 let turns = response
                     .get("thread")
                     .and_then(|thread| thread.get("turns"))
@@ -833,6 +842,24 @@ pub(crate) async fn read_session_summary_ui_snapshot(
             }
         }
 
+        if state
+            .pending_turn_starts
+            .lock()
+            .await
+            .contains(&runtime_key)
+        {
+            continue;
+        }
+        if let Some(current_turn_id) = state.active_turns.lock().await.get(&runtime_key).cloned() {
+            if observed_cached_turn_id.as_deref() != Some(current_turn_id.as_str()) {
+                continue;
+            }
+            if let Some(client) = observed_client.as_ref()
+                && client.has_active_turn_id(&current_turn_id).await
+            {
+                continue;
+            }
+        }
         state.active_turns.lock().await.remove(&runtime_key);
         state.pending_turn_starts.lock().await.remove(&runtime_key);
         with_ui_state_write(state, profile_id, |ui_state| {

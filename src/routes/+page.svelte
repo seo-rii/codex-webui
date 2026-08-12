@@ -70,6 +70,11 @@
     writeSessionListCache
   } from "$lib/session-browser-cache";
   import {
+    sessionCacheModeForStreamEvent,
+    sessionCachePersistDelay,
+    type SessionCachePersistMode
+  } from "$lib/session-cache-policy";
+  import {
     observeSessionStreamEvent,
     reconcileSessionStreamBoundary,
     type SessionStreamCursor,
@@ -1715,6 +1720,13 @@
   >();
   let sessionListCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionDetailCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
+  let sessionDetailCachePersistMode: SessionCachePersistMode | null = null;
+  let sessionDetailCachePersistInFlight = false;
+  let queuedSessionDetailCachePersist: {
+    sessionId: string;
+    cacheKey: string;
+    version: string | null;
+  } | null = null;
   let sessionListRequestVersion = 0;
   let sessionSelectionVersion = 0;
   let accountProfileSwitchGeneration = 0;
@@ -3261,6 +3273,14 @@
       if (staleSessionCatchupTimer) {
         clearTimeout(staleSessionCatchupTimer);
       }
+      if (sessionListCachePersistTimer) {
+        clearTimeout(sessionListCachePersistTimer);
+      }
+      if (sessionDetailCachePersistTimer) {
+        clearTimeout(sessionDetailCachePersistTimer);
+      }
+      sessionDetailCachePersistMode = null;
+      queuedSessionDetailCachePersist = null;
       if (transcriptScrollFrame !== null) {
         cancelAnimationFrame(transcriptScrollFrame);
       }
@@ -4875,7 +4895,41 @@
     }, 120);
   }
 
-  function scheduleSessionDetailCachePersist(version: string | null = sessionDetailCacheVersion) {
+  async function persistSessionDetailCacheSnapshot(
+    sessionId: string,
+    cacheKey: string,
+    version: string | null
+  ) {
+    if (sessionDetailCachePersistInFlight) {
+      queuedSessionDetailCachePersist = { sessionId, cacheKey, version };
+      return;
+    }
+    if (!conversation || conversation.thread.id !== sessionId) {
+      return;
+    }
+
+    sessionDetailCachePersistInFlight = true;
+    const payload = conversationToSessionDetailPayload(conversation);
+    try {
+      await writeSessionDetailCache(cacheKey, payload, version);
+    } finally {
+      sessionDetailCachePersistInFlight = false;
+      const queuedPersist = queuedSessionDetailCachePersist;
+      queuedSessionDetailCachePersist = null;
+      if (queuedPersist) {
+        void persistSessionDetailCacheSnapshot(
+          queuedPersist.sessionId,
+          queuedPersist.cacheKey,
+          queuedPersist.version
+        );
+      }
+    }
+  }
+
+  function scheduleSessionDetailCachePersist(
+    version: string | null = sessionDetailCacheVersion,
+    mode: SessionCachePersistMode = "interactive"
+  ) {
     const sessionId = selectedSessionId;
     if (!sessionId || !conversation || conversation.thread.id !== sessionId || typeof window === "undefined") {
       return;
@@ -4887,22 +4941,27 @@
     }
 
     if (sessionDetailCachePersistTimer) {
+      if (mode === "stream" && sessionDetailCachePersistMode !== "stream") {
+        return;
+      }
       clearTimeout(sessionDetailCachePersistTimer);
     }
 
+    sessionDetailCachePersistMode = mode;
     sessionDetailCachePersistTimer = setTimeout(() => {
       sessionDetailCachePersistTimer = null;
+      sessionDetailCachePersistMode = null;
       if (!conversation || conversation.thread.id !== sessionId) {
         return;
       }
-      void writeSessionDetailCache(cacheKey, conversationToSessionDetailPayload(conversation), version);
-    }, 120);
+      void persistSessionDetailCacheSnapshot(sessionId, cacheKey, version);
+    }, sessionCachePersistDelay(mode));
   }
 
-  function markConversationCacheDirty() {
+  function markConversationCacheDirty(mode: SessionCachePersistMode = "interactive") {
     // Streamed state is newer than the browser cache, but the last server snapshot
     // remains the correct base for conditional detail reads and patches.
-    scheduleSessionDetailCachePersist(null);
+    scheduleSessionDetailCachePersist(null, mode);
   }
 
   function setSessionsStable(nextSessions: SessionSummary[]) {
@@ -5709,6 +5768,8 @@
       clearTimeout(sessionDetailCachePersistTimer);
       sessionDetailCachePersistTimer = null;
     }
+    sessionDetailCachePersistMode = null;
+    queuedSessionDetailCachePersist = null;
     if (saveTimer) {
       clearTimeout(saveTimer);
       saveTimer = null;
@@ -6713,7 +6774,7 @@
         conversation = applyLocalComposerPreferencesToConversation(
           normalizeConversationExecutionState(applyStreamEvent(conversation, payload))
         );
-        markConversationCacheDirty();
+        markConversationCacheDirty(sessionCacheModeForStreamEvent(payload));
         if (
           pendingQueueModeSessionKey === scopeKey &&
           payload.kind === "notification" &&
@@ -7283,7 +7344,12 @@
           flushPendingSessionEvents(sessionId, sessionProfileId, nextConversation)
         );
         conversation = nextConversation;
-        markConversationCacheDirty();
+        const cachePersistMode = pendingEventsBeforeValidation.some(
+          (event) => sessionCacheModeForStreamEvent(event) === "terminal"
+        )
+          ? "terminal"
+          : "stream";
+        markConversationCacheDirty(cachePersistMode);
         if (hadPendingQueueUpdate) {
           applyQueueUpdatedSideEffects(sessionId, sessionProfileId, nextConversation);
           applySessionSummaryUpdate(buildSessionSummaryFromConversation(nextConversation));

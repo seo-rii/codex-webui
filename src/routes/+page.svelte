@@ -7155,14 +7155,6 @@
     }
 
     const patch = payload.patch;
-    if (
-      !sessionDetailStateHash ||
-      patch.baseStateHash !== sessionDetailStateHash ||
-      !sessionDetailCacheVersion ||
-      patch.baseCacheVersion !== sessionDetailCacheVersion
-    ) {
-      return null;
-    }
     const currentTurnsById = new Map(conversation.thread.turns.map((turn) => [turn.id, turn]));
     const upsertsById = new Map(patch.turnUpserts.map((turn) => [turn.id, turn]));
     const turns: SessionDetailPayload["thread"]["turns"] = [];
@@ -7540,6 +7532,25 @@
     }
 
     if (isSessionDetailPatchResponse(detail)) {
+      if (
+        !conversation ||
+        !sessionDetailStateHash ||
+        detail.patch.baseStateHash !== sessionDetailStateHash ||
+        !sessionDetailCacheVersion ||
+        detail.patch.baseCacheVersion !== sessionDetailCacheVersion
+      ) {
+        scheduleSelectedSessionStateRefresh(sessionId, 0, replaceWithRecentWindow);
+        if (loadDraft && conversation?.thread.id === sessionId) {
+          await loadSavedDraft(
+            sessionId,
+            conversation.activeTurnId,
+            conversation.preferences.steeringResumeMode,
+            sessionProfileId,
+            requestSelectionVersion
+          );
+        }
+        return conversation?.thread.id === sessionId ? conversation : null;
+      }
       const patchedDetail = applySessionDetailPatch(detail);
       const fallbackRequestStreamCursor = sessionStreamCursors.get(scopeKey) ?? null;
       const fallbackDetail = patchedDetail

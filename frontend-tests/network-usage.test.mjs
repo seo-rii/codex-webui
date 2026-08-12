@@ -52,3 +52,20 @@ test("completion-tail refresh remains armed after the fast retry window", async 
     "exhausting fast retries must not permanently abandon final-message reconciliation"
   );
 });
+
+test("stale detail patches retry conditionally instead of forcing a full response", async () => {
+  const source = await readFile("src/routes/+page.svelte", "utf8");
+  const refreshStart = source.indexOf("async function refreshSelectedSessionState(");
+  const refreshEnd = source.indexOf("\n  async function recoverFromReconnect(", refreshStart);
+  assert.notEqual(refreshStart, -1, "selected-session refresh should exist");
+  assert.notEqual(refreshEnd, -1, "selected-session refresh should have a stable boundary");
+  const refresh = source.slice(refreshStart, refreshEnd);
+  const patchBranchStart = refresh.indexOf("if (isSessionDetailPatchResponse(detail))");
+  const fallbackRequest = refresh.indexOf("await api.getSession(sessionId, turnLimit, null, null, null", patchBranchStart);
+  const staleRetry = refresh.indexOf("scheduleSelectedSessionStateRefresh(sessionId, 0, replaceWithRecentWindow)", patchBranchStart);
+
+  assert.notEqual(patchBranchStart, -1, "detail patch branch should exist");
+  assert.notEqual(staleRetry, -1, "stale patch should schedule a conditional retry");
+  assert.notEqual(fallbackRequest, -1, "invalid reconstructed patches should retain a full fallback");
+  assert.ok(staleRetry < fallbackRequest, "base mismatch must return before the unconditional fallback request");
+});

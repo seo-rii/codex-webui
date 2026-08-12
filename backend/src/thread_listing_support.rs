@@ -244,7 +244,7 @@ async fn list_app_server_thread_batch(
         cache.retain(|_, entry| entry.created_at.elapsed() < SESSION_THREAD_CACHE_TTL);
         if let Some(cached) = cache.get(&cache_key) {
             let next_cursor = (!cached.next_cursor.is_empty()).then(|| cached.next_cursor.clone());
-            return Ok((cached.threads.clone(), next_cursor));
+            return Ok((cached.threads.as_ref().clone(), next_cursor));
         }
     }
 
@@ -294,7 +294,7 @@ async fn list_app_server_thread_batch(
             cache_key,
             CachedSessionThreads {
                 created_at: Instant::now(),
-                threads: threads.clone(),
+                threads: Arc::new(threads.clone()),
                 next_cursor: next_cursor.clone().unwrap_or_default(),
             },
         );
@@ -558,26 +558,12 @@ async fn collect_rollout_session_summaries_payload(
     needle: Option<&str>,
     include_full_text: bool,
 ) -> ApiResult<Option<Vec<Value>>> {
-    let mut candidates = list_rollout_candidates_payload(state, profile_id, archived).await?;
+    let candidates = list_rollout_candidates_shared_payload(state, profile_id, archived).await?;
     if candidates.is_empty() {
         return Ok(None);
     }
 
     let snapshot = read_session_listing_ui_snapshot(state, profile_id).await?;
-    candidates.sort_by(|left, right| {
-        let updated_difference = normalize_session_timestamp(candidate_effective_updated_at(right))
-            .cmp(&normalize_session_timestamp(
-                candidate_effective_updated_at(left),
-            ));
-        if updated_difference != std::cmp::Ordering::Equal {
-            return updated_difference;
-        }
-        right
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .cmp(left.get("id").and_then(Value::as_str).unwrap_or_default())
-    });
 
     let matched_state_ids = match needle {
         Some(needle) => {
@@ -833,7 +819,7 @@ async fn scan_rollout_sessions_with_query_payload(
     needle: Option<&str>,
     include_full_text: bool,
 ) -> ApiResult<Option<Value>> {
-    let candidates = list_rollout_candidates_payload(state, profile_id, archived).await?;
+    let candidates = list_rollout_candidates_shared_payload(state, profile_id, archived).await?;
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -864,24 +850,21 @@ async fn scan_rollout_sessions_with_query_payload(
         }
         0
     };
-    let candidate_updated_at =
-        |candidate: &Value| normalize_session_timestamp(candidate_effective_updated_at(candidate));
-    let mut candidates = candidates;
-    candidates.sort_by(|left, right| {
-        let priority_difference = candidate_priority(right).cmp(&candidate_priority(left));
-        if priority_difference != std::cmp::Ordering::Equal {
-            return priority_difference;
+    let mut pinned_candidates = Vec::new();
+    let mut active_candidates = Vec::new();
+    let mut remaining_candidates = Vec::new();
+    for candidate in candidates.iter() {
+        match candidate_priority(candidate) {
+            2 => pinned_candidates.push(candidate),
+            1 => active_candidates.push(candidate),
+            _ => remaining_candidates.push(candidate),
         }
-        let updated_difference = candidate_updated_at(right).cmp(&candidate_updated_at(left));
-        if updated_difference != std::cmp::Ordering::Equal {
-            return updated_difference;
-        }
-        right
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .cmp(left.get("id").and_then(Value::as_str).unwrap_or_default())
-    });
+    }
+    let candidates = pinned_candidates
+        .into_iter()
+        .chain(active_candidates)
+        .chain(remaining_candidates)
+        .collect::<Vec<_>>();
     let start = cursor
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(0);
@@ -910,7 +893,7 @@ async fn scan_rollout_sessions_with_query_payload(
             .filter(|candidate| {
                 candidate_matches_session_filter_snapshot(candidate, &snapshot, filter)
             })
-            .cloned()
+            .map(|candidate| (*candidate).clone())
             .collect::<Vec<_>>();
         if hydrated_candidates.is_empty() {
             continue;

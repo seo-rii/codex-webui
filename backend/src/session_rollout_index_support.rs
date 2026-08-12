@@ -583,7 +583,15 @@ fn collect_rollout_candidates(codex_home: &Path, archived: bool) -> Vec<Value> {
     }
 
     candidates.sort_by(|left, right| {
-        candidate_effective_updated_at(right).cmp(&candidate_effective_updated_at(left))
+        candidate_effective_updated_at(right)
+            .cmp(&candidate_effective_updated_at(left))
+            .then_with(|| {
+                right
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(left.get("id").and_then(Value::as_str).unwrap_or_default())
+            })
     });
     candidates
 }
@@ -631,11 +639,11 @@ mod tests {
     }
 }
 
-pub(crate) async fn list_rollout_candidates_payload(
+pub(crate) async fn list_rollout_candidates_shared_payload(
     state: &AppState,
     profile_id: &str,
     archived: bool,
-) -> ApiResult<Vec<Value>> {
+) -> ApiResult<Arc<Vec<Value>>> {
     let cache_key = session_rollout_index_cache_key(profile_id, archived);
     {
         let mut cache = state.session_thread_cache.lock().await;
@@ -674,6 +682,7 @@ pub(crate) async fn list_rollout_candidates_payload(
                 )
             })?;
 
+    let candidates = Arc::new(candidates);
     state.session_thread_cache.lock().await.insert(
         cache_key,
         CachedSessionThreads {
@@ -683,6 +692,19 @@ pub(crate) async fn list_rollout_candidates_payload(
         },
     );
     Ok(candidates)
+}
+
+pub(crate) async fn list_rollout_candidates_payload(
+    state: &AppState,
+    profile_id: &str,
+    archived: bool,
+) -> ApiResult<Vec<Value>> {
+    Ok(
+        list_rollout_candidates_shared_payload(state, profile_id, archived)
+            .await?
+            .as_ref()
+            .clone(),
+    )
 }
 
 pub(crate) async fn read_rollout_thread_metadata_from_candidate(

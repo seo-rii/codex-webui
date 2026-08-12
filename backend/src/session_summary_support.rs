@@ -292,11 +292,13 @@ async fn loaded_thread_ids_from_app_server(
         cache_key,
         CachedSessionThreads {
             created_at: Instant::now(),
-            threads: loaded_thread_ids
-                .iter()
-                .cloned()
-                .map(Value::String)
-                .collect(),
+            threads: Arc::new(
+                loaded_thread_ids
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
             next_cursor: String::new(),
         },
     );

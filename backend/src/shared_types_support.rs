@@ -194,7 +194,7 @@ pub(crate) struct InflightRequest {
 #[derive(Clone)]
 pub(crate) struct CachedSessionThreads {
     pub(crate) created_at: Instant,
-    pub(crate) threads: Vec<Value>,
+    pub(crate) threads: Arc<Vec<Value>>,
     pub(crate) next_cursor: String,
 }
 

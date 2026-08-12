@@ -1958,7 +1958,7 @@ async fn session_detail_uses_direct_rollout_lookup_when_rollout_index_cache_miss
         "default:rollout-index:archived=false".to_string(),
         CachedSessionThreads {
             created_at: Instant::now(),
-            threads: vec![],
+            threads: Arc::new(vec![]),
             next_cursor: String::new(),
         },
     );
@@ -2233,6 +2233,42 @@ async fn rollout_file_listing_promotes_old_pinned_and_running_sessions() {
         Some(newest_id)
     );
 
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollout_candidate_cache_reuses_the_shared_index_allocation() {
+    let sandbox = unique_test_dir("session-rollout-shared-cache");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state_with_fake_app_server(
+        workspace.clone(),
+        vec![workspace.clone()],
+        codex_home.clone(),
+    );
+    write_rollout_fixture(
+        &codex_home,
+        false,
+        "2026/04/24",
+        "2026-04-24T01-06-00",
+        "019e0000-0000-7000-8000-000000000014",
+        &workspace,
+        "Shared rollout candidate",
+        &[],
+        None,
+    );
+
+    let first = list_rollout_candidates_shared_payload(&state, "default", false)
+        .await
+        .unwrap();
+    let second = list_rollout_candidates_shared_payload(&state, "default", false)
+        .await
+        .unwrap();
+
+    assert_eq!(first.len(), 1);
+    assert!(Arc::ptr_eq(&first, &second));
     let _ = fs::remove_dir_all(sandbox);
 }
 

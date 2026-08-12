@@ -75,6 +75,14 @@
     type SessionStreamCursor,
     type SessionStreamCursorResult
   } from "$lib/session-stream-cursor";
+  import {
+    buildTranscriptLayout,
+    computeTranscriptWindowFromLayout,
+    EMPTY_TRANSCRIPT_LAYOUT,
+    EMPTY_TRANSCRIPT_WINDOW,
+    type TranscriptLayout,
+    type TranscriptWindowAlignment
+  } from "$lib/transcript-window";
   import SessionRecoveryModal from "$lib/components/SessionRecoveryModal.svelte";
   import SessionSidebar from "$lib/components/SessionSidebar.svelte";
   import SessionTurnSearchPopover from "$lib/components/SessionTurnSearchPopover.svelte";
@@ -156,6 +164,10 @@
   const SESSION_DETAIL_BROWSER_CACHE_SCHEMA_VERSION = 2;
   const SESSION_LIST_VERSION_HINT_LIMIT = 240;
   const SESSION_DETAIL_VERSION_HINT_LIMIT = 5_000;
+  const transcriptTurnEstimatedHeight = 420;
+  const transcriptTurnGap = 48;
+  const transcriptTurnOverscan = 1_200;
+  const transcriptTurnMountLimit = 48;
 
   type WorkspaceTabId =
     | "chat"
@@ -1711,7 +1723,12 @@
   const lazyWorkspaceLoads = new Map<LazyWorkspaceKind, Promise<void>>();
   let transcriptElement = $state<HTMLDivElement | undefined>(undefined);
   let transcriptContentElement = $state<HTMLDivElement | undefined>(undefined);
+  let transcriptTurnsElement = $state<HTMLDivElement | undefined>(undefined);
   let transcriptDockElement = $state<HTMLDivElement | undefined>(undefined);
+  let transcriptTurnWindow = $state(EMPTY_TRANSCRIPT_WINDOW);
+  let transcriptTurnWindowSessionId: string | null = null;
+  let transcriptTurnLayout: TranscriptLayout = EMPTY_TRANSCRIPT_LAYOUT;
+  const transcriptTurnHeights = new Map<string, number>();
   let stickTranscriptToBottom = $state(true);
   let forceTranscriptScroll = $state(false);
   let pendingTranscriptBottomScroll = $state(false);
@@ -1765,6 +1782,12 @@
   let pendingComposerMutationRevision = $state(0);
   let lastLoadedConversationId = $state<string | null>(null);
   let lastActiveLiveTurnId = $state<string | null>(null);
+  const visibleTranscriptTurns = $derived.by(() => {
+    if (!conversation) {
+      return [];
+    }
+    return conversation.thread.turns.slice(transcriptTurnWindow.start, transcriptTurnWindow.end);
+  });
 
   function selectedSessionStateKey() {
     return selectedSessionId ? sessionStateKey(selectedSessionId, selectedSessionProfileId) : null;
@@ -3482,6 +3505,34 @@
   });
 
   $effect(() => {
+    const sessionId = conversation?.thread.id ?? null;
+    const turnCount = conversation?.thread.turns.length ?? 0;
+    const firstTurnId = conversation?.thread.turns[0]?.id ?? null;
+    const lastTurnId = conversation?.thread.turns.at(-1)?.id ?? null;
+    const sessionChanged = transcriptTurnWindowSessionId !== sessionId;
+    turnCount;
+    firstTurnId;
+
+    if (sessionChanged) {
+      transcriptTurnWindowSessionId = sessionId;
+      transcriptTurnHeights.clear();
+      transcriptTurnLayout = EMPTY_TRANSCRIPT_LAYOUT;
+      transcriptTurnWindow = EMPTY_TRANSCRIPT_WINDOW;
+    }
+
+    void tick().then(() => {
+      if ((conversation?.thread.id ?? null) !== sessionId) {
+        return;
+      }
+      const anchorNewestTurn = sessionChanged || stickTranscriptToBottom || isInitialTranscriptScrollPending(sessionId);
+      refreshTranscriptTurnWindow(anchorNewestTurn ? lastTurnId : null, anchorNewestTurn ? "end" : "center");
+      if (anchorNewestTurn) {
+        scheduleTranscriptScrollToBottom();
+      }
+    });
+  });
+
+  $effect(() => {
     if (typeof window === "undefined" || !transcriptContentElement) {
       transcriptResizeObserver?.disconnect();
       transcriptResizeObserver = null;
@@ -3490,12 +3541,16 @@
 
     transcriptResizeObserver?.disconnect();
     transcriptResizeObserver = new ResizeObserver(() => {
+      refreshTranscriptTurnWindow();
       if (!transcriptElement || loadingOlderTurns || (!stickTranscriptToBottom && !forceTranscriptScroll)) {
         return;
       }
       scheduleTranscriptScrollToBottom();
     });
     transcriptResizeObserver.observe(transcriptContentElement);
+    if (transcriptElement) {
+      transcriptResizeObserver.observe(transcriptElement);
+    }
 
     return () => {
       transcriptResizeObserver?.disconnect();
@@ -4236,6 +4291,109 @@
       }
     }
     return { added, removed };
+  }
+
+  function getTranscriptTurnsOffsetTop() {
+    if (!transcriptElement || !transcriptTurnsElement) {
+      return 0;
+    }
+    const transcriptRect = transcriptElement.getBoundingClientRect();
+    const turnsRect = transcriptTurnsElement.getBoundingClientRect();
+    return Math.max(0, turnsRect.top - transcriptRect.top + transcriptElement.scrollTop);
+  }
+
+  function transcriptWindowsMatch(left: typeof transcriptTurnWindow, right: typeof transcriptTurnWindow) {
+    return (
+      left.start === right.start &&
+      left.end === right.end &&
+      Math.abs(left.topSpacer - right.topSpacer) < 1 &&
+      Math.abs(left.bottomSpacer - right.bottomSpacer) < 1 &&
+      Math.abs(left.totalHeight - right.totalHeight) < 1
+    );
+  }
+
+  function rebuildTranscriptTurnLayout() {
+    const turnIds = conversation?.thread.turns.map((turn) => turn.id) ?? [];
+    transcriptTurnLayout = buildTranscriptLayout({
+      turnIds,
+      measuredHeights: transcriptTurnHeights,
+      estimatedHeight: transcriptTurnEstimatedHeight,
+      gap: transcriptTurnGap
+    });
+  }
+
+  function ensureTranscriptTurnLayout() {
+    const turns = conversation?.thread.turns ?? [];
+    if (
+      transcriptTurnLayout.turnIds.length !== turns.length ||
+      transcriptTurnLayout.turnIds[0] !== turns[0]?.id ||
+      transcriptTurnLayout.turnIds.at(-1) !== turns.at(-1)?.id
+    ) {
+      rebuildTranscriptTurnLayout();
+    }
+  }
+
+  function refreshTranscriptTurnWindow(
+    anchorTurnId: string | null = null,
+    anchorAlignment: TranscriptWindowAlignment = "center"
+  ) {
+    if (!conversation) {
+      if (transcriptTurnWindow.end !== 0) {
+        transcriptTurnWindow = EMPTY_TRANSCRIPT_WINDOW;
+      }
+      return;
+    }
+
+    ensureTranscriptTurnLayout();
+    const anchorIndex = anchorTurnId ? transcriptTurnLayout.turnIds.indexOf(anchorTurnId) : undefined;
+    const nextWindow = computeTranscriptWindowFromLayout({
+      layout: transcriptTurnLayout,
+      scrollOffset: Math.max(0, (transcriptElement?.scrollTop ?? 0) - getTranscriptTurnsOffsetTop()),
+      viewportHeight: transcriptElement?.clientHeight ?? 800,
+      overscan: transcriptTurnOverscan,
+      maxItems: transcriptTurnMountLimit,
+      anchorIndex: anchorIndex !== undefined && anchorIndex >= 0 ? anchorIndex : undefined,
+      anchorAlignment
+    });
+
+    if (!transcriptWindowsMatch(transcriptTurnWindow, nextWindow)) {
+      transcriptTurnWindow = nextWindow;
+    }
+  }
+
+  function measureTranscriptTurn(node: HTMLElement, initialTurnId: string) {
+    let turnId = initialTurnId;
+    let lastHeight = transcriptTurnHeights.get(turnId) ?? 0;
+    const recordHeight = () => {
+      const nextHeight = node.getBoundingClientRect().height;
+      if (!Number.isFinite(nextHeight) || nextHeight <= 0 || Math.abs(nextHeight - lastHeight) < 1) {
+        return;
+      }
+      lastHeight = nextHeight;
+      transcriptTurnHeights.set(turnId, nextHeight);
+      rebuildTranscriptTurnLayout();
+      refreshTranscriptTurnWindow();
+      if (stickTranscriptToBottom || forceTranscriptScroll || pendingTranscriptBottomScroll) {
+        scheduleTranscriptScrollToBottom();
+      }
+    };
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(recordHeight);
+    observer?.observe(node);
+    recordHeight();
+
+    return {
+      update(nextTurnId: string) {
+        if (nextTurnId === turnId) {
+          return;
+        }
+        turnId = nextTurnId;
+        lastHeight = transcriptTurnHeights.get(turnId) ?? 0;
+        recordHeight();
+      },
+      destroy() {
+        observer?.disconnect();
+      }
+    };
   }
 
   function isTranscriptAtBottom(threshold = scrollBottomThreshold) {
@@ -12916,6 +13074,8 @@
       return;
     }
 
+    refreshTranscriptTurnWindow();
+
     const userScrollIntent = hasTranscriptUserScrollIntent();
     const initialScrollPending = isInitialTranscriptScrollPending();
     if (isTranscriptAtBottom()) {
@@ -13198,6 +13358,8 @@
     markConversationCacheDirty();
 
     await tick();
+    refreshTranscriptTurnWindow();
+    await tick();
     if (transcriptElement) {
       const previousBehavior = transcriptElement.style.scrollBehavior;
       transcriptElement.style.scrollBehavior = "auto";
@@ -13373,6 +13535,7 @@
         }
       }
 
+      refreshTranscriptTurnWindow(match.turnId, "center");
       await tick();
       if (!matchesSessionSelection(sessionId, sessionProfileId, selectionVersion)) {
         return;
@@ -14620,16 +14783,22 @@
                   </div>
                 {/if}
 
-                {#each conversation.thread.turns as turn (turn.id)}
+                <div bind:this={transcriptTurnsElement} class="transcript-turn-window">
+                  {#if transcriptTurnWindow.topSpacer > 0}
+                    <div aria-hidden="true" style={`height:${transcriptTurnWindow.topSpacer}px`}></div>
+                  {/if}
+                {#each visibleTranscriptTurns as turn, visibleTurnIndex (turn.id)}
                   {@const turnModel = getTurnRenderModel(turn)}
                   {@const collapsedProgressCount = getCollapsedTurnProgressCount(turn)}
                   <div
-                    class={`space-y-8 rounded-[1.75rem] px-3 py-3 transition-[background-color,box-shadow,border-color] duration-300 animate-in fade-in slide-in-from-bottom-4 ${
+                    class={`space-y-8 rounded-[1.75rem] px-3 py-3 transition-[background-color,box-shadow,border-color] duration-300 ${
                       sessionTurnSearchFocusedTurnId === turn.id
                         ? "border border-amber-200 bg-amber-50/50 shadow-[0_18px_40px_-32px_rgba(245,158,11,0.8)]"
                         : "border border-transparent"
                     }`}
                     data-turn-id={turn.id}
+                    style={`margin-bottom:${transcriptTurnWindow.start + visibleTurnIndex < conversation.thread.turns.length - 1 ? transcriptTurnGap : 0}px`}
+                    use:measureTranscriptTurn={turn.id}
                   >
                     {#each turnModel.userItems as item (item.id)}
                       <div class="flex flex-col items-end gap-2 max-w-[85%] ml-auto group/user-message">
@@ -14780,6 +14949,10 @@
                     </div>
                   </div>
                 {/each}
+                  {#if transcriptTurnWindow.bottomSpacer > 0}
+                    <div aria-hidden="true" style={`height:${transcriptTurnWindow.bottomSpacer}px`}></div>
+                  {/if}
+                </div>
 
                 {#if standaloneOptimisticMessage}
                   <div class="flex flex-col items-end gap-3 max-w-[85%] ml-auto opacity-70">

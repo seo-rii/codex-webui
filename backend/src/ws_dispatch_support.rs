@@ -551,15 +551,22 @@ pub(crate) async fn execute_ws_method(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
+            let (stream_epoch, stream_sequence) =
+                session_stream_boundary(state, &profile_id, &session_id).await;
             let payload = session_detail_payload(state, &profile_id, &session_id, limit)
                 .await
                 .map_err(anyhow::Error::from)?;
-            Ok(cacheable_session_detail_response(
+            let mut response = cacheable_session_detail_response(
                 payload,
                 known_version,
                 known_turn_versions,
                 known_state_hash,
-            ))
+            );
+            if let Some(response) = response.as_object_mut() {
+                response.insert("streamEpoch".to_string(), Value::String(stream_epoch));
+                response.insert("streamSequence".to_string(), json!(stream_sequence));
+            }
+            Ok(response)
         }
         "session/recovery" => {
             let session_id = require_session_id(&params, "sessionId")?;

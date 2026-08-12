@@ -97,6 +97,8 @@ pub(crate) struct AppState {
         Arc<Mutex<HashMap<String, CachedAttachmentStorageUsage>>>,
     pub(crate) attachment_storage_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub(crate) relays: Arc<Mutex<HashMap<String, broadcast::Sender<Value>>>>,
+    pub(crate) session_event_epoch: Arc<str>,
+    pub(crate) session_event_sequences: Arc<Mutex<HashMap<String, u64>>>,
     pub(crate) terminals: Arc<Mutex<HashMap<String, Arc<TerminalSession>>>>,
     pub(crate) session_summary_update_tasks:
         Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,

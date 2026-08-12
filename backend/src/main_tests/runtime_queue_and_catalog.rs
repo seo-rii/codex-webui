@@ -2691,6 +2691,65 @@ async fn runtime_notifications_emit_session_stream_events_from_rust_relay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_stream_sequence_advances_without_subscribers() {
+    let sandbox = unique_test_dir("session-stream-sequence");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    emit_session_notification(
+        &state,
+        "default",
+        "thread-sequence",
+        json!({
+            "kind": "notification",
+            "method": "item/started",
+            "params": { "threadId": "thread-sequence", "itemId": "item-1" }
+        }),
+    )
+    .await;
+
+    let relay = ensure_stream_relay(&state, "default", "thread-sequence")
+        .await
+        .expect("relay should initialize");
+    let mut receiver = relay.subscribe();
+    emit_session_notification(
+        &state,
+        "default",
+        "thread-sequence",
+        json!({
+            "kind": "notification",
+            "method": "item/completed",
+            "params": { "threadId": "thread-sequence", "itemId": "item-1" }
+        }),
+    )
+    .await;
+
+    let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+        .await
+        .expect("sequenced event should arrive")
+        .expect("sequenced event should be readable");
+    let epoch = event
+        .get("streamEpoch")
+        .and_then(Value::as_str)
+        .expect("stream epoch should exist");
+    assert!(!epoch.is_empty());
+    assert_eq!(
+        event.get("streamSequenceStart").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(event.get("streamSequence").and_then(Value::as_u64), Some(2));
+    let (boundary_epoch, boundary_sequence) =
+        session_stream_boundary(&state, "default", "thread-sequence").await;
+    assert_eq!(boundary_epoch, epoch);
+    assert_eq!(boundary_sequence, 2);
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_item_aliases_update_volatile_turn_without_persisting_status() {
     let sandbox = unique_test_dir("runtime-notification-alias-running");
     let workspace = sandbox.join("workspace");

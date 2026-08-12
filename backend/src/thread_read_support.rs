@@ -668,16 +668,46 @@ pub(crate) async fn emit_session_notification(
     state: &AppState,
     profile_id: &str,
     session_id: &str,
-    event: Value,
+    mut event: Value,
 ) {
     let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let relay_key = session_relay_key(&resolved_profile_id, session_id);
+    let sequence = {
+        let mut sequences = state.session_event_sequences.lock().await;
+        let sequence = sequences.entry(relay_key.clone()).or_default();
+        *sequence = sequence.saturating_add(1);
+        *sequence
+    };
+    if let Some(event) = event.as_object_mut() {
+        event.insert(
+            "streamEpoch".to_string(),
+            Value::String(state.session_event_epoch.to_string()),
+        );
+        event.insert("streamSequenceStart".to_string(), json!(sequence));
+        event.insert("streamSequence".to_string(), json!(sequence));
+    }
     let relay = {
         let relays = state.relays.lock().await;
-        relays
-            .get(&session_relay_key(&resolved_profile_id, session_id))
-            .cloned()
+        relays.get(&relay_key).cloned()
     };
     if let Some(relay) = relay {
         let _ = relay.send(event);
     }
+}
+
+pub(crate) async fn session_stream_boundary(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+) -> (String, u64) {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let relay_key = session_relay_key(&resolved_profile_id, session_id);
+    let sequence = state
+        .session_event_sequences
+        .lock()
+        .await
+        .get(&relay_key)
+        .copied()
+        .unwrap_or_default();
+    (state.session_event_epoch.to_string(), sequence)
 }

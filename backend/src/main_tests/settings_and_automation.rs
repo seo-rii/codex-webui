@@ -982,16 +982,11 @@ async fn session_subscription_coalesces_text_delta_events() {
         .await
         .expect("initial queue event should arrive")
         .expect("initial queue event should be readable");
-    let relay = state
-        .relays
-        .lock()
-        .await
-        .get(&session_relay_key("default", "thread-delta"))
-        .cloned()
-        .expect("session relay should exist");
-
-    relay
-        .send(json!({
+    emit_session_notification(
+        &state,
+        "default",
+        "thread-delta",
+        json!({
             "kind": "notification",
             "method": "item/agentMessage/delta",
             "params": {
@@ -1000,10 +995,14 @@ async fn session_subscription_coalesces_text_delta_events() {
                 "itemId": "agent-1",
                 "delta": "hello "
             }
-        }))
-        .expect("first delta should publish");
-    relay
-        .send(json!({
+        }),
+    )
+    .await;
+    emit_session_notification(
+        &state,
+        "default",
+        "thread-delta",
+        json!({
             "kind": "notification",
             "method": "item/agentMessage/delta",
             "params": {
@@ -1012,8 +1011,9 @@ async fn session_subscription_coalesces_text_delta_events() {
                 "itemId": "agent-1",
                 "delta": "world"
             }
-        }))
-        .expect("second delta should publish");
+        }),
+    )
+    .await;
 
     let envelope = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
         .await
@@ -1040,6 +1040,11 @@ async fn session_subscription_coalesces_text_delta_events() {
             .and_then(Value::as_u64),
         Some(11)
     );
+    assert_eq!(
+        event.get("streamSequenceStart").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(event.get("streamSequence").and_then(Value::as_u64), Some(2));
 
     let _ = fs::remove_dir_all(sandbox);
 }

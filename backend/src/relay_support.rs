@@ -5,11 +5,7 @@ const RELAY_DELTA_IDLE_FLUSH_TIMEOUT: Duration = Duration::from_millis(50);
 const RELAY_DELTA_MAX_FLUSH_INTERVAL: Duration = Duration::from_millis(120);
 const RELAY_DELTA_MAX_BYTES: usize = 4 * 1024;
 
-async fn send_relay_envelope(
-    out_tx: &WsOutbound,
-    message: ServerEnvelope,
-    context: &str,
-) -> bool {
+async fn send_relay_envelope(out_tx: &WsOutbound, message: ServerEnvelope, context: &str) -> bool {
     match tokio::time::timeout(RELAY_SEND_TIMEOUT, out_tx.send(message)).await {
         Ok(Ok(())) => true,
         Ok(Err(_)) => false,
@@ -144,6 +140,18 @@ pub(crate) async fn subscribe_session(
                             );
                             if pending_delta_event.is_some() && pending_delta_key == next_key {
                                 pending_delta_started_at.get_or_insert_with(Instant::now);
+                                let stream_sequence =
+                                    event.get("streamSequence").and_then(Value::as_u64);
+                                if let (Some(stream_sequence), Some(pending)) =
+                                    (stream_sequence, pending_delta_event.as_mut())
+                                {
+                                    if let Some(pending) = pending.as_object_mut() {
+                                        pending.insert(
+                                            "streamSequence".to_string(),
+                                            json!(stream_sequence),
+                                        );
+                                    }
+                                }
                                 if let Some(params) = pending_delta_event
                                     .as_mut()
                                     .and_then(|pending| pending.get_mut("params"))
@@ -470,7 +478,7 @@ pub(crate) async fn subscribe_global(
     Ok(())
 }
 
-fn filter_session_event_for_role(role: UserRole, event: Value) -> Option<Value> {
+fn filter_session_event_for_role(role: UserRole, mut event: Value) -> Option<Value> {
     if role_has_admin_access(role) {
         return Some(event);
     }
@@ -484,16 +492,10 @@ fn filter_session_event_for_role(role: UserRole, event: Value) -> Option<Value> 
         .and_then(|params| params.get("queue"))
         .map(redacted_queue_payload)
         .unwrap_or_else(|| redacted_queue_payload(&Value::Null));
-    Some(json!({
-        "kind": event
-            .get("kind")
-            .cloned()
-            .unwrap_or_else(|| json!("notification")),
-        "method": "codex-webui/queueUpdated",
-        "params": {
-            "queue": queue
-        }
-    }))
+    if let Some(params) = event.get_mut("params").and_then(Value::as_object_mut) {
+        params.insert("queue".to_string(), queue);
+    }
+    Some(event)
 }
 
 fn redacted_notification_added_event(event: Value) -> Value {

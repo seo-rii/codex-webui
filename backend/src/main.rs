@@ -319,6 +319,8 @@ async fn run_gateway(config: Arc<Config>) -> Result<()> {
             attachment_storage_usage_cache: Arc::new(Mutex::new(HashMap::new())),
             attachment_storage_locks: Arc::new(Mutex::new(HashMap::new())),
             relays: Arc::new(Mutex::new(HashMap::new())),
+            session_event_epoch: Arc::from(Uuid::new_v4().to_string()),
+            session_event_sequences: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),
             session_summary_update_tasks: Arc::new(Mutex::new(HashMap::new())),
             runtime_config_update_tasks: Arc::new(Mutex::new(HashMap::new())),

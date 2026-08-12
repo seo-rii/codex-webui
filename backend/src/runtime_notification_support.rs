@@ -810,19 +810,68 @@ pub(crate) async fn clear_runtime_activity_after_app_server_client_exit(
         .filter(|value| !value.is_empty())
         .map(Value::from)
         .unwrap_or(Value::Null);
-    let mut affected_session_ids =
+    let mut assigned_session_ids =
         session_ids_for_app_server_client(state, &resolved_profile_id, client_key).await;
+    let runtime_key_prefix = format!("profile::{resolved_profile_id}::session-runtime::");
+    {
+        let pending_requests = state.pending_server_requests.lock().await;
+        for (runtime_key, entries) in pending_requests.iter() {
+            if entries.values().any(|entry| entry.client_key == client_key) {
+                if let Some(session_id) = runtime_key.strip_prefix(&runtime_key_prefix) {
+                    assigned_session_ids.insert(session_id.to_string());
+                }
+            }
+        }
+    }
+    {
+        let assignments = state.session_app_server_assignments.lock().await;
+        let queue_dispatching = state.queue_dispatching.lock().await;
+        for runtime_key in queue_dispatching.iter() {
+            let Some(session_id) = runtime_key.strip_prefix(&runtime_key_prefix) else {
+                continue;
+            };
+            let assigned_client_key = assignments
+                .get(runtime_key)
+                .map(String::as_str)
+                .unwrap_or(resolved_profile_id.as_str());
+            if assigned_client_key == client_key {
+                assigned_session_ids.insert(session_id.to_string());
+            }
+        }
+    }
+    let mut affected_session_ids = HashSet::new();
 
     {
         let mut active_turns = state.active_turns.lock().await;
-        for session_id in &affected_session_ids {
-            active_turns.remove(&runtime_session_key(&resolved_profile_id, session_id));
+        for session_id in &assigned_session_ids {
+            if active_turns
+                .remove(&runtime_session_key(&resolved_profile_id, session_id))
+                .is_some()
+            {
+                affected_session_ids.insert(session_id.clone());
+            }
         }
     }
     {
         let mut pending_turn_starts = state.pending_turn_starts.lock().await;
-        for session_id in &affected_session_ids {
-            pending_turn_starts.remove(&runtime_session_key(&resolved_profile_id, session_id));
+        for session_id in &assigned_session_ids {
+            if pending_turn_starts.remove(&runtime_session_key(&resolved_profile_id, session_id)) {
+                affected_session_ids.insert(session_id.clone());
+            }
+        }
+    }
+    {
+        let pending_requests = state.pending_server_requests.lock().await;
+        let queue_dispatching = state.queue_dispatching.lock().await;
+        for session_id in &assigned_session_ids {
+            let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
+            if pending_requests
+                .get(&runtime_key)
+                .is_some_and(|entries| !entries.is_empty())
+                || queue_dispatching.contains(&runtime_key)
+            {
+                affected_session_ids.insert(session_id.clone());
+            }
         }
     }
 
@@ -860,7 +909,9 @@ pub(crate) async fn clear_runtime_activity_after_app_server_client_exit(
 
     let mut affected_session_ids = affected_session_ids.into_iter().collect::<Vec<_>>();
     affected_session_ids.sort();
-    clear_app_server_assignments_for_sessions(state, profile_id, &affected_session_ids).await;
+    let mut assigned_session_ids = assigned_session_ids.into_iter().collect::<Vec<_>>();
+    assigned_session_ids.sort();
+    clear_app_server_assignments_for_sessions(state, profile_id, &assigned_session_ids).await;
     for session_id in &affected_session_ids {
         clear_session_pending_requests(state, profile_id, session_id).await;
         complete_active_automation_runs_for_session(

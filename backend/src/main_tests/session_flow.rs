@@ -4759,6 +4759,63 @@ async fn app_server_exit_ignores_unassigned_stale_runtime_status() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_server_exit_clears_historical_assignment_without_failing_session() {
+    let sandbox = unique_test_dir("app-server-exit-historical-assignment");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let session_id = "thread-historical-assignment";
+    let runtime_key = runtime_session_key("default", session_id);
+    let client_key = format!("default::session::{session_id}");
+    state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .insert(runtime_key.clone(), client_key.clone());
+    with_ui_state_write(&state, "default", |ui_state| {
+        ui_state["runtimeStatusByThreadId"][session_id] = json!({
+            "status": "completed",
+            "updatedAt": now_unix_ms().saturating_sub(120_000)
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let affected = clear_runtime_activity_after_app_server_client_exit(
+        &state,
+        "default",
+        &client_key,
+        Some("historical app-server exited"),
+    )
+    .await;
+
+    assert!(affected.is_empty());
+    assert!(
+        state
+            .session_app_server_assignments
+            .lock()
+            .await
+            .get(&runtime_key)
+            .is_none(),
+        "historical assignments should still be released"
+    );
+    let ui_state = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ui_state["runtimeStatusByThreadId"][session_id]["status"].as_str(),
+        Some("completed")
+    );
+    assert!(ui_state["highlightsByThreadId"].get(session_id).is_none());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_reconcile_marks_lost_active_session_failed_without_app_server() {
     let sandbox = unique_test_dir("runtime-reconcile-no-app-server");
     let workspace = sandbox.join("workspace");

@@ -3413,14 +3413,6 @@
       }
 
       scheduleSessionRefresh(0);
-      if (
-        selectedSessionId &&
-        conversation?.thread.id === selectedSessionId &&
-        isLiveConversationStatus(conversation.thread.status) &&
-        !loadingDetail
-      ) {
-        scheduleSelectedSessionStateRefresh(selectedSessionId, 0);
-      }
     }, activeSessionStatusPollMs);
 
     return () => {

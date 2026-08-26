@@ -1855,6 +1855,23 @@ pub(crate) async fn send_turn_payload(
         "codex app-server is not running",
     )
     .await;
+    if state
+        .pending_turn_starts
+        .lock()
+        .await
+        .contains(&runtime_key)
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            json!({
+                "code": "TURN_ALREADY_STARTING",
+                "message": "A response is already starting for this session."
+            })
+            .to_string(),
+        ));
+    }
+    let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
+    let _session_guard = session_lock.lock().await;
     {
         let mut pending_turn_starts = state.pending_turn_starts.lock().await;
         if !pending_turn_starts.insert(runtime_key.clone()) {
@@ -1868,8 +1885,6 @@ pub(crate) async fn send_turn_payload(
             ));
         }
     }
-    let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
-    let _session_guard = session_lock.lock().await;
 
     let result = async {
         let attachments =
@@ -2243,6 +2258,23 @@ pub(crate) async fn start_session_compaction_payload(
         "codex app-server is not running",
     )
     .await;
+    if state
+        .pending_turn_starts
+        .lock()
+        .await
+        .contains(&runtime_key)
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            json!({
+                "code": "TURN_ALREADY_STARTING",
+                "message": "A response is already starting for this session."
+            })
+            .to_string(),
+        ));
+    }
+    let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
+    let _session_guard = session_lock.lock().await;
     {
         let mut pending_turn_starts = state.pending_turn_starts.lock().await;
         if !pending_turn_starts.insert(runtime_key.clone()) {
@@ -2256,8 +2288,6 @@ pub(crate) async fn start_session_compaction_payload(
             ));
         }
     }
-    let session_lock = session_operation_lock(state, &resolved_profile_id, session_id).await;
-    let _session_guard = session_lock.lock().await;
 
     let result = async {
         if state.active_turns.lock().await.contains_key(&runtime_key) {

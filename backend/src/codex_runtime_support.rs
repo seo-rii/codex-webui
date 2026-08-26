@@ -353,6 +353,7 @@ pub(crate) async fn force_kill_codex_process_payload(
         state,
         &resolved_profile_id,
         &snapshot.client_key,
+        None,
         Some(&reason),
     )
     .await;

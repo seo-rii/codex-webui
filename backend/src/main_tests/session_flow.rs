@@ -4575,7 +4575,7 @@ async fn session_detail_reconciles_stale_starting_runtime_status() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_summary_reconciles_stale_starting_runtime_status() {
+async fn session_summary_reconciles_stale_status_without_cached_activity() {
     let sandbox = unique_test_dir("session-summary-stale-starting");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -4810,6 +4810,7 @@ async fn app_server_exit_ignores_unassigned_stale_runtime_status() {
         &state,
         "default",
         "default",
+        None,
         Some("old default app-server exited"),
     )
     .await;
@@ -4826,6 +4827,61 @@ async fn app_server_exit_ignores_unassigned_stale_runtime_status() {
         Some("running")
     );
     assert!(ui_state["highlightsByThreadId"].get(session_id).is_none());
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_app_server_instance_exit_does_not_clear_current_runtime_activity() {
+    let sandbox = unique_test_dir("stale-app-server-instance-exit");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let client = app_server_client(&state, "default").await.unwrap();
+    let current_instance_id = client.instance_id();
+    let session_id = "thread-current-instance";
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-current-instance".to_string());
+    state
+        .session_app_server_assignments
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "default".to_string());
+    set_runtime_session_status(&state, "default", session_id, "running").await;
+
+    let affected = clear_runtime_activity_after_app_server_client_exit(
+        &state,
+        "default",
+        "default",
+        Some(current_instance_id.saturating_add(1)),
+        Some("a retired app-server instance exited"),
+    )
+    .await;
+
+    assert!(affected.is_empty());
+    assert_eq!(
+        state
+            .active_turns
+            .lock()
+            .await
+            .get(&runtime_key)
+            .map(String::as_str),
+        Some("turn-current-instance")
+    );
+    let status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][session_id]["status"].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.as_str(), Some("running"));
 
     let _ = fs::remove_dir_all(sandbox);
 }
@@ -4861,6 +4917,7 @@ async fn app_server_exit_clears_historical_assignment_without_failing_session() 
         &state,
         "default",
         &client_key,
+        None,
         Some("historical app-server exited"),
     )
     .await;
@@ -5113,7 +5170,7 @@ async fn runtime_reconcile_preserves_turn_owned_by_live_app_server() {
         .request("debug/requestCount", json!({ "target": "thread/read" }))
         .await
         .unwrap();
-    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(0));
+    assert_eq!(request_count.get("count").and_then(Value::as_u64), Some(1));
 
     let _ = fs::remove_dir_all(sandbox);
 }

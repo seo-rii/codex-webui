@@ -1375,6 +1375,37 @@ pub(crate) async fn build_session_summary_payload(
     Ok(summary)
 }
 
+async fn current_session_summary_status(
+    state: &AppState,
+    profile_id: &str,
+    session_id: &str,
+    fallback: &str,
+) -> String {
+    let resolved_profile_id = resolve_runtime_profile_entry(&state.config, profile_id).0;
+    let runtime_key = runtime_session_key(&resolved_profile_id, session_id);
+    if state
+        .pending_turn_starts
+        .lock()
+        .await
+        .contains(&runtime_key)
+    {
+        return "starting".to_string();
+    }
+    if state.active_turns.lock().await.contains_key(&runtime_key) {
+        return "running".to_string();
+    }
+    with_ui_state_read(state, profile_id, |ui_state| {
+        Ok(ui_state
+            .get("runtimeStatusByThreadId")
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get(session_id))
+            .and_then(|entry| normalized_thread_status(Some(entry)))
+            .unwrap_or_else(|| fallback.to_string()))
+    })
+    .await
+    .unwrap_or_else(|_| fallback.to_string())
+}
+
 pub(crate) async fn emit_session_summary_updated(
     state: &AppState,
     profile_id: &str,
@@ -1397,7 +1428,14 @@ pub(crate) async fn emit_session_summary_updated(
         if !session_assignment_fence_is_current(&state_for_task, &assignment_fence).await {
             return;
         }
-        let summary = if status_override
+        let effective_status = match status_override.as_deref() {
+            Some(status) => Some(
+                current_session_summary_status(&state_for_task, &profile_id, &session_id, status)
+                    .await,
+            ),
+            None => None,
+        };
+        let summary = if effective_status
             .as_deref()
             .is_some_and(|status| status == "starting" || is_live_thread_status(status))
         {
@@ -1406,7 +1444,7 @@ pub(crate) async fn emit_session_summary_updated(
                 &profile_id,
                 &session_id,
                 preferences_override,
-                status_override.as_deref().unwrap_or("running"),
+                effective_status.as_deref().unwrap_or("running"),
             )
             .await)
         } else {
@@ -1415,17 +1453,30 @@ pub(crate) async fn emit_session_summary_updated(
                 &profile_id,
                 &session_id,
                 preferences_override,
-                status_override.as_deref(),
+                effective_status.as_deref(),
             )
             .await
         };
-        if let Ok(summary) = summary {
+        if let Ok(mut summary) = summary {
             let session_lock =
                 session_operation_lock(&state_for_task, &resolved_profile_id, &session_id).await;
             let _session_guard = session_lock.lock().await;
             if !session_assignment_fence_is_current(&state_for_task, &assignment_fence).await {
                 return;
             }
+            let fallback_status = summary
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            summary["status"] = Value::String(
+                current_session_summary_status(
+                    &state_for_task,
+                    &profile_id,
+                    &session_id,
+                    fallback_status,
+                )
+                .await,
+            );
             emit_profile_global_notification(
                 &state_for_task,
                 &profile_id,
@@ -1516,12 +1567,14 @@ pub(crate) async fn emit_session_status_summary_updated(
     {
         existing.abort();
     }
+    let effective_status =
+        current_session_summary_status(state, profile_id, session_id, status).await;
     let summary = build_lightweight_session_summary_payload(
         state,
         profile_id,
         session_id,
         preferences_override,
-        status,
+        &effective_status,
     )
     .await;
     emit_profile_global_notification(

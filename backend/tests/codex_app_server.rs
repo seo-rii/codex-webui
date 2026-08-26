@@ -243,7 +243,7 @@ async fn manager_reuses_one_process_per_profile() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manager_reclaims_idle_process_when_cap_is_full() -> Result<()> {
+async fn manager_stops_idle_process_but_keeps_client_routing_when_cap_is_full() -> Result<()> {
     let temp = temp_dir("manager-idle-eviction")?;
     let first_home = temp.join("first");
     let second_home = temp.join("second");
@@ -282,7 +282,8 @@ async fn manager_reclaims_idle_process_when_cap_is_full() -> Result<()> {
             .await?,
         json!({ "client": "second" })
     );
-    assert_eq!(manager.client_count().await, 1);
+    assert_eq!(manager.active_process_count().await, 1);
+    assert_eq!(manager.client_count().await, 2);
 
     manager.close_all().await?;
     Ok(())

@@ -151,6 +151,7 @@ fn test_state(project_root: PathBuf, allowed_roots: Vec<PathBuf>, codex_home: Pa
         session_assignment_epochs: Arc::new(Mutex::new(HashMap::new())),
         active_turns: Arc::new(Mutex::new(HashMap::new())),
         pending_turn_starts: Arc::new(Mutex::new(HashSet::new())),
+        recent_terminal_turns: Arc::new(Mutex::new(HashMap::new())),
         recent_client_user_messages: Arc::new(Mutex::new(HashMap::new())),
         pending_server_requests: Arc::new(Mutex::new(HashMap::new())),
         account_login_flows: Arc::new(Mutex::new(HashMap::new())),

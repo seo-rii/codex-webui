@@ -115,6 +115,7 @@ pub(crate) struct AppState {
     pub(crate) session_assignment_epochs: Arc<Mutex<HashMap<String, u64>>>,
     pub(crate) active_turns: Arc<Mutex<HashMap<String, String>>>,
     pub(crate) pending_turn_starts: Arc<Mutex<HashSet<String>>>,
+    pub(crate) recent_terminal_turns: Arc<Mutex<HashMap<String, Instant>>>,
     pub(crate) recent_client_user_messages: Arc<Mutex<HashMap<String, Instant>>>,
     pub(crate) pending_server_requests:
         Arc<Mutex<HashMap<String, HashMap<String, PendingServerRequestEntry>>>>,

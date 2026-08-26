@@ -727,7 +727,12 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                 continue;
             }
             if reconcile_candidate_ids.insert(session_id.to_string()) {
-                reconcile_candidates.push((runtime_key.clone(), session_id.to_string(), true));
+                reconcile_candidates.push((
+                    runtime_key.clone(),
+                    session_id.to_string(),
+                    true,
+                    status_updated_at,
+                ));
             }
             if reconcile_candidates.len() >= ACTIVE_SESSION_STATUS_RECONCILE_LIMIT {
                 break;
@@ -754,7 +759,12 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                 continue;
             }
             if reconcile_candidate_ids.insert(session_id.to_string()) {
-                reconcile_candidates.push((runtime_key.clone(), session_id.to_string(), true));
+                reconcile_candidates.push((
+                    runtime_key.clone(),
+                    session_id.to_string(),
+                    true,
+                    status_updated_at,
+                ));
             }
         }
     }
@@ -781,11 +791,14 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                     runtime_session_key(&resolved_profile_id, session_id),
                     session_id.clone(),
                     false,
+                    status_updated_at,
                 ));
             }
         }
     }
-    for (runtime_key, session_id, has_cached_activity) in reconcile_candidates {
+    for (runtime_key, session_id, has_cached_activity, observed_status_updated_at) in
+        reconcile_candidates
+    {
         let observed_cached_turn_id = state.active_turns.lock().await.get(&runtime_key).cloned();
         let mut observed_client = None;
         if has_cached_activity {
@@ -844,12 +857,20 @@ pub(crate) async fn read_session_summary_ui_snapshot(
             }
         }
 
-        if state
-            .pending_turn_starts
-            .lock()
-            .await
-            .contains(&runtime_key)
-        {
+        let session_lock = session_operation_lock(state, &resolved_profile_id, &session_id).await;
+        let _session_guard = session_lock.lock().await;
+        let status_is_unchanged = with_ui_state_read(state, profile_id, |ui_state| {
+            Ok(ui_state
+                .get("runtimeStatusByThreadId")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(&session_id))
+                .and_then(|status| status.get("updatedAt"))
+                .and_then(Value::as_u64)
+                == Some(observed_status_updated_at))
+        })
+        .await
+        .unwrap_or(false);
+        if !status_is_unchanged {
             continue;
         }
         if let Some(current_turn_id) = state.active_turns.lock().await.get(&runtime_key).cloned() {
@@ -871,13 +892,14 @@ pub(crate) async fn read_session_summary_ui_snapshot(
                 active_turns.remove(&runtime_key);
             }
         }
-        if state
-            .pending_turn_starts
-            .lock()
-            .await
-            .contains(&runtime_key)
         {
-            continue;
+            let mut pending_turn_starts = state.pending_turn_starts.lock().await;
+            if pending_turn_starts.contains(&runtime_key) {
+                if !has_cached_activity {
+                    continue;
+                }
+                pending_turn_starts.remove(&runtime_key);
+            }
         }
         with_ui_state_write(state, profile_id, |ui_state| {
             let Some(runtime_status_by_thread_id) = ui_state

@@ -2727,6 +2727,62 @@ async fn assignment_epoch_suppresses_a_delayed_session_summary() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_terminal_summary_projects_the_current_pending_start() {
+    let sandbox = unique_test_dir("delayed-summary-current-lifecycle");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let session_id = "thread-delayed-terminal-summary";
+    app_server_client(&state, "default")
+        .await
+        .unwrap()
+        .request(
+            "thread/seed",
+            json!({
+                "thread": {
+                    "id": session_id,
+                    "name": "Delayed status summary",
+                    "preview": "",
+                    "cwd": workspace.display().to_string(),
+                    "archived": false,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": "completed",
+                    "isSubagent": false,
+                    "turns": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    set_runtime_session_status(&state, "default", session_id, "completed").await;
+    let relay = ensure_global_relay(&state, "default")
+        .await
+        .expect("global relay should initialize");
+    let mut receiver = relay.subscribe();
+
+    emit_session_summary_updated(&state, "default", session_id, None, Some("completed")).await;
+    let runtime_key = runtime_session_key("default", session_id);
+    state.pending_turn_starts.lock().await.insert(runtime_key);
+    set_runtime_session_status(&state, "default", session_id, "starting").await;
+
+    let summary_event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+        .await
+        .expect("summary should publish")
+        .expect("summary should be readable");
+    assert_eq!(
+        summary_event["params"]["session"]["status"].as_str(),
+        Some("starting")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_stream_sequence_advances_without_subscribers() {
     let sandbox = unique_test_dir("session-stream-sequence");
     let workspace = sandbox.join("workspace");
@@ -3244,8 +3300,8 @@ async fn terminal_status_is_not_overridden_by_unversioned_delta() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_completed_clears_stale_different_cached_active_turn() {
-    let sandbox = unique_test_dir("turn-completed-clears-stale-active");
+async fn turn_completed_preserves_a_different_cached_active_turn() {
+    let sandbox = unique_test_dir("turn-completed-preserves-newer-active");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
     fs::create_dir_all(&workspace).unwrap();
@@ -3300,13 +3356,70 @@ async fn turn_completed_clears_stale_different_cached_active_turn() {
     )
     .await;
 
-    assert!(state.active_turns.lock().await.get(&runtime_key).is_none());
+    assert_eq!(
+        state
+            .active_turns
+            .lock()
+            .await
+            .get(&runtime_key)
+            .map(String::as_str),
+        Some("turn-stale")
+    );
     let ui_state = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
         .await
         .unwrap();
     assert_eq!(
         ui_state["runtimeStatusByThreadId"][session_id]["status"].as_str(),
-        Some("completed")
+        Some("running")
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_turn_completed_preserves_a_pending_new_turn_start() {
+    let sandbox = unique_test_dir("turn-completed-preserves-pending-start");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let session_id = "thread-completed-pending-new-start";
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .pending_turn_starts
+        .lock()
+        .await
+        .insert(runtime_key.clone());
+    set_runtime_session_status(&state, "default", session_id, "starting").await;
+
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "turn/completed".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "turnId": "turn-before-pending-start"
+            }),
+        },
+    )
+    .await;
+
+    assert!(
+        state
+            .pending_turn_starts
+            .lock()
+            .await
+            .contains(&runtime_key)
+    );
+    let ui_state = with_ui_state_read(&state, "default", |ui_state| Ok(ui_state.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ui_state["runtimeStatusByThreadId"][session_id]["status"].as_str(),
+        Some("starting")
     );
 
     let _ = fs::remove_dir_all(sandbox);
@@ -7638,7 +7751,7 @@ async fn idle_reconciliation_completes_instead_of_failing_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_delta_recovers_runtime_without_cancelling_scheduled_shutdown() {
+async fn delayed_live_delta_does_not_resurrect_a_terminal_session() {
     let sandbox = unique_test_dir("non-live-runtime-events");
     let workspace = sandbox.join("workspace");
     let codex_home = sandbox.join("codex-home");
@@ -7646,7 +7759,24 @@ async fn live_delta_recovers_runtime_without_cancelling_scheduled_shutdown() {
     fs::create_dir_all(&codex_home).unwrap();
     let state = test_state(workspace.clone(), vec![workspace], codex_home);
     let session_id = "thread-non-live-events";
-    set_runtime_session_status(&state, "default", session_id, "completed").await;
+    let runtime_key = runtime_session_key("default", session_id);
+    state
+        .active_turns
+        .lock()
+        .await
+        .insert(runtime_key.clone(), "turn-1".to_string());
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "turn/completed".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "turn": { "id": "turn-1", "status": "completed", "items": [] }
+            }),
+        },
+    )
+    .await;
     set_session_highlight(
         &state,
         "default",
@@ -7720,9 +7850,54 @@ async fn live_delta_recovers_runtime_without_cancelling_scheduled_shutdown() {
     })
     .await
     .unwrap();
-    assert_eq!(after["runtime"]["status"].as_str(), Some("running"));
+    assert_eq!(after["runtime"]["status"].as_str(), Some("completed"));
+    assert!(state.active_turns.lock().await.get(&runtime_key).is_none());
     assert_eq!(after["scheduledShutdown"], before["scheduledShutdown"]);
     assert_eq!(after["highlight"]["reason"].as_str(), Some("approval"));
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_running_status_does_not_resurrect_a_terminal_session() {
+    let sandbox = unique_test_dir("delayed-running-status");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    let state = test_state(workspace.clone(), vec![workspace], codex_home);
+    let session_id = "thread-delayed-running-status";
+    set_runtime_session_status(&state, "default", session_id, "completed").await;
+
+    let relay = ensure_stream_relay(&state, "default", session_id)
+        .await
+        .expect("relay should initialize");
+    let mut receiver = relay.subscribe();
+    handle_profile_runtime_notification(
+        &state,
+        "default",
+        &AppServerNotification {
+            method: "thread/status/changed".to_string(),
+            params: json!({
+                "threadId": session_id,
+                "status": { "type": "running" }
+            }),
+        },
+    )
+    .await;
+
+    let status = with_ui_state_read(&state, "default", |ui_state| {
+        Ok(ui_state["runtimeStatusByThreadId"][session_id]["status"].clone())
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.as_str(), Some("completed"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+            .await
+            .is_err(),
+        "a rejected stale running status must not reach subscribers"
+    );
 
     let _ = fs::remove_dir_all(sandbox);
 }

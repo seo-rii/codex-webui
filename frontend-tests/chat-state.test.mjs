@@ -172,6 +172,119 @@ test("a stale live snapshot cannot reopen a turn completed while the request was
   assert.equal(merged.activeTurnId, null);
 });
 
+test("a running status received before turn started keeps an existing conversation non-terminal", () => {
+  const current = createConversationState(detailWithItems([], "completed"));
+
+  const running = applyStreamEvent(current, {
+    kind: "notification",
+    method: "thread/status/changed",
+    params: { status: "running" }
+  });
+
+  assert.equal(running.thread.status, "running");
+  assert.equal(running.thread.turns[0].status, "completed");
+  assert.equal(running.activeTurnId, null);
+});
+
+test("delayed item events merge content without reopening a completed turn", async (t) => {
+  const cases = [
+    {
+      name: "item started",
+      initialItem: { id: "tool-1", type: "dynamicToolCall", tool: "lookup", status: "completed" },
+      event: {
+        kind: "notification",
+        method: "item/started",
+        params: {
+          turnId: "turn-1",
+          item: { id: "tool-1", type: "dynamicToolCall", tool: "lookup", status: "running", title: "Lookup" }
+        }
+      },
+      verify(item) {
+        assert.equal(item.title, "Lookup");
+      }
+    },
+    {
+      name: "agent delta",
+      initialItem: { id: "message-1", type: "agentMessage", text: "hel" },
+      event: {
+        kind: "notification",
+        method: "item/agentMessage/delta",
+        params: { turnId: "turn-1", itemId: "message-1", delta: "lo" }
+      },
+      verify(item) {
+        assert.equal(item.text, "hello");
+      }
+    },
+    {
+      name: "reasoning delta",
+      initialItem: { id: "reasoning-1", type: "reasoning", text: "think" },
+      event: {
+        kind: "notification",
+        method: "item/reasoning/textDelta",
+        params: { turnId: "turn-1", itemId: "reasoning-1", delta: "ing" }
+      },
+      verify(item) {
+        assert.equal(item.text, "thinking");
+      }
+    },
+    {
+      name: "command delta",
+      initialItem: { id: "command-1", type: "commandExecution", command: "echo ok", aggregatedOutput: "o" },
+      event: {
+        kind: "notification",
+        method: "item/commandExecution/outputDelta",
+        params: { turnId: "turn-1", itemId: "command-1", delta: "k" }
+      },
+      verify(item) {
+        assert.equal(item.aggregatedOutput, "ok");
+      }
+    }
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, () => {
+      const current = createConversationState(detailWithItems([entry.initialItem], "completed"));
+      const updated = applyStreamEvent(current, entry.event);
+
+      entry.verify(updated.thread.turns[0].items[0]);
+      assert.equal(updated.thread.turns[0].status, "completed");
+      assert.equal(updated.thread.status, "completed");
+      assert.equal(updated.activeTurnId, null);
+    });
+  }
+});
+
+test("item completion without a turn id does not mark the conversation running", () => {
+  const current = createConversationState(detailWithItems([], "completed"));
+
+  const updated = applyStreamEvent(current, {
+    kind: "notification",
+    method: "item/completed",
+    params: {
+      item: { id: "message-1", type: "agentMessage", text: "done" }
+    }
+  });
+
+  assert.equal(updated.thread.status, "completed");
+  assert.equal(updated.thread.turns[0].status, "completed");
+  assert.equal(updated.activeTurnId, null);
+});
+
+test("a terminal thread status settles a locally in-progress turn", () => {
+  const current = createConversationState(detailWithItems([], "running"));
+
+  const completed = applyStreamEvent(current, {
+    kind: "notification",
+    method: "thread/status/changed",
+    params: { status: "completed" }
+  });
+
+  assert.equal(completed.thread.status, "completed");
+  assert.equal(completed.thread.turns[0].status, "completed");
+  assert.equal(completed.activeTurnId, null);
+  assert.ok(completed.thread.turns[0].completedAt);
+});
+
 test("snapshot and optimistic user echoes with different ids are deduplicated", () => {
   const current = createConversationState(
     detailWithItems([{ id: "optimistic-user", type: "userMessage", text: "same prompt" }])

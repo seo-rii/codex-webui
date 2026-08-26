@@ -124,15 +124,6 @@ function resolveConversationRunningTurn(state: ConversationState) {
   return activeTurn ? activeTurn.id : null;
 }
 
-function markSeededTurnLive(state: ConversationState, turnId: string, seeded: ReturnType<typeof ensureTurn>) {
-  seeded.turn.status = "inProgress";
-  seeded.turn.completedAt = null;
-  seeded.turn.durationMs = null;
-  state.thread.turns = seeded.turns;
-  state.activeTurnId = turnId;
-  state.thread.status = "running";
-}
-
 function pruneLivePlansForRunningTurns(livePlans: ConversationState["livePlans"], turns: CodexTurn[]) {
   const runningTurnIds = new Set(turns.filter((turn) => String(turn.status ?? "") === "inProgress").map((turn) => turn.id));
   const pruned = Object.fromEntries(Object.entries(livePlans).filter(([turnId]) => runningTurnIds.has(turnId)));
@@ -734,15 +725,20 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
 
   if (method === "thread/status/changed") {
     const incomingStatus = typeof params.status === "string" ? params.status : next.thread.status;
-    const runningTurnId = resolveConversationRunningTurn(next);
-    if (!isLiveThreadStatus(incomingStatus) && runningTurnId) {
-      next.activeTurnId = runningTurnId;
-      next.thread.status = "running";
-      return next;
-    }
     next.thread.status = incomingStatus;
-    if (next.thread.status !== "running" && next.thread.status !== "active") {
-      next.activeTurnId = resolveConversationRunningTurn(next);
+    if (!isLiveThreadStatus(incomingStatus)) {
+      const completedAt = Date.now();
+      const settledTurnStatus = incomingStatus === "failed" || incomingStatus === "error" ? "failed" : "completed";
+      next.thread.turns = next.thread.turns.map((turn) =>
+        String(turn.status ?? "") === "inProgress"
+          ? {
+              ...turn,
+              status: settledTurnStatus,
+              completedAt: turn.completedAt ?? completedAt
+            }
+          : turn
+      );
+      next.activeTurnId = null;
       next.livePlans = pruneLivePlansForRunningTurns(next.livePlans, next.thread.turns);
     }
     return next;
@@ -1038,13 +1034,14 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
   if (method === "item/started" || method === "item/completed") {
     const turnId = String(params.turnId ?? "");
     if (!turnId) {
-      next.thread.status = "running";
       return next;
     }
     const withoutRealtime = withoutRealtimeTurn(next);
     next.thread.turns = withoutRealtime.thread.turns;
     next.activeTurnId = withoutRealtime.activeTurnId;
-    const seeded = ensureTurn(next, turnId);
+    const seeded = ensureTurn(next, turnId, {
+      status: isLiveThreadStatus(next.thread.status) ? "inProgress" : "completed"
+    });
     const streamItem = (params.item as CodexItem) ?? ({ id: String(params.itemId ?? ""), type: "unknown" } satisfies CodexItem);
     const itemType = normalizeItemTypeName(streamItem.type);
     const lifecycleStatus =
@@ -1054,10 +1051,9 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
       type: itemType,
       lifecycleStatus
     });
-    if (method === "item/started") {
-      markSeededTurnLive(next, turnId, seeded);
-    } else {
-      next.thread.turns = seeded.turns;
+    next.thread.turns = seeded.turns;
+    if (isLiveThreadStatus(next.thread.status) && seeded.turn.status === "inProgress" && !next.activeTurnId) {
+      next.activeTurnId = turnId;
     }
     return next;
   }
@@ -1066,13 +1062,14 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
     const turnId = String(params.turnId ?? "");
     const itemId = String(params.itemId ?? "");
     if (!turnId) {
-      next.thread.status = "running";
       return next;
     }
     const withoutRealtime = withoutRealtimeTurn(next);
     next.thread.turns = withoutRealtime.thread.turns;
     next.activeTurnId = withoutRealtime.activeTurnId;
-    const seeded = ensureTurn(next, turnId);
+    const seeded = ensureTurn(next, turnId, {
+      status: isLiveThreadStatus(next.thread.status) ? "inProgress" : "completed"
+    });
     const type = method === "item/agentMessage/delta" ? "agentMessage" : "plan";
     const existing =
       seeded.turn.items.find((candidate) => candidate.id === itemId) ??
@@ -1086,7 +1083,10 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
       ...existing,
       text: `${String(existing.text ?? "")}${String(params.delta ?? "")}`
     });
-    markSeededTurnLive(next, turnId, seeded);
+    next.thread.turns = seeded.turns;
+    if (isLiveThreadStatus(next.thread.status) && seeded.turn.status === "inProgress" && !next.activeTurnId) {
+      next.activeTurnId = turnId;
+    }
     return next;
   }
 
@@ -1098,13 +1098,14 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
     const turnId = String(params.turnId ?? "");
     const itemId = String(params.itemId ?? "");
     if (!turnId) {
-      next.thread.status = "running";
       return next;
     }
     const withoutRealtime = withoutRealtimeTurn(next);
     next.thread.turns = withoutRealtime.thread.turns;
     next.activeTurnId = withoutRealtime.activeTurnId;
-    const seeded = ensureTurn(next, turnId);
+    const seeded = ensureTurn(next, turnId, {
+      status: isLiveThreadStatus(next.thread.status) ? "inProgress" : "completed"
+    });
     const existing =
       seeded.turn.items.find((candidate) => candidate.id === itemId) ??
       ({
@@ -1133,7 +1134,10 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
           : String(existing.text ?? ""),
       summary
     });
-    markSeededTurnLive(next, turnId, seeded);
+    next.thread.turns = seeded.turns;
+    if (isLiveThreadStatus(next.thread.status) && seeded.turn.status === "inProgress" && !next.activeTurnId) {
+      next.activeTurnId = turnId;
+    }
     return next;
   }
 
@@ -1141,13 +1145,14 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
     const turnId = String(params.turnId ?? "");
     const itemId = String(params.itemId ?? "");
     if (!turnId) {
-      next.thread.status = "running";
       return next;
     }
     const withoutRealtime = withoutRealtimeTurn(next);
     next.thread.turns = withoutRealtime.thread.turns;
     next.activeTurnId = withoutRealtime.activeTurnId;
-    const seeded = ensureTurn(next, turnId);
+    const seeded = ensureTurn(next, turnId, {
+      status: isLiveThreadStatus(next.thread.status) ? "inProgress" : "completed"
+    });
     const existing =
       seeded.turn.items.find((candidate) => candidate.id === itemId) ??
       ({
@@ -1162,7 +1167,10 @@ export function applyStreamEvent(current: ConversationState, event: StreamEvent)
       ...existing,
       aggregatedOutput: `${String(existing.aggregatedOutput ?? "")}${String(params.delta ?? "")}`
     });
-    markSeededTurnLive(next, turnId, seeded);
+    next.thread.turns = seeded.turns;
+    if (isLiveThreadStatus(next.thread.status) && seeded.turn.status === "inProgress" && !next.activeTurnId) {
+      next.activeTurnId = turnId;
+    }
     return next;
   }
 

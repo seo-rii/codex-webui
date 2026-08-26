@@ -1919,10 +1919,6 @@
     return seenAt > 0 && Date.now() - seenAt < recentLiveSessionEvidenceTtlMs;
   }
 
-  function shouldDeferTerminalSessionStatus(sessionId: string | null | undefined, status: string | null | undefined) {
-    return Boolean(sessionId && status && !isLiveConversationStatus(status) && hasRecentLiveSessionEvidence(sessionId));
-  }
-
   function shouldSuppressAttentionReason(sessionId: string, reason: string, profileId: string | null = null) {
     if (
       selectedSessionId === sessionId &&
@@ -1972,42 +1968,26 @@
 
   function normalizeConversationExecutionState(currentConversation: ConversationState) {
     const liveTurn = getConversationLiveTurn(currentConversation);
-    if (liveTurn) {
-      if (currentConversation.activeTurnId === liveTurn.id && isLiveConversationStatus(currentConversation.thread.status)) {
+    if (isLiveConversationStatus(currentConversation.thread.status)) {
+      if (!liveTurn || currentConversation.activeTurnId === liveTurn.id) {
         return currentConversation;
       }
 
       return {
         ...currentConversation,
-        activeTurnId: liveTurn.id,
-        thread: isLiveConversationStatus(currentConversation.thread.status)
-          ? currentConversation.thread
-          : {
-              ...currentConversation.thread,
-              status: "running"
-            }
+        activeTurnId: liveTurn.id
       };
     }
 
-    const shouldKeepLiveShell =
-      isLiveConversationStatus(currentConversation.thread.status) &&
-      (currentConversation.thread.turns.length === 0 || Boolean(currentConversation.activeTurnId));
-    const nextStatus = !shouldKeepLiveShell && isLiveConversationStatus(currentConversation.thread.status) ? "completed" : currentConversation.thread.status;
-    if (currentConversation.activeTurnId === null && nextStatus === currentConversation.thread.status) {
+    if (!liveTurn && currentConversation.activeTurnId === null) {
       return currentConversation;
     }
 
-    return {
-      ...currentConversation,
-      activeTurnId: null,
-      thread:
-        nextStatus === currentConversation.thread.status
-          ? currentConversation.thread
-          : {
-              ...currentConversation.thread,
-              status: nextStatus
-            }
-    };
+    return applyStreamEvent(currentConversation, {
+      kind: "notification",
+      method: "thread/status/changed",
+      params: { status: currentConversation.thread.status }
+    });
   }
 
   function hasQueueableConversationActivity(currentConversation: ConversationState | null = conversation) {
@@ -2200,12 +2180,7 @@
 
   const running = $derived.by(() => {
     const currentConversation = conversation;
-    const sessionId = currentConversation?.thread.id ?? null;
-    return Boolean(
-      hasConversationLiveTurn(currentConversation) ||
-        isLiveConversationStatus(currentConversation?.thread.status) ||
-        hasRecentLiveSessionEvidence(sessionId)
-    );
+    return Boolean(isLiveConversationStatus(currentConversation?.thread.status));
   });
   const sessionListNeedsActiveStatusPolling = $derived.by(() => {
     if (authenticated !== true) {
@@ -5413,8 +5388,6 @@
   }
 
   function buildSessionSummaryFromConversation(state: ConversationState): SessionSummary {
-    const hasLiveTurn = hasConversationLiveTurn(state);
-    const hasRecentLiveEvidence = hasRecentLiveSessionEvidence(state.thread.id);
     const preview = deriveConversationSummaryPreview(state.thread.preview, state.thread.turns);
     const existingSummary =
       sessions.find(
@@ -5422,17 +5395,12 @@
           session.id === state.thread.id &&
           (!selectedSessionProfileId || !session.profileId || session.profileId === selectedSessionProfileId)
       ) ?? null;
-    const status =
-      hasLiveTurn || hasRecentLiveEvidence
-        ? "running"
-        : isLiveConversationStatus(state.thread.status) && state.thread.turns.length > 0
-          ? "completed"
-          : state.thread.status;
+    const status = state.thread.status;
     const updatedAt = Math.max(
       normalizeSessionTimestamp(state.thread.updatedAt),
       normalizeSessionTimestamp(existingSummary?.updatedAt ?? 0),
       normalizeSessionTimestamp(state.thread.createdAt),
-      hasLiveTurn || hasRecentLiveEvidence ? Date.now() : 0
+      isLiveConversationStatus(state.thread.status) ? Date.now() : 0
     );
 
     const activeProfile = activeProfileConfig();
@@ -6916,13 +6884,6 @@
           if (payload.method === "turn/completed" || payload.method === "thread/realtime/closed") {
             clearRecentLiveSessionEvidence(sessionId);
           }
-          if (
-            payload.method === "thread/status/changed" &&
-            shouldDeferTerminalSessionStatus(sessionId, String(payload.params.status ?? ""))
-          ) {
-            scheduleSelectedSessionStateRefresh(sessionId, recentLiveSessionEvidenceTtlMs + 250);
-            return;
-          }
         }
 
         conversation = applyLocalComposerPreferencesToConversation(
@@ -7791,7 +7752,7 @@
         if (summaryMatchesSelectedProfile && summary.status !== undefined && summary.status !== null) {
           if (isLiveConversationStatus(summary.status)) {
             noteRecentLiveSessionEvidence(summary.id);
-          } else if (!shouldDeferTerminalSessionStatus(summary.id, summary.status)) {
+          } else {
             clearRecentLiveSessionEvidence(summary.id);
           }
         }
@@ -7801,43 +7762,39 @@
           conversation &&
           conversation.thread.id === summary.id
         ) {
-          const conversationHasLiveTurn = hasConversationLiveTurn(conversation);
           const effectiveSummaryStatus = summary.status ?? conversation.thread.status;
-          const shouldPreserveLiveStatus =
-            (conversationHasLiveTurn || hasRecentLiveSessionEvidence(summary.id)) &&
-            !isLiveConversationStatus(effectiveSummaryStatus);
-          const nextStatus = shouldPreserveLiveStatus
-            ? isLiveConversationStatus(conversation.thread.status)
-              ? conversation.thread.status
-              : "running"
-            : effectiveSummaryStatus;
+          const nextStatus = effectiveSummaryStatus;
           const summaryUpdatedAt = normalizeSessionTimestamp(summary.updatedAt);
           const conversationUpdatedAt = normalizeSessionTimestamp(conversation.thread.updatedAt);
           const summaryIsNewer = summaryUpdatedAt > conversationUpdatedAt;
-          if (shouldPreserveLiveStatus) {
+          if (
+            summary.highlight?.kind === "attention" &&
+            shouldSuppressAttentionReason(
+              summary.id,
+              String(summary.highlight.reason ?? ""),
+              summary.profileId ?? null
+            )
+          ) {
             summaryForList = {
               ...summary,
-              status: nextStatus,
-              highlight:
-                summary.highlight?.kind === "attention" &&
-                shouldSuppressAttentionReason(
-                  summary.id,
-                  String(summary.highlight.reason ?? ""),
-                  summary.profileId ?? null
-                )
-                  ? null
-                  : summary.highlight
+              highlight: null
             };
-            scheduleSelectedSessionStateRefresh(summary.id, recentLiveSessionEvidenceTtlMs + 250);
           }
+          const statusReconciledConversation =
+            summary.status === undefined || summary.status === null
+              ? conversation
+              : applyStreamEvent(conversation, {
+                  kind: "notification",
+                  method: "thread/status/changed",
+                  params: { status: nextStatus }
+                });
           conversation = {
-            ...conversation,
-            activeTurnId: isLiveConversationStatus(nextStatus) ? conversation.activeTurnId : null,
+            ...statusReconciledConversation,
             thread: {
-              ...conversation.thread,
-              name: summary.name ?? conversation.thread.name,
-              preview: summary.preview ?? conversation.thread.preview,
-              updatedAt: summaryIsNewer ? summary.updatedAt : conversation.thread.updatedAt,
+              ...statusReconciledConversation.thread,
+              name: summary.name ?? statusReconciledConversation.thread.name,
+              preview: summary.preview ?? statusReconciledConversation.thread.preview,
+              updatedAt: summaryIsNewer ? summary.updatedAt : statusReconciledConversation.thread.updatedAt,
               status: nextStatus
             }
           };

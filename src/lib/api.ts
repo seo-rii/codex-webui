@@ -761,12 +761,14 @@ export const api = {
   getSessionLatestCompletedTurn(
     sessionId: string,
     expectedTurnId: string | null = null,
+    afterTurnId: string | null = null,
     knownCompletionVersion: string | null = null,
     profileId: string | null = null
   ) {
     return ws.request<SessionLatestCompletedTurnPayload>("session/latestCompletedTurn/get", {
       sessionId,
       expectedTurnId,
+      afterTurnId,
       knownCompletionVersion,
       profileId
     });

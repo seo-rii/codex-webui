@@ -5670,6 +5670,7 @@ async fn latest_completed_turn_waits_for_rollout_settlement_and_returns_only_the
         session_id,
         Some("turn-completion-tail"),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -5724,6 +5725,7 @@ async fn latest_completed_turn_waits_for_rollout_settlement_and_returns_only_the
         session_id,
         Some("turn-completion-tail"),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -5764,6 +5766,7 @@ async fn latest_completed_turn_waits_for_rollout_settlement_and_returns_only_the
         session_id,
         Some("turn-completion-tail"),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -5787,6 +5790,7 @@ async fn latest_completed_turn_waits_for_rollout_settlement_and_returns_only_the
         "default",
         session_id,
         Some("turn-completion-tail"),
+        None,
         None,
     )
     .await
@@ -5855,6 +5859,7 @@ async fn latest_completed_turn_waits_for_rollout_settlement_and_returns_only_the
         session_id,
         Some("turn-completion-tail"),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -5878,7 +5883,7 @@ async fn latest_completed_turn_waits_for_rollout_settlement_and_returns_only_the
     );
 
     let generic_latest =
-        session_latest_completed_turn_payload(&state, "default", session_id, None, None)
+        session_latest_completed_turn_payload(&state, "default", session_id, None, None, None)
             .await
             .unwrap();
     assert_eq!(
@@ -5916,6 +5921,7 @@ async fn latest_completed_turn_waits_for_rollout_settlement_and_returns_only_the
         session_id,
         Some("turn-completion-tail"),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -5946,6 +5952,7 @@ async fn latest_completed_turn_waits_for_rollout_settlement_and_returns_only_the
         "default",
         session_id,
         Some("turn-completion-tail"),
+        None,
         Some(completion_version),
     )
     .await
@@ -5961,6 +5968,7 @@ async fn latest_completed_turn_waits_for_rollout_settlement_and_returns_only_the
         "default",
         session_id,
         Some("turn-that-does-not-exist"),
+        None,
         None,
     )
     .await
@@ -6039,9 +6047,10 @@ async fn latest_completed_turn_recovers_a_final_reply_beyond_the_initial_tail_wi
 
     let state =
         test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
-    let payload = session_latest_completed_turn_payload(&state, "default", session_id, None, None)
-        .await
-        .unwrap();
+    let payload =
+        session_latest_completed_turn_payload(&state, "default", session_id, None, None, None)
+            .await
+            .unwrap();
 
     assert_eq!(payload.get("settled").and_then(Value::as_bool), Some(true));
     assert_eq!(
@@ -6065,6 +6074,142 @@ async fn latest_completed_turn_recovers_a_final_reply_beyond_the_initial_tail_wi
             .and_then(|revision| revision.get("size"))
             .and_then(Value::as_u64)
             .is_some_and(|size| size > INITIAL_COMPLETION_TAIL_BYTES as u64)
+    );
+
+    let _ = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn latest_completed_turn_waits_until_the_rollout_advances_past_the_loaded_tail() {
+    let sandbox = unique_test_dir("session-latest-completed-turn-baseline");
+    let workspace = sandbox.join("workspace");
+    let codex_home = sandbox.join("codex-home");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let session_id = "019df000-0000-7000-8000-000000000216";
+    let rollout_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("04")
+        .join("24");
+    fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout_path = rollout_dir.join(format!("rollout-2026-04-24T01-19-00-{session_id}.jsonl"));
+    fs::write(
+        &rollout_path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({
+                "timestamp": "2026-04-24T01:19:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-04-24T01:19:00.000Z",
+                    "cwd": workspace.display().to_string()
+                }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:19:01.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-old" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:19:02.000Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "old prompt" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:19:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-old",
+                    "last_agent_message": "old final answer"
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let state =
+        test_state_with_fake_app_server(workspace.clone(), vec![workspace.clone()], codex_home);
+    let stale = session_latest_completed_turn_payload(
+        &state,
+        "default",
+        session_id,
+        None,
+        Some("turn-old"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stale.get("settled").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        stale.get("expectedTurnReady").and_then(Value::as_bool),
+        Some(false),
+        "the last turn already loaded in the browser must not satisfy a newer completion refresh"
+    );
+    assert!(stale.get("turn").is_some_and(Value::is_null));
+
+    {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .unwrap();
+        for record in [
+            json!({
+                "timestamp": "2026-04-24T01:19:04.000Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-new" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:19:05.000Z",
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "new prompt" }
+            }),
+            json!({
+                "timestamp": "2026-04-24T01:19:06.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-new",
+                    "last_agent_message": "new final answer"
+                }
+            }),
+        ] {
+            writeln!(file, "{record}").unwrap();
+        }
+        file.flush().unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let advanced = session_latest_completed_turn_payload(
+        &state,
+        "default",
+        session_id,
+        None,
+        Some("turn-old"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        advanced.get("expectedTurnReady").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        advanced.get("turnId").and_then(Value::as_str),
+        Some("turn-new")
+    );
+    assert_eq!(
+        advanced
+            .get("turn")
+            .and_then(|turn| turn.get("items"))
+            .and_then(Value::as_array)
+            .and_then(|items| items.last())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str),
+        Some("new final answer")
     );
 
     let _ = fs::remove_dir_all(sandbox);

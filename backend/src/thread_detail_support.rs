@@ -3033,9 +3033,13 @@ pub(crate) async fn session_latest_completed_turn_payload(
     profile_id: &str,
     session_id: &str,
     expected_turn_id: Option<&str>,
+    after_turn_id: Option<&str>,
     known_completion_version: Option<&str>,
 ) -> ApiResult<Value> {
     let expected_turn_id = expected_turn_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let after_turn_id = after_turn_id
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let Some((thread, turn_window)) =
@@ -3046,6 +3050,7 @@ pub(crate) async fn session_latest_completed_turn_payload(
             "sessionId": session_id,
             "profileId": profile_id,
             "targetTurnId": expected_turn_id,
+            "afterTurnId": after_turn_id,
             "threadStatus": "unknown",
             "threadUpdatedAt": Value::Null,
             "turn": Value::Null,
@@ -3100,6 +3105,9 @@ pub(crate) async fn session_latest_completed_turn_payload(
         .and_then(Value::as_u64)
         .is_some();
     let expected_turn_matches = expected_turn_id.is_none_or(|expected| turn_id == Some(expected));
+    let completion_advanced = after_turn_id.is_none_or(|loaded_turn_id| {
+        turn_id.is_some_and(|candidate_turn_id| candidate_turn_id != loaded_turn_id)
+    });
     let source_stable = !turn_window.trailing_incomplete && !turn_window.changed_during_read;
     let thread_updated_at = thread.get("updatedAt").and_then(Value::as_u64);
     let turn_completed_at = raw_turn
@@ -3111,6 +3119,7 @@ pub(crate) async fn session_latest_completed_turn_payload(
         && turn_is_terminal
         && turn_has_terminal_content
         && source_stable;
+    let expected_turn_ready = settled && expected_turn_matches && completion_advanced;
     let summarized_turn = settled.then(|| {
         summarize_completed_turn_tail_payload(
             raw_turn
@@ -3122,7 +3131,7 @@ pub(crate) async fn session_latest_completed_turn_payload(
         )
     });
     let completion_version = summarized_turn.as_ref().map(payload_cache_version);
-    let not_modified = settled
+    let not_modified = expected_turn_ready
         && completion_version.as_deref().is_some_and(|version| {
             known_completion_version
                 .map(str::trim)
@@ -3150,16 +3159,17 @@ pub(crate) async fn session_latest_completed_turn_payload(
         "sessionId": session_id,
         "profileId": profile_id,
         "targetTurnId": expected_turn_id,
+        "afterTurnId": after_turn_id,
         "threadStatus": resolved_thread_status,
         "threadUpdatedAt": resolved_updated_at,
-        "turn": if not_modified { Value::Null } else { summarized_turn.unwrap_or(Value::Null) },
+        "turn": if not_modified || !expected_turn_ready { Value::Null } else { summarized_turn.unwrap_or(Value::Null) },
         "turnId": turn_id,
         "turnPosition": (!turn_window.truncated)
             .then(|| raw_turn_index.map(|index| turn_window.loaded_start.saturating_add(index)))
             .flatten(),
         "completionVersion": completion_version,
         "settled": settled,
-        "expectedTurnReady": settled && expected_turn_matches,
+        "expectedTurnReady": expected_turn_ready,
         "sourceStable": source_stable,
         "notModified": not_modified,
         "retryAfterMs": if turn_window.changed_during_read || turn_window.trailing_incomplete {

@@ -716,6 +716,7 @@ pub(crate) async fn execute_ws_method(
                 &profile_id,
                 &session_id,
                 params.get("expectedTurnId").and_then(Value::as_str),
+                params.get("afterTurnId").and_then(Value::as_str),
                 params.get("knownCompletionVersion").and_then(Value::as_str),
             )
             .await

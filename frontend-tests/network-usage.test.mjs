@@ -53,6 +53,28 @@ test("completion-tail refresh remains armed after the fast retry window", async 
   );
 });
 
+test("completion-tail refresh cannot settle on the final turn already loaded from cache", async () => {
+  const pageSource = await readFile("src/routes/+page.svelte", "utf8");
+  const apiSource = await readFile("src/lib/api.ts", "utf8");
+  const anchorStart = pageSource.indexOf("function completionRefreshTurnAnchors(");
+  const anchorEnd = pageSource.indexOf("\n  function getConversationDisplayTitle(", anchorStart);
+  const selectionStart = pageSource.indexOf("async function selectSession(");
+  const selectionEnd = pageSource.indexOf("\n  function rebindSelectedSessionProfile(", selectionStart);
+
+  assert.notEqual(anchorStart, -1, "completion baseline helper should exist");
+  assert.notEqual(anchorEnd, -1, "completion baseline helper should have a stable boundary");
+  assert.notEqual(selectionStart, -1, "session selection should exist");
+  assert.notEqual(selectionEnd, -1, "session selection should have a stable boundary");
+
+  const anchors = pageSource.slice(anchorStart, anchorEnd);
+  const selection = pageSource.slice(selectionStart, selectionEnd);
+  assert.match(anchors, /\{ expectedTurnId: null, afterTurnId: turn\.id \}/u);
+  assert.match(anchors, /\{ expectedTurnId: turn\.id, afterTurnId: null \}/u);
+  assert.match(selection, /sessionDetailSourceUpdatedAt/u);
+  assert.match(selection, /completionAnchors\.afterTurnId/u);
+  assert.match(apiSource, /afterTurnId,/u);
+});
+
 test("stale detail patches retry conditionally instead of forcing a full response", async () => {
   const source = await readFile("src/routes/+page.svelte", "utf8");
   const refreshStart = source.indexOf("async function refreshSelectedSessionState(");

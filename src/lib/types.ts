@@ -608,6 +608,7 @@ export type SessionLatestCompletedTurnPayload = {
   sessionId: string;
   profileId: string;
   targetTurnId: string | null;
+  afterTurnId: string | null;
   threadStatus: string;
   threadUpdatedAt: number | null;
   turn: CodexTurn | null;
